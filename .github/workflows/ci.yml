@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck --severity=warning conduck-connect.sh scripts/*.sh
+
+      - name: bash syntax (parse-only, never executes the wizard)
+        run: bash -n conduck-connect.sh
+
+      - name: verify vendored QR encoder (pinned checksum + stdlib-only imports)
+        run: bash scripts/verify-vendored-encoder.sh

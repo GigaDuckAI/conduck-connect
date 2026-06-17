@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create releases and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify before releasing
+        run: |
+          shellcheck --severity=warning conduck-connect.sh scripts/*.sh
+          bash -n conduck-connect.sh
+          bash scripts/verify-vendored-encoder.sh
+
+      - name: Generate checksum
+        run: sha256sum conduck-connect.sh > conduck-connect.sh.sha256
+
+      - name: Publish release with assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}   # built-in ref name; quoted below, never interpolated into shell
+        run: |
+          prerelease=()
+          case "$TAG" in *-rc*|*-alpha*|*-beta*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" \
+            conduck-connect.sh conduck-connect.sh.sha256 \
+            --title "$TAG" \
+            --notes-file CHANGELOG.md \
+            --verify-tag "${prerelease[@]}" \
+          || gh release upload "$TAG" conduck-connect.sh conduck-connect.sh.sha256 --clobber
