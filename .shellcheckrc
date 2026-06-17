@@ -1,0 +1,11 @@
+# ShellCheck config for conduck-connect — public on purpose, so an auditor sees
+# exactly what is suppressed and why. CI runs `shellcheck --severity=warning`,
+# which also drops info-level SC2015 ("A && B || C is not if-then-else") on the
+# handful of intentional best-effort status lines.
+#
+# SC2034 (unused variable): a few benign dead/reserved assignments in the
+#   feature-frozen, live-verified wizard (FUNNEL_PORTS_RE, local_port, ts_ok,
+#   FS_REUSED). Harmless; suppressed rather than refactoring a frozen script.
+# SC2155 (declare and assign separately): the single site is a `printf | base64`
+#   pipe whose return value cannot fail meaningfully.
+disable=SC2034,SC2155
