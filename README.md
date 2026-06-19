@@ -4,16 +4,16 @@ Pair your self-hosted AI gateway with the **[Conduck](https://gigaduck.ai/conduc
 
 ## Quick start
 
-```bash
-# 1 — download + verify (one paste; works on macOS and Linux)
-curl -fL --remote-name-all https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.1/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi
+One command — downloads the script, verifies it against the published checksum, and (only if it matches) launches the setup wizard. The wizard still **asks before every change**, so nothing touches your server without a y/N:
 
-# 2 — read it (that's the whole point), then run it
-less conduck-connect.sh
-bash conduck-connect.sh          # add --dry-run first to preview without changing anything
+```bash
+curl -fL --remote-name-all https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.1/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi && bash conduck-connect.sh
 ```
 
-`conduck-connect.sh: OK` from step 1 means the download is intact. From there the wizard is interactive and **asks before every change**. First time, or cautious? Skim [Why a shell script?](#why-a-shell-script) and [Trust posture](#trust-posture) below.
+- **Preview first, change nothing?** Append ` --dry-run` to the trailing `bash conduck-connect.sh`.
+- **Read it before running?** Drop the trailing `&& bash conduck-connect.sh` — the rest still downloads and verifies — then `less conduck-connect.sh` and run it when you're happy. It's a plain, readable script on purpose ([why](#why-a-shell-script)).
+
+Works on macOS and Linux. The checksum gate means a corrupted or tampered download is refused before anything runs.
 
 It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck: enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
@@ -21,11 +21,13 @@ It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck:
 
 ## Why a shell script?
 
-Because you should be able to read exactly what runs on your server before it runs. No binary, no installer, no `curl | bash`. You download it, read it, and run it with `bash`.
+Because you can read exactly what would run on your server — it's a plain, auditable script, not an opaque binary or installer. The Quick start writes it to a file, checks it against a published checksum **before** anything runs, and refuses to run if that check fails. Reading it yourself is one `less` away and always encouraged for a tool that touches your gateway.
+
+This is deliberately *not* `curl | bash` — that pipes unverified code straight into your shell, unread (and would break this script's interactive prompts anyway). Here the file lands on disk, gets verified, and only then runs.
 
 ## What each step does
 
-The Quick start above is these five steps condensed. Here they are spelled out:
+The Quick start chains these together. Here they are one at a time, with what each does:
 
 ```bash
 # 1. Download the script and its checksum (pinned release — not `main`)
