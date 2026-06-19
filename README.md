@@ -7,7 +7,7 @@ Pair your self-hosted AI gateway with the **[Conduck](https://gigaduck.ai/conduc
 One command — downloads the script, verifies it against the published checksum, and (only if it matches) launches the setup wizard. The wizard still **asks before every change**, so nothing touches your server without a y/N:
 
 ```bash
-curl -fL --remote-name-all https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.2/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi && bash conduck-connect.sh
+curl -fL --remote-name-all https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi && bash conduck-connect.sh
 ```
 
 - **Preview first, change nothing?** Append ` --dry-run` to the trailing `bash conduck-connect.sh`.
@@ -30,9 +30,9 @@ This is deliberately *not* `curl | bash` — that pipes unverified code straight
 The Quick start chains these together. Here they are one at a time, with what each does:
 
 ```bash
-# 1. Download the script and its checksum (pinned release — not `main`)
-curl -fLO https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.2/conduck-connect.sh
-curl -fLO https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.2/conduck-connect.sh.sha256
+# 1. Download the script and its checksum (latest published release — not `main`)
+curl -fLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh
+curl -fLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh.sha256
 
 # 2. Verify it downloaded intact
 shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-connect.sh.sha256
