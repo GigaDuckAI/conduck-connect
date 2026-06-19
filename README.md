@@ -1,6 +1,21 @@
 # conduck-connect
 
-One script that pairs a self-hosted AI gateway — **OpenClaw**, **Hermes**, or any OpenAI-compatible server — with the [Conduck](https://gigaduck.ai/conduck) app. It enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
+Pair your self-hosted AI gateway with the **[Conduck](https://gigaduck.ai/conduck)** app — one readable script you audit before you run. Zero telemetry.
+
+## Quick start
+
+```bash
+# 1 — download + verify (one paste; works on macOS and Linux)
+curl -fLO https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.1/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi
+
+# 2 — read it (that's the whole point), then run it
+less conduck-connect.sh
+bash conduck-connect.sh          # add --dry-run first to preview without changing anything
+```
+
+`conduck-connect.sh: OK` from step 1 means the download is intact. From there the wizard is interactive and **asks before every change**. First time, or cautious? Skim [Why a shell script?](#why-a-shell-script) and [Trust posture](#trust-posture) below.
+
+It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck: enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
 > **Status: pre-release.** The Conduck app is not yet public. This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
 
@@ -8,7 +23,9 @@ One script that pairs a self-hosted AI gateway — **OpenClaw**, **Hermes**, or 
 
 Because you should be able to read exactly what runs on your server before it runs. No binary, no installer, no `curl | bash`. You download it, read it, and run it with `bash`.
 
-## Get it and run it
+## What each step does
+
+The Quick start above is these five steps condensed. Here they are spelled out:
 
 ```bash
 # 1. Download the script and its checksum (pinned release — not `main`)
