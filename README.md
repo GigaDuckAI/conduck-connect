@@ -6,7 +6,7 @@ Pair your self-hosted AI gateway with the **[Conduck](https://gigaduck.ai/conduc
 
 ```bash
 # 1 — download + verify (one paste; works on macOS and Linux)
-curl -fLO https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.1/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi
+curl -fL --remote-name-all https://github.com/gigaduckai/conduck-connect/releases/download/v0.4.0-rc.1/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi
 
 # 2 — read it (that's the whole point), then run it
 less conduck-connect.sh
