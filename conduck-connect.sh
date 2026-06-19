@@ -5,8 +5,16 @@
 # How to run (no install, nothing to compile — this is a readable shell script
 # on purpose, so you can audit it before running):
 #
-#     bash conduck-connect.sh            # interactive wizard (detects what you run)
-#     bash conduck-connect.sh --dry-run  # show current state + what it WOULD do; change nothing
+# Where this should come from (so you know it's the real, untampered script):
+#   1. Download the script AND its checksum from the official release:
+#        https://github.com/gigaduckai/conduck-connect/releases
+#   2. Check it matches:  sha256sum -c conduck-connect.sh.sha256
+#   3. Skim this file (it's meant to be read), then run it.
+#   If you got this script any other way, get it from the link above first.
+#
+#     bash conduck-connect.sh --dry-run  # START HERE: shows your setup + exactly what a
+#                                        #   real run would change. Changes nothing.
+#     bash conduck-connect.sh            # the real interactive wizard (asks before every change)
 #
 # What this script DOES (always with your confirmation, step by step):
 #   1. Finds your gateway (OpenClaw, Hermes, or any OpenAI-compatible server).
@@ -17,7 +25,7 @@
 #      your agent real files and download its outputs.
 #   5. Verifies everything end-to-end with real requests.
 #   6. Prints a QR code you scan with the Conduck app — URL, token, and file-lane
-#      credentials imported in one scan. Nothing to type.
+#      credentials imported in one scan — nothing to retype on your phone.
 #
 # What this script NEVER does:
 #   - Install your gateway, Tailscale, cloudflared, or any daemon it didn't create.
@@ -37,8 +45,9 @@
 #   bash conduck-connect.sh --hermes        # skip detection, configure Hermes
 #   bash conduck-connect.sh --generic       # any OpenAI-compatible server
 #   bash conduck-connect.sh --dry-run       # show state + plan; mutate nothing
-#   bash conduck-connect.sh --reuse-only    # only reuse existing config; refuse to
-#                                           # change anything (safe against a live box)
+#   bash conduck-connect.sh --reuse-only    # only reuse what's already set up; refuse to
+#                                           # change anything — use this to re-show your QR
+#                                           # on a gateway you don't want touched
 #   bash conduck-connect.sh --allow-keyless-public   # expert: permit a keyless
 #                                           # gateway on a public transport
 #
@@ -78,7 +87,7 @@ for arg in "$@"; do
     --reuse-only) REUSE_ONLY=true ;;
     --allow-keyless-public) ALLOW_KEYLESS_PUBLIC=true ;;
     --version)  say "conduck-connect $VERSION"; exit 0 ;;
-    -h|--help)  sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "Unknown argument: $arg (try --help)" ;;
   esac
 done
@@ -184,7 +193,7 @@ print_and_wait() {  # print_and_wait "why" "command shown to user"
 # --reuse-only safety: refuse any mutation that isn't a pure reuse of existing state.
 mutate_guard() {  # mutate_guard "what would change"
   if $REUSE_ONLY; then
-    die "--reuse-only: refusing to change anything (would: $1). Re-run without --reuse-only on disposable infra to apply."
+    die "--reuse-only mode is on, so I won't change anything (this step would: $1). Re-run without --reuse-only when you're ready to let me apply changes to this machine."
   fi
   return 0
 }
@@ -339,13 +348,13 @@ configure_openclaw() {
   # is only an onboarding seed and can drift from what the gateway actually checks).
   GW_TOKEN=$(json_get "$cfg" "gateway.auth.token")
   if [ -n "$GW_TOKEN" ]; then
-    ok "Read the gateway bearer token from openclaw.json (not shown)."
+    ok "Read the gateway bearer token (the secret key the app sends to log in) from openclaw.json (not shown)."
   elif $DRY_RUN; then
     note "(dry-run: would prompt for the gateway bearer token)"
   else
     warn "No token found at gateway.auth.token in $cfg."
-    GW_TOKEN=$(ask_secret "Paste the gateway bearer token (hidden)")
-    [ -n "$GW_TOKEN" ] || die "A bearer token is required for OpenClaw."
+    GW_TOKEN=$(ask_secret "Paste the gateway bearer token — the secret key the gateway checks on each request (hidden)")
+    [ -n "$GW_TOKEN" ] || die "OpenClaw needs its access token (the secret key the gateway checks). Find it in openclaw.json under gateway.auth.token, then re-run."
   fi
   GW_AUTH="bearer"
 }
@@ -549,7 +558,7 @@ pick_public_port() { # pick_public_port <transport> <local_port> <role>
     return 1
   fi
   if [ "$transport" = "funnel" ]; then
-    die "All Funnel ports (443/8443/10000) are already used by other services. Funnel allows only those three; free one or use Tailscale (Serve) instead."
+    die "All three ports Tailscale Funnel can use (443, 8443, 10000) are already taken by other services on this machine. Run 'tailscale serve status' to see what's using them and free one, OR re-run and pick option 1 (Tailscale, private), which isn't limited to those three ports."
   fi
   die "No free HTTPS port found for the gateway on this transport."
 }
@@ -694,7 +703,7 @@ on_exit() {
   local all=(); all+=( ${APPLIED[@]+"${APPLIED[@]}"} ); all+=( ${FS_APPLIED[@]+"${FS_APPLIED[@]}"} )
   [ ${#all[@]} -gt 0 ] || return 0
   say ""
-  warn "Exited before emitting a pairing code, but exposure changes were applied. To undo them:"
+  warn "Exited before emitting a setup code, but exposure changes were applied. To undo them:"
   local entry port rest averb prior pverb pproxy
   for entry in "${all[@]}"; do
     port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
@@ -712,7 +721,9 @@ choose_exposure() {
   if [ -n "$GW_URL" ] && [ -z "$GW_LOCAL_PORT" ]; then
     head_ "Step 3 — HTTPS reachability"
     ok "Using your existing URL: $GW_URL"
-    if confirm "  Is this URL reachable from the public internet (not tailnet/LAN-only)?"; then SCOPE="public"; else SCOPE="private"; fi
+    note "Rule of thumb: if you could open this URL from your phone on cellular (Wi-Fi off),"
+    note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
+    if confirm "  Is this URL reachable from the public internet (i.e. NOT only on a private network like Tailscale or a home/office LAN)?"; then SCOPE="public"; else SCOPE="private"; fi
     keyless_public_guard
     classify_own_https
     return
@@ -729,28 +740,35 @@ choose_exposure() {
   have cloudflared && cf_state="✓ cloudflared found"
 
   say ""
-  say "  1) ${BOLD}Tailscale${RESET}  ($ts_state)"
-  say "     Private: only devices on your tailnet reach it. Free. End-to-end:"
-  say "     your data path is device → gateway, nobody in between."
-  say "     Your iPhone needs the Tailscale app too. An Apple Watch used away"
-  say "     from the iPhone canNOT reach a tailnet-only gateway."
+  say "  1) ${BOLD}Tailscale${RESET} (private — also called Tailscale Serve)  ($ts_state)"
+  say "     Private: only your own Tailscale devices (your \"tailnet\") reach it. Free."
+  say "     Data path: device → gateway, nobody in between. Your iPhone needs the"
+  say "     Tailscale app too."
+  say "     Apple Watch: works only while near your iPhone (no Tailscale on the Watch)."
   say ""
   say "  2) ${BOLD}Tailscale Funnel${RESET}  ($ts_state)"
-  say "     Same as above but PUBLICLY reachable (TLS passes through end-to-end)."
-  say "     No app needed on your Apple devices; Watch works standalone."
-  say "     Anyone who finds the URL can knock — your bearer token is the lock."
+  say "     Same as above but PUBLICLY reachable (TLS passes through end-to-end). Free."
+  say "     No app needed on your Apple devices."
+  say "     Apple Watch: works on its own, anywhere."
+  say "     Anyone who finds the URL can knock — your bearer token (the gateway's"
+  say "     secret key) is the lock."
   say ""
   say "  3) ${BOLD}Cloudflare Tunnel${RESET}  ($cf_state)"
-  say "     Public hostname on your own domain (~\$8/yr); nothing to install on"
-  say "     Apple devices. Data path: device → Cloudflare's edge → gateway —"
-  say "     Cloudflare can see the traffic."
+  say "     Public hostname on a domain you already manage in Cloudflare (~\$8/yr);"
+  say "     nothing to install on Apple devices. Data path: device → Cloudflare's"
+  say "     edge → gateway — Cloudflare can see the traffic."
+  say "     Apple Watch: works on its own, anywhere."
   say ""
   say "  4) ${BOLD}I already run my own HTTPS for it${RESET}"
   say "     (a reverse proxy, a VPS, or your own/self-signed certificate — I detect"
   say "     which). You give the https:// address; I check the certificate and either"
   say "     let the app trust it normally or pin it for you. No need to know which."
+  say "     Apple Watch: works on its own if that address is reachable without Tailscale/VPN."
   say ""
   say "  ${DIM}b) go back to the gateway choice${RESET}"
+  say ""
+  note "The biggest practical difference between these: an Apple Watch used away from"
+  note "your iPhone can reach a PUBLIC path (2, 3, or 4), never a private one (1)."
   say ""
   local choice; choice=$(require_choice "Choose 1-4, or 'b' to go back" '^([1-4]|[bB])$')
   [[ "$choice" =~ ^[bB]$ ]] && return 10   # back — main re-runs gateway selection (nothing applied yet)
@@ -768,7 +786,14 @@ choose_exposure() {
         warn "then re-run this script; it picks up where you left off."
         exit 0
       fi
-      [ -n "$(tailscale_dns_name)" ] || die "Tailscale is installed but not running/logged in. 'sudo tailscale up', then re-run."
+      if [ -z "$(tailscale_dns_name)" ]; then
+        say ""
+        warn "Tailscale is installed but not logged in on this machine."
+        warn "Run 'sudo tailscale up' to connect it to your tailnet (your private Tailscale"
+        warn "network) — it opens a browser link to sign in the first time. Then re-run this"
+        warn "script; it picks up where you left off."
+        exit 0
+      fi
       keyless_public_guard
       local host; host=$(tailscale_dns_name)
       pick_public_port "$TRANSPORT" "$GW_LOCAL_PORT" "gateway"; local gw_https="$PICKED_PORT"
@@ -778,7 +803,7 @@ choose_exposure() {
       if $funnel && [ -n "$existing" ] && [ "${existing%%$'\t'*}" = "serve" ]; then
         warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
         warn "https://$host:$gw_https reachable from the public internet."
-        confirm "  Make it public?" || die "Left private. Re-run and pick Tailscale (Serve) to stay private."
+        confirm "  Make it public?" || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
       fi
       tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
         || { cleanup_exposures; die "Gateway exposure not confirmed — cannot continue without an HTTPS URL."; }
@@ -797,23 +822,27 @@ choose_exposure() {
       local tname="<your-tunnel>"
       [ "$(printf '%s\n' "$tunnel" | grep -c .)" = "1" ] && tname="$tunnel"
       say ""
-      say "  Your tunnel config (usually ~/.cloudflared/config.yml) needs an ingress"
-      say "  rule per service. For the gateway:"
+      say "  Your tunnel config (usually ~/.cloudflared/config.yml) needs one 'ingress rule'"
+      say "  per service — a line that tells Cloudflare to send requests for a hostname to a"
+      say "  local port. For the gateway:"
       say ""
       say "      - hostname: ${BOLD}gateway.YOURDOMAIN${RESET}"
       say "        service: http://127.0.0.1:$GW_LOCAL_PORT"
+      note "(127.0.0.1 means \"this same machine\" — keep it as-is if the gateway runs on this host.)"
       say ""
       print_and_wait "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
         "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
       local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "")
-      [ -n "$h" ] || die "Need the hostname to continue."
+      [ -n "$h" ] || die "No hostname given. This option needs a domain already added to your Cloudflare account; if you don't have one yet, re-run and pick Tailscale instead, or add a domain in Cloudflare first."
       GW_URL="https://$h"
       ;;
     4)
       # One option for "I run my own HTTPS." The script figures out whether the
       # certificate is publicly trusted (no pin) or self-managed (pin its SPKI).
       GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com")
-      if confirm "  Is this address reachable from the public internet (not tailnet/LAN-only)?"; then SCOPE="public"; else SCOPE="private"; fi
+      note "Rule of thumb: if you could open this address from your phone on cellular (Wi-Fi off),"
+      note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
+      if confirm "  Is this address reachable from the public internet (i.e. NOT only on a private network like Tailscale or a home/office LAN)?"; then SCOPE="public"; else SCOPE="private"; fi
       keyless_public_guard
       classify_own_https   # sets TRANSPORT=public|selfsigned (+ GW_CERT_FP); STOPs on a broken cert
       ;;
@@ -947,6 +976,7 @@ classify_own_https() {  # GW_URL + SCOPE already set
     || die "Couldn't read a usable certificate from $GW_URL (key must be RSA-2048/3072/4096 or EC P-256/P-384)."
   TRANSPORT="selfsigned"
   $pinnable && ok "Detected a self-managed certificate — I'll pin it so the app trusts it."
+  $pinnable && note "Pinning = the app trusts exactly this certificate from now on (and skips the normal public-trust check). Re-run this script if you ever replace the certificate."
   ok "Fingerprint: $GW_CERT_FP (rides inside the QR — no transcription)."
 }
 
@@ -1080,7 +1110,7 @@ Restart=on-failure
 WantedBy=default.target
 EOF
   systemctl --user daemon-reload
-  systemctl --user enable --now "conduck-files-$GW_ID.service" && ok "Service running." \
+  systemctl --user enable --now "conduck-files-$GW_ID.service" && ok "File server running in the background (a systemd user service)." \
     || warn "Could not start the service — check 'systemctl --user status conduck-files-$GW_ID'."
   loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes' || {
     warn "User services stop at logout unless 'linger' is on (needed for a 24/7 box)."
@@ -1110,7 +1140,7 @@ with open(os.environ["PLIST"],"wb") as f: plistlib.dump(d,f)
 PY
   chmod 600 "$FS_UNIT"
   launchctl unload "$FS_UNIT" 2>/dev/null || true
-  launchctl load -w "$FS_UNIT" && ok "LaunchAgent running." \
+  launchctl load -w "$FS_UNIT" && ok "File server running in the background (a macOS LaunchAgent that restarts it automatically)." \
     || warn "Could not load the LaunchAgent — check 'launchctl list | grep conduck'."
   if pmset -g 2>/dev/null | grep -qE 'sleep[[:space:]]+[1-9]'; then
     warn "This Mac is set to sleep — a sleeping host isn't reachable 24/7."
@@ -1147,7 +1177,9 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
         # silently drop a working lane: offer to keep it private instead of losing it.
         warn "Couldn't make the file lane public — all three Funnel ports (443/8443/10000) are already in use by other services on this machine."
         if confirm "  Keep the file lane PRIVATE instead (reachable on your Tailscale network)?"; then
-          FS_URL="https://$host:$ehttps"; ok "Keeping the file lane private at $FS_URL — only your Tailscale devices can reach it."
+          FS_URL="https://$host:$ehttps"
+          warn "Keeping the file lane private at $FS_URL."
+          warn "Heads-up: the gateway is PUBLIC but this file lane stays Tailscale-only, so attachments work only on your Tailscale-connected devices — an Apple Watch used away from your iPhone won't reach them. Chat still works everywhere."
         else FS_CRED=""; note "Leaving the file lane out."; fi
         return 0
       fi
@@ -1227,7 +1259,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
 setup_file_lane() {
   head_ "Step 4 — agent file lane (optional, recommended)"
   say "  Lets Conduck hand your agent REAL files (PDF/CSV/zip…) for its tools, and"
-  say "  download files the agent writes back. Runs a small WebDAV server (rclone)"
+  say "  download files the agent writes back. It runs a tiny file server (over WebDAV —"
+  say "  a standard way to read and write files over the web — using the rclone tool)"
   say "  over the agent's working folder, same HTTPS exposure as the gateway."
   if ! confirm "  Set it up?"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
 
@@ -1449,7 +1482,7 @@ emit_payload() {
   if $VERIFY_FAILED; then
     cleanup_exposures
     warn "Some checks failed above — fix those first, then re-run me."
-    warn "I only hand you a pairing code that is known to work."
+    warn "I only hand you a setup code that is known to work."
     exit 1
   fi
 
@@ -1477,8 +1510,11 @@ PY
   local pairing="conduck-setup:v${PAYLOAD_VERSION}:$(printf '%s' "$payload" | b64_nowrap)"
 
   say ""
-  warn "The code below CONTAINS YOUR TOKEN. Anyone who scans it can use your agent."
-  warn "Show it to your own phone only; press Ctrl-L to clear the terminal afterwards."
+  warn "The setup code below CONTAINS YOUR TOKEN — both the QR and the plain-text string."
+  warn "Treat it like a password: anyone who scans or copies it can use your agent."
+  warn "Show it to your own phone only. Note: over SSH, Ctrl-L only clears the visible screen —"
+  warn "the code stays in your scroll-back, so close the terminal (or clear scroll-back) when"
+  warn "you're done, and never paste it into chat or a bug report."
   say ""
 
   render_qr "$pairing" || true   # prints a QR, or its own "widen/paste" note; string still follows
@@ -1487,13 +1523,13 @@ PY
   say "  ${BOLD}In Conduck:${RESET} Settings → Personal AI → Scan or paste setup code"
   say "  (the row sits right under 'Add custom gateway')."
   say ""
-  say "  Paste string (same content as the QR, for the Mac app or if scanning fails):"
+  say "  Setup code (same secret as the QR — paste this for the Mac app or if scanning fails):"
   say ""
   printf '%s\n' "$pairing"
   say ""
   case "$TRANSPORT" in
     tailscale) note "Reminder: this gateway is tailnet-only — the iPhone/iPad/Mac running Conduck needs the Tailscale app, logged in to the same tailnet." ;;
-    selfsigned) note "The cert fingerprint rides in the code — the app pins it automatically." ;;
+    selfsigned) note "Your gateway uses its own certificate; a secure fingerprint of it travels inside the code, so the app trusts it automatically — nothing for you to copy." ;;
   esac
   say "  Re-run this script any time to re-verify or show the code again."
   EMITTED=true   # success — the EXIT backstop must not print "undo" hints
@@ -2512,7 +2548,21 @@ print_plan() {
   fi
   say ""
   say "  ${BOLD}Decisions gathered:${RESET}"
-  note "gateway = $GW_KIND${GW_NAME:+ ($GW_NAME)}   transport = ${TRANSPORT:-?}   scope = $SCOPE"
+  local gw_h tr_h reach_h
+  case "$GW_KIND" in
+    openclaw) gw_h="OpenClaw" ;; hermes) gw_h="Hermes" ;;
+    custom)   gw_h="your OpenAI-compatible server" ;; *) gw_h="${GW_KIND:-?}" ;;
+  esac
+  case "$TRANSPORT" in
+    tailscale) tr_h="Tailscale (private)" ;; funnel) tr_h="Tailscale Funnel (public)" ;;
+    cloudflare) tr_h="Cloudflare Tunnel (public)" ;; public) tr_h="your own HTTPS (trusted cert)" ;;
+    selfsigned) tr_h="your own HTTPS (pinned cert)" ;; *) tr_h="to be decided during exposure" ;;
+  esac
+  case "$SCOPE" in
+    public) reach_h="public (anyone with the URL)" ;; private) reach_h="private (your devices only)" ;;
+    *) reach_h="to be decided during exposure" ;;
+  esac
+  note "gateway = $gw_h${GW_NAME:+ ($GW_NAME)}   reach = $reach_h   how = $tr_h"
   note "gateway URL = ${GW_URL:-<set during exposure>}"
   [ -n "$GW_CERT_FP" ] && note "self-signed pin = $GW_CERT_FP"
   say ""
@@ -2531,8 +2581,9 @@ print_plan() {
 
 say "${BOLD}conduck-connect $VERSION${RESET} — pair your self-hosted AI gateway with Conduck."
 $DRY_RUN && note "(dry-run: nothing will be changed)"
-$REUSE_ONLY && note "(reuse-only: will refuse any change; safe to run against a live box)"
-say "Every change asks first. Nothing leaves this machine. Ctrl-C any time."
+$REUSE_ONLY && note "(reuse-only: I'll reuse what's set up and refuse any change — safe to run on a gateway you don't want touched)"
+say "Every change asks first. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
+note "Two kinds of step: things I made (I offer to run them for you), and things you already own — your gateway config, Tailscale, daemons — which I never touch; I print the exact command for you to run."
 
 # Gateway selection → configure → transport, looped so the transport menu's
 # "b" can return to the gateway choice (only reachable before any change is applied).
