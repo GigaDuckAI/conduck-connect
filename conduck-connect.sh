@@ -1520,8 +1520,8 @@ PY
   render_qr "$pairing" || true   # prints a QR, or its own "widen/paste" note; string still follows
 
   say ""
-  say "  ${BOLD}In Conduck:${RESET} Settings → Personal AI → Scan or paste setup code"
-  say "  (the row sits right under 'Add custom gateway')."
+  say "  ${BOLD}In Conduck:${RESET} Settings → Personal AI → look for the setup-code option."
+  say "  On iPhone/iPad, scan the QR or paste this code; on Mac, paste the code below."
   say ""
   say "  Setup code (same secret as the QR — paste this for the Mac app or if scanning fails):"
   say ""
