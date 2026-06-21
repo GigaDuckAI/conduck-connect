@@ -2,10 +2,12 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
-## [Unreleased]
+## [0.4.0-rc.3] — pairing-hint accuracy fix
+
+Same script behavior as rc.2 — still `VERSION=0.4.0`, same flags, same exposure paths, same `conduck-setup:v1` payload. A one-line accuracy fix to the closing in-app instruction; no functional or security change.
 
 ### Changed
-- **Final in-app pairing hint reworded to be label-agnostic.** The closing "In Conduck:" instruction no longer names a single button label or its on-screen position — the app's setup-code entry point now lives in a top-level **Connect** section, and its label varies by state (a first-time user sees "I have a setup code"; a returning user sees "Scan or paste setup code"). The hint now points at "the setup-code option" and spells out scan-or-paste on iPhone/iPad vs paste on Mac, so it stays accurate as the app's UI evolves. No script behavior, flags, or payload change — still `VERSION=0.4.0`, `conduck-setup:v1`.
+- **Final in-app pairing hint reworded to be label-agnostic.** The closing "In Conduck:" instruction no longer names a single button label or its on-screen position — the app's setup-code entry point now lives in a top-level **Connect** section, and its label varies by state (a first-time user sees "I have a setup code"; a returning user sees "Scan or paste setup code"). The hint now points at "the setup-code option" and spells out scan-or-paste on iPhone/iPad vs paste on Mac, so it stays accurate as the app's UI evolves.
 
 ## [0.4.0-rc.2] — clarity pass
 
@@ -30,5 +32,6 @@ First public, auditable release. The script itself is `VERSION=0.4.0`, live-rig 
 - **`--reuse-only`** reuses existing config and refuses any mutation — safe to point at a live box.
 - **Local terminal QR** via a vendored, stdlib-only Python encoder — no `qrencode`, no install.
 
+[0.4.0-rc.3]: https://github.com/gigaduckai/conduck-connect/releases/tag/v0.4.0-rc.3
 [0.4.0-rc.2]: https://github.com/gigaduckai/conduck-connect/releases/tag/v0.4.0-rc.2
 [0.4.0-rc.1]: https://github.com/gigaduckai/conduck-connect/releases/tag/v0.4.0-rc.1
