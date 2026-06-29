@@ -4,16 +4,16 @@ Pair your self-hosted AI gateway with the **[Conduck](https://gigaduck.ai/conduc
 
 ## Quick start
 
-One command — downloads the script, verifies it against the published checksum, and (only if it matches) launches the setup wizard. The wizard still **asks before every change**, so nothing touches your server without a y/N:
+One command — downloads the script from GitHub Releases to disk over HTTPS, then launches the setup wizard. The wizard still **asks before every change**, so nothing touches your server without a y/N:
 
 ```bash
-curl -fL --remote-name-all https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh{,.sha256} && if command -v sha256sum >/dev/null; then sha256sum -c conduck-connect.sh.sha256; else shasum -a 256 -c conduck-connect.sh.sha256; fi && bash conduck-connect.sh
+curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh && bash conduck-connect.sh
 ```
 
 - **Preview first, change nothing?** Append ` --dry-run` to the trailing `bash conduck-connect.sh`.
-- **Read it before running?** Drop the trailing `&& bash conduck-connect.sh` — the rest still downloads and verifies — then `less conduck-connect.sh` and run it when you're happy. It's a plain, readable script on purpose ([why](#why-a-shell-script)).
+- **Read it before running?** Drop the trailing `&& bash conduck-connect.sh` — the rest still downloads the file — then `less conduck-connect.sh` and run it when you're happy. It's a plain, readable script on purpose ([why](#why-a-shell-script)).
 
-Works on macOS and Linux. The checksum gate means a corrupted or tampered download is refused before anything runs.
+Works on macOS and Linux. `-O` lands the full file on disk before anything runs, so reading it first is one `less` away — that, plus the HTTPS download from GitHub, is your real protection. (An optional same-release checksum is [below](#what-each-step-does); it confirms the download arrived intact but is not a tamper-proof signature.)
 
 It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck: enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
@@ -21,30 +21,33 @@ It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck:
 
 ## Why a shell script?
 
-Because you can read exactly what would run on your server — it's a plain, auditable script, not an opaque binary or installer. The Quick start writes it to a file, checks it against a published checksum **before** anything runs, and refuses to run if that check fails. Reading it yourself is one `less` away and always encouraged for a tool that touches your gateway.
+Because you can read exactly what would run on your server — it's a plain, auditable script, not an opaque binary or installer. The Quick start writes it to a file **before** anything runs, so reading it yourself is one `less` away — always encouraged for a tool that touches your gateway.
 
-This is deliberately *not* `curl | bash` — that pipes unverified code straight into your shell, unread (and would break this script's interactive prompts anyway). Here the file lands on disk, gets verified, and only then runs.
+This is deliberately *not* `curl | bash` — that pipes unverified code straight into your shell, unread (and would break this script's interactive prompts anyway). Here the file lands on disk, remains available to inspect, and only then runs.
 
 ## What each step does
 
 The Quick start chains these together. Here they are one at a time, with what each does:
 
 ```bash
-# 1. Download the script and its checksum (latest published release — not `main`)
-curl -fLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh
-curl -fLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh.sha256
+# 1. Download the script to disk (latest published release — not `main`)
+curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh
 
-# 2. Verify it downloaded intact
-shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-connect.sh.sha256
-
-# 3. Read it — that is the point
+# 2. Read it — that is the point
 less conduck-connect.sh
 
-# 4. See what it WOULD do, changing nothing
+# 3. See what it WOULD do, changing nothing
 bash conduck-connect.sh --dry-run
 
-# 5. Run it for real (every change still asks first)
+# 4. Run it for real (every change still asks first)
 bash conduck-connect.sh
+```
+
+**Optional integrity check.** Each release also ships a checksum. It confirms the file downloaded intact — it is **not** a signature and can't prove the release wasn't swapped (it rides the same release channel); reading the script is what catches that:
+
+```bash
+curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh.sha256
+shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-connect.sh.sha256
 ```
 
 No `chmod` needed. The one large block near the bottom of the script is a vendored, unmodified QR-code encoder (Project Nayuki, MIT) used to draw the QR locally. It is inert — Python standard library only, no network, file, or process access — and safe to skip when reading.
