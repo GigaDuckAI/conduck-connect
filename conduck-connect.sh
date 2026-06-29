@@ -5,11 +5,15 @@
 # How to run (no install, nothing to compile — this is a readable shell script
 # on purpose, so you can audit it before running):
 #
-# Where this should come from (so you know it's the real, untampered script):
-#   1. Download the script AND its checksum from the official release:
-#        https://github.com/gigaduckai/conduck-connect/releases
-#   2. Check it matches:  sha256sum -c conduck-connect.sh.sha256
-#   3. Skim this file (it's meant to be read), then run it.
+# Where this should come from:
+#   1. Get it over HTTPS from the official release — not forwarded to you by
+#      someone else:  https://github.com/gigaduckai/conduck-connect/releases
+#   2. Skim this file before running it; it's short and meant to be read. That,
+#      plus the HTTPS download, is your real protection.
+#   3. Optional integrity check: the release also ships a checksum
+#        sha256sum -c conduck-connect.sh.sha256
+#      It catches a corrupted download, but it rides the same release channel —
+#      so it can't prove the release itself wasn't swapped. Reading the script can.
 #   If you got this script any other way, get it from the link above first.
 #
 #     bash conduck-connect.sh --dry-run  # START HERE: shows your setup + exactly what a

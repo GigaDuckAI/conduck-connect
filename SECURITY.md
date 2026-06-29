@@ -40,13 +40,15 @@ See [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md) for the exhaustive list and how to 
 
 ## Verifying your download
 
-Every release publishes `conduck-connect.sh.sha256`. Verify before running:
+The script is delivered over HTTPS straight from GitHub Releases, and it is short and meant to be **read** before you run it — those two things are your real protection. Read it first (`less conduck-connect.sh`).
+
+Every release also publishes `conduck-connect.sh.sha256` for an optional integrity check:
 
 ```bash
 shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-connect.sh.sha256
 ```
 
-Release tags are protected and are not moved after publication, so a given version's bytes never change underneath you.
+This confirms the bytes arrived intact, but the checksum rides the same release channel as the script — so it catches a **corrupted** download, not a **swapped or tampered** release. Reading the script is what catches that. Release tags are protected and are not moved after publication, so a given version's bytes never change underneath you.
 
 ## The pairing code is a secret
 
