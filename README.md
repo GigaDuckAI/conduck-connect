@@ -17,7 +17,7 @@ Works on macOS and Linux. `-O` lands the full file on disk before anything runs,
 
 It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck: enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
-> **Status: pre-release.** The Conduck app is not yet public. This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
+> **Status: the script is at its first stable release (`v0.4.0`); the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
 
 ## Why a shell script?
 

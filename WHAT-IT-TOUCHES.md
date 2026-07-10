@@ -19,8 +19,9 @@ bash conduck-connect.sh --dry-run
 | Change | Detail | How to undo |
 |---|---|---|
 | Enable OpenClaw chat endpoint | Sets `gateway.http.endpoints.chatCompletions.enabled = true` and restarts OpenClaw. | Set it back to `false` and restart. |
-| Enable Hermes API server | Appends `API_SERVER_ENABLED` / `API_SERVER_HOST` / `API_SERVER_PORT` / `API_SERVER_KEY` to `~/.hermes/.env`, then restarts `hermes-gateway`. | Remove the appended lines and restart. |
-| Tailscale exposure | `tailscale serve` (private) or `tailscale funnel` (public) on an auto-selected HTTPS port. | `tailscale serve --https=<port> off` / `tailscale funnel --https=<port> off`. The script also prints the exact command to restore any prior mapping it replaced. |
+| Enable Hermes API server | Appends `API_SERVER_ENABLED` / `API_SERVER_HOST` / `API_SERVER_PORT` to `~/.hermes/.env`, then restarts `hermes-gateway`. An `API_SERVER_KEY` already present is reused, never rotated; a new one is generated only when none exists. If the file has to be created, it is created `0600` (the key lands inside it). | Remove the appended lines and restart. |
+| Tailscale exposure | `tailscale serve` (private) or `tailscale funnel` (public) on an auto-selected HTTPS port. If that port already maps to the same gateway with the *other* verb, the mapping is switched in place — going private drops the public Funnel flag first, so the port really stops being public. | `tailscale serve --https=<port> off` / `tailscale funnel --https=<port> off`. The script also prints the exact command to restore any prior mapping it replaced. |
+| Turn off a **stale public exposure it did not create** | When you choose a private path, the script looks for Tailscale **Funnels** (public) on *other* ports that still point at the same gateway or file-lane port from an earlier setup, tells you where they are, and offers to switch them off. It never does this without an explicit yes, and never touches a mapping for a different service. Declining leaves them running and says so. | Re-create it: `tailscale funnel --bg --https=<port> http://127.0.0.1:<local-port>`. Note this removal is treated as intentional, so the script's own rollback will not put it back for you. |
 | File-server service (optional) | rclone WebDAV bound to `127.0.0.1:<port>`, as a service the script owns: Linux `~/.config/systemd/user/conduck-files-<id>.service`; macOS `~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist`. | Linux: `systemctl --user disable --now conduck-files-<id>` then delete the unit. macOS: `launchctl unload <plist>` then delete it. |
 | File-lane credential | A 32-hex secret written to a `0600` file under `~/.config/conduck/`. | Delete the file. |
 
@@ -28,6 +29,10 @@ bash conduck-connect.sh --dry-run
 
 - **Cloudflare Tunnel** config / DNS — the script prints the exact commands; you run them; it re-verifies.
 - Anything needing `sudo` (Tailscale operator rights, `loginctl enable-linger`, `pmset`) — printed for you to review and run.
+
+## When it cannot prove what it did
+
+Every exposure change is re-checked against `tailscale serve status --json` afterwards. If that check cannot confirm the result — the command needed rights it did not have, or the status could not be read — the script says so plainly and prints the exact commands to fix it by hand. It never reports a change as done on faith, and it will not end a run silently while a file server it exposed may still be reachable.
 
 ## Network
 
