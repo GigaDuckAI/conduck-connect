@@ -40,7 +40,8 @@
 #
 # Works on Linux and macOS gateway hosts. Requires: bash, curl, python3, openssl.
 # No extra install: the QR is rendered locally by a vendored, stdlib-only Python
-# encoder (Project Nayuki, MIT — the big, inert block near the end of this file).
+# encoder (Project Nayuki, MIT — the big, inert block near the end of this file;
+# it needs Python 3.7+ — on an older Python you just use the printed code).
 # The pairing string is always printed too, so the QR is never required.
 #
 # Usage:
@@ -91,7 +92,7 @@ for arg in "$@"; do
     --reuse-only) REUSE_ONLY=true ;;
     --allow-keyless-public) ALLOW_KEYLESS_PUBLIC=true ;;
     --version)  say "conduck-connect $VERSION"; exit 0 ;;
-    -h|--help)  sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)  sed -n '2,${/^#/!q;s/^# \{0,1\}//p;}' "$0"; exit 0 ;;   # whole header comment, wherever it ends
     *) die "Unknown argument: $arg (try --help)" ;;
   esac
 done
@@ -132,14 +133,21 @@ ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden)
 }
 
 # A choice with NO Enter-default — loops until the answer matches the regex.
+# Callers capture this with $(), so EVERY human-facing line goes to stderr —
+# a retry warning on stdout would be captured as part of the answer, and a typo
+# would then silently decide a safety question. On EOF it RETURNS NONZERO rather
+# than calling die: a `die` inside $() kills only the subshell, so the parent
+# must be the one to stop (every caller pairs this with `|| die`).
 require_choice() {  # require_choice "prompt" "regex" -> echoes the choice
   local reply
   while true; do
-    read -r -p "  $1: " reply
+    read -r -p "  $1: " reply || return 1     # closed stdin — never spin the loop
     if [[ "$reply" =~ $2 ]]; then printf '%s' "$reply"; return 0; fi
-    warn "Please enter one of the listed options."
+    warn "Please enter one of the listed options." >&2
   done
 }
+
+NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask you questions."
 
 # A URL prompt that NEVER aborts on a typo — loops until it gets an https:// URL
 # (or blank, when allow_blank=1, where leaving it out is a valid choice). Trims
@@ -149,8 +157,9 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] -> echoes the URL (or ""
   local prompt="$1" example="$2" allow_blank="${3:-0}" reply
   say "  $prompt" >&2
   while true; do
-    read -r -p "  https URL (e.g. $example) > " reply
+    read -r -p "  https URL (e.g. $example) > " reply || return 1   # EOF: caller dies (see require_choice)
     reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
+    while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done   # trailing / would make //v1/… requests
     if [ -z "$reply" ]; then
       [ "$allow_blank" = "1" ] && return 0
       warn "Please enter an https:// URL, for example $example." >&2; continue
@@ -299,15 +308,19 @@ detect_gateway() {
   say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, …)"
   local choice
   if [ -n "$default_choice" ]; then
-    choice=$(ask "  Choose 1-3" "$default_choice")
+    # Enter takes the detected default; a typo re-prompts (never aborts).
+    while true; do
+      choice=$(ask "  Choose 1-3" "$default_choice")
+      case "$choice" in [123]) break ;; *) warn "Please enter 1, 2, or 3 (or press Enter for $default_choice)." ;; esac
+    done
   else
-    choice=$(require_choice "Choose 1-3" '^[123]$')
+    choice=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
   fi
   case "$choice" in
     1) GW_KIND="openclaw" ;;
     2) GW_KIND="hermes" ;;
     3) GW_KIND="custom" ;;
-    *) die "Invalid choice." ;;
+    *) die "Invalid choice." ;;   # unreachable; a silent fallthrough would leave GW_KIND unset
   esac
 }
 
@@ -381,16 +394,25 @@ configure_hermes() {
   else
     warn "Hermes's OpenAI API server is OFF (the setup wizard does not enable it)."
     mutate_guard "append API_SERVER_* to $envf" || return 0
-    local newkey; newkey=$(openssl rand -hex 32)
+    # Reuse an existing key rather than silently rotating one other clients may use.
+    local newkey keyline=""
+    newkey=$(env_get "$envf" "API_SERVER_KEY")
+    [ -n "$newkey" ] || { newkey=$(openssl rand -hex 32); keyline="API_SERVER_KEY=$newkey"; }
     say "  I'd append to $envf:"
     say "    API_SERVER_ENABLED=true"
     say "    API_SERVER_HOST=127.0.0.1"
     say "    API_SERVER_PORT=$GW_LOCAL_PORT"
-    say "    API_SERVER_KEY=<freshly generated, not shown>"
+    if [ -n "$keyline" ]; then say "    API_SERVER_KEY=<freshly generated, not shown>"
+    else say "    (keeping the API_SERVER_KEY already in your .env)"; fi
     if confirm "  Append these now?"; then
+      [ -f "$envf" ] || ( umask 077; : > "$envf" )   # the key lands inside — never create it world-readable
+      # No `|| true` here: a failed append (read-only fs, perms) must NOT report
+      # "Written." and send the user on to a verify step that mis-diagnoses it.
       { echo ""; echo "# added by conduck-connect $(date -u +%Y-%m-%dT%H:%MZ)";
         echo "API_SERVER_ENABLED=true"; echo "API_SERVER_HOST=127.0.0.1";
-        echo "API_SERVER_PORT=$GW_LOCAL_PORT"; echo "API_SERVER_KEY=$newkey"; } >> "$envf"
+        echo "API_SERVER_PORT=$GW_LOCAL_PORT";
+        if [ -n "$keyline" ]; then echo "$keyline"; fi; } >> "$envf" \
+        || die "Could not write to $envf. Fix its permissions (or add the API_SERVER_* lines yourself), then re-run me."
       ok "Written."
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "restart Hermes so the API server starts" \
@@ -432,10 +454,20 @@ configure_generic() {
   GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
   if confirm "  Does it already have a public https:// URL?"; then
     GW_LOCAL_PORT=""
-    GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com")
+    GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
   else
-    GW_LOCAL_PORT=$(ask "  Local port it listens on (e.g. 11434 for Ollama)" "")
-    [ -n "$GW_LOCAL_PORT" ] || die "Need the local port (or an https URL)."
+    while true; do
+      GW_LOCAL_PORT=$(ask "  Local port it listens on (e.g. 11434 for Ollama)" "")
+      [ -n "$GW_LOCAL_PORT" ] || die "Need the local port (or an https URL)."
+      case "$GW_LOCAL_PORT" in
+        *[!0-9]*) warn "That's not a port number — digits only (e.g. 11434)." ;;
+        # Length-bound BEFORE the numeric test (6+ digits can't be a port): bash
+        # 3.2 errors out loudly on an integer comparison wider than intmax.
+        ??????*) warn "Ports go from 1 to 65535." ;;
+        *) [ "$GW_LOCAL_PORT" -ge 1 ] && [ "$GW_LOCAL_PORT" -le 65535 ] && break
+           warn "Ports go from 1 to 65535." ;;
+      esac
+    done
   fi
   GW_HEALTH_PATH=""   # no portable health endpoint on arbitrary servers
   if confirm "  Does it require a bearer token / API key?"; then
@@ -467,8 +499,28 @@ declare -a APPLIED=()         # "port<TAB>applied-verb<TAB>prior-state" snapshot
 declare -a FS_APPLIED=()      # same, but for the OPTIONAL file lane — rolled back on its own when the
                               # lane is dropped post-mutation, so a public Funnel is never orphaned
 FS_HTTPS_PORT=""              # chosen at exposure time (transport-aware)
+FS_ROLLBACK_INCOMPLETE=false  # a file-lane exposure we applied could not be proven removed
 
-FUNNEL_PORTS_RE='^(443|8443|10000)$'
+# The one undo recipe, used by every path that has to tell the user how to put a
+# port back: a funnel WE created needs its OWN `off` (`serve off` clears the web
+# handler but NOT the AllowFunnel flag, so public exposure would survive).
+print_undo_hints() { # print_undo_hints <"port\tapplied-verb\tprior">…
+  local entry port rest averb prior pverb pproxy
+  for entry in "$@"; do
+    [ -n "$entry" ] || continue
+    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
+    averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
+    if [ "$averb" = "funnel" ]; then
+      printf '    %stailscale funnel --https=%s off%s   # remove PUBLIC exposure\n' "$BOLD" "$port" "$RESET"
+    fi
+    if [ "$prior" = "EMPTY" ]; then
+      printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$port" "$RESET"
+    else
+      pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
+      printf '    %stailscale %s --bg --https=%s %s%s   # restore previous mapping\n' "$BOLD" "$pverb" "$port" "$pproxy" "$RESET"
+    fi
+  done
+}
 
 tailscale_dns_name() {
   tailscale status --json 2>/dev/null | python3 -c '
@@ -537,7 +589,7 @@ ts_port_for_backend() { # ts_port_for_backend <local-port>
 PICKED_PORT=""
 RESERVED_PORTS=" "   # ports already chosen THIS run (so gateway + file lane never collide, incl. dry-run)
 pick_public_port() { # pick_public_port <transport> <local_port> <role>
-  local transport="$1" local_port="$2" role="$3" want="http://127.0.0.1:$2"
+  local transport="$1" role="$3" want="http://127.0.0.1:$2"
   local want_verb="serve"; [ "$transport" = "funnel" ] && want_verb="funnel"   # transport label → tailscale verb
   PICKED_PORT=""
   $TS_STATE_KNOWN || die "Could not read 'tailscale serve status --json' — refusing to guess port state. Update Tailscale or check 'tailscale serve status'."
@@ -550,6 +602,16 @@ pick_public_port() { # pick_public_port <transport> <local_port> <role>
     t=$(ts_target_for_port "$p"); [ -n "$t" ] || continue
     verb="${t%%$'\t'*}"; proxy="${t#*$'\t'}"
     if [ "$proxy" = "$want" ] && [ "$verb" = "$want_verb" ]; then PICKED_PORT="$p"; RESERVED_PORTS="$RESERVED_PORTS$p "; return 0; fi
+  done
+  # 1b) Same backend, OTHER verb → pick THAT port so the mapping is flipped in
+  # place (caller warns + confirms). Allocating a fresh port here would leave the
+  # old exposure live — e.g. a "go private" run that quietly keeps an old public
+  # Funnel serving the same gateway.
+  for p in $candidates; do
+    case "$RESERVED_PORTS" in *" $p "*) continue ;; esac
+    t=$(ts_target_for_port "$p"); [ -n "$t" ] || continue
+    proxy="${t#*$'\t'}"
+    if [ "$proxy" = "$want" ]; then PICKED_PORT="$p"; RESERVED_PORTS="$RESERVED_PORTS$p "; return 0; fi
   done
   # 2) First permitted port that is neither reserved this run nor already mapped.
   for p in $candidates; do
@@ -589,15 +651,29 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     fi
   fi
 
+  # Verb flip funnel→serve: a new `serve` mapping can leave the AllowFunnel flag
+  # on (the port would still be public), so the flip drops the funnel explicitly
+  # first; the verb-match confirm below then proves the port really went private.
+  local demote=false demote_cmd="tailscale funnel --https=$httpsport off"
+  [ -n "$t" ] && [ "${t%%$'\t'*}" = "funnel" ] && [ "$verb" = "serve" ] && demote=true
+
   say ""
   say "  Mapping: https port $httpsport  →  127.0.0.1:$localport  (${verb})"
-  if $DRY_RUN; then plan_add "RUN  $cmd"; note "(dry-run: would run the above)"; return 0; fi
+  if $DRY_RUN; then
+    $demote && plan_add "RUN  $demote_cmd   # drop the public Funnel before going private"
+    plan_add "RUN  $cmd"; note "(dry-run: would run the above)"; return 0
+  fi
   mutate_guard "expose port $httpsport via tailscale $verb" || return 1
-  snapshot_port "$httpsport" "$verb" "$role"
   if confirm "  Run '$cmd' now?"; then
+    # Snapshot only once the user has AGREED — a declined confirm must leave no
+    # rollback record for a port we never touched.
+    snapshot_port "$httpsport" "$verb" "$role"
+    if $demote; then tailscale funnel --https="$httpsport" off 2>/dev/null || true; fi
     $cmd 2>/dev/null || {
       warn "That needs elevated rights on this machine."
-      print_and_wait "Tailscale serve/funnel often needs sudo (or operator rights)." "sudo $cmd" || { return 1; }
+      local fallback="sudo $cmd"
+      $demote && fallback="sudo $demote_cmd; sudo $cmd"
+      print_and_wait "Tailscale serve/funnel often needs sudo (or operator rights)." "$fallback" || { return 1; }
     }
   else
     return 1
@@ -622,25 +698,14 @@ cleanup_exposures() {
   say ""
   warn "Some exposure changes were applied but verification did not pass."
   warn "Here is how to put each affected port back the way it was:"
-  local entry port rest averb prior pverb pproxy
-  for entry in "${all[@]}"; do
-    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
-    averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
-    # A funnel we created needs its OWN `off` — `serve off` clears the web handler
-    # but NOT the AllowFunnel flag, so public exposure would survive a serve-only undo.
-    if [ "$averb" = "funnel" ]; then
-      printf '    %stailscale funnel --https=%s off%s   # remove PUBLIC exposure\n' "$BOLD" "$port" "$RESET"
-    fi
-    if [ "$prior" = "EMPTY" ]; then
-      printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$port" "$RESET"
-    else
-      pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
-      printf '    %stailscale %s --bg --https=%s %s%s   # restore previous mapping\n' "$BOLD" "$pverb" "$port" "$pproxy" "$RESET"
-    fi
-  done
+  print_undo_hints "${all[@]}"
   say ""
   if ! $REUSE_ONLY && confirm "  Run these cleanup commands now?"; then
-    for entry in "${all[@]}"; do
+    # Reverse order: the LAST mapping applied is undone first, so when two records
+    # touch one port the earliest-recorded prior state is the one that survives.
+    local i entry port rest averb prior pverb pproxy
+    for (( i=${#all[@]}-1; i>=0; i-- )); do
+      entry="${all[$i]}"
       port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
       averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
       if [ "$averb" = "funnel" ]; then tailscale funnel --https="$port" off 2>/dev/null || true; fi
@@ -670,9 +735,20 @@ ts_unmap() { # ts_unmap <port> <verb>
   fi
   mutate_guard "remove the old $verb mapping on port $port" || return 1
   snapshot_port "$port" "$verb" file        # record (in FS_APPLIED) so cleanup can restore it
-  tailscale "$verb" --https="$port" off 2>/dev/null || true
+  tailscale "$verb" --https="$port" off 2>/dev/null || {
+    warn "That needs elevated rights on this machine."
+    print_and_wait "Removing a Tailscale mapping often needs sudo (or operator rights)." \
+      "sudo tailscale $verb --https=$port off" || true
+  }
+  # FAIL CLOSED: only claim removal a status re-parse can prove.
   ts_targets
-  ok "Removed the old $verb mapping on port $port — the file lane now rides the public exposure."
+  if ! $TS_STATE_KNOWN; then
+    warn "Could not re-read Tailscale status — cannot confirm port $port was cleared. Check 'tailscale serve status'."
+  elif [ -z "$(ts_target_for_port "$port")" ]; then
+    ok "Removed the old $verb mapping on port $port — the file lane now rides the public exposure."
+  else
+    warn "Port $port still carries a mapping — run: tailscale $verb --https=$port off"
+  fi
 }
 
 # Undo ONLY the file-lane exposure changes applied this run (FS_APPLIED), best-effort +
@@ -690,9 +766,29 @@ rollback_fs_exposures() {
     if [ "$prior" = "EMPTY" ]; then tailscale serve --https="$port" off 2>/dev/null || true
     else pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"; tailscale "$pverb" --bg --https="$port" "$pproxy" 2>/dev/null || true; fi
   done
+  # FAIL CLOSED: claim success only when a status re-parse PROVES each port is
+  # back to its prior state. Otherwise keep the record (the EXIT backstop and
+  # cleanup_exposures still act on it) and say so — never "all clear" on faith.
   ts_targets
-  note "Rolled back the file-lane exposure — no public file server is left behind."
-  FS_APPLIED=()
+  local leftover=() t want
+  for entry in "${FS_APPLIED[@]}"; do
+    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"; prior="${rest#*$'\t'}"
+    want=""; [ "$prior" != "EMPTY" ] && want="$prior"
+    t=$(ts_target_for_port "$port")
+    if ! $TS_STATE_KNOWN || [ "${t:-}" != "$want" ]; then leftover+=("$entry"); fi
+  done
+  if [ ${#leftover[@]} -eq 0 ]; then
+    note "Rolled back the file-lane exposure — confirmed no public file server is left behind."
+    FS_APPLIED=()
+  else
+    # Keep the record AND remember the failure: emit_payload must not close a run
+    # with a green QR while a file server we exposed is still reachable.
+    FS_ROLLBACK_INCOMPLETE=true
+    warn "Could not confirm the file-lane exposure was fully rolled back."
+    warn "Check 'tailscale serve status' / 'tailscale funnel status'. To undo by hand:"
+    print_undo_hints ${leftover[@]+"${leftover[@]}"}
+    FS_APPLIED=( "${leftover[@]}" )
+  fi
 }
 
 # Drop the file lane from the pairing AND undo any exposure we applied for it.
@@ -702,22 +798,72 @@ drop_file_lane() { rollback_fs_exposures; FS_URL=""; FS_CRED=""; }
 # emitting a code, print exactly how to undo them. Non-interactive (safe in a trap).
 EMITTED=false
 on_exit() {
-  $EMITTED && return 0
   $DRY_RUN && return 0
   local all=(); all+=( ${APPLIED[@]+"${APPLIED[@]}"} ); all+=( ${FS_APPLIED[@]+"${FS_APPLIED[@]}"} )
   [ ${#all[@]} -gt 0 ] || return 0
+  # A successful run normally has nothing to undo. The exception: a file-lane
+  # rollback that could NOT be proven — that exposure may still be live, so the
+  # undo hints must survive even a green QR.
+  if $EMITTED && ! $FS_ROLLBACK_INCOMPLETE; then return 0; fi
   say ""
-  warn "Exited before emitting a setup code, but exposure changes were applied. To undo them:"
-  local entry port rest averb prior pverb pproxy
-  for entry in "${all[@]}"; do
-    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
-    averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
-    if [ "$averb" = "funnel" ]; then printf '    tailscale funnel --https=%s off\n' "$port"; fi
-    if [ "$prior" = "EMPTY" ]; then printf '    tailscale serve --https=%s off\n' "$port"
-    else pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"; printf '    tailscale %s --bg --https=%s %s\n' "$pverb" "$port" "$pproxy"; fi
-  done
+  if $EMITTED; then
+    warn "A file-lane exposure this run applied could NOT be confirmed removed. It may still be reachable. To undo it:"
+  else
+    warn "Exited before emitting a setup code, but exposure changes were applied. To undo them:"
+  fi
+  print_undo_hints "${all[@]}"
 }
 trap on_exit EXIT
+
+# An EARLIER run (or a hand setup) may still expose the SAME local backend
+# publicly on a DIFFERENT port. A private choice must not leave that live
+# silently. Removal here is INTENTIONAL, so it is deliberately NOT recorded in
+# APPLIED/FS_APPLIED — those drive "undo my changes", and re-creating a public
+# Funnel the user just asked to kill is never the right rollback.
+sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-port> <host>
+  local localport="$1" keep="$2" host="$3"
+  $TS_STATE_KNOWN || return 0     # unknown state: pick_public_port already died; nothing to assert
+  local rline rport rrest rverb rproxy off_cmd
+  for rline in ${TS_PORTS[@]+"${TS_PORTS[@]}"}; do
+    rport="${rline%%$'\t'*}"; rrest="${rline#*$'\t'}"
+    rverb="${rrest%%$'\t'*}"; rproxy="${rrest#*$'\t'}"
+    [ "$rproxy" = "http://127.0.0.1:$localport" ] || continue
+    [ "$rverb" = "funnel" ] || continue
+    [ "$rport" != "$keep" ] || continue
+    warn "Port $rport ALSO exposes this backend PUBLICLY (Tailscale Funnel), from an earlier setup."
+    off_cmd="tailscale funnel --https=$rport off"
+    if $DRY_RUN; then
+      plan_add "OFFER  $off_cmd (+ serve off)   # stale public exposure of this backend"
+      note "(dry-run: would offer to turn that stale public exposure off)"
+      continue
+    fi
+    if $REUSE_ONLY; then
+      warn "(--reuse-only: leaving it as-is — re-run without --reuse-only to remove it.)"
+      continue
+    fi
+    if ! confirm "  Turn that public exposure off now?"; then
+      warn "Leaving it live: this backend stays reachable at https://$host:$rport from the internet."
+      continue
+    fi
+    # Reserve it so the file lane can't allocate the port we're clearing.
+    RESERVED_PORTS="$RESERVED_PORTS$rport "
+    if ! { tailscale funnel --https="$rport" off 2>/dev/null \
+           && tailscale serve --https="$rport" off 2>/dev/null; }; then
+      warn "That needs elevated rights on this machine."
+      print_and_wait "Removing a public Funnel often needs sudo (or operator rights)." \
+        "sudo $off_cmd; sudo tailscale serve --https=$rport off" || true
+    fi
+    # FAIL CLOSED: an unreadable status is NOT proof of removal.
+    ts_targets
+    if ! $TS_STATE_KNOWN; then
+      warn "Could not re-read Tailscale status — cannot confirm port $rport is closed. Check 'tailscale funnel status'."
+    elif [ -z "$(ts_target_for_port "$rport")" ]; then
+      ok "Port $rport is no longer exposed."
+    else
+      warn "Port $rport is STILL exposed — run: $off_cmd"
+    fi
+  done
+}
 
 choose_exposure() {
   # Generic with a ready URL skips the transport menu — but still classifies the
@@ -725,9 +871,7 @@ choose_exposure() {
   if [ -n "$GW_URL" ] && [ -z "$GW_LOCAL_PORT" ]; then
     head_ "Step 3 — HTTPS reachability"
     ok "Using your existing URL: $GW_URL"
-    note "Rule of thumb: if you could open this URL from your phone on cellular (Wi-Fi off),"
-    note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
-    if confirm "  Is this URL reachable from the public internet (i.e. NOT only on a private network like Tailscale or a home/office LAN)?"; then SCOPE="public"; else SCOPE="private"; fi
+    scope_choice
     keyless_public_guard
     classify_own_https
     return
@@ -736,9 +880,8 @@ choose_exposure() {
   head_ "Step 3 — how should your iPhone reach this gateway?"
   ts_targets
   local ts_state="not installed" cf_state="not installed"
-  local ts_ok=false
   if have tailscale; then
-    if [ -n "$(tailscale_dns_name)" ]; then ts_state="✓ detected and running"; ts_ok=true
+    if [ -n "$(tailscale_dns_name)" ]; then ts_state="✓ detected and running"
     else ts_state="installed, but not running/logged in"; fi
   fi
   have cloudflared && cf_state="✓ cloudflared found"
@@ -774,7 +917,7 @@ choose_exposure() {
   note "The biggest practical difference between these: an Apple Watch used away from"
   note "your iPhone can reach a PUBLIC path (2, 3, or 4), never a private one (1)."
   say ""
-  local choice; choice=$(require_choice "Choose 1-4, or 'b' to go back" '^([1-4]|[bB])$')
+  local choice; choice=$(require_choice "Choose 1-4, or 'b' to go back" '^([1-4]|[bB])$') || die "$NO_ANSWER"
   [[ "$choice" =~ ^[bB]$ ]] && return 10   # back — main re-runs gateway selection (nothing applied yet)
   $DRY_RUN || note "From here I may apply changes to this machine; to change an earlier choice, stop (Ctrl-C) and re-run."
 
@@ -802,16 +945,26 @@ choose_exposure() {
       local host; host=$(tailscale_dns_name)
       pick_public_port "$TRANSPORT" "$GW_LOCAL_PORT" "gateway"; local gw_https="$PICKED_PORT"
       ok "Chosen public port for the gateway: $gw_https"
-      # If we're about to flip an existing private Serve to public Funnel, say so.
+      # A verb flip changes who can reach the gateway — say so, in BOTH directions.
       local existing; existing=$(ts_target_for_port "$gw_https")
-      if $funnel && [ -n "$existing" ] && [ "${existing%%$'\t'*}" = "serve" ]; then
-        warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
-        warn "https://$host:$gw_https reachable from the public internet."
-        confirm "  Make it public?" || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
+      if [ -n "$existing" ]; then
+        local everb="${existing%%$'\t'*}"
+        if $funnel && [ "$everb" = "serve" ]; then
+          warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
+          warn "https://$host:$gw_https reachable from the public internet."
+          confirm "  Make it public?" || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
+        elif ! $funnel && [ "$everb" = "funnel" ]; then
+          warn "Port $gw_https is currently PUBLIC (Tailscale Funnel). Going private turns the"
+          warn "public URL off — afterwards only devices on your tailnet reach this gateway."
+          confirm "  Make it private (turn the public URL off)?" || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
+        fi
       fi
       tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
         || { cleanup_exposures; die "Gateway exposure not confirmed — cannot continue without an HTTPS URL."; }
       GW_URL="https://$host"; [ "$gw_https" != "443" ] && GW_URL="https://$host:$gw_https"
+      if [ "$SCOPE" = "private" ]; then
+        sweep_stale_public_funnels "$GW_LOCAL_PORT" "$gw_https" "$host"
+      fi
       ;;
     3)
       TRANSPORT="cloudflare"; SCOPE="public"
@@ -834,8 +987,12 @@ choose_exposure() {
       say "        service: http://127.0.0.1:$GW_LOCAL_PORT"
       note "(127.0.0.1 means \"this same machine\" — keep it as-is if the gateway runs on this host.)"
       say ""
-      print_and_wait "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
-        "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
+      if $REUSE_ONLY; then
+        note "(reuse-only: assuming your gateway ingress rule already exists — I won't guide changes)"
+      else
+        print_and_wait "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
+          "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
+      fi
       local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "")
       [ -n "$h" ] || die "No hostname given. This option needs a domain already added to your Cloudflare account; if you don't have one yet, re-run and pick Tailscale instead, or add a domain in Cloudflare first."
       GW_URL="https://$h"
@@ -843,15 +1000,25 @@ choose_exposure() {
     4)
       # One option for "I run my own HTTPS." The script figures out whether the
       # certificate is publicly trusted (no pin) or self-managed (pin its SPKI).
-      GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com")
-      note "Rule of thumb: if you could open this address from your phone on cellular (Wi-Fi off),"
-      note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
-      if confirm "  Is this address reachable from the public internet (i.e. NOT only on a private network like Tailscale or a home/office LAN)?"; then SCOPE="public"; else SCOPE="private"; fi
+      GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com") || die "$NO_ANSWER"
+      scope_choice
       keyless_public_guard
       classify_own_https   # sets TRANSPORT=public|selfsigned (+ GW_CERT_FP); STOPs on a broken cert
       ;;
     *) die "Invalid choice." ;;
   esac
+}
+
+# Ask whether the URL is publicly reachable. Safety-relevant (it gates the
+# keyless-public guard), so it takes an explicit 1/2 — no Enter default a typo
+# could fall into. Sets SCOPE.
+scope_choice() {
+  note "Rule of thumb: if you could open this address from your phone on cellular (Wi-Fi off),"
+  note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
+  say "    1) Public — reachable from the open internet"
+  say "    2) Private — only my own network / VPN (Tailscale, home or office LAN)"
+  local c; c=$(require_choice "Is this address public or private? Choose 1-2" '^[12]$') || die "$NO_ANSWER"
+  if [ "$c" = "1" ]; then SCOPE="public"; else SCOPE="private"; fi
 }
 
 # Refuse to publish a keyless gateway unless explicitly overridden.
@@ -913,15 +1080,30 @@ cert_verify_code() { # cert_verify_code <https-url> -> numeric code (or "")
     | sed -n 's/.*[Vv]erify return code: \([0-9][0-9]*\).*/\1/p' | tail -1
 }
 
-# Is the leaf cert expired (or unreadable)? Checked independently of the chain
-# verify code so a self-signed cert that is ALSO expired never gets pinned.
-cert_leaf_expired() { # cert_leaf_expired <https-url> -> exit 0 if expired/unreadable
+# Leaf-cert date sanity, checked independently of the chain verify code (some
+# OpenSSL builds report the chain error first) so a self-signed cert that is
+# ALSO expired or not-yet-valid never gets pinned. Echoes "expired" / "notyet" /
+# nothing; an unreadable cert counts as expired (fail closed).
+cert_leaf_date_problem() { # cert_leaf_date_problem <https-url>
   local url="$1" hp pem
   hp="${url#https://}"; hp="${hp%%/*}"
   case "$hp" in *:*) ;; *) hp="$hp:443" ;; esac
   pem=$(openssl s_client -connect "$hp" -servername "${hp%%:*}" </dev/null 2>/dev/null | openssl x509 2>/dev/null)
-  [ -n "$pem" ] || return 0
-  printf '%s' "$pem" | openssl x509 -checkend 0 >/dev/null 2>&1 && return 1 || return 0
+  [ -n "$pem" ] || { printf 'expired'; return 0; }
+  printf '%s' "$pem" | openssl x509 -checkend 0 >/dev/null 2>&1 || { printf 'expired'; return 0; }
+  # notBefore: `-checkend` only covers expiry, so compare the start date via the
+  # python3 that's already required (portable — no GNU/BSD `date -d` split).
+  local start; start=$(printf '%s' "$pem" | openssl x509 -noout -startdate 2>/dev/null | sed 's/^notBefore=//')
+  [ -n "$start" ] || { printf 'expired'; return 0; }
+  printf '%s' "$start" | python3 -c '
+import sys, datetime
+raw = sys.stdin.read().strip()
+try:
+    nb = datetime.datetime.strptime(raw, "%b %d %H:%M:%S %Y %Z")
+except Exception:
+    sys.exit(0)   # unparseable date -> do not block on this secondary check
+if nb > datetime.datetime.utcnow():
+    print("notyet")' 2>/dev/null
 }
 
 # Resolve the merged "I run my own HTTPS" choice: probe the cert and decide
@@ -939,12 +1121,15 @@ classify_own_https() {  # GW_URL + SCOPE already set
   fi
   say ""
   note "Checking the certificate at $GW_URL …"
-  if curl -sS --max-time 15 -o /dev/null "$GW_URL/v1/models" 2>/dev/null; then
+  # Capture curl's exit code directly — `$?` read after a completed `if` would be
+  # the if-statement's own status (always 0 here), never curl's.
+  local rc=0
+  curl -sS --max-time 15 -o /dev/null "$GW_URL/v1/models" 2>/dev/null || rc=$?
+  if [ "$rc" = "0" ]; then
     TRANSPORT="public"
     ok "Its certificate is trusted normally — the app needs no pin."
     return 0
   fi
-  local rc=$?
   case "$rc" in
     6)  die "Couldn't resolve the host in $GW_URL. Check the address and re-run." ;;
     7)  die "Couldn't connect to $GW_URL (connection refused). Is the gateway up? Re-run when it is." ;;
@@ -964,9 +1149,15 @@ classify_own_https() {  # GW_URL + SCOPE already set
     0)  reason="is valid but does not match this address (it's issued for a different hostname)" ;;
     *)  reason="couldn't be classified (TLS verify code '${code:-none}')" ;;
   esac
-  # Belt-and-suspenders: even a self-signed cert must not be pinned while expired
-  # (some OpenSSL builds report the chain error, not the date error, first).
-  if $pinnable && cert_leaf_expired "$GW_URL"; then pinnable=false; reason="has expired"; fi
+  # Belt-and-suspenders: even a self-signed cert must not be pinned while its
+  # dates are wrong (expired OR not yet valid).
+  if $pinnable; then
+    local dateprob; dateprob=$(cert_leaf_date_problem "$GW_URL")
+    case "$dateprob" in
+      expired) pinnable=false; reason="has expired" ;;
+      notyet)  pinnable=false; reason="is not valid yet (check the gateway's clock)" ;;
+    esac
+  fi
   if ! $pinnable; then
     bad "The certificate at $GW_URL $reason."
     say "  Pinning it would make the app trust it permanently and skip the normal"
@@ -999,7 +1190,6 @@ sys.stdout.write(base64.b64encode(binascii.unhexlify(h)).decode() if h else "")'
 FS_URL=""; FS_CRED=""; FS_CERT_FP=""
 FS_LOCAL_PORT=""
 FS_UNIT=""          # resolved unit/plist path actually in use (existing or new)
-FS_REUSED=false
 FS_CRED_LEGACY_ARGV=false   # true when a reused unit keeps the password on argv (ps-visible)
 
 state_cred_file() { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$GW_ID"; }
@@ -1018,8 +1208,8 @@ mac_unit_candidates() {
     "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"
 }
 
-# Find an existing file-server unit (script OR app generated) and recover its full
-# config: workspace + local port + credential. Sets FS_* + FS_UNIT + FS_REUSED.
+# Find an existing file-server unit (script OR app generated) and recover its
+# config: local port + credential. Sets FS_LOCAL_PORT + FS_CRED + FS_UNIT.
 existing_fs_config() {
   local unit="" f
   if [ "$OS" = "Linux" ]; then
@@ -1028,21 +1218,26 @@ existing_fs_config() {
     while IFS= read -r f; do [ -f "$f" ] && { unit="$f"; break; }; done < <(mac_unit_candidates)
   fi
   [ -n "$unit" ] || return 1
-  FS_UNIT="$unit"; FS_REUSED=true
+  FS_UNIT="$unit"
 
-  # workspace + addr port: parse from the unit's rclone invocation (handles both
-  # ExecStart=… serve webdav <ws> --addr 127.0.0.1:PORT and plist ProgramArguments).
-  local ws port
-  ws=$(grep -oE 'serve[" >]+webdav[" >]+[^ "<]+' "$unit" 2>/dev/null | head -1 | awk '{print $3}')
-  [ -z "$ws" ] && ws=$(python3 - "$unit" <<'PY' 2>/dev/null
-import sys,plistlib
+  # addr port: systemd ExecStart carries `--addr 127.0.0.1:PORT` on one line, but
+  # a plist splits it across two <string> elements — parse those STRUCTURALLY, or
+  # a lane on a non-default port silently falls back to 5006 and probes nothing.
+  local port=""
+  if [ "${unit##*.}" = "plist" ]; then
+    port=$(python3 - "$unit" <<'PY' 2>/dev/null
+import sys, plistlib
 try:
-    a=plistlib.load(open(sys.argv[1],'rb')).get("ProgramArguments",[])
-    i=a.index("webdav"); print(a[i+1])
+    a = plistlib.load(open(sys.argv[1], 'rb')).get("ProgramArguments", [])
+    i = a.index("--addr")
+    print(a[i + 1].rsplit(":", 1)[-1])
 except Exception: pass
 PY
 )
-  port=$(grep -oE -- '--addr[" >]+127\.0\.0\.1:[0-9]+' "$unit" 2>/dev/null | grep -oE '[0-9]+$' | head -1)
+  else
+    port=$(grep -oE -- '--addr[" >]+127\.0\.0\.1:[0-9]+' "$unit" 2>/dev/null | grep -oE '[0-9]+$' | head -1)
+  fi
+  case "$port" in ''|*[!0-9]*) port="" ;; esac
   FS_LOCAL_PORT="${port:-5006}"
 
   # credential: prefer our 0600 state cred file; else env file RCLONE_PASS; else
@@ -1086,7 +1281,7 @@ PY
     fi
     [ -n "$argv_exposed" ] && FS_CRED_LEGACY_ARGV=true
   fi
-  [ -n "$FS_CRED" ] || { FS_REUSED=false; FS_UNIT=""; return 1; }
+  [ -n "$FS_CRED" ] || { FS_UNIT=""; return 1; }
   return 0
 }
 
@@ -1146,6 +1341,7 @@ PY
   launchctl unload "$FS_UNIT" 2>/dev/null || true
   launchctl load -w "$FS_UNIT" && ok "File server running in the background (a macOS LaunchAgent that restarts it automatically)." \
     || warn "Could not load the LaunchAgent — check 'launchctl list | grep conduck'."
+  note "LaunchAgents run while this user is logged in — for a 24/7 Mac, keep automatic login on."
   if pmset -g 2>/dev/null | grep -qE 'sleep[[:space:]]+[1-9]'; then
     warn "This Mac is set to sleep — a sleeping host isn't reachable 24/7."
     note "For an always-on gateway: enable automatic login + 'sudo pmset -a sleep 0'."
@@ -1198,9 +1394,8 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
 }
 
 # Demote a public file lane to PRIVATE (Serve) so it matches a private gateway.
-# serve-only on the same port — most-recent-command-wins makes it private; the
-# verb-match verify inside tailscale_expose is the fail-safe (never ship a public
-# lane labelled private), so NO `funnel off` is needed.
+# tailscale_expose handles the flip (drops the funnel flag first, re-applies as
+# serve, then verifies the verb) — never ship a public lane labelled private.
 fs_demote_private() { # fs_demote_private <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
   if tailscale_expose "$ehttps" "$FS_LOCAL_PORT" false file; then
@@ -1219,7 +1414,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    1) Leave the file lane out  (chat still works everywhere; no attachments)"
       say "    2) Include it as-is  (advanced — attachments only on your Tailscale devices)"
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2" '^[12]$')
+      c=$(require_choice "Choose 1-2" '^[12]$') || die "$NO_ANSWER"
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out." ;;
         2) FS_URL="https://$host:$ehttps"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
@@ -1229,7 +1424,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    1) Make the file lane public too  (puts a password-protected file server on the public internet)"
     say "    2) Leave the file lane out  (chat still works everywhere; no attachments)"
     say "    3) Include it as-is  (advanced — attachments only on your Tailscale devices)"
-    c=$(require_choice "Choose 1-3" '^[123]$')
+    c=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway." ;;
@@ -1241,7 +1436,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    1) Leave the file lane out"
       say "    2) Keep it public anyway  (advanced)"
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2" '^[12]$')
+      c=$(require_choice "Choose 1-2" '^[12]$') || die "$NO_ANSWER"
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out." ;;
         2) FS_URL="https://$host:$ehttps"; warn "Including a public file lane at $FS_URL." ;;
@@ -1251,7 +1446,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    1) Make the file lane private too — match the gateway (recommended)"
     say "    2) Leave the file lane out"
     say "    3) Keep it public anyway  (advanced)"
-    c=$(require_choice "Choose 1-3" '^[123]$')
+    c=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out." ;;
@@ -1286,6 +1481,20 @@ setup_file_lane() {
       note "password from a 0600 env file ('RCLONE_PASS' / '--htpasswd'); newly-created units already do."
     fi
   else
+    if $REUSE_ONLY; then
+      note "(reuse-only: no existing file server found; skipping the file lane — re-run without --reuse-only to create one)"
+      FS_CRED=""; return 0
+    fi
+    # Keeping the file server running needs a service manager we know how to
+    # drive; on Linux that's a systemd USER session. Check BEFORE minting a
+    # credential or writing a unit that could never start.
+    if [ "$OS" = "Linux" ] && ! { have systemctl && systemctl --user show-environment >/dev/null 2>&1; }; then
+      warn "No systemd user session here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
+      warn "I can't keep a file server running in the background. Skipping the file lane; chat still works."
+      note "If this box does run systemd, log in directly as this user (ssh, not 'su -') and re-run."
+      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:5006 --user conduck' under your own supervisor."
+      FS_CRED=""; return 0
+    fi
     FS_LOCAL_PORT=5006
     local workspace
     case "$GW_KIND" in
@@ -1332,6 +1541,13 @@ setup_file_lane() {
         else
           resolve_fs_scope_mismatch "$ehttps" "$everb" "$host"
         fi
+        # The lane's own backend can carry stale public Funnels on OTHER ports too.
+        if [ "$SCOPE" = "private" ] && [ -n "$FS_CRED" ] && [ -n "$FS_URL" ]; then
+          sweep_stale_public_funnels "$FS_LOCAL_PORT" "${FS_URL##*:}" "$host"
+        fi
+      elif $REUSE_ONLY; then
+        note "(reuse-only: the file lane has no HTTPS exposure yet and I won't create one — leaving it out)"
+        FS_CRED=""
       elif pick_public_port "$TRANSPORT" "$FS_LOCAL_PORT" "file"; then
         # Not yet exposed — allocate on the gateway's transport (scope matches by construction).
         FS_HTTPS_PORT="$PICKED_PORT"
@@ -1353,28 +1569,43 @@ setup_file_lane() {
       say "      - hostname: ${BOLD}files.YOURDOMAIN${RESET}"
       say "        service: http://127.0.0.1:$FS_LOCAL_PORT"
       say ""
-      if print_and_wait "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
-        "cloudflared tunnel route dns <your-tunnel> files.YOURDOMAIN"; then
-        local h; h=$(ask_url "The file-lane web address you configured (blank to skip the file lane)" "https://files.example.com" 1)
+      if $REUSE_ONLY; then
+        note "(reuse-only: assuming your file-lane ingress rule already exists)"
+        local h; h=$(ask_url "The file-lane web address (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
         [ -n "$h" ] && FS_URL="$h" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
+      elif print_and_wait "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
+        "cloudflared tunnel route dns <your-tunnel> files.YOURDOMAIN"; then
+        local h2; h2=$(ask_url "The file-lane web address you configured (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
+        [ -n "$h2" ] && FS_URL="$h2" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
       else FS_CRED=""; fi
       ;;
     public|selfsigned)
       say ""
       say "  Your gateway's web server needs a second route for the file lane → 127.0.0.1:$FS_LOCAL_PORT"
       say "  (a second server block, a subdomain, or another port)."
-      local h; h=$(ask_url "The https:// web address that reaches it (blank to skip the file lane)" "https://files.example.com" 1)
+      note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
+      local h; h=$(ask_url "The https:// web address that reaches it (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
       if [ -n "$h" ]; then
         FS_URL="$h"
-        # If self-signed AND a different host than the gateway, pin the file host too.
-        if [ -n "$FS_URL" ] && [ "$TRANSPORT" = "selfsigned" ]; then
+        # If self-signed AND a different host than the gateway, pin the file host
+        # too — behind the same broken-cert date gate as the gateway pin.
+        if [ "$TRANSPORT" = "selfsigned" ]; then
           local g_host="${GW_URL#https://}"; g_host="${g_host%%/*}"
           local f_host="${FS_URL#https://}"; f_host="${f_host%%/*}"
           if [ "$f_host" != "$g_host" ]; then
             if $DRY_RUN; then note "(dry-run: would compute the file host's SPKI fingerprint from $FS_URL)"
             else
-              FS_CERT_FP=$(compute_spki_hex "$FS_URL") || { warn "Could not pin the file host's cert — leaving file lane out."; FS_CRED=""; FS_URL=""; }
-              [ -n "$FS_CERT_FP" ] && ok "File-lane fingerprint computed (rides in the QR)."
+              local fs_datep; fs_datep=$(cert_leaf_date_problem "$FS_URL")
+              if [ "$fs_datep" = "notyet" ]; then
+                warn "The file host's certificate is not valid yet (check its clock) — leaving the file lane out. Fix it and re-run."
+                FS_CRED=""; FS_URL=""
+              elif [ -n "$fs_datep" ]; then
+                warn "The file host's certificate has expired (or could not be read) — leaving the file lane out. Fix it and re-run."
+                FS_CRED=""; FS_URL=""
+              else
+                FS_CERT_FP=$(compute_spki_hex "$FS_URL") || { warn "Could not pin the file host's cert — leaving file lane out."; FS_CRED=""; FS_URL=""; }
+                [ -n "$FS_CERT_FP" ] && ok "File-lane fingerprint computed (rides in the QR)."
+              fi
             fi
           fi
         fi
@@ -1394,43 +1625,65 @@ check() { # check "label" <command...>  (command's exit code decides)
 
 # curl wrapper: normal TLS validation, EXCEPT self-signed which is verified by
 # pinning the SPKI (matching what the app pins) instead of disabling checks.
+# The bearer token rides a stdin curl config, never argv (argv shows in `ps`).
 curl_gw() { # curl_gw <curl args…>
   local extra=()
-  [ "$GW_AUTH" = "bearer" ] && extra=(-H "Authorization: Bearer $GW_TOKEN")
   if [ "$TRANSPORT" = "selfsigned" ] && [ -n "$GW_CERT_FP" ]; then
     local b64; b64=$(hex_to_b64 "$GW_CERT_FP")     # pin the QR's fingerprint, not a re-fetch
     [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64")
   fi
   # ${extra[@]+…} guard: expanding an empty array under `set -u` is an error in bash 3.2.
-  curl -sS --max-time 30 ${extra[@]+"${extra[@]}"} "$@"
+  if [ "$GW_AUTH" = "bearer" ]; then
+    local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"   # curl-config quoting
+    printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+      | curl -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
+  else
+    curl -sS --max-time 30 ${extra[@]+"${extra[@]}"} "$@"
+  fi
 }
 
-models_is_json() { # 1 arg: base URL — /v1/models must be JSON, not the Control-UI HTML
-  local body; body=$(curl_gw "$1/v1/models" 2>/dev/null) || return 1
-  case "$body" in
-    \{*) return 0 ;;
-    *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;;
-    *) return 1 ;;
-  esac
+models_is_json() { # 1 arg: base URL — /v1/models must answer 200 with JSON, not the Control-UI HTML
+  local out code body
+  out=$(curl_gw -w '\n%{http_code}' "$1/v1/models" 2>/dev/null) || return 1
+  code="${out##*$'\n'}"; body="${out%$'\n'*}"
+  # HTML first: the endpoint-off page often comes back 200, and it deserves its
+  # own diagnosis either way.
+  case "$body" in *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;; esac
+  # Status must be green — a 401/500 JSON error body is a FAILURE, not "answers
+  # with JSON" (wrong token was the false-green case).
+  [ "$code" = "200" ] || return 1
+  case "$body" in \{*|\[*) return 0 ;; *) return 1 ;; esac
 }
 
 # A self-signed-aware curl for the FILE lane (its own pin if set, else gateway's).
+# The credential rides a stdin curl config, never argv (argv shows in `ps`).
 curl_fs() { # curl_fs <curl args…>
-  local extra=(-u "conduck:$FS_CRED")
+  local extra=()
   if [ "$TRANSPORT" = "selfsigned" ]; then
     local fp="$GW_CERT_FP"; [ -n "$FS_CERT_FP" ] && fp="$FS_CERT_FP"   # file's own pin if it has one
     if [ -n "$fp" ]; then local b64; b64=$(hex_to_b64 "$fp"); [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64"); fi
   fi
-  curl -sS --max-time 30 ${extra[@]+"${extra[@]}"} "$@"
+  local cred="$FS_CRED"; cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"   # curl-config quoting
+  printf 'user = "conduck:%s"\n' "$cred" \
+    | curl -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
+}
+
+local_health_ok() { # local_health_ok <url> -> 0 when the server answered with < 500
+  local code
+  code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
+  case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
 }
 
 verify_all() {
   head_ "Step 5 — verify (real requests, before you touch your phone)"
 
   # Local health first (when the gateway has a health endpoint).
+  # "Is it up locally?" — any HTTP answer below 500 counts (this request carries
+  # no token, so an auth-gated health route answering 401 still proves it's up).
+  # A 5xx or no answer at all is a real failure.
   if [ -n "$GW_HEALTH_PATH" ] && [ -n "$GW_LOCAL_PORT" ]; then
     check "gateway is up locally ($GW_HEALTH_PATH)" \
-      curl -sS --max-time 10 "http://127.0.0.1:$GW_LOCAL_PORT$GW_HEALTH_PATH"
+      local_health_ok "http://127.0.0.1:$GW_LOCAL_PORT$GW_HEALTH_PATH"
   fi
 
   # Public URL: model list must come back as JSON.
@@ -1450,8 +1703,15 @@ verify_all() {
   # Ollama/vLLM/LiteLLM need the model named — include it exactly as the app will.
   say "  Asking the gateway for a one-word reply (can take a minute on modest hardware)…"
   local reply body
-  body='{"messages":[{"role":"user","content":"Reply with exactly: pong"}],"stream":false}'
-  [ -n "$GW_MODEL" ] && body='{"model":"'"$GW_MODEL"'","messages":[{"role":"user","content":"Reply with exactly: pong"}],"stream":false}'
+  # Build the JSON with a real encoder — a quote/backslash in a model name must
+  # not silently break the request body.
+  body=$(GW_MODEL="$GW_MODEL" python3 -c '
+import json, os
+p = {"messages": [{"role": "user", "content": "Reply with exactly: pong"}], "stream": False}
+m = os.environ.get("GW_MODEL", "")
+if m: p["model"] = m
+print(json.dumps(p))') || die "Could not build the test request (python3 failed)."
+  [ -n "$body" ] || die "Could not build the test request."
   reply=$(curl_gw "$GW_URL/v1/chat/completions" --max-time 180 \
       -H "Content-Type: application/json" \
       -d "$body" \
@@ -1510,8 +1770,11 @@ if e("FS_URL") and e("FS_CRED"):
     p["fileServer"] = fs
 print(json.dumps(p, separators=(",", ":")))
 PY
-)
-  local pairing="conduck-setup:v${PAYLOAD_VERSION}:$(printf '%s' "$payload" | b64_nowrap)"
+) || die "Could not build the pairing payload (python3 failed)."
+  [ -n "$payload" ] || die "Could not build the pairing payload."
+  local encoded; encoded=$(printf '%s' "$payload" | b64_nowrap)
+  [ -n "$encoded" ] || die "Could not base64-encode the pairing payload."
+  local pairing="conduck-setup:v${PAYLOAD_VERSION}:$encoded"
 
   say ""
   warn "The setup code below CONTAINS YOUR TOKEN — both the QR and the plain-text string."
@@ -1536,7 +1799,13 @@ PY
     selfsigned) note "Your gateway uses its own certificate; a secure fingerprint of it travels inside the code, so the app trusts it automatically — nothing for you to copy." ;;
   esac
   say "  Re-run this script any time to re-verify or show the code again."
-  EMITTED=true   # success — the EXIT backstop must not print "undo" hints
+  if $FS_ROLLBACK_INCOMPLETE; then
+    say ""
+    warn "One thing still needs YOUR attention: a file-server exposure this run created"
+    warn "could not be confirmed removed, so it may still be reachable. The exact undo"
+    warn "commands print below — run them, then check 'tailscale funnel status'."
+  fi
+  EMITTED=true   # success — the EXIT backstop prints undo hints only for an unconfirmed rollback
 }
 
 # =============================================================================
@@ -2589,9 +2858,14 @@ $REUSE_ONLY && note "(reuse-only: I'll reuse what's set up and refuse any change
 say "Every change asks first. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
 note "Two kinds of step: things I made (I offer to run them for you), and things you already own — your gateway config, Tailscale, daemons — which I never touch; I print the exact command for you to run."
 
-# Gateway selection → configure → transport, looped so the transport menu's
-# "b" can return to the gateway choice (only reachable before any change is applied).
+# Gateway selection → configure → transport, looped so the transport menu's "b"
+# can return to the gateway choice. No EXPOSURE change has happened before the
+# menu; Step-2 gateway-config changes are detect-and-reuse on re-entry. Globals
+# reset each pass so "b" never leaks one gateway's answers (name/model/URL)
+# into the next pick's payload.
 while true; do
+  GW_KIND=""; GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
+  GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""; GW_CERT_FP=""
   detect_gateway
   case "$GW_KIND" in
     openclaw) configure_openclaw ;;

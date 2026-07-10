@@ -2,6 +2,41 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.4.0] — first stable release: exposure, certificate, and secret-handling fixes
+
+A quality-control pass over the whole wizard found four paths that did not behave the way the script documented, plus one introduced while fixing them. **If you are on `0.4.0-rc.4` or earlier, upgrade** — the exposure bug below can leave your gateway publicly reachable after you asked for a private setup.
+
+### Fixed — exposure
+
+- **Choosing a private path could leave an old public Funnel serving your gateway.** When a port already carried a Tailscale mapping for the same gateway with the opposite verb, the wizard allocated a *different* port instead of switching that one, so an existing public Funnel kept running untouched. Worse, the run then recorded itself as private and skipped the keyless-public refusal. The mapping is now switched **in place** (confirmed in both directions), and `funnel → serve` drops the `AllowFunnel` flag explicitly, because `serve off` alone leaves a port public.
+- **Stale public Funnels are now surfaced.** On a private choice, the wizard finds Funnels on *other* ports still pointing at the same gateway or file lane from an earlier setup and offers to switch them off. It never removes one without an explicit yes — see `WHAT-IT-TOUCHES.md`.
+- **Rollback is genuinely fail-closed.** Undoing a file-lane exposure now proves the port is restored by re-reading Tailscale's status before claiming success; a rollback that cannot be confirmed keeps its undo record, prints the exact commands, and refuses to end the run quietly behind a green pairing code. Undo records are written only after you confirm a change, and replayed newest-first.
+
+### Fixed — certificates
+
+- **The certificate diagnosis never ran.** An exit code was read after the wrong statement, so every "couldn't resolve the host / connection refused / timed out" message was unreachable, and real network failures fell through to a confusing classification error.
+- Broken-certificate detection now catches **not-yet-valid** certificates (a wrong clock), not just expired ones, and the **file-lane** certificate goes through the same safety gate as the gateway's before it is pinned.
+
+### Fixed — secrets
+
+- **The gateway token and file-lane credential no longer appear in the process list.** They were passed to `curl` as command-line arguments, which any user on the host can read via `ps`; they now ride a private stdin config. This matches the posture the script already applied to the rclone service.
+- `~/.hermes/.env` is created `0600` when it does not exist (the generated key lands inside it), and an existing `API_SERVER_KEY` is reused rather than silently rotated out from under other clients.
+
+### Fixed — prompts (found while reviewing the fixes above)
+
+- **A typo could silently answer a safety question.** The retry warning on a no-default prompt was written to standard output, so it was captured as part of your answer. The new public-vs-private question would then read as "private" — the one value that skips the refusal to publish a keyless gateway. All prompt output now goes to standard error, and a closed input stream stops the run instead of looping forever.
+
+### Changed
+
+- Verification is stricter: `/v1/models` must answer **HTTP 200** with JSON (an authentication error that happens to be JSON is no longer green), the local health check accepts any answer below 500 (an auth-gated health route is still proof the gateway is up), and the test request body is built by a real JSON encoder.
+- `--help` prints the whole header (it was cut off mid-sentence). Typos re-prompt rather than aborting. `--reuse-only` no longer exits when an optional step *would* have changed something — it skips it and says so. A missing systemd user session is detected **before** a credential is minted. Trailing slashes are stripped from URLs. A file lane on a non-default port is now read correctly from a macOS LaunchAgent.
+
+### Verification
+
+Parse + `shellcheck --severity=warning` clean, vendored QR encoder checksum verified, and the prompt, guard, and port-validation paths exercised on macOS `bash` 3.2. The companion app's pairing-payload suite is green.
+
+> Unlike `0.4.0-rc.1`–`rc.4`, this release has **not yet been re-run end-to-end against the live OpenClaw / Hermes rigs**; the changes are covered by static analysis and targeted regression tests. It ships now because the exposure bug it fixes is worse than the risk it carries. If you hit anything, please open an issue.
+
 ## [0.4.0-rc.3] — pairing-hint accuracy fix
 
 Same script behavior as rc.2 — still `VERSION=0.4.0`, same flags, same exposure paths, same `conduck-setup:v1` payload. A one-line accuracy fix to the closing in-app instruction; no functional or security change.
