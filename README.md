@@ -17,7 +17,7 @@ Works on macOS and Linux. `-O` lands the full file on disk before anything runs,
 
 It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
-> **Status: the script is at `v0.5.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
+> **Status: the script is at `v0.6.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
 
 ## Why a shell script?
 
@@ -123,6 +123,44 @@ rclone serve webdav ~/.openclaw/workspace --addr 127.0.0.1:5006 --user conduck
 (`read -rs` keeps the password out of your shell history and off `argv`; a `0600` env file read by your service manager does the same job for a persistent unit.)
 
 `serve` runs in the foreground and binds to loopback only — put it under systemd / launchd / your own supervisor for a real deployment, and front it with the tunnel or reverse proxy of your choice to reach it over HTTPS. Swap the folder, port, and exposure for whatever your setup uses.
+
+## Troubleshooting
+
+The wizard's Step 5 verifies with real requests and names what failed. What each message means, and the fix. (App-side setup help — including what to do *before* the script runs — lives at https://conduck.com/setup/#troubleshooting.)
+
+| The wizard says | What it means | The fix |
+|---|---|---|
+| `…/v1/models returned an HTML page instead of model data` | On OpenClaw/Hermes, most likely the chat endpoint is still off (it ships off by default). Behind a tunnel or reverse proxy, a login/access page may have answered instead — a 401/403 status shown in the message points that way. | Re-run the wizard (its Step 2 enables the endpoint), restart the gateway. If an access layer answered, allow the gateway host through it. |
+| `…answers, but not with the required envelope` | The server replied JSON, but not the shape Conduck requires: an object with a top-level `"data"` array. Bare arrays and `{"models": …}` shapes are refused — by the script and the app alike. | Fix the server's `/v1/models` reply — the contract lives at https://conduck.com/setup/adapter/v1/. |
+| `…failed: DNS lookup failed` | The hostname doesn't resolve. | Check the spelling; a just-created DNS record can take a minute to propagate. |
+| `…failed: connection refused` | Nothing is listening at that host and port. | Is the server running? Right port? Firewall open? Many local servers (Ollama, LM Studio) bind to `127.0.0.1` only — front them with the wizard's exposure step. |
+| `…failed: timed out` | No answer at all. | Host offline, unreachable address, or a firewall silently dropping traffic. |
+| `…failed: TLS/certificate problem` | The HTTPS front rejected the handshake. | Renew or fix the certificate — expired and wrong-hostname certs both stop the run, deliberately. A wrong system clock on either end produces the same failure. |
+| `…failed: pinned key mismatch` | The server's certificate is not the one this run pinned. | Re-run the wizard so it pins the current cert (it never re-pins silently). |
+| `…failed: HTTP 401 — token rejected` | Wrong or stale bearer token — or an access layer in front wants its own login. (A 403 prints the same shape.) | Re-read the token from the gateway's config (OpenClaw: `gateway.auth.token` · Hermes: `API_SERVER_KEY`); check any proxy access policy. |
+| `…failed: HTTP 404 — nothing at that path` | No `/v1/models` at that base address. | Give the server's *base* address — the script and the app append `/v1/…` themselves. (A pasted `…/v1` is normalized away automatically.) |
+| `…failed: HTTP 5xx — the server errored` | The gateway itself failed. | Read the gateway's own logs. |
+| `…failed: answered 200, but the body isn't JSON` | Something replied OK — but not with JSON (a proxy's plaintext page, or malformed JSON the strict parser refuses). | Check what actually answers at that address; the reply contract lives at https://conduck.com/setup/adapter/v1/. |
+| `…but its model list is EMPTY` | The endpoint is real, yet advertises no models — it can't answer a chat. | Pull/load a model (e.g. `ollama pull …`, load one in LM Studio), or set the model name your gateway expects. |
+| `live round-trip failed (transfer error — timed out or the connection dropped)` | The test chat request didn't complete within 300 s (the app's own limit), or the connection broke mid-reply. | Modest hardware and busy agents are slow — try again; check server load and any proxy read-timeout in front. |
+| `live round-trip failed (no answer from the gateway)` | The request went out, but nothing came back — no status, no body. | Usually a tunnel or proxy swallowing the request — check the rail the gateway rides, then the gateway's own logs. |
+| `live round-trip failed (HTTP …)` | The chat endpoint rejected the request. | A 404 here usually means the named model isn't available on the server; a 400 often means the server requires a `model` field — set one when the wizard asks. |
+| `live round-trip failed (HTTP 200, but no usable text — "content" must be a non-empty string)` | The reply's `content` wasn't plain text — e.g. a tool-call turn, or a streaming-only adapter. | The endpoint must honor `stream: false` and return the final answer as a plain string — see the adapter contract. |
+| `This gateway has NO authentication, and this transport is publicly reachable.` | Keyless + public would put an unauthenticated, tool-capable agent on the open internet. The script refuses. | Keep it private (Tailscale), put a token on the gateway — or, expert-only, re-run with `--allow-keyless-public`. |
+
+### Other endpoint gotchas
+
+Nothing fails, so no message prints — but the result quietly isn't what you wanted:
+
+- **Hermes: pair the full-agent API server (default `8642`), never `hermes proxy` (`8645`).** Both chat, but the proxy carries no tools, skills, or memory. The wizard challenges a Hermes config whose `API_SERVER_PORT` is 8645; if you wired it by hand, re-check the port.
+- **vLLM can list a model whose chat fails** — a model served without a chat template answers `/v1/models` but errors on `/v1/chat/completions`.
+- **In-app symptoms** (Test Connection inside Conduck, device-specific behavior like Apple Watch reach): the setup ladder at https://conduck.com/setup/#troubleshooting covers those.
+
+### File-lane problems
+
+- `file lane probe failed` / `the saved profile's file lane failed live verification` — the WebDAV server didn't complete the PUT → GET → DELETE round-trip: wrong credential (regenerate it in the app and update the server), server not running, or its HTTPS front broken.
+- **Every check green, but the agent never sees uploaded files** — the WebDAV root points at the wrong folder. It must be the agent's *working directory*; see the contract in "Set up the file lane by hand" above. No test can catch this one.
+- **Chat works everywhere, but attachments fail on a standalone Apple Watch** — the file lane rides a narrower rail than the gateway (say, a tailnet-only lane behind a public gateway). Expose both on the same rail; re-running the wizard reconciles the two.
 
 ## Pairing code
 

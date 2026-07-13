@@ -20,3 +20,9 @@ jobs:
 
       - name: verify vendored QR encoder (pinned checksum + stdlib-only imports)
         run: bash scripts/verify-vendored-encoder.sh
+
+      - name: URL-normalization parity fixtures (mirror of the app's Swift suite)
+        run: bash scripts/test-url-normalization.sh
+
+      - name: /v1/models probe classification (live local mock server)
+        run: bash scripts/test-models-probe.sh

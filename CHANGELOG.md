@@ -2,6 +2,27 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.6.0] — failures that name themselves, and a README that decodes them
+
+Better diagnosis end to end: the wizard now says *what* failed instead of making you guess, and this README gained a [Troubleshooting](README.md#troubleshooting) section keyed to the exact messages it prints. No breaking changes — pairing codes, flags, and file locations from 0.5.0 keep working.
+
+### Added
+
+- **A Troubleshooting section in this README** — every verification message, what it means, and the fix, plus the silent gotchas no check can catch (wrong Hermes port, wrong WebDAV root, a lane on a narrower rail than the gateway). The Conduck setup page links straight to it.
+- **Empty-model-list warning.** A server whose `/v1/models` answers the canonical envelope with zero models now verifies green *with a warning* — the endpoint is real, but with no models it can't answer a chat (matches the app's own "connected — no models yet" verdict).
+- **Hermes proxy-port guard.** A Hermes config whose `API_SERVER_PORT` is 8645 — the tool-less `hermes proxy`, not the full-agent API server — gets a warning and an explicit confirm. It chats fine, so nothing downstream would ever catch the silent loss of tools, skills, and memory. (`--dry-run` notes it; `--reuse-only` warns and continues.)
+- **Parity + probe test suites in CI** (`scripts/test-url-normalization.sh`, `scripts/test-models-probe.sh`) — the URL normalizer is pinned to the app's fixtures, and the `/v1/models` classifier is exercised against a live local mock server, on every push and before every release.
+
+### Changed
+
+- **Verification failures now name the concrete cause.** The old catch-all `unreachable or rejected (URL? token? HTTPS front?)` is gone; the wizard distinguishes DNS failure, connection refused, timeout, TLS/certificate rejection, pinned-key mismatch, `401` token rejection, `404` wrong path, `5xx` server error, and an OK reply that isn't JSON — each with its own one-line fix.
+- **The HTML diagnosis stopped asserting.** `/v1/models` answering a web page used to be reported flatly as "the chat endpoint is still OFF". A reverse-proxy login or access page produces the identical symptom, so the message is now hedged and kind-aware: on OpenClaw/Hermes it names the endpoint flag as the *likely* cause with the interstitial as the alternative; on a custom server it points at the proxy/base-address family instead — and it shows the HTTP status either way.
+
+### Fixed
+
+- **Pasting a base URL that ends in `/v1` no longer breaks every request.** Ollama/LiteLLM docs write the endpoint as `…/v1`, but the script and the app both append `/v1/…` themselves — so the pasted form probed `/v1/v1/models` and failed. User-entered gateway URLs are now normalized exactly the way the Conduck app normalizes them (strip one terminal `/v1`, `/v1/models`, or `/v1/chat/completions` — segment-wise, percent-encoding-aware, port and path prefix preserved, query/fragment dropped), and the wizard says so when it rewrites.
+- The Cloudflare hostname prompt now tolerates a pasted full URL (the scheme is stripped instead of producing `https://https://…`).
+
 ## [0.5.0] — pair a second device in seconds, and verification that matches the app exactly
 
 Two features and a stricter verify step. No breaking changes — pairing codes, flags, and file locations from 0.4.0 keep working.

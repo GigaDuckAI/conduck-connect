@@ -69,7 +69,7 @@
 
 set -u -o pipefail
 
-VERSION="0.5.0"
+VERSION="0.6.0"
 PAYLOAD_VERSION=1
 
 # ---------------------------------------------------------------- utilities --
@@ -277,6 +277,41 @@ env_get() { # env_get <file> <KEY>  (last assignment wins; strips quotes)
 # Sanitize a free-form gateway name into a safe id token ([a-z0-9-], no injection).
 slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-32; }
 
+normalize_gateway_base_url() { # normalize_gateway_base_url <url> -> echoes the app-parity base URL
+  # Mirror of the app's SettingsViewModel.normalizedGatewayBaseURL — keep the two
+  # in lockstep (parity fixtures belong in the public repo's CI; land them there
+  # at release — no CI guards this today). Users paste the
+  # full endpoint their server's docs name (Ollama/LiteLLM write it as "…/v1"),
+  # but the app and this script both append /v1/… themselves — a base that
+  # already ends in it would 404 every request. Segment-wise on the URL PATH (a
+  # host or segment that merely contains "v1" is untouched): strip exactly ONE
+  # terminal /v1/chat/completions, /v1/models, or /v1 (longest first), drop
+  # query+fragment, keep port and any legitimate path prefix.
+  # Suffix comparison runs on percent-DECODED segments (Foundation's
+  # URLComponents.path decodes, so the app recognizes an encoded "/v1" too);
+  # the surviving path is emitted exactly as typed — no re-encoding surprises.
+  printf '%s' "$1" | python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit, unquote
+u = urlsplit(sys.stdin.read().strip())
+segs = [s for s in u.path.split("/") if s]
+dec = [unquote(s) for s in segs]
+for suf in (["v1", "chat", "completions"], ["v1", "models"], ["v1"]):
+    if len(dec) >= len(suf) and dec[-len(suf):] == suf:
+        del segs[-len(suf):]
+        break
+sys.stdout.write(urlunsplit((u.scheme, u.netloc, "/" + "/".join(segs) if segs else "", "", "")))' 2>/dev/null
+}
+
+apply_gateway_url_normalization() { # rewrites GW_URL in place; says so when it changed
+  local norm; norm=$(normalize_gateway_base_url "$GW_URL")
+  [ -n "$norm" ] || return 0   # python hiccup → keep the URL as typed
+  if [ "$norm" != "$GW_URL" ]; then
+    note "Using $norm — Conduck adds /v1/… itself, so the base address must not already end in it."
+    GW_URL="$norm"
+  fi
+}
+
 OS="$(uname -s)"   # Linux | Darwin
 STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/conduck"
 
@@ -404,6 +439,23 @@ configure_hermes() {
   GW_LOCAL_PORT=$(env_get "$envf" "API_SERVER_PORT"); GW_LOCAL_PORT="${GW_LOCAL_PORT:-8642}"
   GW_HEALTH_PATH="/v1/health"
 
+  # 8645 is Hermes's OTHER OpenAI door: the tool-less `hermes proxy`. It chats
+  # fine, so nothing downstream would fail — the user would just silently lose
+  # tools, skills, and memory. Challenge it here; verification can't catch it.
+  if [ "$GW_LOCAL_PORT" = "8645" ]; then
+    warn "API_SERVER_PORT is 8645 — the port of the tool-less 'hermes proxy', not the full-agent API server (default 8642)."
+    say  "  Both can chat, but only the full-agent API server carries Hermes's tools, skills, and memory."
+    if $DRY_RUN; then
+      note "(dry-run: a real run asks whether to continue with 8645)"
+    elif $REUSE_ONLY; then
+      # reuse-only reuses what exists — it warns, never gates (a new die-by-default
+      # prompt here would break "safe to point at a live gateway").
+      note "(reuse-only: continuing with the existing config — if this is wrong, fix API_SERVER_PORT and re-run the wizard)"
+    elif ! confirm "  Continue with port 8645 anyway?"; then
+      die "Stopped — point API_SERVER_PORT in ~/.hermes/.env at the full-agent API server (default 8642), then re-run me."
+    fi
+  fi
+
   if [ "$enabled" = "true" ]; then
     ok "Hermes OpenAI API server already enabled (port $GW_LOCAL_PORT)."
   elif $DRY_RUN; then
@@ -473,6 +525,7 @@ configure_generic() {
   if confirm "  Does it already have an https:// URL?"; then
     GW_LOCAL_PORT=""
     GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
+    apply_gateway_url_normalization
   else
     while true; do
       GW_LOCAL_PORT=$(ask "  Local port it listens on (e.g. 11434 for Ollama)" "")
@@ -1033,13 +1086,17 @@ choose_exposure() {
           "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
       fi
       local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "")
+      case "$h" in http://*|https://*) h="${h#*://}" ;; esac   # tolerate a pasted URL — keep the host part
+      while [ "${h%/}" != "$h" ]; do h="${h%/}"; done
       [ -n "$h" ] || die "No hostname given. This option needs a domain already added to your Cloudflare account; if you don't have one yet, re-run and pick Tailscale instead, or add a domain in Cloudflare first."
       GW_URL="https://$h"
+      apply_gateway_url_normalization
       ;;
     4)
       # One option for "I run my own HTTPS." The script figures out whether the
       # certificate is publicly trusted (no pin) or self-managed (pin its SPKI).
       GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com") || die "$NO_ANSWER"
+      apply_gateway_url_normalization
       scope_choice
       keyless_public_guard
       classify_own_https   # sets TRANSPORT=public|selfsigned (+ GW_CERT_FP); STOPs on a broken cert
@@ -1704,12 +1761,21 @@ curl_gw() { # curl_gw <curl args…>
   fi
 }
 
+# Diagnostics from the LAST models_is_json call — verify_all turns these into a
+# concrete sub-cause instead of one lossy "unreachable or rejected" bucket.
+MODELS_CURL_RC=0        # curl exit code (0 = the transfer itself completed)
+MODELS_HTTP_CODE=""     # HTTP status of the reply ("" when the transfer failed)
+MODELS_DATA_EMPTY=false # 200 + canonical envelope, but "data" is [] (valid, yet can't answer)
+
 models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canonical envelope
                    #   (JSON object with a top-level "data" ARRAY), not the Control-UI HTML.
                    # Return codes: 0 ok · 1 unreachable/rejected/non-JSON · 2 HTML · 3 wrong shape.
+                   # Sets MODELS_CURL_RC / MODELS_HTTP_CODE / MODELS_DATA_EMPTY either way.
   local out code body
-  out=$(curl_gw -w '\n%{http_code}' "$1/v1/models" 2>/dev/null) || return 1
+  MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false
+  out=$(curl_gw -w '\n%{http_code}' "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
+  MODELS_HTTP_CODE="$code"
   # HTML first: the endpoint-off page often comes back 200, and it deserves its
   # own diagnosis either way.
   case "$body" in *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;; esac
@@ -1717,11 +1783,13 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canoni
   # with JSON" (wrong token was the false-green case).
   [ "$code" = "200" ] || return 1
   # Canonical envelope: the app's Test Connection needs a JSON OBJECT whose
-  # top-level "data" is an ARRAY (empty is fine). A bare array, a {"models":…}
-  # shape, or "data" that isn't a list parses as JSON but fails the app's
-  # stricter probe — flag it as its own case (return 3) so verify_all can say
-  # so. Python is the sole classifier (unparseable → 1): a shell first-byte
-  # test would wrongly reject leading whitespace and misfile JSON scalars.
+  # top-level "data" is an ARRAY. A bare array, a {"models":…} shape, or "data"
+  # that isn't a list parses as JSON but fails the app's stricter probe — flag
+  # it as its own case (return 3) so verify_all can say so. An EMPTY array is
+  # structurally valid (the app calls it "connected — no models yet") but can't
+  # answer a chat, so it reports success + the MODELS_DATA_EMPTY warning flag.
+  # Python is the sole classifier (unparseable → 1): a shell first-byte test
+  # would wrongly reject leading whitespace and misfile JSON scalars.
   # parse_constant: NaN/Infinity are REJECTED — python accepts them by default
   # but Apple Foundation's parsers do not, and the script must never be laxer
   # than the app it green-lights for.
@@ -1732,7 +1800,15 @@ try:
     d = json.load(sys.stdin, parse_constant=bad)
 except Exception:
     sys.exit(1)
-sys.exit(0 if isinstance(d, dict) and isinstance(d.get("data"), list) else 3)' 2>/dev/null
+if not (isinstance(d, dict) and isinstance(d.get("data"), list)):
+    sys.exit(3)
+sys.exit(4 if not d["data"] else 0)' 2>/dev/null
+  local prc=$?
+  case "$prc" in
+    0) return 0 ;;
+    4) MODELS_DATA_EMPTY=true; return 0 ;;
+    *) return "$prc" ;;
+  esac
 }
 
 # A self-signed-aware curl for the FILE lane (its own pin if set, else gateway's).
@@ -1766,20 +1842,56 @@ verify_all() {
       local_health_ok "http://127.0.0.1:$GW_LOCAL_PORT$GW_HEALTH_PATH"
   fi
 
-  # Public URL: model list must come back as JSON.
-  local rc=0; models_is_json "$GW_URL" || rc=$?
+  # Public URL: model list must come back as JSON. On failure, name the concrete
+  # sub-cause (models_is_json leaves it in MODELS_CURL_RC / MODELS_HTTP_CODE) —
+  # a lone "unreachable or rejected" makes the user guess among seven problems.
+  local rc=0 why=""; models_is_json "$GW_URL" || rc=$?
   if [ "$rc" = "0" ]; then
     ok "$GW_URL/v1/models answers with JSON"
+    if $MODELS_DATA_EMPTY; then
+      warn "…but its model list is EMPTY — the endpoint is real, yet with no models it can't answer."
+      say  "    (pull/load a model on the server — or set the model name your gateway expects — then re-run me)"
+    fi
   elif [ "$rc" = "2" ]; then
-    bad "$GW_URL/v1/models returns an HTML page — the chat endpoint is still OFF"
-    say  "    (re-run Step 2, then restart the gateway)"
+    # Hedged on purpose: the endpoint-off page is the LIKELY cause on the known
+    # gateways, but a reverse-proxy login or access interstitial produces the
+    # identical symptom — asserting "it's off" would send that user in circles.
+    bad "$GW_URL/v1/models returned an HTML page instead of model data (HTTP ${MODELS_HTTP_CODE:-?})"
+    case "$GW_KIND" in
+      openclaw|hermes)
+        say "    (most likely the chat endpoint is still off — re-run Step 2, then restart the gateway;"
+        say "     a 401/403 status here usually means a login or access page in front answered instead)"
+        ;;
+      *)
+        say "    (something answered with a web page — often a reverse proxy, a login/access page, or a"
+        say "     wrong base address; check the URL and whatever sits in front of the server)"
+        ;;
+    esac
     VERIFY_FAILED=true
   elif [ "$rc" = "3" ]; then
     bad "$GW_URL/v1/models answers, but not with the required envelope"
     say  '    (must be JSON with a top-level "data" array — see conduck.com/setup/adapter/v1/)'
     VERIFY_FAILED=true
   else
-    bad "$GW_URL/v1/models unreachable or rejected (URL? token? HTTPS front?)"
+    if [ "$MODELS_CURL_RC" != "0" ]; then
+      case "$MODELS_CURL_RC" in
+        6)     why="DNS lookup failed — that hostname doesn't resolve" ;;
+        7)     why="connection refused — nothing is listening there (wrong port? firewall? server down?)" ;;
+        28)    why="timed out — no answer from the host" ;;
+        35|60) why="TLS/certificate problem — the HTTPS front rejected the connection" ;;
+        90)    why="pinned key mismatch — the server's certificate is not the one this run pinned" ;;
+        *)     why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
+      esac
+    else
+      case "$MODELS_HTTP_CODE" in
+        401|403) why="HTTP $MODELS_HTTP_CODE — token rejected (or an access layer in front wants a login)" ;;
+        404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
+        5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
+        200)     why="answered 200, but the body isn't JSON" ;;
+        *)       why="HTTP $MODELS_HTTP_CODE" ;;
+      esac
+    fi
+    bad "$GW_URL/v1/models failed: $why"
     VERIFY_FAILED=true
   fi
 
