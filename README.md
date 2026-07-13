@@ -87,6 +87,42 @@ Conduck needs the gateway at an `https://` URL. The wizard walks four paths and 
 - **Cloudflare Tunnel** — public; needs a domain and `cloudflared`.
 - **I already run my own HTTPS** — give the address; the script trusts a publicly-valid cert (e.g. Let's Encrypt) or pins a self-signed one for you. A broken cert (expired / wrong host) stops the run rather than getting silently pinned.
 
+## Set up the file lane by hand (any WebDAV server)
+
+**The easy path is to re-run `conduck-connect`.** It's the supported way to add file transfer after chat is already paired: it detects an existing `conduck-files-<gwid>` server, reuses its folder, port, and credential, reconciles the lane's reach against the gateway's, verifies a `PUT` → `GET` → `DELETE` round-trip, and emits a fresh pairing code. Reach for the manual path below only when you run your own topology — Caddy, nginx, a NAS appliance, containers, or rclone under your own supervisor — anything that already speaks WebDAV.
+
+Conduck doesn't care *how* the endpoint is built, only that it satisfies the contract the in-app **Test Connection** stages check. Serve that contract with whatever you already run.
+
+**The contract**
+
+- **HTTPS, not HTTP.** The app rejects an `http://` file URL outright. Terminate TLS with a real or self-signed certificate (see security notes).
+- **HTTP Basic auth, username `conduck`.** The password is generated *in the app* — **Settings → your gateway → File transfer → Generate credential** — and pasted into your server's config. Conduck never accepts a password you invent; the app is the source of truth for that credential.
+- **Serve the folder the agent actually reads and writes.** The WebDAV root must be the agent's working directory — for OpenClaw its workspace (`~/.openclaw/workspace` by default), for Hermes the folder `terminal.cwd` points at in `~/.hermes/config.yaml`. This is the one requirement no test can catch: point the root at the wrong folder and uploads land on disk, every check goes green, and your agent still never sees the file.
+- **Same reach as the gateway.** Expose the file server on the same rail you exposed the gateway on. If the gateway is public but the file server is tailnet-only, a standalone Apple Watch can still chat but silently can't send or open attachments.
+
+Then, in the app: paste the file-lane URL and run **Test Connection**. The staged test proves reachability, auth, and a byte-faithful `PUT` → `GET` → `DELETE` round-trip — everything except whether the root is the *right* folder, which only you can confirm.
+
+**Security**
+
+- **Never put the password on a command line** — `argv` is visible to `ps`. Pass it through an environment variable or a config file with `0600` permissions.
+- **HTTPS with a real or self-signed cert.** Self-signed is fine — pin its SPKI fingerprint in the app under **Advanced** so Conduck trusts exactly that cert.
+- **Isolate lanes.** If you run more than one file lane on a host, give each its own credential, port, and service name — no shared state between them.
+
+**Exposure**
+
+Any HTTPS route works: **Tailscale Serve** (private tailnet), **Tailscale Funnel** (public), a **Cloudflare named tunnel** (public — use a routed hostname, not the ephemeral quick-tunnel URL), or your own reverse proxy / VPS. Usually the file server should ride the *same* rail you already used for the gateway.
+
+**Example** (illustrative, not the blessed way) — serve OpenClaw's workspace with rclone, credential via the environment so it never reaches `argv`:
+
+```
+read -rs RCLONE_PASS && export RCLONE_PASS   # paste the app-generated password at the silent prompt
+rclone serve webdav ~/.openclaw/workspace --addr 127.0.0.1:5006 --user conduck
+```
+
+(`read -rs` keeps the password out of your shell history and off `argv`; a `0600` env file read by your service manager does the same job for a persistent unit.)
+
+`serve` runs in the foreground and binds to loopback only — put it under systemd / launchd / your own supervisor for a real deployment, and front it with the tunnel or reverse proxy of your choice to reach it over HTTPS. Swap the folder, port, and exposure for whatever your setup uses.
+
 ## Pairing code
 
 `conduck-setup:v1:<base64(JSON)>` — same content in the QR and the paste string. Full contract in **[PAYLOAD.md](PAYLOAD.md)**.
