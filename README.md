@@ -1,6 +1,6 @@
 # conduck-connect
 
-Pair your self-hosted AI gateway with the **[Conduck](https://gigaduck.ai/conduck)** app — one readable script you audit before you run. Zero telemetry.
+Pair your self-hosted AI gateway with the **[Conduck](https://conduck.com)** app — one readable script you audit before you run. Zero telemetry.
 
 ## Quick start
 
