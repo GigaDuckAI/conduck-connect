@@ -2,6 +2,28 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.5.0] — pair a second device in seconds, and verification that matches the app exactly
+
+Two features and a stricter verify step. No breaking changes — pairing codes, flags, and file locations from 0.4.0 keep working.
+
+### Added
+
+- **`--show-qr` — re-show your pairing code without redoing setup.** A successful wizard run now saves a **non-secret profile** at `~/.config/conduck/profile-<gateway>.json` (routing facts only — never tokens or credentials; see `WHAT-IT-TOUCHES.md`). `--show-qr` re-emits the same QR from it with no setup questions and zero configuration changes — the fast path for pairing a second device. It validates the saved profile before trusting it (a hand-edited or corrupted file stops with a clear message instead of emitting a code the apps reject), re-derives secrets from their canonical homes (a profile whose token can't be read stops rather than emit a keyless code), and refuses with a secret-free diff if your live setup has drifted — including a profile that names a different machine on your tailnet. It never rewrites the profile: a transient verification failure can drop the file lane from one emission, never from your saved setup. It may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code.
+- **Built your own AI? The wizard now meets you halfway.** The gateway menu names "your own adapter" alongside Ollama/LiteLLM/vLLM, and a server that answers with the wrong response shape gets its own diagnosis pointing at the published adapter contract — https://conduck.com/setup/adapter/v1/ — instead of a generic failure.
+
+### Changed — verification now matches the Conduck app exactly
+
+The verify step previously accepted some responses the app would go on to reject, so a green pairing code could still produce a broken first connection. Every check now mirrors the app's own parser:
+
+- `/v1/models` must answer `200` with the canonical envelope — a JSON **object** whose top-level `data` is an **array**. Valid JSON in any other shape gets the new wrong-envelope diagnosis (see the adapter contract above) instead of passing.
+- The live pong must be a clean transfer (a response that times out mid-body no longer counts), HTTP `200`, and a **non-empty text** `content` — a `tool_calls` reply carrying `content: null`, an error body, or an empty answer no longer passes.
+- `NaN`/`Infinity` anywhere in a response now fail: Python's parser accepts them by default, Apple's rejects them, and the wizard must never be more lenient than the app it green-lights for.
+- The pong wait now matches the app's own request timeout (300 s, up from 180 s) — slow self-hosted agents no longer fail verification the app itself would have survived.
+
+### Fixed
+
+- JSON responses with leading whitespace were misclassified as non-JSON by a shell-level first-byte check; the real parser now decides.
+
 ## [0.4.0] — first stable release: exposure, certificate, and secret-handling fixes
 
 A quality-control pass over the whole wizard found four paths that did not behave the way the script documented, plus one introduced while fixing them. **If you are on `0.4.0-rc.4` or earlier, upgrade** — the exposure bug below can leave your gateway publicly reachable after you asked for a private setup.
