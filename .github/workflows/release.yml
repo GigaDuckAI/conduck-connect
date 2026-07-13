@@ -19,6 +19,8 @@ jobs:
           shellcheck --severity=warning conduck-connect.sh scripts/*.sh
           bash -n conduck-connect.sh
           bash scripts/verify-vendored-encoder.sh
+          bash scripts/test-url-normalization.sh
+          bash scripts/test-models-probe.sh
 
       - name: Generate checksum
         run: sha256sum conduck-connect.sh > conduck-connect.sh.sha256
