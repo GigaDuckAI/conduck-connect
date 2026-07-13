@@ -29,7 +29,8 @@
 #      your agent real files and download its outputs.
 #   5. Verifies everything end-to-end with real requests.
 #   6. Prints a QR code you scan with the Conduck app — URL, token, and file-lane
-#      credentials imported in one scan — nothing to retype on your phone.
+#      credentials imported in one scan — nothing to retype on your phone
+#      (iPhone, iPad, or Android).
 #
 # What this script NEVER does:
 #   - Install your gateway, Tailscale, cloudflared, or any daemon it didn't create.
@@ -50,6 +51,12 @@
 #   bash conduck-connect.sh --hermes        # skip detection, configure Hermes
 #   bash conduck-connect.sh --generic       # any OpenAI-compatible server
 #   bash conduck-connect.sh --dry-run       # show state + plan; mutate nothing
+#   bash conduck-connect.sh --show-qr       # re-show a SAVED pairing QR — skips the setup
+#                                           # questions and changes NOTHING (needs one prior
+#                                           # successful run; may still ask you to pick a
+#                                           # profile, re-enter a custom gateway's token, or
+#                                           # confirm a gateway-only code; verification still
+#                                           # makes its real requests)
 #   bash conduck-connect.sh --reuse-only    # only reuse what's already set up; refuse to
 #                                           # change anything — use this to re-show your QR
 #                                           # on a gateway you don't want touched
@@ -57,11 +64,12 @@
 #                                           # gateway on a public transport
 #
 # Re-running is safe: every step detects existing state and reuses what's done.
-# Run it again any time you just want the QR code back.
+# Run it again any time you just want the QR code back — or --show-qr to re-show a
+# saved gateway's code, skipping the setup questions (handy for pairing a second device).
 
 set -u -o pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 PAYLOAD_VERSION=1
 
 # ---------------------------------------------------------------- utilities --
@@ -80,6 +88,7 @@ die()  { printf '%sError:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
 DRY_RUN=false
 REUSE_ONLY=false
+SHOW_QR=false
 ALLOW_KEYLESS_PUBLIC=false
 MODE=""            # openclaw | hermes | generic
 
@@ -89,6 +98,7 @@ for arg in "$@"; do
     --hermes)   MODE="hermes" ;;
     --generic)  MODE="generic" ;;
     --dry-run)  DRY_RUN=true ;;
+    --show-qr)  SHOW_QR=true ;;
     --reuse-only) REUSE_ONLY=true ;;
     --allow-keyless-public) ALLOW_KEYLESS_PUBLIC=true ;;
     --version)  say "conduck-connect $VERSION"; exit 0 ;;
@@ -96,6 +106,14 @@ for arg in "$@"; do
     *) die "Unknown argument: $arg (try --help)" ;;
   esac
 done
+
+# --show-qr re-emits a SAVED profile's QR: reads only, changes nothing. It cannot
+# combine with --dry-run (which plans a fresh run and emits no QR). REUSE_ONLY is
+# forced on so any mutation that gets accidentally reached dies via mutate_guard.
+if $SHOW_QR; then
+  $DRY_RUN && die "--show-qr and --dry-run don't combine: --show-qr re-emits a saved gateway's QR and changes nothing, while --dry-run plans a fresh run and emits no QR. Pick one."
+  REUSE_ONLY=true
+fi
 
 # PLAN[] accumulates human-readable "would do" lines for --dry-run.
 PLAN=()
@@ -305,7 +323,7 @@ detect_gateway() {
   say "  Which gateway should Conduck talk to?"
   say "    1) OpenClaw $( [[ " ${found[*]-} " == *" openclaw "* ]] && echo '(detected)' )"
   say "    2) Hermes   $( [[ " ${found[*]-} " == *" hermes "* ]] && echo '(detected)' )"
-  say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, …)"
+  say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, your own adapter, …)"
   local choice
   if [ -n "$default_choice" ]; then
     # Enter takes the detected default; a typo re-prompts (never aborts).
@@ -452,7 +470,7 @@ configure_generic() {
   head_ "Step 2 — your OpenAI-compatible server"
   GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
   GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
-  if confirm "  Does it already have a public https:// URL?"; then
+  if confirm "  Does it already have an https:// URL?"; then
     GW_LOCAL_PORT=""
     GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
   else
@@ -495,6 +513,8 @@ TRANSPORT=""       # tailscale | funnel | cloudflare | public | selfsigned
 SCOPE="unknown"    # private | public | unknown  (actual reachability, NOT the label)
 TS_STATE_KNOWN=true
 declare -a TS_PORTS=()        # "port<TAB>verb<TAB>proxy" lines from ts_targets
+declare -a TS_HOSTS=()        # unique lowercased tailnet hostnames serving on THIS machine (from ts_targets)
+declare -a TS_MAPS=()         # "host<TAB>port<TAB>verb<TAB>proxy" per mapping (host lowercased) — show-qr's host-qualified assert
 declare -a APPLIED=()         # "port<TAB>applied-verb<TAB>prior-state" snapshots for cleanup (gateway)
 declare -a FS_APPLIED=()      # same, but for the OPTIONAL file lane — rolled back on its own when the
                               # lane is dropped post-mutation, so a public Funnel is never orphaned
@@ -531,10 +551,14 @@ try:
 except Exception: pass'
 }
 
-# Parse `tailscale serve status --json` into "port<TAB>verb<TAB>proxy" lines.
+# Parse `tailscale serve status --json` into "port<TAB>verb<TAB>proxy" lines (TS_PORTS)
+# plus one "HOST<TAB>hostname" line per unique serving host (→ TS_HOSTS) and one
+# "MAP<TAB>host<TAB>port<TAB>verb<TAB>proxy" line per mapping (→ TS_MAPS, for show-qr's
+# host-qualified assert — a matching port on a DIFFERENT hostname must not count).
+# TS_PORTS' line format is UNCHANGED — several consumers split it on tabs.
 # FAIL CLOSED: on any parse/exec error TS_STATE_KNOWN=false (caller refuses to mutate).
 ts_targets() {
-  TS_PORTS=(); TS_STATE_KNOWN=true
+  TS_PORTS=(); TS_HOSTS=(); TS_MAPS=(); TS_STATE_KNOWN=true
   local raw; raw=$(tailscale serve status --json 2>/dev/null) || { TS_STATE_KNOWN=false; return 0; }
   [ -n "$raw" ] || return 0   # genuinely no targets is fine (empty, but known)
   local parsed
@@ -547,12 +571,22 @@ except Exception:
 web=d.get("Web") or {}
 af=d.get("AllowFunnel") or {}
 print("OK")
+# Emit each unique serving HOST (hostport minus the trailing :port, lowercased) BEFORE
+# the port lines so the caller can prove the profile URL names THIS machine.
+seen=set()
+for hostport in web.keys():
+    host=hostport.rsplit(":",1)[0].lower()
+    if host and host not in seen:
+        seen.add(host)
+        print(f"HOST\t{host}")
 for hostport,conf in web.items():
+    host=hostport.rsplit(":",1)[0].lower()
     port=hostport.rsplit(":",1)[-1]
     proxy=""
     for _,h in ((conf or {}).get("Handlers") or {}).items():
         proxy=(h or {}).get("Proxy","") or proxy
     verb="funnel" if af.get(hostport) else "serve"
+    print(f"MAP\t{host}\t{port}\t{verb}\t{proxy}")
     print(f"{port}\t{verb}\t{proxy}")
 ') || { TS_STATE_KNOWN=false; return 0; }
   # First line must be the OK sentinel, else treat as unknown.
@@ -560,7 +594,12 @@ for hostport,conf in web.items():
   local line first=true
   while IFS= read -r line; do
     if $first; then first=false; continue; fi   # skip OK
-    [ -n "$line" ] && TS_PORTS+=("$line")
+    [ -n "$line" ] || continue
+    case "$line" in
+      HOST$'\t'*) TS_HOSTS+=("${line#HOST$'\t'}") ;;   # host line → TS_HOSTS (additive; port consumers unaffected)
+      MAP$'\t'*)  TS_MAPS+=("${line#MAP$'\t'}") ;;     # mapping tuple → TS_MAPS (additive, show-qr only)
+      *)          TS_PORTS+=("$line") ;;               # unchanged "port<TAB>verb<TAB>proxy"
+    esac
   done <<< "$parsed"
 }
 
@@ -877,7 +916,7 @@ choose_exposure() {
     return
   fi
 
-  head_ "Step 3 — how should your iPhone reach this gateway?"
+  head_ "Step 3 — how should your phone reach this gateway?"
   ts_targets
   local ts_state="not installed" cf_state="not installed"
   if have tailscale; then
@@ -889,8 +928,8 @@ choose_exposure() {
   say ""
   say "  1) ${BOLD}Tailscale${RESET} (private — also called Tailscale Serve)  ($ts_state)"
   say "     Private: only your own Tailscale devices (your \"tailnet\") reach it. Free."
-  say "     Data path: device → gateway, nobody in between. Your iPhone needs the"
-  say "     Tailscale app too."
+  say "     Data path: device → gateway, nobody in between. Your phone needs the"
+  say "     Tailscale app too (iPhone or Android)."
   say "     Apple Watch: works only while near your iPhone (no Tailscale on the Watch)."
   say ""
   say "  2) ${BOLD}Tailscale Funnel${RESET}  ($ts_state)"
@@ -1190,6 +1229,7 @@ sys.stdout.write(base64.b64encode(binascii.unhexlify(h)).decode() if h else "")'
 FS_URL=""; FS_CRED=""; FS_CERT_FP=""
 FS_LOCAL_PORT=""
 FS_UNIT=""          # resolved unit/plist path actually in use (existing or new)
+FS_FOLDER=""        # served workspace path — for the non-secret profile only; "" when unknown
 FS_CRED_LEGACY_ARGV=false   # true when a reused unit keeps the password on argv (ps-visible)
 
 state_cred_file() { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$GW_ID"; }
@@ -1209,7 +1249,8 @@ mac_unit_candidates() {
 }
 
 # Find an existing file-server unit (script OR app generated) and recover its
-# config: local port + credential. Sets FS_LOCAL_PORT + FS_CRED + FS_UNIT.
+# config: local port + credential + served folder. Sets FS_LOCAL_PORT + FS_CRED +
+# FS_UNIT + FS_FOLDER (folder is best-effort — for the profile only, never gates).
 existing_fs_config() {
   local unit="" f
   if [ "$OS" = "Linux" ]; then
@@ -1239,6 +1280,26 @@ PY
   fi
   case "$port" in ''|*[!0-9]*) port="" ;; esac
   FS_LOCAL_PORT="${port:-5006}"
+
+  # served folder: the `rclone serve webdav <folder>` argument. Plist → the element
+  # right after "webdav" (STRUCTURAL, handles any path); systemd → the text between
+  # `serve webdav` and `--addr` (the existing grep style; strip its surrounding
+  # quotes). Best-effort: recorded in the profile only, omitted when unreadable.
+  FS_FOLDER=""
+  if [ "${unit##*.}" = "plist" ]; then
+    FS_FOLDER=$(python3 - "$unit" <<'PY' 2>/dev/null
+import sys, plistlib
+try:
+    a = plistlib.load(open(sys.argv[1], 'rb')).get("ProgramArguments", [])
+    i = a.index("webdav")
+    print(a[i + 1])
+except Exception: pass
+PY
+)
+  else
+    FS_FOLDER=$(sed -n 's/^ExecStart=.* serve webdav \(.*\) --addr .*/\1/p' "$unit" 2>/dev/null | head -1)
+    FS_FOLDER="${FS_FOLDER#\"}"; FS_FOLDER="${FS_FOLDER%\"}"
+  fi
 
   # credential: prefer our 0600 state cred file; else env file RCLONE_PASS; else
   # recover it from the unit. Plists are parsed STRUCTURALLY (`<string>--pass</string>`
@@ -1510,6 +1571,7 @@ setup_file_lane() {
       done
     fi
     [ "$GW_KIND" = "hermes" ] && note "Hermes: also point terminal.cwd at this folder in ~/.hermes/config.yaml so its tools land here."
+    FS_FOLDER="$workspace"   # new lane knows its own folder — recorded in the profile
 
     if $DRY_RUN; then
       plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
@@ -1642,7 +1704,9 @@ curl_gw() { # curl_gw <curl args…>
   fi
 }
 
-models_is_json() { # 1 arg: base URL — /v1/models must answer 200 with JSON, not the Control-UI HTML
+models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canonical envelope
+                   #   (JSON object with a top-level "data" ARRAY), not the Control-UI HTML.
+                   # Return codes: 0 ok · 1 unreachable/rejected/non-JSON · 2 HTML · 3 wrong shape.
   local out code body
   out=$(curl_gw -w '\n%{http_code}' "$1/v1/models" 2>/dev/null) || return 1
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
@@ -1652,7 +1716,23 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer 200 with JSON, n
   # Status must be green — a 401/500 JSON error body is a FAILURE, not "answers
   # with JSON" (wrong token was the false-green case).
   [ "$code" = "200" ] || return 1
-  case "$body" in \{*|\[*) return 0 ;; *) return 1 ;; esac
+  # Canonical envelope: the app's Test Connection needs a JSON OBJECT whose
+  # top-level "data" is an ARRAY (empty is fine). A bare array, a {"models":…}
+  # shape, or "data" that isn't a list parses as JSON but fails the app's
+  # stricter probe — flag it as its own case (return 3) so verify_all can say
+  # so. Python is the sole classifier (unparseable → 1): a shell first-byte
+  # test would wrongly reject leading whitespace and misfile JSON scalars.
+  # parse_constant: NaN/Infinity are REJECTED — python accepts them by default
+  # but Apple Foundation's parsers do not, and the script must never be laxer
+  # than the app it green-lights for.
+  printf '%s' "$body" | python3 -c '
+import json, sys
+def bad(x): raise ValueError(x)
+try:
+    d = json.load(sys.stdin, parse_constant=bad)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and isinstance(d.get("data"), list) else 3)' 2>/dev/null
 }
 
 # A self-signed-aware curl for the FILE lane (its own pin if set, else gateway's).
@@ -1694,6 +1774,10 @@ verify_all() {
     bad "$GW_URL/v1/models returns an HTML page — the chat endpoint is still OFF"
     say  "    (re-run Step 2, then restart the gateway)"
     VERIFY_FAILED=true
+  elif [ "$rc" = "3" ]; then
+    bad "$GW_URL/v1/models answers, but not with the required envelope"
+    say  '    (must be JSON with a top-level "data" array — see conduck.com/setup/adapter/v1/)'
+    VERIFY_FAILED=true
   else
     bad "$GW_URL/v1/models unreachable or rejected (URL? token? HTTPS front?)"
     VERIFY_FAILED=true
@@ -1701,8 +1785,8 @@ verify_all() {
 
   # A real round-trip. Agents can be slow; give it time. Servers like
   # Ollama/vLLM/LiteLLM need the model named — include it exactly as the app will.
-  say "  Asking the gateway for a one-word reply (can take a minute on modest hardware)…"
-  local reply body
+  say "  Asking the gateway for a one-word reply (can take a few minutes on modest hardware or a busy agent)…"
+  local reply body out code resp curl_rc
   # Build the JSON with a real encoder — a quote/backslash in a model name must
   # not silently break the request body.
   body=$(GW_MODEL="$GW_MODEL" python3 -c '
@@ -1712,14 +1796,37 @@ m = os.environ.get("GW_MODEL", "")
 if m: p["model"] = m
 print(json.dumps(p))') || die "Could not build the test request (python3 failed)."
   [ -n "$body" ] || die "Could not build the test request."
-  reply=$(curl_gw "$GW_URL/v1/chat/completions" --max-time 180 \
+  # Status AND shape must both be green — mirror the app's decoder exactly:
+  # a non-200, or a 200 whose "content" isn't a non-empty STRING (a tool_calls
+  # reply carries content:null, which python would happily print as "None"),
+  # must not pass as a live round-trip.
+  out=$(curl_gw -w '\n%{http_code}' "$GW_URL/v1/chat/completions" --max-time 300 \
       -H "Content-Type: application/json" \
-      -d "$body" \
-    | python3 -c 'import json,sys
-try: print(json.load(sys.stdin)["choices"][0]["message"]["content"])
+      -d "$body" 2>/dev/null); curl_rc=$?
+  code="${out##*$'\n'}"; resp="${out%$'\n'*}"
+  reply=""
+  # Parse ONLY a clean transfer: a curl that timed out or dropped mid-body can
+  # still hand back a 200 + parseable prefix — that must not pass. Same strict
+  # parse_constant as models_is_json (NaN/Infinity would crash the app's decode).
+  if [ "$curl_rc" = "0" ] && [ "$code" = "200" ]; then
+    reply=$(printf '%s' "$resp" | python3 -c 'import json,sys
+def bad(x): raise ValueError(x)
+try:
+    c = json.load(sys.stdin, parse_constant=bad)["choices"][0]["message"]["content"]
+    if isinstance(c, str): sys.stdout.write(c)
 except Exception: pass' 2>/dev/null)
+  fi
   if [ -n "$reply" ]; then ok "live round-trip: gateway replied (${reply%% *}…)"
-  else bad "live round-trip failed"; VERIFY_FAILED=true; fi
+  elif [ "$curl_rc" != "0" ]; then
+    bad "live round-trip failed (transfer error — timed out or the connection dropped)"; VERIFY_FAILED=true
+  elif [ -z "$code" ] || [ "$code" = "000" ]; then
+    bad "live round-trip failed (no answer from the gateway)"; VERIFY_FAILED=true
+  elif [ "$code" != "200" ]; then
+    bad "live round-trip failed (HTTP $code)"; VERIFY_FAILED=true
+  else
+    bad 'live round-trip failed (HTTP 200, but no usable text — "content" must be a non-empty string)'
+    VERIFY_FAILED=true
+  fi
 
   # File lane: PUT → GET → DELETE a throwaway.
   if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
@@ -1731,6 +1838,19 @@ except Exception: pass' 2>/dev/null)
       else
         ok "file lane: write → read green (delete probe left a stray file: $probe)"
       fi
+    elif $SHOW_QR; then
+      # --show-qr never rewrites the saved profile (write_profile guards on $SHOW_QR),
+      # so dropping the lane here only affects THIS emission — the saved lane is untouched.
+      bad "the saved profile's file lane failed live verification — a transient outage or a real breakage."
+      if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+        drop_file_lane
+      else
+        # Best-effort probe cleanup before dying: the PUT may have landed even though
+        # the GET failed, and die would also skip the rm -f below.
+        curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true
+        rm -f "$tmp"
+        die "Stopped — nothing changed. Fix the file server (or re-run the wizard: bash conduck-connect.sh), then try --show-qr again."
+      fi
     else
       bad "file lane probe failed — leaving it out of the QR (re-run me after fixing)"
       drop_file_lane
@@ -1740,6 +1860,60 @@ except Exception: pass' 2>/dev/null)
 }
 
 # -------------------------------------------------------------- pairing emit --
+
+# Write a NON-SECRET pairing profile so a later `--show-qr` can re-emit without
+# re-answering the wizard. NEVER holds tokens/credentials — only the routing facts
+# needed to reconstruct + re-verify. 0600, umask 077, built with a real JSON
+# encoder (never hand-quoted). Refreshed on every successful WIZARD emit (incl.
+# --reuse-only) but NEVER under --show-qr: that mode is a pure read of saved state,
+# and a transient probe failure there can drop a file lane from this one emission —
+# rewriting the profile would make that drop permanent. A failure here only WARNs —
+# it must not sink a completed pairing.
+write_profile() {
+  # --show-qr is a pure read of saved state; rewriting here could permanently strip a
+  # file lane that a transient probe failure dropped from this one emission. Guard first.
+  $SHOW_QR && return 0
+  $DRY_RUN && return 0                       # emit_payload never runs in dry-run, but stay explicit
+  [ -n "$GW_ID" ] || return 0                # no stable id → nowhere to key the profile; skip quietly
+  local pf; pf="$STATE_DIR/profile-$GW_ID.json"
+  ( umask 077; mkdir -p "$STATE_DIR" ) 2>/dev/null \
+    || { warn "Couldn't create $STATE_DIR to save the pairing profile — pairing is still complete."; return 0; }
+  local out
+  out=$(GW_ID="$GW_ID" GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_AUTH="$GW_AUTH" \
+        TRANSPORT="$TRANSPORT" SCOPE="$SCOPE" GW_URL="$GW_URL" GW_LOCAL_PORT="$GW_LOCAL_PORT" \
+        GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
+        FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_LOCAL_PORT="$FS_LOCAL_PORT" \
+        FS_CERT_FP="$FS_CERT_FP" FS_FOLDER="$FS_FOLDER" \
+        python3 - <<'PY'
+import json, os
+e = os.environ.get
+# Gateway: routing facts only. No token, ever.
+gw = {"id": e("GW_ID"), "kind": e("GW_KIND"), "auth": e("GW_AUTH"),
+      "transport": e("TRANSPORT"), "reach": e("SCOPE"), "url": e("GW_URL")}
+if e("GW_NAME"):       gw["name"] = e("GW_NAME")
+if e("GW_LOCAL_PORT"): gw["localPort"] = e("GW_LOCAL_PORT")
+if e("GW_MODEL"):      gw["model"] = e("GW_MODEL")
+if e("GW_CERT_FP"):    gw["certFP"] = e("GW_CERT_FP")
+p = {"schemaVersion": 1, "gateway": gw, "fileServer": None}
+# Record the file lane only when it actually shipped in the QR (URL + credential
+# both present) — and record its URL/port/cert/folder, NEVER the credential.
+if e("FS_URL") and e("FS_CRED"):
+    fs = {"url": e("FS_URL")}
+    if e("FS_LOCAL_PORT"): fs["localPort"] = e("FS_LOCAL_PORT")
+    if e("FS_CERT_FP"):    fs["certFP"]    = e("FS_CERT_FP")
+    if e("FS_FOLDER"):     fs["folder"]    = e("FS_FOLDER")
+    p["fileServer"] = fs
+print(json.dumps(p, indent=1))
+PY
+) || { warn "Couldn't build the pairing profile to save — pairing is still complete."; return 0; }
+  [ -n "$out" ] || { warn "Couldn't build the pairing profile to save — pairing is still complete."; return 0; }
+  if ( umask 077; printf '%s\n' "$out" > "$pf" ) 2>/dev/null; then
+    chmod 600 "$pf" 2>/dev/null || true       # belt-and-suspenders; umask 077 already made it 0600
+    note "Saved a non-secret pairing profile (no token) — re-show this QR later with:  bash conduck-connect.sh --show-qr"
+  else
+    warn "Couldn't save the pairing profile to $pf — pairing is still complete."
+  fi
+}
 
 emit_payload() {
   head_ "Step 6 — pair with the Conduck app"
@@ -1788,14 +1962,14 @@ PY
 
   say ""
   say "  ${BOLD}In Conduck:${RESET} Settings → Personal AI → look for the setup-code option."
-  say "  On iPhone/iPad, scan the QR or paste this code; on Mac, paste the code below."
+  say "  On iPhone, iPad, or Android, scan the QR or paste this code; on Mac, paste the code below."
   say ""
   say "  Setup code (same secret as the QR — paste this for the Mac app or if scanning fails):"
   say ""
   printf '%s\n' "$pairing"
   say ""
   case "$TRANSPORT" in
-    tailscale) note "Reminder: this gateway is tailnet-only — the iPhone/iPad/Mac running Conduck needs the Tailscale app, logged in to the same tailnet." ;;
+    tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, Mac, or Android) needs the Tailscale app, logged in to the same tailnet." ;;
     selfsigned) note "Your gateway uses its own certificate; a secure fingerprint of it travels inside the code, so the app trusts it automatically — nothing for you to copy." ;;
   esac
   say "  Re-run this script any time to re-verify or show the code again."
@@ -1806,6 +1980,7 @@ PY
     warn "commands print below — run them, then check 'tailscale funnel status'."
   fi
   EMITTED=true   # success — the EXIT backstop prints undo hints only for an unconfirmed rollback
+  write_profile  # refresh the non-secret profile so a later --show-qr needs no questions
 }
 
 # =============================================================================
@@ -2850,13 +3025,400 @@ print_plan() {
   say "  Re-run without --dry-run to apply and show the QR (each change still asks first)."
 }
 
+# --------------------------------------------------------------- --show-qr fast path --
+# Re-emit a SAVED profile's QR while skipping the SETUP questions and making ZERO
+# configuration changes. It is NOT question-free: it may still ask you to pick a profile
+# (when several are saved), re-enter a custom gateway's token, or confirm a gateway-only
+# code. "No changes" means no serve/funnel/config mutations — verification's real
+# requests (incl. the file-lane PUT/GET/DELETE probe) still run, on purpose. The whole
+# path reconstructs state from $STATE_DIR/profile-*.json (non-secret), re-derives secrets
+# from their canonical homes, refuses on any drift from the saved expectations, then
+# hands off to the UNCHANGED verify_all + emit_payload.
+
+# The https port a URL reaches on (443 when the URL carries none). Authority parse
+# matches url_host_lc/show_qr_is_https_host (ends at the first /, ? or #).
+url_https_port() { # url_https_port <https-url>
+  local hp="${1#https://}"; hp="${hp%%[/?#]*}"
+  case "$hp" in *:*) printf '%s' "${hp##*:}" ;; *) printf '443' ;; esac
+}
+
+# The host part of an https URL, lowercased. Same authority parse as
+# show_qr_is_https_host (ends at the first /, ? or #; strips a trailing :port) so the
+# two always agree. Empty output when the URL isn't https://. Used to prove a profile
+# URL names THIS tailnet machine.
+url_host_lc() { # url_host_lc <https-url>
+  case "$1" in https://*) ;; *) return 0 ;; esac
+  local a="${1#https://}"; a="${a%%[/?#]*}"
+  local h="$a"; case "$a" in *:*) h="${a%:*}" ;; esac
+  printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
+}
+
+# Does a saved profile's gateway.kind match an explicit --openclaw/--hermes/--generic?
+# No mode flag → every profile matches.
+profile_matches_mode() { # profile_matches_mode <kind>
+  case "$MODE" in
+    "")       return 0 ;;
+    openclaw) [ "$1" = "openclaw" ] ;;
+    hermes)   [ "$1" = "hermes" ] ;;
+    generic)  [ "$1" = "custom" ] ;;
+    *)        return 0 ;;
+  esac
+}
+
+# Discover saved profiles and set PROFILE_FILE. None → friendly die; one (or one
+# matching the mode flag) → use it; several → numbered pick via require_choice.
+# Dies directly (not via $()) so a "no profile" die halts the whole script.
+PROFILE_FILE=""
+show_qr_pick_profile() {
+  local pf; local all=(); local cand=()
+  for pf in "$STATE_DIR"/profile-*.json; do
+    [ -e "$pf" ] || continue          # no matches → the literal glob; skip it
+    all+=("$pf")
+  done
+  [ ${#all[@]} -gt 0 ] || die "No saved pairing profile on this machine yet — run the wizard once (bash conduck-connect.sh) to pair and save one. From then on, --show-qr re-shows the code, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code)."
+  local k
+  for pf in "${all[@]}"; do
+    k=$(json_get "$pf" "gateway.kind")
+    profile_matches_mode "$k" && cand+=("$pf")
+  done
+  [ ${#cand[@]} -gt 0 ] || die "No saved pairing profile matches --$MODE on this machine. Re-run --show-qr without the mode flag to pick from all saved profiles, or run the wizard to create one."
+  if [ ${#cand[@]} -eq 1 ]; then PROFILE_FILE="${cand[0]}"; return 0; fi
+  say ""
+  say "  ${BOLD}Saved pairing profiles on this machine:${RESET}"
+  local i=1 n u
+  for pf in "${cand[@]}"; do
+    k=$(json_get "$pf" "gateway.kind"); n=$(json_get "$pf" "gateway.name"); u=$(json_get "$pf" "gateway.url")
+    printf '    %d) %s%s — %s\n' "$i" "${k:-?}" "${n:+ ($n)}" "${u:-?}"
+    i=$((i+1))
+  done
+  local pick
+  while true; do
+    # {1,3} length-bounds the input so the numeric compare below can't overflow bash 3.2's intmax.
+    pick=$(require_choice "Which profile? Choose 1-$((i-1))" '^[0-9]{1,3}$') || die "$NO_ANSWER"
+    { [ "$pick" -ge 1 ] && [ "$pick" -le $((i-1)) ]; } 2>/dev/null && break
+    warn "Please enter a number between 1 and $((i-1))."
+  done
+  PROFILE_FILE="${cand[$((pick-1))]}"
+}
+
+# --show-qr profile-validation helpers (bash 3.2-safe, secret-free — they inspect only
+# routing facts, never tokens). Used by show_qr_load_profile to reject a hand-edited or
+# corrupted profile up front, before any secret recovery or live probe.
+show_qr_is_https_host() { # show_qr_is_https_host <url> -> 0 iff https:// + sane authority
+  # Real authority parse — a bare `%%/*` host grab let https://?query, https://#frag
+  # and https://user:pass@host slip through. Authority ends at the first /, ? or #;
+  # userinfo is rejected (the wizard never emits it); an explicit :port must be a
+  # real port; the host may contain only [A-Za-z0-9.-].
+  case "$1" in https://*) ;; *) return 1 ;; esac
+  local a="${1#https://}"; a="${a%%[/?#]*}"
+  case "$a" in *@*) return 1 ;; esac
+  local h="$a"
+  case "$a" in *:*) show_qr_is_port "${a##*:}" || return 1; h="${a%:*}" ;; esac
+  [ -n "$h" ] || return 1
+  case "$h" in *[!A-Za-z0-9.-]*) return 1 ;; esac
+  return 0
+}
+show_qr_is_port() { # show_qr_is_port <str> -> 0 if a decimal in 1..65535
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 5 ] || return 1        # length-bound so bash 3.2's intmax can't overflow
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+show_qr_is_certfp() { # show_qr_is_certfp <str> -> 0 if 64 lowercase SPKI-sha256 hex chars
+  case "$1" in *[!0-9a-f]*) return 1 ;; esac
+  [ "${#1}" -eq 64 ]
+}
+
+# Is <host-lc> one of the hostnames THIS machine currently serves (TS_HOSTS)? Compares
+# case-insensitively and FAILS CLOSED when TS_HOSTS is empty (host state unknown).
+ts_host_known() { # ts_host_known <host> — lowercases BOTH sides before comparing
+  local want h
+  want=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [ ${#TS_HOSTS[@]} -gt 0 ] || return 1
+  for h in "${TS_HOSTS[@]}"; do
+    [ "$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]')" = "$want" ] && return 0
+  done
+  return 1
+}
+
+# Reconstruct the GW_* vars from PROFILE_FILE. Health path + (missing) local port are
+# re-derived exactly as the wizard does, never trusted blindly from the file.
+show_qr_load_profile() {
+  local sv; sv=$(json_get "$PROFILE_FILE" "schemaVersion")
+  [ "$sv" = "1" ] || die "That saved profile uses schema version '${sv:-unknown}', which this script ($VERSION) doesn't understand — a newer conduck-connect wrote it. Update this script, then try again (or run the wizard once to rewrite it)."
+
+  GW_KIND=$(json_get "$PROFILE_FILE" "gateway.kind")
+  GW_ID=$(json_get "$PROFILE_FILE" "gateway.id")
+  GW_NAME=$(json_get "$PROFILE_FILE" "gateway.name")
+  GW_AUTH=$(json_get "$PROFILE_FILE" "gateway.auth")
+  TRANSPORT=$(json_get "$PROFILE_FILE" "gateway.transport")
+  SCOPE=$(json_get "$PROFILE_FILE" "gateway.reach")
+  GW_URL=$(json_get "$PROFILE_FILE" "gateway.url")
+  GW_LOCAL_PORT=$(json_get "$PROFILE_FILE" "gateway.localPort")
+  GW_MODEL=$(json_get "$PROFILE_FILE" "gateway.model")
+  GW_CERT_FP=$(json_get "$PROFILE_FILE" "gateway.certFP")
+  [ -n "$GW_KIND" ] && [ -n "$GW_ID" ] && [ -n "$GW_URL" ] && [ -n "$TRANSPORT" ] && [ -n "$GW_AUTH" ] \
+    || die "That saved profile is missing required fields (kind/id/url/transport/auth) — re-run the wizard (bash conduck-connect.sh) to refresh it."
+
+  # ---- Schema validation. A hand-edited or corrupted profile (http:// URL, a kind the
+  # apps reject, a garbage port) must die HERE with a friendly, secret-free message —
+  # not sail through verification and hand the app a code it silently rejects. ----
+  case "$GW_KIND" in
+    openclaw|hermes|custom) ;;
+    *) die "That saved profile names an unknown gateway kind '$GW_KIND' — this tool pairs only openclaw, hermes, or custom gateways. Re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
+  esac
+  # tr -d [:space:]: a whitespace-only name passes -n but the app trims and rejects it.
+  [ "$GW_KIND" != "custom" ] || [ -n "$(printf '%s' "$GW_NAME" | tr -d '[:space:]')" ] \
+    || die "That saved profile is a custom gateway but stores no name (or only whitespace) — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  case "$GW_AUTH" in
+    bearer|none) ;;
+    *) die "That saved profile has an unknown auth mode '$GW_AUTH' — it must be 'bearer' or 'none'. Re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
+  esac
+  show_qr_is_https_host "$GW_URL" \
+    || die "That saved profile's gateway URL isn't a valid https:// address with a host — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  case "$TRANSPORT" in
+    tailscale|funnel|cloudflare|public|selfsigned) ;;
+    *) die "That saved profile has an unrecognized transport '$TRANSPORT' — re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
+  esac
+  [ "$TRANSPORT" != "selfsigned" ] || [ -n "$GW_CERT_FP" ] \
+    || die "That saved profile uses a self-signed certificate but stores no fingerprint — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  # The wizard writes a certFP ONLY on the self-signed path; anywhere else it would
+  # import a WRONG pin into the app.
+  [ "$TRANSPORT" = "selfsigned" ] || [ -z "$GW_CERT_FP" ] \
+    || die "That saved profile pins a certificate but doesn't use the self-signed path — the app would import a wrong pin. Re-run the wizard (bash conduck-connect.sh) to refresh it."
+  [ -z "$GW_LOCAL_PORT" ] || show_qr_is_port "$GW_LOCAL_PORT" \
+    || die "That saved profile's gateway local port isn't a number in 1-65535 — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  [ -z "$GW_CERT_FP" ] || show_qr_is_certfp "$GW_CERT_FP" \
+    || die "That saved profile's gateway certificate fingerprint isn't a 64-character lowercase hex value — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  # File-lane half (read straight from the profile — the credential itself is never stored).
+  local _fsurl _fsport _fsfp
+  _fsurl=$(json_get "$PROFILE_FILE" "fileServer.url")
+  _fsport=$(json_get "$PROFILE_FILE" "fileServer.localPort")
+  _fsfp=$(json_get "$PROFILE_FILE" "fileServer.certFP")
+  if [ -n "$_fsurl" ]; then
+    show_qr_is_https_host "$_fsurl" \
+      || die "That saved profile's file-server URL isn't a valid https:// address with a host — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  fi
+  [ -z "$_fsport" ] || show_qr_is_port "$_fsport" \
+    || die "That saved profile's file-server local port isn't a number in 1-65535 — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  [ -z "$_fsfp" ] || show_qr_is_certfp "$_fsfp" \
+    || die "That saved profile's file-server certificate fingerprint isn't a 64-character lowercase hex value — re-run the wizard (bash conduck-connect.sh) to refresh it."
+  [ "$TRANSPORT" = "selfsigned" ] || [ -z "$_fsfp" ] \
+    || die "That saved profile pins a file-server certificate but doesn't use the self-signed path — the app would import a wrong pin. Re-run the wizard (bash conduck-connect.sh) to refresh it."
+
+  # Health path is derived from kind (not stored), exactly as the wizard sets it.
+  case "$GW_KIND" in
+    openclaw) GW_HEALTH_PATH="/healthz" ;;
+    hermes)   GW_HEALTH_PATH="/v1/health" ;;
+    *)        GW_HEALTH_PATH="" ;;
+  esac
+  # Local port: prefer the profile; else re-detect from the gateway config like the wizard.
+  if [ -z "$GW_LOCAL_PORT" ]; then
+    case "$GW_KIND" in
+      openclaw)
+        local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}" praw
+        praw=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_PORT")
+        GW_LOCAL_PORT="${praw##*:}"; GW_LOCAL_PORT="${GW_LOCAL_PORT:-18789}"
+        ;;
+      hermes)
+        GW_LOCAL_PORT=$(env_get "$HOME/.hermes/.env" "API_SERVER_PORT"); GW_LOCAL_PORT="${GW_LOCAL_PORT:-8642}"
+        ;;
+    esac
+  fi
+  ok "Using saved profile: ${GW_KIND}${GW_NAME:+ ($GW_NAME)} → $GW_URL"
+}
+
+# Re-derive the gateway secret from its canonical home — exactly like the wizard.
+# FAIL CLOSED: a bearer profile whose token can't be recovered DIES; never emit keyless.
+show_qr_recover_gateway_secret() {
+  case "$GW_AUTH" in
+    none)   GW_TOKEN=""; note "This gateway has no token (auth=none in the saved profile)."; return 0 ;;
+    bearer) ;;
+    *)      die "The saved profile has an unknown auth mode '$GW_AUTH' — re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
+  esac
+  case "$GW_KIND" in
+    openclaw)
+      local cfg="$HOME/.openclaw/openclaw.json"
+      [ -f "$cfg" ] || die "Can't find $cfg to read the gateway token — is this the machine you paired on? Re-run the wizard (bash conduck-connect.sh) if OpenClaw moved."
+      GW_TOKEN=$(json_get "$cfg" "gateway.auth.token")
+      [ -n "$GW_TOKEN" ] || die "No token at gateway.auth.token in $cfg — refusing to emit a keyless code (auth is explicit). Fix the gateway config, then re-run."
+      ok "Re-read the gateway bearer token from openclaw.json (not shown)."
+      ;;
+    hermes)
+      local envf="$HOME/.hermes/.env"
+      GW_TOKEN=$(env_get "$envf" "API_SERVER_KEY")
+      [ -n "$GW_TOKEN" ] || die "No API_SERVER_KEY in $envf — refusing to emit a keyless code (auth is explicit). Fix Hermes, then re-run."
+      ok "Re-read API_SERVER_KEY from ~/.hermes/.env (not shown)."
+      ;;
+    *)
+      # Custom gateway: nothing on disk to read (by design — this tool never stores tokens).
+      say ""
+      note "Custom gateways have no config file I can read, and this tool deliberately never stores your token."
+      GW_TOKEN=$(ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)")
+      [ -n "$GW_TOKEN" ] || die "A token is required (the saved profile says auth=bearer). Re-run when you have it."
+      ;;
+  esac
+}
+
+# Recover the file-lane credential from disk when the profile carries a lane. If it
+# can't be recovered, WARN loudly and (with an explicit confirm) continue gateway-only.
+show_qr_recover_file_lane() {
+  local fsurl; fsurl=$(json_get "$PROFILE_FILE" "fileServer.url")
+  [ -n "$fsurl" ] || { FS_URL=""; FS_CRED=""; return 0; }   # profile has no file lane
+  local saved_port saved_fp saved_folder
+  saved_port=$(json_get "$PROFILE_FILE" "fileServer.localPort")
+  saved_fp=$(json_get "$PROFILE_FILE" "fileServer.certFP")
+  saved_folder=$(json_get "$PROFILE_FILE" "fileServer.folder")
+  # existing_fs_config recovers the credential (state cred file / env file / unit) and
+  # sets FS_CRED + FS_LOCAL_PORT + FS_FOLDER; keep the profile's URL/port/cert authoritative.
+  if existing_fs_config && [ -n "$FS_CRED" ]; then
+    FS_URL="$fsurl"
+    [ -n "$saved_port" ] && FS_LOCAL_PORT="$saved_port"
+    FS_CERT_FP="$saved_fp"
+    [ -n "$saved_folder" ] && FS_FOLDER="$saved_folder"
+    ok "Recovered the file-lane credential from this machine (not shown)."
+    if $FS_CRED_LEGACY_ARGV; then
+      note "Heads-up: that file-server unit keeps its password on the command line (visible via 'ps'). The QR is still correct."
+    fi
+  else
+    warn "The saved profile includes a file lane at $fsurl, but I can't recover its credential on this machine"
+    warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
+    if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?"; then
+      note "Leaving the file lane out of this QR — re-run the wizard (bash conduck-connect.sh) to rebuild it."
+      FS_URL=""; FS_CRED=""; FS_CERT_FP=""; FS_FOLDER=""
+    else
+      die "Stopped — re-run the wizard (bash conduck-connect.sh) to rebuild the file lane and refresh the profile."
+    fi
+  fi
+}
+
+# Compare ONE (host, https-port) pair's live Tailscale mapping to what the profile
+# expects, via TS_MAPS. HOST-QUALIFIED on purpose: a port-only lookup would accept a
+# correct-looking mapping that lives on a DIFFERENT tailnet hostname of this machine
+# (stale profile naming beta.ts.net passing on alpha.ts.net's mapping). Used only by
+# the show-qr path; the wizard's ts_target_for_port consumers are untouched.
+# Prints a SECRET-FREE diff and returns non-zero on mismatch. Reads only.
+show_qr_assert_mapping() { # show_qr_assert_mapping <host-lc> <https-port> <local-port> <want-verb> <label>
+  local host="$1" port="$2" localp="$3" wantverb="$4" label="$5"
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')   # TS_MAPS hosts are lowercased; match that
+  local wantproxy="http://127.0.0.1:$localp"
+  local m rest mhost mport verb proxy matched=false
+  for m in ${TS_MAPS[@]+"${TS_MAPS[@]}"}; do
+    mhost="${m%%$'\t'*}"; rest="${m#*$'\t'}"
+    mport="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+    [ "$mhost" = "$host" ] && [ "$mport" = "$port" ] || continue
+    verb="${rest%%$'\t'*}"; proxy="${rest#*$'\t'}"
+    matched=true; break
+  done
+  if ! $matched; then
+    bad "The $label is no longer exposed at $host:$port."
+    note "expected: $host:$port → $wantproxy ($wantverb)"
+    note "live:     no live mapping for $host:$port"
+    return 1
+  fi
+  if [ "$proxy" != "$wantproxy" ] || [ "$verb" != "$wantverb" ]; then
+    bad "The $label's exposure changed since this profile was saved."
+    note "expected: $host:$port → $wantproxy ($wantverb)"
+    note "live:     $host:$port → ${proxy:-<none>} (${verb:-<none>})"
+    return 1
+  fi
+  ok "$label exposure still matches the saved profile ($host:$port, $wantverb)."
+  return 0
+}
+
+# The mismatch gate: refuse (secret-free) when the machine's live state no longer
+# matches the saved profile. READS ONLY — no serve/funnel/config mutations. Runs
+# BEFORE verify_all so drift reads as "your setup changed", not a generic failure.
+show_qr_stale() {
+  die "Your setup changed since this profile was saved — re-run the wizard (bash conduck-connect.sh) to reconcile and refresh it."
+}
+show_qr_check_live() {
+  head_ "Checking your saved setup still matches this machine"
+  case "$TRANSPORT" in
+    tailscale|funnel)
+      ts_targets
+      $TS_STATE_KNOWN || die "Couldn't read 'tailscale serve status --json', so I can't confirm your saved exposure still matches — refusing to show a possibly-wrong code. Check 'tailscale serve status' (is Tailscale up?), then re-run. To reconcile from scratch: bash conduck-connect.sh."
+      local want_verb="serve"; [ "$SCOPE" = "public" ] && want_verb="funnel"
+      # HOST gate first for the clearer "names another machine" diagnostic; the
+      # host-qualified show_qr_assert_mapping below closes the cross-host hole
+      # behind it. Fails closed when TS_HOSTS is empty (ts_host_known non-zero).
+      local gw_host; gw_host=$(url_host_lc "$GW_URL")
+      if ! ts_host_known "$gw_host"; then
+        bad "The gateway URL points at a tailnet host this machine no longer serves."
+        note "expected host (from profile): ${gw_host:-<none>}"
+        note "live tailscale hosts:         ${TS_HOSTS[*]:-<none>}"
+        show_qr_stale
+      fi
+      show_qr_assert_mapping "$gw_host" "$(url_https_port "$GW_URL")" "$GW_LOCAL_PORT" "$want_verb" "gateway" || show_qr_stale
+      if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+        local fs_host; fs_host=$(url_host_lc "$FS_URL")
+        if ! ts_host_known "$fs_host"; then
+          bad "The file lane's URL points at a tailnet host this machine no longer serves."
+          note "expected host (from profile): ${fs_host:-<none>}"
+          note "live tailscale hosts:         ${TS_HOSTS[*]:-<none>}"
+          show_qr_stale
+        fi
+        show_qr_assert_mapping "$fs_host" "$(url_https_port "$FS_URL")" "$FS_LOCAL_PORT" "$want_verb" "file lane" || show_qr_stale
+      fi
+      ;;
+    selfsigned)
+      # Re-pin check: the cert the app would trust must be the one we saved.
+      local live; live=$(compute_spki_hex "$GW_URL" 2>/dev/null)
+      if [ -z "$live" ] || [ "$live" != "$GW_CERT_FP" ]; then
+        bad "The gateway's certificate changed since this profile was saved."
+        note "expected fingerprint: ${GW_CERT_FP:-<none>}"
+        note "live fingerprint:     ${live:-<unreadable>}"
+        die "The gateway's certificate changed; re-run the wizard (bash conduck-connect.sh) to re-pin — scanning an old pin would fail on the device."
+      fi
+      ok "Gateway certificate still matches the pinned fingerprint."
+      if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] && [ -n "$FS_CERT_FP" ]; then
+        local flive; flive=$(compute_spki_hex "$FS_URL" 2>/dev/null)
+        if [ -z "$flive" ] || [ "$flive" != "$FS_CERT_FP" ]; then
+          bad "The file lane's certificate changed since this profile was saved."
+          note "expected fingerprint: $FS_CERT_FP"
+          note "live fingerprint:     ${flive:-<unreadable>}"
+          die "The file lane's certificate changed; re-run the wizard (bash conduck-connect.sh) to re-pin it."
+        fi
+        ok "File-lane certificate still matches its pinned fingerprint."
+      fi
+      ;;
+    cloudflare|public)
+      note "This transport has no local exposure to introspect — reachability is proven by the real requests below."
+      ;;
+    *)
+      die "The saved profile has an unrecognized transport '$TRANSPORT' — re-run the wizard (bash conduck-connect.sh) to refresh it."
+      ;;
+  esac
+}
+
+# Orchestrate the --show-qr path: pick → load → secrets → live-match gate, then the
+# UNCHANGED verify_all + emit_payload. Nothing here mutates (REUSE_ONLY is forced on),
+# so APPLIED/FS_APPLIED stay empty and cleanup_exposures has nothing to undo.
+run_show_qr() {
+  head_ "Re-show your pairing code (--show-qr) — skips the setup questions, changes nothing"
+  show_qr_pick_profile
+  show_qr_load_profile
+  show_qr_recover_gateway_secret
+  show_qr_recover_file_lane
+  show_qr_check_live
+  verify_all
+  emit_payload
+}
+
 # ----------------------------------------------------------------------- main --
 
 say "${BOLD}conduck-connect $VERSION${RESET} — pair your self-hosted AI gateway with Conduck."
 $DRY_RUN && note "(dry-run: nothing will be changed)"
-$REUSE_ONLY && note "(reuse-only: I'll reuse what's set up and refuse any change — safe to run on a gateway you don't want touched)"
+# --show-qr forces REUSE_ONLY on, so print its OWN banner instead of the reuse-only one.
+if $SHOW_QR; then note "(--show-qr: re-showing a saved pairing code — skips the setup questions, changes nothing; may still ask you to pick a profile or re-enter a custom token)"
+elif $REUSE_ONLY; then note "(reuse-only: I'll reuse what's set up and refuse any change — safe to run on a gateway you don't want touched)"; fi
 say "Every change asks first. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
 note "Two kinds of step: things I made (I offer to run them for you), and things you already own — your gateway config, Tailscale, daemons — which I never touch; I print the exact command for you to run."
+
+# --show-qr: skip the whole wizard — reconstruct from a saved profile, then verify + emit.
+if $SHOW_QR; then
+  run_show_qr
+  exit 0
+fi
 
 # Gateway selection → configure → transport, looped so the transport menu's "b"
 # can return to the gateway choice. No EXPOSURE change has happened before the

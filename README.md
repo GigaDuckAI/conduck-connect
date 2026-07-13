@@ -15,9 +15,9 @@ curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/downlo
 
 Works on macOS and Linux. `-O` lands the full file on disk before anything runs, so reading it first is one `less` away — that, plus the HTTPS download from GitHub, is your real protection. (An optional same-release checksum is [below](#what-each-step-does); it confirms the download arrived intact but is not a tamper-proof signature.)
 
-It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck: enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
+It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
-> **Status: the script is at its first stable release (`v0.4.0`); the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
+> **Status: the script is at `v0.5.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
 
 ## Why a shell script?
 
@@ -59,6 +59,7 @@ No `chmod` needed. The one large block near the bottom of the script is a vendor
 | _(none)_ | Interactive wizard — detects what you run |
 | `--dry-run` | Baseline + plan: show current state and the exact actions a real run would take, then stop. Never prompts for secrets, mints credentials, sends requests, or emits a code. |
 | `--reuse-only` | Reuse existing config; refuse any mutation. Safe to point at a **live** gateway. |
+| `--show-qr` | Re-show a saved gateway's pairing code — reads only, changes nothing (uses the non-secret profile a successful run saves; may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code). Verification still makes its real requests. |
 | `--openclaw` · `--hermes` · `--generic` | Skip detection; target a specific gateway kind |
 | `--allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
 | `--help` | All flags |
@@ -70,7 +71,7 @@ No `chmod` needed. The one large block near the bottom of the script is a vendor
 - Asks before every change. Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
 - Never elevates silently — where `sudo` is needed it prints the exact command for you to review and run.
 - Never makes your gateway public without telling you, in plain words, that it will — and refuses to publish a keyless gateway unless you pass `--allow-keyless-public`.
-- Re-running is safe, and is also how you get the pairing code shown again.
+- Re-running is safe; `--show-qr` re-shows your saved pairing code without touching anything.
 
 See **[WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md)** for the exact files, services, and ports it reads or changes — and how to undo each.
 
