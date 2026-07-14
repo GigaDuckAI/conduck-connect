@@ -2,6 +2,28 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.7.0] — press `?` when unsure, and quieter sharp edges
+
+Every decision prompt now explains itself in plain words on request, and a cross-surface audit (checked against current Tailscale, Cloudflare, OpenClaw, Hermes, and rclone documentation) landed a batch of correctness fixes. No breaking changes — pairing codes, flags, and profiles from 0.6.0 keep working.
+
+### Added
+
+- **`?` help at every decision prompt.** The exposure choice, the public/private question, and the file-lane mismatch menus all take `?` and compare the options in plain words — who can reach the address, what to install, who can see traffic, and what an Apple Watch needs. Purely additive: type the answer directly and nothing changed.
+- **Profiles remember the file lane's own reach.** Fixes `--show-qr` refusing with a false "your setup changed" for a public gateway paired with a private file lane (or the reverse). Old profiles keep working.
+
+### Changed
+
+- **OpenClaw discovery handles modern configs.** Reads JSON5 configs (comments and trailing commas no longer break detection — with a heads-up that OpenClaw's own `config set` rewrites the file as plain JSON and drops comments); honors `gateway.auth.mode` (token *and* password); never embeds a `${ENV}` placeholder or secret reference as the token — the wizard asks for the real value instead, and `--show-qr` now resolves secrets the exact same way; finds the port wherever it lives (`OPENCLAW_GATEWAY_PORT` > `gateway.port` > default, validated).
+- **TLS failures name the right side.** curl exit 60 — this machine refused the *server's* certificate — is no longer reported as "the HTTPS front rejected the connection" (exit 35 keeps that wording). The Troubleshooting row's explanation covers both directions now.
+- **Tailscale refusals show Tailscale's own words.** A failed `serve`/`funnel` no longer blames missing sudo rights while hiding the real error; when your tailnet still needs Funnel or HTTPS enabled, you now see Tailscale's instructions.
+
+### Fixed
+
+- The macOS sleep warning no longer fires on every Mac (it also matched `disksleep`/`displaysleep`).
+- Bracketed IPv6 gateway URLs pin correctly (portless `https://[::1]` defaults to `:443`; no SNI is sent for IP literals), and `--show-qr` accepts IPv6 profiles.
+- The advanced rclone one-liner now names `RCLONE_PASS` — run bare, it served with an *empty* password.
+- Piped or exhausted input can no longer mark a press-Enter step as done; failed file-lane probes clean up their test file; `--dry-run` stopped promising a verification it never runs; a model name over 100 characters gets a warning (the app stores only the first 100).
+
 ## [0.6.0] — failures that name themselves, and a README that decodes them
 
 Better diagnosis end to end: the wizard now says *what* failed instead of making you guess, and this README gained a [Troubleshooting](README.md#troubleshooting) section keyed to the exact messages it prints. No breaking changes — pairing codes, flags, and file locations from 0.5.0 keep working.
