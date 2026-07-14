@@ -12,6 +12,7 @@
 #      plus the HTTPS download, is your real protection.
 #   3. Optional integrity check: the release also ships a checksum
 #        sha256sum -c conduck-connect.sh.sha256
+#        # macOS: shasum -a 256 -c conduck-connect.sh.sha256
 #      It catches a corrupted download, but it rides the same release channel —
 #      so it can't prove the release itself wasn't swapped. Reading the script can.
 #   If you got this script any other way, get it from the link above first.
@@ -30,7 +31,7 @@
 #   5. Verifies everything end-to-end with real requests.
 #   6. Prints a QR code you scan with the Conduck app — URL, token, and file-lane
 #      credentials imported in one scan — nothing to retype on your phone
-#      (iPhone, iPad, or Android).
+#      (iPhone or iPad).
 #
 # What this script NEVER does:
 #   - Install your gateway, Tailscale, cloudflared, or any daemon it didn't create.
@@ -69,7 +70,7 @@
 
 set -u -o pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 PAYLOAD_VERSION=1
 
 # ---------------------------------------------------------------- utilities --
@@ -156,10 +157,15 @@ ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden)
 # would then silently decide a safety question. On EOF it RETURNS NONZERO rather
 # than calling die: a `die` inside $() kills only the subshell, so the parent
 # must be the one to stop (every caller pairs this with `|| die`).
-require_choice() {  # require_choice "prompt" "regex" -> echoes the choice
+# Optional 3rd arg names a help function: answering `?` prints it and re-asks.
+# Help is ADDITIVE only — it explains the same options in plain words, never
+# changes them (the canonical menu/prompt strings stay the single source).
+# The help function's stdout is redirected to stderr here, same $()-capture rule.
+require_choice() {  # require_choice "prompt" "regex" [help_fn] -> echoes the choice
   local reply
   while true; do
     read -r -p "  $1: " reply || return 1     # closed stdin — never spin the loop
+    if [ -n "${3:-}" ] && [ "$reply" = "?" ]; then "$3" >&2; continue; fi
     if [[ "$reply" =~ $2 ]]; then printf '%s' "$reply"; return 0; fi
     warn "Please enter one of the listed options." >&2
   done
@@ -216,7 +222,11 @@ print_and_wait() {  # print_and_wait "why" "command shown to user"
   printf '    %s%s%s\n' "$BOLD" "$2" "$RESET"
   say ""
   note "$1"
-  read -r -p "  Press Enter here once it's done (or 's' to skip): " reply
+  local reply
+  if ! read -r -p "  Press Enter here once it's done (or 's' to skip): " reply; then
+    warn "No answer — treating this step as skipped."
+    return 1
+  fi
   [ "$reply" = "s" ] && return 1
   return 0
 }
@@ -254,20 +264,102 @@ b64_nowrap() { # stdin -> single-line base64
   if base64 --help 2>&1 | grep -q -- '-w'; then base64 -w0; else base64 | tr -d '\n'; fi
 }
 
-json_get() { # json_get <file> <dotted.path>  (empty output when absent)
-  python3 - "$1" "$2" <<'PY'
+# Read a value from a JSON *or* JSON5 config. Strict json.load first; on failure a
+# string-aware strip of // and /* */ comments + trailing commas, then strict again
+# (OpenClaw writes plain JSON, but its config format legalises JSON5). If both fail,
+# fail empty (unchanged behaviour). Ops:
+#   get      -> a scalar leaf value; empty for absent/null/non-scalar
+#   classify -> "absent" | "ref" (an object/array or a "${…}" placeholder — an
+#               indirect secret we must NOT use) | "literal\t<value>"
+json_query() { # json_query <file> <op:get|classify> <dotted.path>  (empty output when absent)
+  python3 - "$1" "$2" "$3" <<'PY'
 import json, sys
+
+def strip_json5(s):
+    # Remove // and /* */ comments, then trailing commas — but NEVER touch bytes
+    # inside a "…" or '…' literal (a // inside a value must survive verbatim).
+    out = []; i = 0; n = len(s); q = ''
+    while i < n:
+        c = s[i]
+        if q:
+            out.append(c)
+            if c == '\\' and i + 1 < n:
+                out.append(s[i+1]); i += 2; continue
+            if c == q: q = ''
+            i += 1; continue
+        if c == '"' or c == "'":
+            q = c; out.append(c); i += 1; continue
+        if c == '/' and i + 1 < n and s[i+1] == '/':
+            i += 2
+            while i < n and s[i] != '\n': i += 1
+            continue
+        if c == '/' and i + 1 < n and s[i+1] == '*':
+            i += 2
+            while i + 1 < n and not (s[i] == '*' and s[i+1] == '/'): i += 1
+            i += 2; continue
+        out.append(c); i += 1
+    t = ''.join(out)
+    res = []; i = 0; n = len(t); q = ''
+    while i < n:
+        c = t[i]
+        if q:
+            res.append(c)
+            if c == '\\' and i + 1 < n:
+                res.append(t[i+1]); i += 2; continue
+            if c == q: q = ''
+            i += 1; continue
+        if c == '"' or c == "'":
+            q = c; res.append(c); i += 1; continue
+        if c == ',':
+            j = i + 1
+            while j < n and t[j] in ' \t\r\n': j += 1
+            if j < n and (t[j] == '}' or t[j] == ']'):
+                i += 1; continue
+        res.append(c); i += 1
+    return ''.join(res)
+
+def load(path):
+    raw = open(path).read()
+    try:
+        return json.loads(raw)
+    except Exception:
+        return json.loads(strip_json5(raw))
+
+def scalar(v):
+    if v is True: return "true"
+    if v is False: return "false"
+    return str(v)
+
+path, op, dotted = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    obj = json.load(open(sys.argv[1]))
-    for part in sys.argv[2].split('.'):
-        obj = obj[part]
-    if obj is True: print("true")
-    elif obj is False: print("false")
-    elif obj is not None: print(obj)
+    obj = load(path)
 except Exception:
-    pass
+    if op == "classify": sys.stdout.write("absent")
+    sys.exit(0)
+cur = obj
+try:
+    for part in dotted.split('.'):
+        cur = cur[part]
+except Exception:
+    if op == "classify": sys.stdout.write("absent")
+    sys.exit(0)
+if op == "classify":
+    if isinstance(cur, (dict, list)):
+        sys.stdout.write("ref")
+    elif cur is None or cur == "":
+        sys.stdout.write("absent")
+    else:
+        s = scalar(cur)
+        sys.stdout.write("ref" if s.startswith("${") else "literal\t" + s)
+    sys.exit(0)
+if cur is True: print("true")
+elif cur is False: print("false")
+elif isinstance(cur, (dict, list)): pass
+elif cur is not None: print(cur)
 PY
 }
+
+json_get() { json_query "$1" "get" "$2"; }   # scalar leaf value (empty when absent)
 
 env_get() { # env_get <file> <KEY>  (last assignment wins; strips quotes)
   [ -f "$1" ] || return 0
@@ -377,16 +469,128 @@ detect_gateway() {
   esac
 }
 
+# Resolve OpenClaw's loopback port. Precedence: a live --port override (unknowable from
+# outside the process, so unread) > OPENCLAW_GATEWAY_PORT in the compose .env > gateway.port
+# in openclaw.json > 18789. Shared by the wizard AND --show-qr so the two never disagree.
+# A config gateway.port is validated as a real 1-65535 port (like the interactive prompt);
+# garbage is noted (stderr — this runs under $()) and skipped so it can't interpolate into
+# a probe URL or the exposure commands.
+openclaw_local_port() {
+  local cfg="$HOME/.openclaw/openclaw.json"
+  local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
+  local praw port
+  praw=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_PORT")
+  port="${praw##*:}"
+  if [ -z "$port" ]; then
+    port=$(json_get "$cfg" "gateway.port")
+    if [ -n "$port" ] && ! show_qr_is_port "$port"; then
+      note "Ignoring gateway.port='$port' in openclaw.json — not a whole number in 1-65535; using the default." >&2
+      port=""
+    fi
+  fi
+  printf '%s' "${port:-18789}"
+}
+
+# Prompt for the OpenClaw bearer credential (hidden), or die with <die-msg> on empty input.
+# In the wizard's dry-run it only notes the intent (a real run would ask). Sets GW_TOKEN.
+_openclaw_prompt_secret() { # _openclaw_prompt_secret <ctx> <ask-prompt> <die-msg-on-empty>
+  local ctx="$1" ask="$2" diemsg="$3"
+  if [ "$ctx" = "wizard" ] && $DRY_RUN; then
+    note "(dry-run: would prompt for the gateway credential)"
+    return 0
+  fi
+  GW_TOKEN=$(ask_secret "$ask")
+  [ -n "$GW_TOKEN" ] || die "$diemsg"
+}
+
+# Resolve OpenClaw's gateway credential from openclaw.json's auth.mode. Shared by the wizard
+# (configure_openclaw) and the --show-qr re-emit so BOTH resolve IDENTICALLY. Sets GW_AUTH +
+# GW_TOKEN. mode ""/token → gateway.auth.token; password → gateway.auth.password (rides as the
+# bearer credential); none → keyless; trusted-proxy/unknown → prompt. A literal value is used
+# as-is; an indirect value (an "${ENV}" placeholder or a SecretRef object) is NEVER embedded —
+# we prompt for the real secret instead. Absent in the config falls back to
+# OPENCLAW_GATEWAY_TOKEN in the compose .env (token mode), then prompts.
+# ctx = "wizard" | "showqr": affects wording + dry-run only. In showqr a non-literal resolution
+# ALWAYS prompts (its documented "may still ask" contract), and a bearer profile whose config
+# now reads mode=none is treated as a token to re-enter — never a silent keyless downgrade.
+openclaw_resolve_secret() { # openclaw_resolve_secret <ctx>
+  local ctx="$1"
+  local cfg="$HOME/.openclaw/openclaw.json"
+  local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
+  [ -f "$cfg" ] || die "Can't find $cfg to read the OpenClaw credential — is this the machine you paired on? Re-run the wizard (bash conduck-connect.sh) if OpenClaw moved."
+  local mode; mode=$(json_get "$cfg" "gateway.auth.mode")
+  case "$mode" in
+    none)
+      if [ "$ctx" = "showqr" ]; then
+        warn "OpenClaw's config now shows auth mode 'none', but your saved profile expects a token."
+        _openclaw_prompt_secret "$ctx" \
+          "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" \
+          "A token is required (your saved profile says auth=bearer). Re-run when you have it."
+        return 0
+      fi
+      GW_AUTH="none"; GW_TOKEN=""
+      note "OpenClaw's gateway auth mode is 'none' — this gateway has no token. Fine on a private network; I'll guard against publishing it keyless below."
+      ;;
+    ""|token|password)
+      GW_AUTH="bearer"
+      local key="gateway.auth.token"; [ "$mode" = "password" ] && key="gateway.auth.password"
+      local cls; cls=$(json_query "$cfg" "classify" "$key")
+      case "$cls" in
+        literal$'\t'*)
+          GW_TOKEN="${cls#*$'\t'}"
+          ok "Read the gateway bearer credential (the secret key the app sends to log in) from openclaw.json (not shown)."
+          ;;
+        ref)
+          warn "Your OpenClaw config references the credential indirectly (an env placeholder or secret reference), not as a literal value."
+          _openclaw_prompt_secret "$ctx" \
+            "Paste the actual secret value the gateway checks (hidden)" \
+            "OpenClaw's config points at the credential indirectly, so I can't read it — paste the real value and re-run."
+          ;;
+        *)
+          # Absent in the config → try the compose .env (OPENCLAW_GATEWAY_TOKEN; token mode
+          # only), then prompt. The seed .env can drift, but it beats no token at all.
+          [ "$mode" = "password" ] || GW_TOKEN=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_TOKEN")
+          if [ -n "$GW_TOKEN" ]; then
+            ok "Read the gateway bearer token from the OpenClaw compose .env (not shown)."
+          else
+            warn "No literal token found at $key in $cfg (or in the compose .env)."
+            _openclaw_prompt_secret "$ctx" \
+              "Paste the gateway bearer token — the secret key the gateway checks on each request (hidden)" \
+              "OpenClaw needs its access token (the secret key the gateway checks). Find it in openclaw.json under $key, then re-run."
+          fi
+          ;;
+      esac
+      ;;
+    *)
+      # trusted-proxy or anything unknown: we can't infer the credential to send.
+      GW_AUTH="bearer"
+      note "OpenClaw's gateway auth mode is '$mode' — I won't guess a credential for it; paste whatever bearer value the gateway expects."
+      _openclaw_prompt_secret "$ctx" \
+        "Paste the bearer credential the gateway expects (hidden)" \
+        "This auth mode ('$mode') needs a credential I can't read automatically — paste it and re-run."
+      ;;
+  esac
+}
+
 configure_openclaw() {
   head_ "Step 2 — OpenClaw: chat endpoint + token"
   GW_ID="openclaw"
   local cfg="$HOME/.openclaw/openclaw.json"
   [ -f "$cfg" ] || die "Cannot find $cfg — is OpenClaw onboarded on this machine? (Run its onboarding first; this script doesn't install gateways.)"
 
-  # Port: host publish from the compose .env (OPENCLAW_GATEWAY_PORT=127.0.0.1:18789), default 18789.
-  local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
-  local port_raw; port_raw=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_PORT")
-  GW_LOCAL_PORT="${port_raw##*:}"; GW_LOCAL_PORT="${GW_LOCAL_PORT:-18789}"
+  # OpenClaw's config is JSON5 on read (comments + trailing commas legal); its own
+  # 'config set' (which the enable-endpoint step below may run) rewrites the file as
+  # plain JSON and DROPS comments. Say so once when the file isn't strict JSON, so a
+  # comment-keeping user can back it up first. (json_get reads it either way — it
+  # parses JSON5.)
+  if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$cfg" 2>/dev/null; then
+    warn "Your OpenClaw config isn't strict JSON — it likely uses JSON5 comments or trailing commas." >&2
+    note "If I enable the chat endpoint, OpenClaw's 'config set' rewrites the file as plain JSON and drops any comments — back it up first if you want to keep them." >&2
+  fi
+
+  # Loopback port + its precedence live in openclaw_local_port (shared with --show-qr).
+  local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"   # still needed for the enable-endpoint check below
+  GW_LOCAL_PORT=$(openclaw_local_port)
   GW_HEALTH_PATH="/healthz"
   ok "Gateway port: $GW_LOCAL_PORT"
 
@@ -409,24 +613,17 @@ configure_openclaw() {
       print_and_wait "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \
         "openclaw config set gateway.http.endpoints.chatCompletions.enabled true" || true
     fi
-    enabled=$(json_get "$cfg" "gateway.http.endpoints.chatCompletions.enabled")
-    [ "$enabled" = "true" ] && ok "Chat endpoint is now enabled." \
-      || warn "Could not confirm the flag in $cfg — verification below will tell us for sure."
+    if ! $DRY_RUN; then
+      enabled=$(json_get "$cfg" "gateway.http.endpoints.chatCompletions.enabled")
+      [ "$enabled" = "true" ] && ok "Chat endpoint is now enabled." \
+        || warn "Could not confirm the flag in $cfg — verification below will tell us for sure."
+    fi
   fi
 
-  # The REAL runtime token is gateway.auth.token in openclaw.json (the .env value
-  # is only an onboarding seed and can drift from what the gateway actually checks).
-  GW_TOKEN=$(json_get "$cfg" "gateway.auth.token")
-  if [ -n "$GW_TOKEN" ]; then
-    ok "Read the gateway bearer token (the secret key the app sends to log in) from openclaw.json (not shown)."
-  elif $DRY_RUN; then
-    note "(dry-run: would prompt for the gateway bearer token)"
-  else
-    warn "No token found at gateway.auth.token in $cfg."
-    GW_TOKEN=$(ask_secret "Paste the gateway bearer token — the secret key the gateway checks on each request (hidden)")
-    [ -n "$GW_TOKEN" ] || die "OpenClaw needs its access token (the secret key the gateway checks). Find it in openclaw.json under gateway.auth.token, then re-run."
-  fi
-  GW_AUTH="bearer"
+  # The REAL runtime credential lives in openclaw.json (the .env value is only an onboarding
+  # seed and can drift from what the gateway actually checks). Resolution — mode → classify →
+  # literal | env-fallback | prompt — is shared with --show-qr so the two never diverge.
+  openclaw_resolve_secret "wizard"
 }
 
 configure_hermes() {
@@ -557,6 +754,9 @@ configure_generic() {
     GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
   else
     GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
+  fi
+  if [ "${#GW_MODEL}" -gt 100 ]; then
+    warn "That model name is over 100 characters — the app stores only the first 100, which will break chats. Double-check the exact ID."
   fi
 }
 
@@ -710,9 +910,11 @@ pick_public_port() { # pick_public_port <transport> <local_port> <role>
     case "$RESERVED_PORTS" in *" $p "*) continue ;; esac
     [ -z "$(ts_target_for_port "$p")" ] && { PICKED_PORT="$p"; RESERVED_PORTS="$RESERVED_PORTS$p "; return 0; }
   done
-  # 3) None free. The file lane is OPTIONAL — skip it rather than abort the pairing.
+  # 3) None free. The file lane is OPTIONAL — the CALLER decides what to do (skip, or
+  # offer to keep it private), so don't announce "skipping the file lane" from here:
+  # one caller (fs_promote_public) goes on to offer keeping it, and the double message
+  # was contradictory.
   if [ "$role" = "file" ]; then
-    warn "No free HTTPS port for the file lane on this transport — skipping the file lane." >&2
     return 1
   fi
   if [ "$transport" = "funnel" ]; then
@@ -761,8 +963,8 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     # rollback record for a port we never touched.
     snapshot_port "$httpsport" "$verb" "$role"
     if $demote; then tailscale funnel --https="$httpsport" off 2>/dev/null || true; fi
-    $cmd 2>/dev/null || {
-      warn "That needs elevated rights on this machine."
+    $cmd || {
+      warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
       local fallback="sudo $cmd"
       $demote && fallback="sudo $demote_cmd; sudo $cmd"
       print_and_wait "Tailscale serve/funnel often needs sudo (or operator rights)." "$fallback" || { return 1; }
@@ -827,8 +1029,8 @@ ts_unmap() { # ts_unmap <port> <verb>
   fi
   mutate_guard "remove the old $verb mapping on port $port" || return 1
   snapshot_port "$port" "$verb" file        # record (in FS_APPLIED) so cleanup can restore it
-  tailscale "$verb" --https="$port" off 2>/dev/null || {
-    warn "That needs elevated rights on this machine."
+  tailscale "$verb" --https="$port" off || {
+    warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
     print_and_wait "Removing a Tailscale mapping often needs sudo (or operator rights)." \
       "sudo tailscale $verb --https=$port off" || true
   }
@@ -884,7 +1086,7 @@ rollback_fs_exposures() {
 }
 
 # Drop the file lane from the pairing AND undo any exposure we applied for it.
-drop_file_lane() { rollback_fs_exposures; FS_URL=""; FS_CRED=""; }
+drop_file_lane() { rollback_fs_exposures; FS_URL=""; FS_CRED=""; FS_REACH=""; }
 
 # Backstop: if the script exits (incl. a `die`) AFTER applying exposures but BEFORE
 # emitting a code, print exactly how to undo them. Non-interactive (safe in a trap).
@@ -939,9 +1141,9 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
     fi
     # Reserve it so the file lane can't allocate the port we're clearing.
     RESERVED_PORTS="$RESERVED_PORTS$rport "
-    if ! { tailscale funnel --https="$rport" off 2>/dev/null \
-           && tailscale serve --https="$rport" off 2>/dev/null; }; then
-      warn "That needs elevated rights on this machine."
+    if ! { tailscale funnel --https="$rport" off \
+           && tailscale serve --https="$rport" off; }; then
+      warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
       print_and_wait "Removing a public Funnel often needs sudo (or operator rights)." \
         "sudo $off_cmd; sudo tailscale serve --https=$rport off" || true
     fi
@@ -955,6 +1157,48 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
       warn "Port $rport is STILL exposed — run: $off_cmd"
     fi
   done
+}
+
+# The plain-words comparison behind the exposure menu's `?`. ADDITIVE only: it
+# explains the same four options and re-prompts — never changes the choices,
+# never recommends one (co-equal paths, honest trade-offs — the user picks).
+explain_exposure_paths() {
+  say ""
+  say "  ${BOLD}The same gateway, four ways to reach it${RESET} — what each choice really means:"
+  say ""
+  say "  1) Tailscale — PRIVATE  (Tailscale's own name for this: \"Serve\")"
+  say "     Who can reach it:  only devices signed in to your own Tailscale network."
+  say "     What to install:   the free Tailscale app on each phone, tablet, or computer"
+  say "                        running Conduck (an Apple Watch rides its nearby iPhone)."
+  say "     Who sees traffic:  nobody — encrypted end-to-end; when Tailscale relays it,"
+  say "                        it relays only encrypted data it cannot read."
+  say "     Apple Watch:       works only while your iPhone is nearby (no Watch Tailscale app)."
+  say ""
+  say "  2) Tailscale Funnel — PUBLIC"
+  say "     Who can reach it:  anyone on the internet who finds the URL can knock;"
+  say "                        your gateway's token (its secret key) is the lock."
+  say "     What to install:   nothing on your devices."
+  say "     Who sees traffic:  nobody in between — encrypted end-to-end, Tailscale only relays."
+  say "     Apple Watch:       works on its own, anywhere."
+  say ""
+  say "  3) Cloudflare Tunnel — PUBLIC"
+  say "     Who can reach it:  anyone on the internet — same lock: the gateway's token."
+  say "     What to install:   nothing on your devices; needs a domain you manage in"
+  say "                        Cloudflare (~\$8/yr for the domain) and Cloudflare's"
+  say "                        connector program (cloudflared) on this machine."
+  say "     Who sees traffic:  Cloudflare can read it — your HTTPS ends at their servers;"
+  say "                        the onward leg to this machine rides their encrypted tunnel."
+  say "     Apple Watch:       works on its own, anywhere."
+  say ""
+  say "  4) Your own HTTPS — reach is whatever you built"
+  say "     For a gateway that already has an https:// address — a reverse proxy, a"
+  say "     rented server (VPS), or a self-signed certificate you made yourself. You"
+  say "     paste the address; I check the certificate and set up the app's trust —"
+  say "     you don't need to know which kind you have."
+  say "     Apple Watch:       works on its own IF that address works without a VPN."
+  say ""
+  say "  You can re-run this script any time and pick a different path."
+  say ""
 }
 
 choose_exposure() {
@@ -979,37 +1223,24 @@ choose_exposure() {
   have cloudflared && cf_state="✓ cloudflared found"
 
   say ""
-  say "  1) ${BOLD}Tailscale${RESET} (private — also called Tailscale Serve)  ($ts_state)"
-  say "     Private: only your own Tailscale devices (your \"tailnet\") reach it. Free."
-  say "     Data path: device → gateway, nobody in between. Your phone needs the"
-  say "     Tailscale app too (iPhone or Android)."
-  say "     Apple Watch: works only while near your iPhone (no Tailscale on the Watch)."
+  say "  1) ${BOLD}Tailscale${RESET} — private, free  ($ts_state)"
+  say "     Only devices on your own Tailscale network reach it; each device needs the Tailscale app."
   say ""
-  say "  2) ${BOLD}Tailscale Funnel${RESET}  ($ts_state)"
-  say "     Same as above but PUBLICLY reachable (TLS passes through end-to-end). Free."
-  say "     No app needed on your Apple devices."
-  say "     Apple Watch: works on its own, anywhere."
-  say "     Anyone who finds the URL can knock — your bearer token (the gateway's"
-  say "     secret key) is the lock."
+  say "  2) ${BOLD}Tailscale Funnel${RESET} — public, free  ($ts_state)"
+  say "     Reachable from anywhere; nothing to install on your devices."
   say ""
-  say "  3) ${BOLD}Cloudflare Tunnel${RESET}  ($cf_state)"
-  say "     Public hostname on a domain you already manage in Cloudflare (~\$8/yr);"
-  say "     nothing to install on Apple devices. Data path: device → Cloudflare's"
-  say "     edge → gateway — Cloudflare can see the traffic."
-  say "     Apple Watch: works on its own, anywhere."
+  say "  3) ${BOLD}Cloudflare Tunnel${RESET} — public  ($cf_state)"
+  say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
   say ""
   say "  4) ${BOLD}I already run my own HTTPS for it${RESET}"
-  say "     (a reverse proxy, a VPS, or your own/self-signed certificate — I detect"
-  say "     which). You give the https:// address; I check the certificate and either"
-  say "     let the app trust it normally or pin it for you. No need to know which."
-  say "     Apple Watch: works on its own if that address is reachable without Tailscale/VPN."
+  say "     You give the https:// address; I check its certificate and set up the app's trust."
   say ""
   say "  ${DIM}b) go back to the gateway choice${RESET}"
   say ""
-  note "The biggest practical difference between these: an Apple Watch used away from"
-  note "your iPhone can reach a PUBLIC path (2, 3, or 4), never a private one (1)."
+  say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
+  say "  only if that address is reachable from anywhere."
   say ""
-  local choice; choice=$(require_choice "Choose 1-4, or 'b' to go back" '^([1-4]|[bB])$') || die "$NO_ANSWER"
+  local choice; choice=$(require_choice "Choose 1-4 ('?' compares them in plain words, 'b' goes back)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
   [[ "$choice" =~ ^[bB]$ ]] && return 10   # back — main re-runs gateway selection (nothing applied yet)
   $DRY_RUN || note "From here I may apply changes to this machine; to change an earlier choice, stop (Ctrl-C) and re-run."
 
@@ -1105,6 +1336,26 @@ choose_exposure() {
   esac
 }
 
+# The plain-words help behind the reach question's `?`. The safety stakes are
+# asymmetric — "public" only ADDS checks, a wrong "private" SKIPS them — so the
+# unsure are pointed at Public (a fail-safe direction, not a transport pick).
+explain_scope_choice() {
+  say ""
+  say "  Why I ask: your answer doesn't change who can reach the address — it only"
+  say "  decides how strict I am. If you answer Public, I refuse to pair a gateway"
+  say "  that has no token (secret key). Calling a public address \"private\" would"
+  say "  skip that protection; calling a private one \"public\" can at worst block a"
+  say "  token-less private setup — it never weakens anything."
+  say ""
+  say "  Public  — reachable from the open internet. Typical: Tailscale Funnel,"
+  say "            Cloudflare Tunnel, a rented server (VPS) with its own domain."
+  say "  Private — answers only inside your home/office network or a VPN like"
+  say "            Tailscale. From anywhere else the address simply doesn't load."
+  say ""
+  say "  Honestly unsure? Answer Public — the strict path is the safe path."
+  say ""
+}
+
 # Ask whether the URL is publicly reachable. Safety-relevant (it gates the
 # keyless-public guard), so it takes an explicit 1/2 — no Enter default a typo
 # could fall into. Sets SCOPE.
@@ -1113,7 +1364,7 @@ scope_choice() {
   note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
   say "    1) Public — reachable from the open internet"
   say "    2) Private — only my own network / VPN (Tailscale, home or office LAN)"
-  local c; c=$(require_choice "Is this address public or private? Choose 1-2" '^[12]$') || die "$NO_ANSWER"
+  local c; c=$(require_choice "Is this address public or private? Choose 1-2 ('?' explains)" '^[12]$' explain_scope_choice) || die "$NO_ANSWER"
   if [ "$c" = "1" ]; then SCOPE="public"; else SCOPE="private"; fi
 }
 
@@ -1132,15 +1383,39 @@ keyless_public_guard() {
   die "Refusing to publish a keyless gateway."
 }
 
+# Split an https URL's authority into an openssl `-connect` target and an SNI
+# servername, handling a bracketed IPv6 literal. Echoes "connectarg<TAB>servername".
+# The servername is EMPTY for a bracketed IP literal (no SNI is sent for a bare IP);
+# a portless authority defaults to :443. The naive `*:*` port test wrongly fires on an
+# IPv6 literal's inner colons, so a portless [::1] never got :443 — hence the explicit
+# bracket case. bash 3.2-safe (no arrays, no mid-`local` self-reference).
+tls_connect_target() { # tls_connect_target <https-url> -> "connectarg\tservername"
+  local a; a="${1#https://}"; a="${a%%/*}"
+  local connectarg sni after port
+  case "$a" in
+    \[*\]*)                                    # bracketed IPv6 literal, optional :port
+      sni=""                                   # openssl/curl send no SNI for an IP literal
+      after="${a#*\]}"                          # "" or ":port"
+      case "$after" in :*) port="${after#:}" ;; *) port="443" ;; esac
+      connectarg="${a%%\]*}]:$port" ;;          # keep the brackets for -connect
+    *:*)  connectarg="$a"; sni="${a%:*}" ;;     # host:port (single colon)
+    *)    connectarg="$a:443"; sni="$a" ;;      # bare host, no port
+  esac
+  # No SNI for a bare IP literal — the IPv6 case above, and a bare IPv4 (host is only
+  # digits and dots) here; curl/openssl send no SNI for an IP, so we mustn't either.
+  case "$sni" in ''|*[!0-9.]*) ;; *) sni="" ;; esac
+  printf '%s\t%s' "$connectarg" "$sni"
+}
+
 # Self-signed SPKI: compute the lowercase hex digest (for the QR) AND validate the
 # key algorithm is one the app can actually pin. Echoes hex on success.
 compute_spki_hex() { # compute_spki_hex <https-url>
-  local url="$1" hostport
-  hostport="${url#https://}"; hostport="${hostport%%/*}"   # split: bash 3.2 won't see url mid-`local`
-  case "$hostport" in *:*) ;; *) hostport="$hostport:443" ;; esac
+  local url="$1" _tgt connectarg sni; _tgt=$(tls_connect_target "$url")
+  connectarg="${_tgt%%$'\t'*}"; sni="${_tgt#*$'\t'}"
+  local sni_args=(); [ -n "$sni" ] && sni_args=(-servername "$sni")   # omit SNI for an IP literal
   local der; der=$(mktemp); local cert; cert=$(mktemp)
   trap 'rm -f "$der" "$cert"' RETURN
-  openssl s_client -connect "$hostport" -servername "${hostport%%:*}" </dev/null 2>/dev/null \
+  openssl s_client -connect "$connectarg" ${sni_args[@]+"${sni_args[@]}"} </dev/null 2>/dev/null \
     | openssl x509 -outform PEM > "$cert" 2>/dev/null
   [ -s "$cert" ] || return 1
   # Reject key types the app's pinner does not support (RSA 2048/3072/4096, EC P-256/P-384).
@@ -1169,10 +1444,10 @@ compute_spki_hex() { # compute_spki_hex <https-url>
 # numbers (same on OpenSSL and LibreSSL), so we classify WHY normal TLS trust
 # failed without fragile date math.
 cert_verify_code() { # cert_verify_code <https-url> -> numeric code (or "")
-  local url="$1" hp
-  hp="${url#https://}"; hp="${hp%%/*}"   # NB: bash 3.2 won't see url mid-`local`, so split
-  case "$hp" in *:*) ;; *) hp="$hp:443" ;; esac
-  openssl s_client -connect "$hp" -servername "${hp%%:*}" </dev/null 2>/dev/null \
+  local url="$1" _tgt connectarg sni; _tgt=$(tls_connect_target "$url")
+  connectarg="${_tgt%%$'\t'*}"; sni="${_tgt#*$'\t'}"
+  local sni_args=(); [ -n "$sni" ] && sni_args=(-servername "$sni")
+  openssl s_client -connect "$connectarg" ${sni_args[@]+"${sni_args[@]}"} </dev/null 2>/dev/null \
     | sed -n 's/.*[Vv]erify return code: \([0-9][0-9]*\).*/\1/p' | tail -1
 }
 
@@ -1181,10 +1456,10 @@ cert_verify_code() { # cert_verify_code <https-url> -> numeric code (or "")
 # ALSO expired or not-yet-valid never gets pinned. Echoes "expired" / "notyet" /
 # nothing; an unreadable cert counts as expired (fail closed).
 cert_leaf_date_problem() { # cert_leaf_date_problem <https-url>
-  local url="$1" hp pem
-  hp="${url#https://}"; hp="${hp%%/*}"
-  case "$hp" in *:*) ;; *) hp="$hp:443" ;; esac
-  pem=$(openssl s_client -connect "$hp" -servername "${hp%%:*}" </dev/null 2>/dev/null | openssl x509 2>/dev/null)
+  local url="$1" pem _tgt connectarg sni; _tgt=$(tls_connect_target "$url")
+  connectarg="${_tgt%%$'\t'*}"; sni="${_tgt#*$'\t'}"
+  local sni_args=(); [ -n "$sni" ] && sni_args=(-servername "$sni")
+  pem=$(openssl s_client -connect "$connectarg" ${sni_args[@]+"${sni_args[@]}"} </dev/null 2>/dev/null | openssl x509 2>/dev/null)
   [ -n "$pem" ] || { printf 'expired'; return 0; }
   printf '%s' "$pem" | openssl x509 -checkend 0 >/dev/null 2>&1 || { printf 'expired'; return 0; }
   # notBefore: `-checkend` only covers expiry, so compare the start date via the
@@ -1256,9 +1531,9 @@ classify_own_https() {  # GW_URL + SCOPE already set
   fi
   if ! $pinnable; then
     bad "The certificate at $GW_URL $reason."
-    say "  Pinning it would make the app trust it permanently and skip the normal"
-    say "  hostname / validity checks — unsafe unless you know exactly why."
-    say "  Best fix: correct the certificate (or use a Let's Encrypt one), then re-run."
+    say "  Pinning it would tell the app to accept this server's key from now on —"
+    say "  skipping the very checks that just caught this problem."
+    say "  Best fix: correct the certificate (or use a free Let's Encrypt one), then re-run me."
     confirm "  Advanced: pin THIS certificate anyway?" \
       || die "Stopped — the certificate $reason. Fix it and re-run."
     warn "Pinning a certificate that $reason, at your request."
@@ -1285,6 +1560,8 @@ sys.stdout.write(base64.b64encode(binascii.unhexlify(h)).decode() if h else "")'
 
 FS_URL=""; FS_CRED=""; FS_CERT_FP=""
 FS_LOCAL_PORT=""
+FS_REACH=""         # the file lane's OWN reach (public|private) — can differ from the gateway's
+                    # SCOPE in a mixed-scope setup; recorded as fileServer.reach for --show-qr
 FS_UNIT=""          # resolved unit/plist path actually in use (existing or new)
 FS_FOLDER=""        # served workspace path — for the non-secret profile only; "" when unknown
 FS_CRED_LEGACY_ARGV=false   # true when a reused unit keeps the password on argv (ps-visible)
@@ -1429,11 +1706,12 @@ EOF
   systemctl --user daemon-reload
   systemctl --user enable --now "conduck-files-$GW_ID.service" && ok "File server running in the background (a systemd user service)." \
     || warn "Could not start the service — check 'systemctl --user status conduck-files-$GW_ID'."
-  loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes' || {
+  local user_name="${USER:-$(id -un)}"   # $USER can be unset under set -u (su/cron shells)
+  loginctl show-user "$user_name" 2>/dev/null | grep -q 'Linger=yes' || {
     warn "User services stop at logout unless 'linger' is on (needed for a 24/7 box)."
     run_step "enable linger so the file server survives logout/reboot" \
-      sudo loginctl enable-linger "$USER" || \
-      note "Tip: 'sudo loginctl enable-linger $USER' keeps user services running after logout."
+      sudo loginctl enable-linger "$user_name" || \
+      note "Tip: 'sudo loginctl enable-linger $user_name' keeps user services running after logout."
   }
 }
 
@@ -1460,7 +1738,7 @@ PY
   launchctl load -w "$FS_UNIT" && ok "File server running in the background (a macOS LaunchAgent that restarts it automatically)." \
     || warn "Could not load the LaunchAgent — check 'launchctl list | grep conduck'."
   note "LaunchAgents run while this user is logged in — for a 24/7 Mac, keep automatic login on."
-  if pmset -g 2>/dev/null | grep -qE 'sleep[[:space:]]+[1-9]'; then
+  if pmset -g 2>/dev/null | grep -qE '^[[:space:]]*sleep[[:space:]]+[1-9]'; then
     warn "This Mac is set to sleep — a sleeping host isn't reachable 24/7."
     note "For an always-on gateway: enable automatic login + 'sudo pmset -a sleep 0'."
   fi
@@ -1485,7 +1763,7 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
       # Already on a Funnel-eligible port → switch in place (serve → funnel; most-recent
       # command wins, so funnel cleanly supersedes the serve handler — no `serve off`).
       if tailscale_expose "$ehttps" "$FS_LOCAL_PORT" true file; then
-        FS_URL="https://$host:$ehttps"; ok "File lane is now public at $FS_URL."
+        FS_URL="https://$host:$ehttps"; FS_REACH="public"; ok "File lane is now public at $FS_URL."
       else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fi
       ;;
     *)
@@ -1495,7 +1773,7 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
         # silently drop a working lane: offer to keep it private instead of losing it.
         warn "Couldn't make the file lane public — all three Funnel ports (443/8443/10000) are already in use by other services on this machine."
         if confirm "  Keep the file lane PRIVATE instead (reachable on your Tailscale network)?"; then
-          FS_URL="https://$host:$ehttps"
+          FS_URL="https://$host:$ehttps"; FS_REACH="private"
           warn "Keeping the file lane private at $FS_URL."
           warn "Heads-up: the gateway is PUBLIC but this file lane stays Tailscale-only, so attachments work only on your Tailscale-connected devices — an Apple Watch used away from your iPhone won't reach them. Chat still works everywhere."
         else FS_CRED=""; note "Leaving the file lane out."; fi
@@ -1505,7 +1783,7 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
       if tailscale_expose "$PICKED_PORT" "$FS_LOCAL_PORT" true file; then
         local newport="$PICKED_PORT"
         ts_unmap "$ehttps" "$everb"
-        FS_URL="https://$host:$newport"; ok "File lane is now public at $FS_URL."
+        FS_URL="https://$host:$newport"; FS_REACH="public"; ok "File lane is now public at $FS_URL."
       else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fi
       ;;
   esac
@@ -1517,8 +1795,32 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
 fs_demote_private() { # fs_demote_private <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
   if tailscale_expose "$ehttps" "$FS_LOCAL_PORT" false file; then
-    FS_URL="https://$host:$ehttps"; ok "File lane is now private at $FS_URL — only your Tailscale devices can reach it."
+    FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "File lane is now private at $FS_URL — only your Tailscale devices can reach it."
   else warn "Could not make the file lane private — leaving it out (won't ship a public lane as private)."; drop_file_lane; fi
+}
+
+# The plain-words help behind the mismatch menus' `?`. Branches on the gateway's
+# $SCOPE; deliberately NUMBER-FREE (the reuse-only menus number differently).
+# ADDITIVE only — explains the situation, never changes the choices.
+explain_fs_mismatch() {
+  say ""
+  say "  What's going on: chat and file transfer are two separate doors. Right now"
+  if [ "$SCOPE" = "public" ]; then
+    say "  the CHAT door is public (works from anywhere), but the FILE door only opens"
+    say "  for devices on your Tailscale network. Left as-is, that shows up in the app"
+    say "  as: chat works everywhere, attachments only on your Tailscale-connected"
+    say "  devices — and a Watch away from its iPhone can't use them at all."
+  else
+    say "  the CHAT door only opens for devices on your Tailscale network, but the"
+    say "  FILE door is on the public internet — your files are reachable more widely"
+    say "  than your chat, guarded only by their password."
+  fi
+  say ""
+  say "  Matching the two doors is the predictable setup: attachments then work"
+  say "  exactly where chat works. Leaving the file lane out costs only attachments —"
+  say "  chat is unaffected. Keeping the mismatch is the advanced choice: pick it only"
+  say "  if the split described above is what you actually intend."
+  say ""
 }
 
 # Resolve a scope mismatch: align / omit / include as-is. Sets FS_URL on inclusion,
@@ -1529,56 +1831,64 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     warn "Your file lane can be reached only by your own Tailscale-connected devices, but the gateway is public."
     note "As-is, attachments would work only on your Tailscale network — a Watch used away from the phone couldn't reach files."
     if $REUSE_ONLY; then
-      say "    1) Leave the file lane out  (chat still works everywhere; no attachments)"
-      say "    2) Include it as-is  (advanced — attachments only on your Tailscale devices)"
+      say "    1) Leave the file lane out — chat still works everywhere; no attachments"
+      say "    2) Include it as-is  (advanced) — attachments only on your Tailscale devices"
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2" '^[12]$') || die "$NO_ANSWER"
+      c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out." ;;
-        2) FS_URL="https://$host:$ehttps"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
+        2) FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
       esac
       return 0
     fi
-    say "    1) Make the file lane public too  (puts a password-protected file server on the public internet)"
-    say "    2) Leave the file lane out  (chat still works everywhere; no attachments)"
-    say "    3) Include it as-is  (advanced — attachments only on your Tailscale devices)"
-    c=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
+    say "    1) Make the file lane public too — attachments then work wherever chat works"
+    say "       (puts the password-protected file server on the public internet)"
+    say "    2) Leave the file lane out — chat still works everywhere; no attachments"
+    say "    3) Include it as-is  (advanced) — attachments only on your Tailscale devices;"
+    say "       the file server itself stays private"
+    c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway." ;;
-      3) FS_URL="https://$host:$ehttps"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
+      3) FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
     esac
   else
     warn "Your file lane is on the public internet, but the gateway is private (only your Tailscale devices) — that exposes your files more widely than the gateway itself."
     if $REUSE_ONLY; then
-      say "    1) Leave the file lane out"
-      say "    2) Keep it public anyway  (advanced)"
+      say "    1) Leave the file lane out — chat unaffected; no attachments"
+      say "    2) Keep it public anyway  (advanced) — the file server stays reachable"
+      say "       from the whole internet, unlike the gateway"
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2" '^[12]$') || die "$NO_ANSWER"
+      c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out." ;;
-        2) FS_URL="https://$host:$ehttps"; warn "Including a public file lane at $FS_URL." ;;
+        2) FS_URL="https://$host:$ehttps"; FS_REACH="public"; warn "Including a public file lane at $FS_URL." ;;
       esac
       return 0
     fi
-    say "    1) Make the file lane private too — match the gateway (recommended)"
-    say "    2) Leave the file lane out"
-    say "    3) Keep it public anyway  (advanced)"
-    c=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
+    say "    1) Make the file lane private too — match the gateway (recommended);"
+    say "       attachments then work wherever chat works"
+    say "    2) Leave the file lane out — chat unaffected; no attachments"
+    say "    3) Keep it public anyway  (advanced) — the file server stays reachable"
+    say "       from the whole internet, unlike the gateway"
+    c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out." ;;
-      3) FS_URL="https://$host:$ehttps"; warn "Including a public file lane at $FS_URL." ;;
+      3) FS_URL="https://$host:$ehttps"; FS_REACH="public"; warn "Including a public file lane at $FS_URL." ;;
     esac
   fi
 }
 
 setup_file_lane() {
   head_ "Step 4 — agent file lane (optional, recommended)"
-  say "  Lets Conduck hand your agent REAL files (PDF/CSV/zip…) for its tools, and"
-  say "  download files the agent writes back. It runs a tiny file server (over WebDAV —"
-  say "  a standard way to read and write files over the web — using the rclone tool)"
-  say "  over the agent's working folder, same HTTPS exposure as the gateway."
+  say "  Lets Conduck hand your agent real files (PDF/CSV/zip…) for its tools, and"
+  say "  download files the agent writes back. Skipping is fine — chat (including"
+  say "  pasted images) still works; the agent's tools just can't open attachments"
+  say "  as real files."
+  say "  How: a small password-protected file server (rclone WebDAV — a standard way"
+  say "  to read and write files over the web) over the agent's working folder,"
+  say "  shared the same way as the gateway."
   if ! confirm "  Set it up?"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
 
   if ! have rclone; then
@@ -1610,7 +1920,7 @@ setup_file_lane() {
       warn "No systemd user session here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
       warn "I can't keep a file server running in the background. Skipping the file lane; chat still works."
       note "If this box does run systemd, log in directly as this user (ssh, not 'su -') and re-run."
-      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:5006 --user conduck' under your own supervisor."
+      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:5006 --user conduck' with the app-generated password exported as RCLONE_PASS, under your own supervisor."
       FS_CRED=""; return 0
     fi
     FS_LOCAL_PORT=5006
@@ -1655,7 +1965,7 @@ setup_file_lane() {
         local ehttps="${existing%%$'\t'*}" everb="${existing#*$'\t'}"
         local escope="private"; [ "$everb" = "funnel" ] && escope="public"
         if [ "$escope" = "$SCOPE" ]; then
-          FS_URL="https://$host:$ehttps"
+          FS_URL="https://$host:$ehttps"; FS_REACH="$escope"
           ok "File lane ready at $FS_URL (reusing its existing $everb exposure)."
         else
           resolve_fs_scope_mismatch "$ehttps" "$everb" "$host"
@@ -1671,14 +1981,15 @@ setup_file_lane() {
         # Not yet exposed — allocate on the gateway's transport (scope matches by construction).
         FS_HTTPS_PORT="$PICKED_PORT"
         if tailscale_expose "$FS_HTTPS_PORT" "$FS_LOCAL_PORT" "$gw_funnel" "file"; then
-          FS_URL="https://$host:$FS_HTTPS_PORT"
+          FS_URL="https://$host:$FS_HTTPS_PORT"; FS_REACH="$SCOPE"
           ok "File lane ready at $FS_URL."
         else
           warn "File-lane exposure not confirmed — leaving it out of the QR."
           drop_file_lane
         fi
       else
-        FS_CRED=""   # no permitted port free; file lane skipped (pick_public_port warned)
+        warn "No free HTTPS port for the file lane on this transport — skipping the file lane."
+        FS_CRED=""   # no permitted port free; file lane skipped
       fi
       ;;
     cloudflare)
@@ -1878,7 +2189,8 @@ verify_all() {
         6)     why="DNS lookup failed — that hostname doesn't resolve" ;;
         7)     why="connection refused — nothing is listening there (wrong port? firewall? server down?)" ;;
         28)    why="timed out — no answer from the host" ;;
-        35|60) why="TLS/certificate problem — the HTTPS front rejected the connection" ;;
+        35)    why="TLS/certificate problem — the HTTPS front rejected the connection" ;;
+        60)    why="TLS/certificate problem — this machine doesn't trust the server's certificate" ;;
         90)    why="pinned key mismatch — the server's certificate is not the one this run pinned" ;;
         *)     why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
       esac
@@ -1955,6 +2267,7 @@ except Exception: pass' 2>/dev/null)
       # so dropping the lane here only affects THIS emission — the saved lane is untouched.
       bad "the saved profile's file lane failed live verification — a transient outage or a real breakage."
       if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+        curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
         drop_file_lane
       else
         # Best-effort probe cleanup before dying: the PUT may have landed even though
@@ -1965,6 +2278,7 @@ except Exception: pass' 2>/dev/null)
       fi
     else
       bad "file lane probe failed — leaving it out of the QR (re-run me after fixing)"
+      curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
       drop_file_lane
     fi
     rm -f "$tmp"
@@ -1995,7 +2309,7 @@ write_profile() {
         TRANSPORT="$TRANSPORT" SCOPE="$SCOPE" GW_URL="$GW_URL" GW_LOCAL_PORT="$GW_LOCAL_PORT" \
         GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
         FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_LOCAL_PORT="$FS_LOCAL_PORT" \
-        FS_CERT_FP="$FS_CERT_FP" FS_FOLDER="$FS_FOLDER" \
+        FS_CERT_FP="$FS_CERT_FP" FS_FOLDER="$FS_FOLDER" FS_REACH="$FS_REACH" \
         python3 - <<'PY'
 import json, os
 e = os.environ.get
@@ -2012,6 +2326,7 @@ p = {"schemaVersion": 1, "gateway": gw, "fileServer": None}
 if e("FS_URL") and e("FS_CRED"):
     fs = {"url": e("FS_URL")}
     if e("FS_LOCAL_PORT"): fs["localPort"] = e("FS_LOCAL_PORT")
+    if e("FS_REACH"):      fs["reach"]     = e("FS_REACH")
     if e("FS_CERT_FP"):    fs["certFP"]    = e("FS_CERT_FP")
     if e("FS_FOLDER"):     fs["folder"]    = e("FS_FOLDER")
     p["fileServer"] = fs
@@ -2074,14 +2389,14 @@ PY
 
   say ""
   say "  ${BOLD}In Conduck:${RESET} Settings → Personal AI → look for the setup-code option."
-  say "  On iPhone, iPad, or Android, scan the QR or paste this code; on Mac, paste the code below."
+  say "  On iPhone or iPad, scan the QR or paste this code; on Mac, paste the code below."
   say ""
   say "  Setup code (same secret as the QR — paste this for the Mac app or if scanning fails):"
   say ""
   printf '%s\n' "$pairing"
   say ""
   case "$TRANSPORT" in
-    tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, Mac, or Android) needs the Tailscale app, logged in to the same tailnet." ;;
+    tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, or Mac) needs the Tailscale app, logged in to the same tailnet." ;;
     selfsigned) note "Your gateway uses its own certificate; a secure fingerprint of it travels inside the code, so the app trusts it automatically — nothing for you to copy." ;;
   esac
   say "  Re-run this script any time to re-verify or show the code again."
@@ -3151,7 +3466,12 @@ print_plan() {
 # matches url_host_lc/show_qr_is_https_host (ends at the first /, ? or #).
 url_https_port() { # url_https_port <https-url>
   local hp="${1#https://}"; hp="${hp%%[/?#]*}"
-  case "$hp" in *:*) printf '%s' "${hp##*:}" ;; *) printf '443' ;; esac
+  case "$hp" in
+    \[*\]:*) printf '%s' "${hp##*\]:}" ;;   # bracketed IPv6 with an explicit port
+    \[*\])   printf '443' ;;                 # bracketed IPv6, no port (inner colons aren't a port)
+    *:*)     printf '%s' "${hp##*:}" ;;
+    *)       printf '443' ;;
+  esac
 }
 
 # The host part of an https URL, lowercased. Same authority parse as
@@ -3161,7 +3481,12 @@ url_https_port() { # url_https_port <https-url>
 url_host_lc() { # url_host_lc <https-url>
   case "$1" in https://*) ;; *) return 0 ;; esac
   local a="${1#https://}"; a="${a%%[/?#]*}"
-  local h="$a"; case "$a" in *:*) h="${a%:*}" ;; esac
+  local h
+  case "$a" in
+    \[*\]*) h="${a%%\]*}]" ;;               # bracketed IPv6 → keep [..], drop any trailing :port
+    *:*)    h="${a%:*}" ;;                   # host:port
+    *)      h="$a" ;;
+  esac
   printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
 }
 
@@ -3220,10 +3545,19 @@ show_qr_is_https_host() { # show_qr_is_https_host <url> -> 0 iff https:// + sane
   # Real authority parse — a bare `%%/*` host grab let https://?query, https://#frag
   # and https://user:pass@host slip through. Authority ends at the first /, ? or #;
   # userinfo is rejected (the wizard never emits it); an explicit :port must be a
-  # real port; the host may contain only [A-Za-z0-9.-].
+  # real port; the host may contain only [A-Za-z0-9.-], OR be a bracketed IPv6 literal.
   case "$1" in https://*) ;; *) return 1 ;; esac
   local a="${1#https://}"; a="${a%%[/?#]*}"
   case "$a" in *@*) return 1 ;; esac
+  # A bracketed IPv6 literal ([hex:.]) with an optional :port is a valid authority too.
+  local ip
+  case "$a" in
+    \[*\]:*) show_qr_is_port "${a##*\]:}" || return 1; ip="${a#\[}"; ip="${ip%%\]*}"
+             case "$ip" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; *) return 0 ;; esac ;;
+    \[*\])   ip="${a#\[}"; ip="${ip%\]}"
+             case "$ip" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; *) return 0 ;; esac ;;
+    \[*)     return 1 ;;   # opened a bracket but no valid close → reject
+  esac
   local h="$a"
   case "$a" in *:*) show_qr_is_port "${a##*:}" || return 1; h="${a%:*}" ;; esac
   [ -n "$h" ] || return 1
@@ -3323,13 +3657,13 @@ show_qr_load_profile() {
     hermes)   GW_HEALTH_PATH="/v1/health" ;;
     *)        GW_HEALTH_PATH="" ;;
   esac
-  # Local port: prefer the profile; else re-detect from the gateway config like the wizard.
+  # Local port: prefer the profile; else re-detect from the gateway config exactly as the
+  # wizard does (same precedence + gateway.port validation), so the drift check never
+  # false-alarms on a gateway.port-configured install.
   if [ -z "$GW_LOCAL_PORT" ]; then
     case "$GW_KIND" in
       openclaw)
-        local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}" praw
-        praw=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_PORT")
-        GW_LOCAL_PORT="${praw##*:}"; GW_LOCAL_PORT="${GW_LOCAL_PORT:-18789}"
+        GW_LOCAL_PORT=$(openclaw_local_port)
         ;;
       hermes)
         GW_LOCAL_PORT=$(env_get "$HOME/.hermes/.env" "API_SERVER_PORT"); GW_LOCAL_PORT="${GW_LOCAL_PORT:-8642}"
@@ -3349,11 +3683,10 @@ show_qr_recover_gateway_secret() {
   esac
   case "$GW_KIND" in
     openclaw)
-      local cfg="$HOME/.openclaw/openclaw.json"
-      [ -f "$cfg" ] || die "Can't find $cfg to read the gateway token — is this the machine you paired on? Re-run the wizard (bash conduck-connect.sh) if OpenClaw moved."
-      GW_TOKEN=$(json_get "$cfg" "gateway.auth.token")
-      [ -n "$GW_TOKEN" ] || die "No token at gateway.auth.token in $cfg — refusing to emit a keyless code (auth is explicit). Fix the gateway config, then re-run."
-      ok "Re-read the gateway bearer token from openclaw.json (not shown)."
+      # Same mode-aware resolution as the wizard: honours auth.mode, reads the right key
+      # (token vs password), and NEVER embeds an indirect "${ENV}"/SecretRef value — it
+      # prompts for the real secret instead (the --show-qr "may still ask" contract).
+      openclaw_resolve_secret "showqr"
       ;;
     hermes)
       local envf="$HOME/.hermes/.env"
@@ -3469,7 +3802,13 @@ show_qr_check_live() {
           note "live tailscale hosts:         ${TS_HOSTS[*]:-<none>}"
           show_qr_stale
         fi
-        show_qr_assert_mapping "$fs_host" "$(url_https_port "$FS_URL")" "$FS_LOCAL_PORT" "$want_verb" "file lane" || show_qr_stale
+        # The lane can legitimately ride a DIFFERENT reach than the gateway (a mixed-scope
+        # setup the wizard allows). Assert the LANE's own verb from its saved reach; fall
+        # back to the gateway's scope only for older profiles with no fileServer.reach.
+        local fs_reach; fs_reach=$(json_get "$PROFILE_FILE" "fileServer.reach")
+        [ -n "$fs_reach" ] || fs_reach="$SCOPE"
+        local fs_verb="serve"; [ "$fs_reach" = "public" ] && fs_verb="funnel"
+        show_qr_assert_mapping "$fs_host" "$(url_https_port "$FS_URL")" "$FS_LOCAL_PORT" "$fs_verb" "file lane" || show_qr_stale
       fi
       ;;
     selfsigned)
@@ -3523,8 +3862,8 @@ $DRY_RUN && note "(dry-run: nothing will be changed)"
 # --show-qr forces REUSE_ONLY on, so print its OWN banner instead of the reuse-only one.
 if $SHOW_QR; then note "(--show-qr: re-showing a saved pairing code — skips the setup questions, changes nothing; may still ask you to pick a profile or re-enter a custom token)"
 elif $REUSE_ONLY; then note "(reuse-only: I'll reuse what's set up and refuse any change — safe to run on a gateway you don't want touched)"; fi
-say "Every change asks first. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
-note "Two kinds of step: things I made (I offer to run them for you), and things you already own — your gateway config, Tailscale, daemons — which I never touch; I print the exact command for you to run."
+say "Every change asks first, and you see the exact command before it happens. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
+note "Some commands I offer to run for you (you say yes or no to each); the rest you copy-paste and run yourself while I wait."
 
 # --show-qr: skip the whole wizard — reconstruct from a saved profile, then verify + emit.
 if $SHOW_QR; then

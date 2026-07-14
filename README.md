@@ -17,7 +17,7 @@ Works on macOS and Linux. `-O` lands the full file on disk before anything runs,
 
 It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
-> **Status: the script is at `v0.6.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
+> **Status: the script is at `v0.7.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
 
 ## Why a shell script?
 
@@ -106,7 +106,7 @@ Then, in the app: paste the file-lane URL and run **Test Connection**. The stage
 **Security**
 
 - **Never put the password on a command line** — `argv` is visible to `ps`. Pass it through an environment variable or a config file with `0600` permissions.
-- **HTTPS with a real or self-signed cert.** Self-signed is fine — pin its SPKI fingerprint in the app under **Advanced** so Conduck trusts exactly that cert.
+- **HTTPS with a real or self-signed cert.** Self-signed is fine — paste its SPKI fingerprint in the app (your gateway → **File transfer** → Advanced → *Pinned cert fingerprint*) so Conduck trusts exactly that key.
 - **Isolate lanes.** If you run more than one file lane on a host, give each its own credential, port, and service name — no shared state between them.
 
 **Exposure**
@@ -126,7 +126,7 @@ rclone serve webdav ~/.openclaw/workspace --addr 127.0.0.1:5006 --user conduck
 
 ## Troubleshooting
 
-The wizard's Step 5 verifies with real requests and names what failed. What each message means, and the fix. (App-side setup help — including what to do *before* the script runs — lives at https://conduck.com/setup/#troubleshooting.)
+The wizard's Step 5 verifies with real requests and names what failed. What each message means, and the fix (the last row prints during the exposure step, before verification). App-side setup help — including what to do *before* the script runs — lives at https://conduck.com/setup/#troubleshooting.
 
 | The wizard says | What it means | The fix |
 |---|---|---|
@@ -135,7 +135,7 @@ The wizard's Step 5 verifies with real requests and names what failed. What each
 | `…failed: DNS lookup failed` | The hostname doesn't resolve. | Check the spelling; a just-created DNS record can take a minute to propagate. |
 | `…failed: connection refused` | Nothing is listening at that host and port. | Is the server running? Right port? Firewall open? Many local servers (Ollama, LM Studio) bind to `127.0.0.1` only — front them with the wizard's exposure step. |
 | `…failed: timed out` | No answer at all. | Host offline, unreachable address, or a firewall silently dropping traffic. |
-| `…failed: TLS/certificate problem` | The HTTPS front rejected the handshake. | Renew or fix the certificate — expired and wrong-hostname certs both stop the run, deliberately. A wrong system clock on either end produces the same failure. |
+| `…failed: TLS/certificate problem` | Either the server's certificate is bad (expired, wrong hostname) or this machine's own trust store rejected it. | Renew or fix the certificate — expired and wrong-hostname certs both stop the run, deliberately. A wrong system clock on either end produces the same failure. |
 | `…failed: pinned key mismatch` | The server's certificate is not the one this run pinned. | Re-run the wizard so it pins the current cert (it never re-pins silently). |
 | `…failed: HTTP 401 — token rejected` | Wrong or stale bearer token — or an access layer in front wants its own login. (A 403 prints the same shape.) | Re-read the token from the gateway's config (OpenClaw: `gateway.auth.token` · Hermes: `API_SERVER_KEY`); check any proxy access policy. |
 | `…failed: HTTP 404 — nothing at that path` | No `/v1/models` at that base address. | Give the server's *base* address — the script and the app append `/v1/…` themselves. (A pasted `…/v1` is normalized away automatically.) |
