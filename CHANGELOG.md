@@ -6,6 +6,8 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 Every decision prompt now explains itself in plain words on request, and a cross-surface audit (checked against current Tailscale, Cloudflare, OpenClaw, Hermes, and rclone documentation) landed a batch of correctness fixes. No breaking changes — pairing codes, flags, and profiles from 0.6.0 keep working.
 
+> **Same-day asset refresh (2026-07-14).** The `v0.7.0` script and checksum were re-published later the same day with three small fixes; `VERSION` stays `0.7.0` and nothing about pairing changes. If a checksum you saved from the morning no longer matches, this is why. What changed: the single-model pre-fill probe now sends the token you just entered (a server that correctly rejects anonymous requests used to silently kill the pre-fill); a machine without Tailscale gets a calm "only matters if you'd pick the Tailscale path" note instead of a refusing-to-guess warning; and the `--help` text now tells `--reuse-only` apart from `--show-qr` (advanced read-only walk of a live or hand-built setup vs. re-showing a saved code), with a pointer to `--reuse-only` from `--show-qr`'s no-saved-profile message.
+
 ### Added
 
 - **`?` help at every decision prompt.** The exposure choice, the public/private question, and the file-lane mismatch menus all take `?` and compare the options in plain words — who can reach the address, what to install, who can see traffic, and what an Apple Watch needs. Purely additive: type the answer directly and nothing changed.
