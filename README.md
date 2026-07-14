@@ -79,6 +79,8 @@ See **[WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md)** for the exact files, services, 
 
 `bash` (3.2+), `curl`, `python3`, `openssl`. A Linux or macOS gateway host.
 
+The wizard is interactive and needs a real terminal: prompts cannot be piped in, and there are no non-interactive answer flags. (An AI tool driving it needs a real PTY.)
+
 ## Reaching your gateway
 
 Conduck needs the gateway at an `https://` URL. The wizard walks four paths and lets you pick — no auto-recommendation, just honest trade-offs:

@@ -13,6 +13,10 @@ bash conduck-connect.sh --dry-run
 | `~/.openclaw/openclaw.json` | OpenClaw: discover the local port and read the runtime bearer token (`gateway.auth.token`). |
 | `~/.hermes/.env` | Hermes: discover `API_SERVER_PORT` and read `API_SERVER_KEY`. |
 | `tailscale serve status --json` | Read current exposure mappings. Fail-closed: if it can't be read, the script refuses to guess rather than mutate. |
+| `~/.config/conduck/` | Reuse state from earlier runs: the saved non-secret profiles (`--show-qr`, drift check) and an existing file-lane credential file (reused, never rotated). |
+| Existing `conduck-files-*` service units | The systemd user units / LaunchAgents plists an earlier run created: re-read to recover the file lane's port and credential-file path for reuse. |
+| `cloudflared tunnel list` | Cloudflare path: discover existing tunnels so the printed instructions reference the right one. |
+| `http://127.0.0.1:<port>/v1/models` | One loopback probe of your own server during setup, to pre-fill the model name when it advertises exactly one. |
 
 ## May change — always with your confirmation
 
