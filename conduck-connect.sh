@@ -58,9 +58,12 @@
 #                                           # profile, re-enter a custom gateway's token, or
 #                                           # confirm a gateway-only code; verification still
 #                                           # makes its real requests)
-#   bash conduck-connect.sh --reuse-only    # only reuse what's already set up; refuse to
-#                                           # change anything — use this to re-show your QR
-#                                           # on a gateway you don't want touched
+#   bash conduck-connect.sh --reuse-only    # advanced: run the FULL wizard, but refuse
+#                                           # every change (a read-only walk of your live
+#                                           # setup). To just re-show a saved code,
+#                                           # --show-qr is the normal way — use --reuse-only
+#                                           # when there's no saved profile yet (e.g. a
+#                                           # setup you built by hand)
 #   bash conduck-connect.sh --allow-keyless-public   # expert: permit a keyless
 #                                           # gateway on a public transport
 #
@@ -705,9 +708,20 @@ configure_hermes() {
 
 # Probe a local OpenAI-compatible server for its model list; if exactly one model
 # is returned, echo it (used to pre-fill the model default — saves a prompt).
+# Sends the just-collected bearer when there is one — a compliant server 401s an
+# unauthenticated probe, which used to silently kill the pre-fill.
 probe_single_model() { # probe_single_model <local_port>
   [ -n "$1" ] || return 0
-  curl -sS --max-time 5 "http://127.0.0.1:$1/v1/models" 2>/dev/null | python3 -c '
+  local body=""
+  if [ "${GW_AUTH:-none}" = "bearer" ] && [ -n "${GW_TOKEN:-}" ]; then
+    # Same stdin-config idiom as curl_gw: the token never rides argv (`ps`).
+    local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
+    body=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+      | curl -sS --max-time 5 --config - "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+  else
+    body=$(curl -sS --max-time 5 "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+  fi
+  printf '%s' "$body" | python3 -c '
 import json,sys
 try:
     ids=[m.get("id") for m in (json.load(sys.stdin).get("data") or []) if m.get("id")]
@@ -3413,7 +3427,11 @@ print_plan() {
   head_ "Dry-run plan — this is what a real run WOULD do (nothing was changed)"
   say ""
   say "  ${BOLD}Current Tailscale exposures:${RESET}"
-  if ! $TS_STATE_KNOWN; then
+  if ! have tailscale; then
+    # Not installed is a calm fact, not a failure — the refuse-to-guess warning
+    # is for an INSTALLED Tailscale whose state can't be read.
+    note "(Tailscale isn't installed — only matters if you'd pick the Tailscale path)"
+  elif ! $TS_STATE_KNOWN; then
     note "(could not read 'tailscale serve status --json' — a real run would refuse to guess)"
   elif [ ${#TS_PORTS[@]} -eq 0 ]; then
     note "(none)"
@@ -3512,7 +3530,7 @@ show_qr_pick_profile() {
     [ -e "$pf" ] || continue          # no matches → the literal glob; skip it
     all+=("$pf")
   done
-  [ ${#all[@]} -gt 0 ] || die "No saved pairing profile on this machine yet — run the wizard once (bash conduck-connect.sh) to pair and save one. From then on, --show-qr re-shows the code, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code)."
+  [ ${#all[@]} -gt 0 ] || die "No saved pairing profile on this machine yet — run the wizard once (bash conduck-connect.sh) to pair and save one; add --reuse-only if you don't want it changing anything on this machine. From then on, --show-qr re-shows the code, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code)."
   local k
   for pf in "${all[@]}"; do
     k=$(json_get "$pf" "gateway.kind")
