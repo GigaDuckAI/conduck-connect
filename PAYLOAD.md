@@ -35,5 +35,6 @@ The base64 is standard and unwrapped (single line). The decoded JSON:
 - **Conditional fields are omitted, not null.** `name` only for custom gateways; `token` only when `auth` is `bearer`; `certFP` only for a self-signed cert; `model` only when the gateway requires one; the whole `fileServer` object only when the file lane is configured.
 - **`transport` is your explicit path choice** and supersedes any guess the app might make from the URL pattern.
 - **The token and the file-lane credential are secrets.** The code is scannable by anyone who can see your screen; the script warns you when it emits it.
+- **The app hard-rejects an invalid payload — whole, never partially** (mind this if you mint codes yourself): every URL must be `https://` with a host; `auth: "bearer"` with a missing or empty `token` rejects (fail closed — never an unauthenticated import); `kind: "custom"` requires a nonempty `name`; a present `certFP` must normalize to exactly 64 hex characters; a missing or non-integer `v` rejects.
 
 This contract is **locked at v1** — fields are added compatibly (tolerant decode), never repurposed.
