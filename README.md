@@ -61,8 +61,22 @@ No `chmod` needed. The one large block near the bottom of the script is a vendor
 | `--reuse-only` | Reuse existing config; refuse any mutation. Safe to point at a **live** gateway. |
 | `--show-qr` | Re-show a saved gateway's pairing code — reads only, changes nothing (uses the non-secret profile a successful run saves; may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code). Verification still makes its real requests. |
 | `--openclaw` · `--hermes` · `--generic` | Skip detection; target a specific gateway kind |
+| `--doctor [url]` | Check an adapter built for Conduck against the rules at [conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/) — real requests, graded strictly, changes nothing (see below) |
+| `--deep` | With `--doctor`: also test how the adapter handles a message with an image |
 | `--allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
 | `--help` | All flags |
+
+## Check your own adapter (`--doctor`)
+
+Have an adapter built for Conduck — by hand or by an AI coding tool? Before exposing or pairing it, run the check on the machine where it listens:
+
+```bash
+CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --doctor http://127.0.0.1:8080
+```
+
+The script changes nothing. It sends a handful of real requests, grades the answers against the rules at **[conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/)** — including the one the pairing wizard can't prove: that your token check is actually **enforced** (a missing or a wrong token must both get `401`, on both routes) — and tells you what to fix. Exit code `0` means every check passed, so you can loop it from a build script while you iterate. Plain `http://` is accepted toward `127.0.0.1`/`localhost` only; the token comes from `$CONDUCK_TOKEN` or a hidden prompt, never the command line. Add `--deep` to also test a message with an image (an honest HTTP `400` "images unsupported" answer passes).
+
+One scope note: it grades the *adapter* rules. OpenClaw and Hermes legitimately do things those rules forbid (keyless mode, for one), so pointing the doctor at them produces failures that don't mean anything is wrong — use the normal wizard verification for those.
 
 ## Trust posture
 

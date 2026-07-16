@@ -64,6 +64,17 @@
 #                                           # --show-qr is the normal way — use --reuse-only
 #                                           # when there's no saved profile yet (e.g. a
 #                                           # setup you built by hand)
+#   bash conduck-connect.sh --doctor [url]  # check an adapter built for Conduck against the rules
+#                                           # at conduck.com/setup/adapter/v1/ — a handful of real
+#                                           # requests, graded strictly; changes NOTHING. It also
+#                                           # proves what the wizard's verify step can't — that your
+#                                           # auth is actually ENFORCED (a missing or wrong token
+#                                           # must 401).
+#                                           # http:// is allowed toward 127.0.0.1/localhost only, so
+#                                           # you can test BEFORE exposing. Token comes from
+#                                           # $CONDUCK_TOKEN or a hidden prompt. Exit 0 = all green
+#                                           # (loop it from a shell while you iterate). Add --deep
+#                                           # for the image/parts tolerance test.
 #   bash conduck-connect.sh --allow-keyless-public   # expert: permit a keyless
 #                                           # gateway on a public transport
 #
@@ -73,7 +84,7 @@
 
 set -u -o pipefail
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 PAYLOAD_VERSION=1
 
 # ---------------------------------------------------------------- utilities --
@@ -94,6 +105,9 @@ DRY_RUN=false
 REUSE_ONLY=false
 SHOW_QR=false
 ALLOW_KEYLESS_PUBLIC=false
+DOCTOR=false
+DOCTOR_DEEP=false
+DOCTOR_URL=""
 MODE=""            # openclaw | hermes | generic
 
 for arg in "$@"; do
@@ -105,9 +119,17 @@ for arg in "$@"; do
     --show-qr)  SHOW_QR=true ;;
     --reuse-only) REUSE_ONLY=true ;;
     --allow-keyless-public) ALLOW_KEYLESS_PUBLIC=true ;;
+    --doctor)   DOCTOR=true ;;
+    --deep)     DOCTOR_DEEP=true ;;
     --version)  say "conduck-connect $VERSION"; exit 0 ;;
     -h|--help)  sed -n '2,${/^#/!q;s/^# \{0,1\}//p;}' "$0"; exit 0 ;;   # whole header comment, wherever it ends
-    *) die "Unknown argument: $arg (try --help)" ;;
+    # The ONLY positional argument is --doctor's target URL. It's collected in
+    # either order ("--doctor url" or "url --doctor") but validated after the
+    # loop: a bare word WITHOUT --doctor still dies, so a stray argument can
+    # never silently pick a mode.
+    -*) die "Unknown argument: $arg (try --help)" ;;
+    *)  if [ -z "$DOCTOR_URL" ]; then DOCTOR_URL="$arg"
+        else die "Unknown argument: $arg (try --help)"; fi ;;
   esac
 done
 
@@ -117,6 +139,20 @@ done
 if $SHOW_QR; then
   $DRY_RUN && die "--show-qr and --dry-run don't combine: --show-qr re-emits a saved gateway's QR and changes nothing, while --dry-run plans a fresh run and emits no QR. Pick one."
   REUSE_ONLY=true
+fi
+
+# --doctor is a pure read-over-HTTP conformance check: no wizard, no exposure,
+# no QR, no saved state — so every wizard-shaping flag is a contradiction, not
+# a combination. REUSE_ONLY is forced on for the same belt-and-braces reason as
+# --show-qr: any mutation that somehow gets reached dies via mutate_guard.
+if $DOCTOR; then
+  $DRY_RUN  && die "--doctor and --dry-run don't combine: the doctor already changes nothing."
+  $SHOW_QR  && die "--doctor and --show-qr don't combine: one checks an adapter, the other re-shows a code. Pick one."
+  [ -n "$MODE" ] && die "--doctor doesn't combine with --openclaw/--hermes/--generic: it asks for a URL and tests it as-is."
+  REUSE_ONLY=true
+else
+  [ -n "$DOCTOR_URL" ] && die "A bare URL argument only makes sense with --doctor (try --help)."
+  $DOCTOR_DEEP && die "--deep only works together with --doctor."
 fi
 
 # PLAN[] accumulates human-readable "would do" lines for --dry-run.
@@ -248,7 +284,11 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Collect ALL missing required tools and report together, with install hints.
 preflight() {
   local missing=()
-  for t in curl python3 openssl; do need "$t" || missing+=("$t"); done
+  # openssl is only used by the wizard's self-signed cert path (SPKI compute /
+  # pin); the doctor never reaches it, so don't gate a read-only conformance
+  # check on a tool it doesn't use.
+  local tools="curl python3"; $DOCTOR || tools="$tools openssl"
+  for t in $tools; do need "$t" || missing+=("$t"); done
   if [ ${#missing[@]} -gt 0 ]; then
     bad "Missing required tool(s): ${missing[*]}"
     case "$(uname -s)" in
@@ -408,7 +448,10 @@ apply_gateway_url_normalization() { # rewrites GW_URL in place; says so when it 
 }
 
 OS="$(uname -s)"   # Linux | Darwin
-STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/conduck"
+# ${HOME:-} so a doctor run in a HOME-less environment (a bare CI shell) doesn't
+# abort here under `set -u` on a path it never uses; the wizard would fail later
+# anyway if it genuinely needed a state dir, which is the correct place to notice.
+STATE_DIR="${XDG_CONFIG_HOME:-${HOME:-}/.config}/conduck"
 
 preflight
 
@@ -2076,13 +2119,21 @@ curl_gw() { # curl_gw <curl args…>
     local b64; b64=$(hex_to_b64 "$GW_CERT_FP")     # pin the QR's fingerprint, not a re-fetch
     [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64")
   fi
+  # Doctor hardening: `-q` (MUST be curl's first arg) ignores ~/.curlrc, so a
+  # stray `proxy`/`output`/redirect line there can neither reroute the request
+  # nor write a file; `--noproxy '*'` refuses ALL proxies, so a $http_proxy in
+  # the environment can't carry the bearer token (in cleartext, for a plain-http
+  # loopback target) to a host the user never named. The doctor's whole promise
+  # is "direct to the server you gave me, nothing else" — enforce it. Scoped to
+  # $DOCTOR so the wizard's shipped behavior is untouched.
+  local pre=() ; $DOCTOR && pre=(-q) && extra+=(--noproxy '*')
   # ${extra[@]+…} guard: expanding an empty array under `set -u` is an error in bash 3.2.
   if [ "$GW_AUTH" = "bearer" ]; then
     local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"   # curl-config quoting
     printf 'header = "Authorization: Bearer %s"\n' "$tok" \
-      | curl -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
+      | curl ${pre[@]+"${pre[@]}"} -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
   else
-    curl -sS --max-time 30 ${extra[@]+"${extra[@]}"} "$@"
+    curl ${pre[@]+"${pre[@]}"} -sS --max-time 30 ${extra[@]+"${extra[@]}"} "$@"
   fi
 }
 
@@ -2091,28 +2142,37 @@ curl_gw() { # curl_gw <curl args…>
 MODELS_CURL_RC=0        # curl exit code (0 = the transfer itself completed)
 MODELS_HTTP_CODE=""     # HTTP status of the reply ("" when the transfer failed)
 MODELS_DATA_EMPTY=false # 200 + canonical envelope, but "data" is [] (valid, yet can't answer)
+MODELS_NO_VALID_ID=false # 200 + non-empty "data", but no entry has a usable string "id"
+MODELS_TIME=""          # curl %{time_total} for the models request (seconds, e.g. "0.123")
 
 models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canonical envelope
                    #   (JSON object with a top-level "data" ARRAY), not the Control-UI HTML.
                    # Return codes: 0 ok · 1 unreachable/rejected/non-JSON · 2 HTML · 3 wrong shape.
-                   # Sets MODELS_CURL_RC / MODELS_HTTP_CODE / MODELS_DATA_EMPTY either way.
-  local out code body
-  MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false
-  out=$(curl_gw -w '\n%{http_code}' "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
-  code="${out##*$'\n'}"; body="${out%$'\n'*}"
-  MODELS_HTTP_CODE="$code"
+                   # Sets MODELS_CURL_RC / MODELS_HTTP_CODE / MODELS_DATA_EMPTY /
+                   # MODELS_NO_VALID_ID / MODELS_TIME either way.
+  local out statusline body
+  MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false; MODELS_TIME=""
+  out=$(curl_gw -w '\n%{http_code} %{time_total}' "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
+  # The -w line is "<code> <seconds>"; the body is everything before that last
+  # newline (the `-w` prefix `\n` guarantees the split even for an empty body).
+  statusline="${out##*$'\n'}"; body="${out%$'\n'*}"
+  MODELS_HTTP_CODE="${statusline%% *}"; MODELS_TIME="${statusline#* }"
   # HTML first: the endpoint-off page often comes back 200, and it deserves its
   # own diagnosis either way.
   case "$body" in *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;; esac
   # Status must be green — a 401/500 JSON error body is a FAILURE, not "answers
   # with JSON" (wrong token was the false-green case).
-  [ "$code" = "200" ] || return 1
+  [ "$MODELS_HTTP_CODE" = "200" ] || return 1
   # Canonical envelope: the app's Test Connection needs a JSON OBJECT whose
   # top-level "data" is an ARRAY. A bare array, a {"models":…} shape, or "data"
   # that isn't a list parses as JSON but fails the app's stricter probe — flag
   # it as its own case (return 3) so verify_all can say so. An EMPTY array is
   # structurally valid (the app calls it "connected — no models yet") but can't
   # answer a chat, so it reports success + the MODELS_DATA_EMPTY warning flag.
+  # A non-empty array whose entries carry no usable string "id" (e.g. [{}], [1],
+  # [{"id":null}]) is the CONTRACT's failure — the app has to name a model, and
+  # can't — so it's flagged MODELS_NO_VALID_ID (the doctor fails on it; the
+  # wizard, which mirrors the app and doesn't inspect ids, returns 0 unchanged).
   # Python is the sole classifier (unparseable → 1): a shell first-byte test
   # would wrongly reject leading whitespace and misfile JSON scalars.
   # parse_constant: NaN/Infinity are REJECTED — python accepts them by default
@@ -2127,11 +2187,16 @@ except Exception:
     sys.exit(1)
 if not (isinstance(d, dict) and isinstance(d.get("data"), list)):
     sys.exit(3)
-sys.exit(4 if not d["data"] else 0)' 2>/dev/null
+data = d["data"]
+if not data:
+    sys.exit(4)
+has_id = any(isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"] for x in data)
+sys.exit(0 if has_id else 5)' 2>/dev/null
   local prc=$?
   case "$prc" in
     0) return 0 ;;
     4) MODELS_DATA_EMPTY=true; return 0 ;;
+    5) MODELS_NO_VALID_ID=true; return 0 ;;
     *) return "$prc" ;;
   esac
 }
@@ -2299,6 +2364,414 @@ except Exception: pass' 2>/dev/null)
   fi
 }
 
+# ------------------------------------------------------------------- doctor --
+#
+# --doctor: a black-box check of an adapter built for Conduck against the
+# rules at conduck.com/setup/adapter/v1/. Built for people whose adapter was
+# written for Conduck — by hand or by an AI coding tool — around Claude Code,
+# an agent framework, anything. It sends a handful of real requests and
+# grades the answers strictly; it never touches configs, saved state, or the
+# QR flow. (It will run against any OpenAI-compatible server, but grading
+# OpenClaw/Hermes with it invites false FAILs — they legitimately do things
+# the adapter rules forbid, e.g. keyless mode.)
+#
+# Why it exists next to verify_all: the wizard's verify step proves the HAPPY
+# path (right token, clean request). The doctor also proves what verify can't
+# without pretending to be an attacker or a sloppy client — that auth is
+# actually ENFORCED (a missing or wrong token must 401; the adapter that
+# forgot its token check passes verify and gets a green QR while sitting wide
+# open with tool access), that an ABSENT "model" field is tolerated, and that
+# unknown request fields are ignored.
+#
+# Deliberately NOT here (they need a harness inside the adapter process, not
+# HTTP probes — they belong in an adapter's own tests): the 285-second
+# cancellation kill, concurrency/queue behaviour, and session or permission
+# internals.
+#
+# Exit code: 0 = every check green, 1 = at least one failed — loop it from a
+# shell while iterating on an adapter.
+
+DOCTOR_CHECKS=0
+DOCTOR_FAILS=0
+d_ok()  { DOCTOR_CHECKS=$((DOCTOR_CHECKS+1)); ok "$@"; }
+d_bad() { DOCTOR_CHECKS=$((DOCTOR_CHECKS+1)); DOCTOR_FAILS=$((DOCTOR_FAILS+1)); bad "$@"; }
+
+# stdin: a response body -> 0 iff it's the contract's OpenAI error shape,
+# {"error": {"message": "<non-empty>", …}}. A bare {"error":{}} is NOT enough —
+# the contract requires a real message. Used by the 401 soft-warn and the
+# --deep image-refusal accept, so both judge "is this a real error body?" the
+# same way.
+doctor_is_openai_error() {
+  python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+e = d.get("error") if isinstance(d, dict) else None
+sys.exit(0 if isinstance(e, dict) and isinstance(e.get("message"), str) and e.get("message") else 1)' 2>/dev/null
+}
+
+# Accept an https URL anywhere, or plain http toward THIS machine only
+# (127.*/localhost/[::1]) — testing on the adapter's own host before HTTPS
+# exposure is exactly the right order, and refusing loopback http would force
+# people to expose first and test second. Echoes the normalized URL (trimmed,
+# trailing slashes stripped, scheme lowercased); rc 1 when unacceptable.
+doctor_accept_url() { # doctor_accept_url <candidate>
+  local reply="$1" low rest hostport host
+  reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
+  while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done
+  [ -n "$reply" ] || return 1
+  low=$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')
+  case "$low" in
+    https://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
+    http://?*) ;;   # maybe-loopback — fall through to the strict host check
+    *) return 1 ;;
+  esac
+  # A prefix glob is NOT enough to prove loopback: "http://127.0.0.1@evil.com"
+  # (curl reads the part before @ as a username and connects to evil.com) and
+  # "http://127.0.0.1.evil.com" (attacker's wildcard DNS) both start with
+  # "http://127." — and would carry the REAL bearer token in cleartext to a
+  # remote host. Parse out the authority and validate it strictly.
+  rest="${low#http://}"; hostport="${rest%%/*}"
+  case "$hostport" in *@*|*' '*) return 1 ;; esac    # userinfo/junk → refuse
+  case "$hostport" in
+    '[::1]'|'[::1]:'*) ;;                            # IPv6 loopback (+ optional port)
+    localhost|localhost:*) ;;
+    127.*) host="${hostport%%:*}"
+           case "$host" in *[!0-9.]*) return 1 ;; esac ;;  # 127.x must be a pure dotted quad
+    *) return 1 ;;
+  esac
+  printf 'http://%s' "${reply#*://}"; return 0
+}
+
+doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stderr)
+  local reply url
+  say "  Where is the server? Its base address, without any /v1 tail (I strip that myself)." >&2
+  say "  Plain http:// is fine toward this machine (127.0.0.1/localhost) — test locally first," >&2
+  say "  expose over HTTPS after." >&2
+  while true; do
+    read -r -p "  URL (e.g. http://127.0.0.1:8080) > " reply || return 1   # EOF: caller dies
+    if url=$(doctor_accept_url "$reply"); then
+      printf '  %s→ testing %s%s\n' "$DIM" "$url" "$RESET" >&2
+      printf '%s' "$url"; return 0
+    fi
+    case "$reply" in
+      [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." >&2 ;;
+      *) warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." >&2 ;;
+    esac
+  done
+}
+
+# The auth-NEGATIVE requests: no Authorization header at all, or a deliberately
+# wrong bearer token. Plain curl on purpose — curl_gw would helpfully inject the
+# REAL token, which is exactly what these two requests must not carry. The wrong
+# token is a fixed harmless literal (nothing secret rides argv).
+doctor_curl_negauth() { # doctor_curl_negauth <none|wrong> <curl args…>
+  local kind="$1"; shift
+  # Same egress isolation as curl_gw's doctor path: `-q` (first arg) ignores
+  # ~/.curlrc so it can't inject a proxy/output-file/header, and `--noproxy '*'`
+  # refuses every proxy — a proxy answering these probes could otherwise forge a
+  # 401 and make the doctor report auth as "enforced" when the server is open.
+  if [ "$kind" = "wrong" ]; then
+    printf 'header = "Authorization: Bearer conduck-doctor-wrong-token"\n' \
+      | curl -q -sS --max-time 30 --noproxy '*' --config - "$@"
+  else
+    curl -q -sS --max-time 30 --noproxy '*' "$@"
+  fi
+}
+
+# Check 1 — GET /v1/models with the REAL token: reachability + the canonical
+# envelope, via the same models_is_json the wizard trusts (the script must never
+# be laxer than the app it green-lights for). rc 1 = transport/status trouble →
+# the caller aborts the remaining checks instead of failing four ways at once.
+doctor_models_check() {
+  local rc=0 why="" secs over
+  models_is_json "$GW_URL" || rc=$?
+  # curl's own %{time_total} — the real wire time, with no python-spawn overhead
+  # polluting it (formatted to 1 decimal; awk tolerates an odd value).
+  secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
+  over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
+  if [ "$rc" = "0" ]; then
+    if $MODELS_DATA_EMPTY; then
+      d_bad "GET /v1/models — canonical envelope, but \"data\" is EMPTY"
+      say   '    (the contract requires at least one {"id": …} entry — the app has to offer a model)'
+    elif $MODELS_NO_VALID_ID; then
+      d_bad "GET /v1/models — \"data\" has entries, but none carry a usable \"id\" string"
+      say   '    (each entry must be {"id": "<model-name>"} with a non-empty string — the app names a'
+      say   '     model from this list; an entry with no id can'\''t be selected)'
+    elif [ "$over" = "1" ]; then
+      # A models answer past 15s is a hard FAIL, not a warning: the app's Test
+      # Connection gives up at 15s, so this gateway simply won't connect.
+      d_bad "GET /v1/models — answered, but took ${secs}s (over the 15s limit)"
+      say   "    (the app's Test Connection gives up after 15s — answer from cache, never cold-start"
+      say   "     or lazy-load a model on this route)"
+    else
+      d_ok "GET /v1/models — canonical envelope (${secs}s)"
+    fi
+    return 0
+  elif [ "$rc" = "2" ]; then
+    d_bad "GET /v1/models — returned an HTML page instead of JSON (HTTP ${MODELS_HTTP_CODE:-?})"
+    say   "    (something else answered — a reverse proxy, a login/access page, or a wrong base address)"
+    return 1
+  elif [ "$rc" = "3" ]; then
+    d_bad "GET /v1/models — answers, but not the canonical envelope"
+    say   '    (must be a JSON OBJECT whose top-level "data" is an ARRAY of {"id": …} — not a bare'
+    say   '     array, not {"models": …}. This is the app'\''s Test Connection rule, applied verbatim.)'
+    return 1
+  fi
+  if [ "$MODELS_CURL_RC" != "0" ]; then
+    case "$MODELS_CURL_RC" in
+      6)  why="DNS lookup failed — that hostname doesn't resolve" ;;
+      7)  why="connection refused — nothing is listening there (wrong port? not started?)" ;;
+      28) why="timed out — no answer from the host" ;;
+      35) why="TLS problem — the HTTPS front rejected the connection" ;;
+      60) why="TLS problem — this machine doesn't trust the server's certificate (self-signed? run me ON the server against http://127.0.0.1:<port> instead)" ;;
+      *)  why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
+    esac
+  else
+    case "$MODELS_HTTP_CODE" in
+      401|403) why="HTTP $MODELS_HTTP_CODE with the token you gave me — the server rejected it (typo? or an access layer in front wants its own login)" ;;
+      404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
+      5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
+      200)     why="answered 200, but the body isn't strict JSON (NaN/Infinity also count as not-JSON — Conduck's decoder refuses them)" ;;
+      *)       why="HTTP $MODELS_HTTP_CODE" ;;
+    esac
+  fi
+  d_bad "GET /v1/models — $why"
+  return 1
+}
+
+# One route's auth-enforcement pair: a no-token request AND a wrong-token
+# request must EACH answer 401. `$@` is the curl args that address the route
+# (URL for a GET; URL + `-H Content-Type` + `-d body` for the chat POST). The
+# real token never rides these — doctor_curl_negauth sends none, or the fixed
+# harmless wrong literal.
+doctor_auth_route() { # doctor_auth_route <route-label> <curl-args…>
+  local route="$1"; shift
+  local out rc code body
+  out=$(doctor_curl_negauth none -w '\n%{http_code}' "$@" 2>/dev/null); rc=$?
+  code="${out##*$'\n'}"; body="${out%$'\n'*}"
+  if [ "$rc" != "0" ] || [ -z "$code" ] || [ "$code" = "000" ]; then
+    d_bad "auth ($route): WITHOUT a token — no answer (the with-token request worked, so this looks like per-request trouble)"
+  elif [ "$code" = "401" ]; then
+    d_ok "auth ($route): WITHOUT a token → 401 (enforced)"
+    # Soft check only — the status is the load-bearing part; the body shape
+    # decides how nice the app's error message can be, not whether auth holds.
+    if ! printf '%s' "$body" | doctor_is_openai_error; then
+      warn "  …its 401 body isn't the OpenAI error shape — send {\"error\": {\"message\": …, \"type\": …}} so the app can show a real message."
+    fi
+  elif [ "$code" = "200" ]; then
+    d_bad "auth ($route): WITHOUT a token → 200 — the server did the work anyway"
+    say   "    (this is the dangerous one: anyone who can reach this address can drive your AI and"
+    say   "     its tools. Check the Authorization header BEFORE doing anything else, on every route.)"
+  else
+    d_bad "auth ($route): WITHOUT a token → HTTP $code (the contract pins exactly 401)"
+  fi
+  code=$(doctor_curl_negauth wrong -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || code=""
+  case "$code" in
+    401) d_ok "auth ($route): WRONG token → 401 (enforced)" ;;
+    200) d_bad "auth ($route): WRONG token → 200 — the token isn't actually compared"
+         say  "    (compare byte-for-byte against the token you issued — e.g. hmac.compare_digest in Python)" ;;
+    ""|000) d_bad "auth ($route): WRONG token — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
+    *)   d_bad "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)" ;;
+  esac
+}
+
+# Auth must be ENFORCED, not merely accepted — on EVERY route the app calls.
+# Testing only /v1/models would green-light a server that gates its model list
+# but leaves the tool-running /v1/chat/completions wide open: the exact hole
+# this check exists to catch. So both routes are probed. The chat probe carries
+# a minimal body (auth is meant to reject BEFORE the body is read); if a
+# vulnerable server instead RUNS the agent on the unauthenticated request, the
+# probe still fails — either 200 (caught) or a >30s timeout reported as a
+# failure (fail-safe, never a green pass).
+doctor_auth_checks() {
+  if [ "$GW_AUTH" != "bearer" ]; then
+    d_bad "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
+    say   "    (the contract requires a bearer token on EVERY route — a keyless adapter that can run"
+    say   "     tools is wide open to whoever can reach it. Add a token check, then re-run me.)"
+    return 0
+  fi
+  doctor_auth_route "/v1/models" "$GW_URL/v1/models"
+  doctor_auth_route "/v1/chat/completions" "$GW_URL/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
+}
+
+# Check 4 (and --deep's check 5) — one real chat turn, graded against the
+# contract's response rules (strict JSON, exactly one choice, non-empty STRING
+# content, no tool_calls, no SSE). This is STRICTER than today's app decoder,
+# which reads choices[0].message.content leniently — deliberately: the contract
+# is the forward promise an adapter must meet, so the doctor holds that bar.
+# Never prints the reply's CONTENT (only its length): the doctor may be run
+# against a live personal agent, and this script never logs message content.
+doctor_chat_check() { # doctor_chat_check <label> <payload-json> [mode:image]
+  local label="$1" payload="$2" mode="${3:-}"
+  local out curl_rc tail_ code timing resp res verdict detail
+  out=$(curl_gw -w '\n%{http_code} %{time_total}' "$GW_URL/v1/chat/completions" --max-time 300 \
+        -H "Content-Type: application/json" -d "$payload" 2>/dev/null); curl_rc=$?
+  tail_="${out##*$'\n'}"; resp="${out%$'\n'*}"
+  code="${tail_%% *}"; timing="${tail_#* }"
+  timing=$(printf '%s' "$timing" | awk '{printf "%.1f", $1}' 2>/dev/null)
+  if [ "$curl_rc" != "0" ]; then
+    d_bad "$label — transfer failed (timed out or the connection dropped)"
+    return 1
+  fi
+  # SSE despite stream:false is its own diagnosis — a JSON parse error would
+  # bury the actual mistake.
+  case "$resp" in data:*)
+    d_bad "$label — the server STREAMED the reply despite \"stream\": false"
+    say   "    (when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)"
+    return 1 ;;
+  esac
+  if [ "$code" != "200" ]; then
+    # Image probe (--deep): the contract EXPLICITLY allows a text-only adapter to
+    # decline an image with HTTP 400 + an OpenAI error body ("image-unsupported")
+    # instead of answering. That's a PASS, not a failure — the forbidden move is
+    # silently pretending no image was there, which a black-box probe can't see.
+    # ONLY a real 400 counts: a 401/429/503 here is an auth/overload problem, not
+    # an image-capability answer, so it must still fail like any other non-200.
+    if [ "$mode" = "image" ] && [ "$code" = "400" ] \
+       && printf '%s' "$resp" | doctor_is_openai_error; then
+      d_ok "$label — declined the image with HTTP 400 + an error body (honest refusal, allowed)"
+      return 0
+    fi
+    d_bad "$label — HTTP ${code:-?}"
+    case "$code" in
+      4??) say "    (a 4xx here usually means the request body was rejected — the contract requires"
+           say "     tolerating an ABSENT \"model\" field (pick your own default) and IGNORING unknown fields)" ;;
+      5??) say "    (the server errored — its own logs have the real story)" ;;
+    esac
+    return 1
+  fi
+  # Strict parse (parse_constant: NaN/Infinity refused, matching the app's
+  # decoder) + the contract's one-choice / non-empty-string rules on top.
+  res=$(printf '%s' "$resp" | python3 -c '
+import json, sys
+def bad(x): raise ValueError(x)
+try:
+    d = json.load(sys.stdin, parse_constant=bad)
+except Exception:
+    print("badjson -"); sys.exit(0)
+ch = d.get("choices") if isinstance(d, dict) else None
+if not isinstance(ch, list) or not ch:
+    print("nochoices -"); sys.exit(0)
+if len(ch) != 1:
+    print("manychoices %d" % len(ch)); sys.exit(0)
+msg = ch[0].get("message") if isinstance(ch[0], dict) else None
+if not isinstance(msg, dict):
+    print("nochoices -"); sys.exit(0)
+if msg.get("tool_calls"):
+    print("toolcalls -"); sys.exit(0)
+c = msg.get("content")
+if not isinstance(c, str):
+    print("notstring -"); sys.exit(0)
+if not c:
+    print("empty -"); sys.exit(0)
+print("ok %d" % len(c))' 2>/dev/null)
+  verdict="${res%% *}"; detail="${res#* }"
+  case "$verdict" in
+    ok)         d_ok "$label — one choice, non-empty string content ($detail chars, ${timing:-?}s)"; return 0 ;;
+    badjson)    d_bad "$label — HTTP 200, but the body isn't strict JSON"
+                say   "    (one complete JSON object; NaN/Infinity are refused by Conduck's decoder)" ;;
+    nochoices)  d_bad "$label — no usable \"choices\" array"
+                say   '    (the reply must carry choices[0].message.content — see the contract'\''s response shape)' ;;
+    manychoices) d_bad "$label — $detail choices in the reply (the contract pins exactly ONE)" ;;
+    toolcalls)  d_bad "$label — the reply carries tool_calls"
+                say   "    (never return tool_calls to Conduck — run your tools SERVER-side and answer with the final text)" ;;
+    notstring)  d_bad "$label — \"content\" isn't a plain string"
+                say   "    (in the RESPONSE, content must be a non-empty STRING — null or parts-form content is refused)" ;;
+    empty)      d_bad "$label — \"content\" is an empty string" ;;
+    *)          d_bad "$label — could not grade the reply" ;;
+  esac
+  return 1
+}
+
+run_doctor() {
+  say "${BOLD}conduck-connect $VERSION — doctor${RESET}"
+  say "Checks whether an adapter built for Conduck follows the rules at"
+  say "${BOLD}conduck.com/setup/adapter/v1/${RESET} — a handful of real requests. Changes NOTHING."
+  note "Building your own adapter? Loop me from a shell — exit code 0 means every check passed."
+
+  # Target: the positional URL if one was given, else ask.
+  if [ -n "$DOCTOR_URL" ]; then
+    GW_URL=$(doctor_accept_url "$DOCTOR_URL") \
+      || die "Can't test '$DOCTOR_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+  else
+    say ""
+    GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
+  fi
+  apply_gateway_url_normalization
+
+  # Token: $CONDUCK_TOKEN (scripted re-runs) or a hidden prompt. Never argv.
+  if [ -n "${CONDUCK_TOKEN:-}" ]; then
+    GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
+    note "Using the bearer token from \$CONDUCK_TOKEN."
+  else
+    say ""
+    note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
+    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter if it has none)")
+    if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
+  fi
+  # Plain TLS validation; the doctor has no pairing profile to pin from. For a
+  # self-signed cert, run it on the server itself against http://127.0.0.1.
+  TRANSPORT=""; GW_CERT_FP=""
+
+  head_ "Doctor — $GW_URL"
+
+  if ! doctor_models_check; then
+    say ""
+    bad "Doctor verdict: FAIL — /v1/models isn't answering correctly, so I stopped here."
+    say "  Fix that first (every other check would only fail the same way), then re-run me."
+    say "  The contract, with a copy-paste self-test: ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+    exit 1
+  fi
+
+  doctor_auth_checks
+
+  say ""
+  say "  Now one real chat turn — deliberately WITHOUT a \"model\" field, WITH an unknown extra"
+  say "  field, and \"stream\": false. The contract requires all three to be tolerated. Agents"
+  say "  can be slow; I wait up to 5 minutes…"
+  local payload
+  payload=$(python3 -c 'import json
+print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+                  "stream": False, "conduck_doctor_probe": True}))') \
+    || die "Could not build the test request (python3 failed)."
+  doctor_chat_check "chat: absent model + unknown field + stream:false" "$payload" || true
+
+  if $DOCTOR_DEEP; then
+    say ""
+    say "  --deep: the same turn again, but the content arrives as PARTS (text + a tiny image) —"
+    say "  the shape Conduck sends when a photo rides along. A conforming server either answers"
+    say "  200, OR declines with HTTP 400 + an image-unsupported error — both pass. (A server that"
+    say "  silently drops the image and answers anyway is forbidden by the contract, but a black-box"
+    say "  probe can't tell that apart from a real answer — so this checks TOLERANCE, not honesty.)"
+    payload=$(python3 -c 'import json, zlib, struct, base64
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00\xff")) + chunk(b"IEND", b"")
+uri = "data:image/png;base64," + base64.b64encode(png).decode()
+print(json.dumps({"messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Reply with exactly: pong"},
+    {"type": "image_url", "image_url": {"url": uri}}]}], "stream": False}))') \
+      || die "Could not build the image test request (python3 failed)."
+    doctor_chat_check "chat (--deep): parts-form content with an image" "$payload" image || true
+  fi
+
+  say ""
+  if [ "$DOCTOR_FAILS" = "0" ]; then
+    ok "Doctor verdict: PASS — $DOCTOR_CHECKS/$DOCTOR_CHECKS checks green. This adapter follows Conduck's rules."
+    case "$GW_URL" in
+      http://*) say "  Next: expose it over HTTPS and pair — run me again without --doctor." ;;
+      *)        say "  Next: pair it — run me again without --doctor (or scan an existing code)." ;;
+    esac
+    exit 0
+  fi
+  bad "Doctor verdict: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."
+  say "  Every rule above, with a copy-paste self-test:  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+  exit 1
+}
+
 # -------------------------------------------------------------- pairing emit --
 
 # Write a NON-SECRET pairing profile so a later `--show-qr` can re-emit without
@@ -2362,6 +2835,15 @@ emit_payload() {
     cleanup_exposures
     warn "Some checks failed above — fix those first, then re-run me."
     warn "I only hand you a setup code that is known to work."
+    # Custom targets only: the doctor is for adapters written for Conduck, and
+    # pointing OpenClaw/Hermes users at it would hand them false FAILs.
+    if [ "$GW_KIND" = "custom" ]; then
+      local dt="$GW_URL"
+      [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
+      say ""
+      say "  If this adapter was built for Conduck, run:  ${BOLD}bash conduck-connect.sh --doctor $dt${RESET}"
+      say "  That checks it directly, so you can tell an adapter problem from a connection problem."
+    fi
     exit 1
   fi
 
@@ -2413,7 +2895,13 @@ PY
     tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, or Mac) needs the Tailscale app, logged in to the same tailnet." ;;
     selfsigned) note "Your gateway uses its own certificate; a secure fingerprint of it travels inside the code, so the app trusts it automatically — nothing for you to copy." ;;
   esac
-  say "  Re-run this script any time to re-verify or show the code again."
+  say "  Run this script again any time to check the connection or show the code again."
+  # Custom targets only (see the matching gate in emit_payload's failure branch).
+  if [ "$GW_KIND" = "custom" ]; then
+    local dt="$GW_URL"
+    [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
+    say "  If this adapter was built for Conduck, check it directly with:  ${BOLD}bash conduck-connect.sh --doctor $dt${RESET}"
+  fi
   if $FS_ROLLBACK_INCOMPLETE; then
     say ""
     warn "One thing still needs YOUR attention: a file-server exposure this run created"
@@ -3874,6 +4362,14 @@ run_show_qr() {
 }
 
 # ----------------------------------------------------------------------- main --
+
+# --doctor: conformance fast path — its own banner, its own exit; no wizard.
+if $DOCTOR; then
+  run_doctor
+  # run_doctor exits on every path; if a refactor ever makes it RETURN, the
+  # doctor must neither fall into the wizard nor read as a pass — so fail.
+  exit 1
+fi
 
 say "${BOLD}conduck-connect $VERSION${RESET} — pair your self-hosted AI gateway with Conduck."
 $DRY_RUN && note "(dry-run: nothing will be changed)"
