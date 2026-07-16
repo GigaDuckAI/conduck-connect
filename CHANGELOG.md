@@ -2,6 +2,16 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.8.0] — a doctor for adapters you built yourself
+
+New `--doctor` mode: a read-only check-up for adapters built for Conduck, graded against the rules at [conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/). No breaking changes — pairing codes, flags, and profiles from 0.7.0 keep working.
+
+### Added
+
+- **`--doctor [url]`.** Run it on the machine where your adapter listens and it sends a handful of real requests, grades the answers strictly, and names the first thing to fix — changing nothing anywhere. It proves what the wizard's verify step can't: that your token check is actually **enforced** — a missing token and a wrong token must each get `401`, on `/v1/models` *and* `/v1/chat/completions` (an adapter that forgot its token check passes normal verification while sitting wide open). Also graded: the `/v1/models` answer shape (with at least one usable model `id`, inside the app's 15-second patience), and one real chat turn sent the way Conduck sends it — no `model` field, an unknown extra field, `"stream": false` — whose reply must be strict JSON with exactly one choice and plain-text content. Exit code `0` means every check passed; loop it from a build script while you iterate. Plain `http://` is accepted toward `127.0.0.1`/`localhost` only, so you can test before exposing; the token comes from `$CONDUCK_TOKEN` or a hidden prompt, never the command line, and the doctor's requests ignore proxies and curl config files so they go only to the address you gave it.
+- **`--deep`.** With `--doctor`: one more chat turn with an image riding along, the shape Conduck sends when a photo is attached. Answering it works; declining it honestly with HTTP `400` and a clear error also passes.
+- **Pointers where you'd look for them.** When verification of a custom (`--generic`) target fails — and once at the end of a successful custom pairing — the wizard prints the exact `--doctor` command for your adapter, so you can tell an adapter problem from a connection problem. Other gateway kinds see nothing new.
+
 ## [0.7.0] — press `?` when unsure, and quieter sharp edges
 
 Every decision prompt now explains itself in plain words on request, and a cross-surface audit (checked against current Tailscale, Cloudflare, OpenClaw, Hermes, and rclone documentation) landed a batch of correctness fixes. No breaking changes — pairing codes, flags, and profiles from 0.6.0 keep working.

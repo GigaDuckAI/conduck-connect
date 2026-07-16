@@ -14,6 +14,7 @@ class H(http.server.BaseHTTPRequestHandler):
         cases = {
             "/ok/v1/models":     (200, "application/json", '{"object":"list","data":[{"id":"m","object":"model"}]}'),
             "/empty/v1/models":  (200, "application/json", '{"object":"list","data":[]}'),
+            "/noid/v1/models":   (200, "application/json", '{"object":"list","data":[{"object":"model"}]}'),
             "/bare/v1/models":   (200, "application/json", '["m1","m2"]'),
             "/models/v1/models": (200, "application/json", '{"models":[{"id":"m"}]}'),
             "/html/v1/models":   (200, "text/html", "<!DOCTYPE html><html><body>control ui</body></html>"),
@@ -39,6 +40,10 @@ fn_curl=$(sed -n '/^curl_gw()/,/^}/p' "$SCRIPT")
 fn_probe=$(sed -n '/^models_is_json()/,/^}/p' "$SCRIPT")
 eval "$fn_curl"; eval "$fn_probe"
 MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false
+MODELS_NO_VALID_ID=false
+# MODELS_TIME/DOCTOR are read only inside the eval'd functions — export keeps
+# the unused-variable lint quiet (same pattern as the TRANSPORT line below).
+export MODELS_TIME="" DOCTOR=false
 # Consumed by the eval'd curl_gw / models_is_json (export: they read, we set).
 export TRANSPORT="public" GW_AUTH="none" GW_TOKEN="" GW_CERT_FP=""
 
@@ -58,6 +63,13 @@ probe() { # probe <label> <url> <want_rc> <want_empty> <want_http-or-'-'> <want_
 B="http://127.0.0.1:8971"
 probe canonical      "$B/ok"     0 false 200 0
 probe empty-list     "$B/empty"  0 true  200 0
+# Structurally valid but no entry carries a usable string id — rc stays 0, the
+# MODELS_NO_VALID_ID diagnostic global is the signal (--doctor fails on it).
+probe no-valid-id    "$B/noid"   0 false 200 0
+if [ "$MODELS_NO_VALID_ID" != "true" ]; then
+  printf 'FAIL no-valid-id    MODELS_NO_VALID_ID=%s (want true)\n' "$MODELS_NO_VALID_ID"; fail=1
+fi
+MODELS_NO_VALID_ID=false
 probe bare-array     "$B/bare"   3 false 200 0
 probe models-shape   "$B/models" 3 false 200 0
 probe html-page      "$B/html"   2 false 200 0
