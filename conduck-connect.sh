@@ -27,7 +27,11 @@
 #   3. Helps you expose the gateway over HTTPS (works WITH what you have installed:
 #      Tailscale, Cloudflare Tunnel, your own reverse proxy, or a self-signed cert).
 #   4. Optionally sets up the agent file lane (rclone WebDAV) so Conduck can hand
-#      your agent real files and download its outputs.
+#      your agent real files and download its outputs. On OpenClaw it also checks
+#      the gateway's TOOL POLICY (a policy denying read/write breaks attachments
+#      agent-side even when every transport test is green) and installs a short
+#      agent-guidance block in the workspace TOOLS.md (how to open attachments,
+#      how to return files) — both shown first, both optional.
 #   5. Verifies everything end-to-end with real requests.
 #   6. Prints a QR code you scan with the Conduck app — URL, token, and file-lane
 #      credentials imported in one scan — nothing to retype on your phone
@@ -84,7 +88,7 @@
 
 set -u -o pipefail
 
-VERSION="0.8.0"
+VERSION="0.9.0"
 PAYLOAD_VERSION=1
 
 # ---------------------------------------------------------------- utilities --
@@ -1937,6 +1941,412 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
   fi
 }
 
+# --- OpenClaw agent-side readiness (tool policy + TOOLS.md guidance) ----------
+# A green file-lane test proves only that Conduck can STORE bytes — never that
+# the AGENT may read or return them. Four gateway-side traps break attachments
+# silently even with every transport check green (all verified live, July 2026):
+#   1. tools.deny containing group:fs (a common hardening move) — the agent
+#      can't open a single uploaded file;
+#   2. the pdf tool isn't in the "coding" profile — PDFs get read as raw bytes
+#      and answered with plausible nonsense;
+#   3. output files need `write` — without it there are no download chips;
+#   4. MEDIA:-style reply directives are STRIPPED on the OpenAI-compatible
+#      endpoint — the agent "sends" a file that never arrives.
+# 1-3 are config → openclaw_tool_policy_step checks and offers the exact fix.
+# 4 is agent behavior → install_conduck_tools_block teaches it (TOOLS.md),
+# scoped to Conduck turns so messaging channels (where MEDIA: is correct) are
+# untouched. Neither is detectable app-side (the app deliberately has no
+# capability probe), which is why the wizard is where this lives.
+
+# Read tools.{profile,allow,alsoAllow,deny} from openclaw.json (JSON5-tolerant)
+# and print a machine-readable verdict:
+#   status<TAB><ok|none|fix|manual|unreadable><TAB><reason>
+#   change<TAB><key>: <before> → <after>          (fix only, one per key)
+#   cmd<TAB><manual `openclaw config set …` line>  (fix only, one per key)
+#   ops<TAB><config set --batch-json payload>      (fix only)
+# Encodes only DOC-VERIFIED semantics (docs.openclaw.ai, July 2026): deny wins;
+# group:fs = read/write/edit/apply_patch; allow and alsoAllow are mutually
+# exclusive per scope; pdf is absent from the coding profile. The fix is the
+# MINIMUM relaxation: read/write (+pdf) on, edit/apply_patch/exec untouched —
+# group:fs in deny is REPLACED by its mutating members, never just dropped.
+openclaw_tools_analysis() { # openclaw_tools_analysis <config-path>
+  python3 - "$1" <<'PY'
+import json, sys, fnmatch
+
+def strip_json5(s):
+    # Same comment/trailing-comma stripper as json_query (keep in lockstep).
+    out = []; i = 0; n = len(s); q = ''
+    while i < n:
+        c = s[i]
+        if q:
+            out.append(c)
+            if c == '\\' and i + 1 < n:
+                out.append(s[i+1]); i += 2; continue
+            if c == q: q = ''
+            i += 1; continue
+        if c == '"' or c == "'":
+            q = c; out.append(c); i += 1; continue
+        if c == '/' and i + 1 < n and s[i+1] == '/':
+            i += 2
+            while i < n and s[i] != '\n': i += 1
+            continue
+        if c == '/' and i + 1 < n and s[i+1] == '*':
+            i += 2
+            while i + 1 < n and not (s[i] == '*' and s[i+1] == '/'): i += 1
+            i += 2; continue
+        out.append(c); i += 1
+    t = ''.join(out)
+    res = []; i = 0; n = len(t); q = ''
+    while i < n:
+        c = t[i]
+        if q:
+            res.append(c)
+            if c == '\\' and i + 1 < n:
+                res.append(t[i+1]); i += 2; continue
+            if c == q: q = ''
+            i += 1; continue
+        if c == '"' or c == "'":
+            q = c; res.append(c); i += 1; continue
+        if c == ',':
+            j = i + 1
+            while j < n and t[j] in ' \t\r\n': j += 1
+            if j < n and t[j] in '}]':
+                i += 1; continue
+        res.append(c); i += 1
+    return ''.join(res)
+
+def emit(tag, *fields):
+    print(tag + "\t" + "\t".join(fields))
+
+try:
+    cfg = json.loads(strip_json5(open(sys.argv[1]).read()))
+    if not isinstance(cfg, dict):
+        raise ValueError("not an object")
+except Exception:
+    emit("status", "unreadable", "the config did not parse (JSON5 read attempted)")
+    sys.exit(0)
+
+tools = cfg.get("tools")
+if not isinstance(tools, dict):
+    emit("status", "none",
+         "no tools block in openclaw.json — the default policy leaves the agent's file tools on")
+    sys.exit(0)
+
+def arr(key):
+    v = tools.get(key)
+    if isinstance(v, list):
+        return [x for x in v if isinstance(x, str)]
+    return None
+
+profile = tools.get("profile") if isinstance(tools.get("profile"), str) else None
+allow, also, deny = arr("allow"), arr("alsoAllow"), arr("deny")
+targets = ("read", "write", "pdf")
+
+# An invalid config (both allow + alsoAllow) must never be auto-edited into a
+# different invalid config — surface it instead.
+if allow is not None and also is not None:
+    emit("status", "manual",
+         "tools.allow and tools.alsoAllow are BOTH set — OpenClaw's config validation "
+         "rejects that combination; reconcile the two by hand first")
+    sys.exit(0)
+
+# A wildcard deny (e.g. "wri*", "*") that matches a file tool is a deliberate,
+# broad operator choice — flag it for the human, never auto-rewrite it.
+wild = [e for e in (deny or [])
+        if any(ch in e for ch in "*?[")
+        and (any(fnmatch.fnmatchcase(t, e.lower()) for t in targets)
+             or fnmatch.fnmatchcase("group:fs", e.lower()))]
+if wild:
+    emit("status", "manual",
+         "tools.deny has wildcard entries (%s) matching the agent's file tools — too "
+         "broad for an automatic fix; edit tools.deny by hand so read/write are not matched"
+         % ", ".join(wild))
+    sys.exit(0)
+
+changes = {}   # key -> (before-or-None, after)
+
+if deny and any(e in ("group:fs", "read", "write") for e in deny):
+    new_deny = []
+    for e in deny:
+        if e == "group:fs":
+            # Replace with its MUTATING members: read/write freed, the rest of
+            # the group's denial preserved.
+            for m in ("edit", "apply_patch"):
+                if m not in deny and m not in new_deny:
+                    new_deny.append(m)
+        elif e in ("read", "write"):
+            continue
+        else:
+            new_deny.append(e)
+    changes["tools.deny"] = (deny, new_deny)
+
+if allow is not None:
+    # A non-empty allowlist blocks everything omitted; group:fs inside it
+    # already covers read/write. (alsoAllow is invalid alongside allow, so the
+    # additions go HERE.)
+    missing = [t for t in targets
+               if t not in allow and not ("group:fs" in allow and t in ("read", "write"))]
+    if missing:
+        changes["tools.allow"] = (allow, allow + missing)
+else:
+    ensure = ["pdf"]                      # not in the coding profile
+    if profile in ("minimal", "messaging"):
+        ensure = ["read", "write", "pdf"]  # base profile may lack fs entirely
+    elif profile == "full":
+        ensure = []                        # full already includes everything
+    base = also or []
+    add = [t for t in ensure if t not in base]
+    if add:
+        changes["tools.alsoAllow"] = (also, base + add)
+
+if not changes:
+    detail = "profile: %s" % profile if profile else "no profile set"
+    emit("status", "ok", "read/write allowed, pdf on (%s)" % detail)
+    sys.exit(0)
+
+bits = []
+if "tools.deny" in changes:
+    bits.append("tools.deny blocks the agent's read/write file tools")
+if "tools.allow" in changes:
+    bits.append("tools.allow omits " + ", ".join(
+        t for t in targets if t in changes["tools.allow"][1] and t not in changes["tools.allow"][0]))
+if "tools.alsoAllow" in changes:
+    bits.append("the active profile lacks " + ", ".join(
+        t for t in changes["tools.alsoAllow"][1]
+        if t not in (changes["tools.alsoAllow"][0] or [])))
+emit("status", "fix", "; ".join(bits))
+
+ops = []
+for key, (before, after) in changes.items():
+    emit("change", "%s: %s → %s" % (
+        key, json.dumps(before) if before is not None else "(absent)", json.dumps(after)))
+    emit("cmd", "openclaw config set %s '%s' --strict-json" % (key, json.dumps(after)))
+    ops.append({"path": key, "value": after})
+emit("ops", json.dumps(ops))
+PY
+}
+
+# Check OpenClaw's tool policy for the file lane; offer the exact fix through
+# the same config-set + restart machinery as the Step-2 endpoint enable.
+# Returns 0 = lane proceeds, 1 = user chose to drop the lane. Declining the FIX
+# never silently drops the lane (consent-ladder idiom: warn loudly, explicit
+# confirm to continue — byte transport still works, only agent-side use is
+# broken until the policy allows it).
+openclaw_tool_policy_step() {
+  local cfg="$HOME/.openclaw/openclaw.json"
+  [ -f "$cfg" ] || return 0
+
+  local tab status="" reason="" ops="" line body
+  tab=$(printf '\t')
+  local changes=() cmds=()
+  while IFS= read -r line; do
+    case "$line" in
+      "status$tab"*) body="${line#status$tab}"; status="${body%%$tab*}"; reason="${body#*$tab}" ;;
+      "change$tab"*) changes+=("${line#change$tab}") ;;
+      "cmd$tab"*)    cmds+=("${line#cmd$tab}") ;;
+      "ops$tab"*)    ops="${line#ops$tab}" ;;
+    esac
+  done < <(openclaw_tools_analysis "$cfg")
+
+  say ""
+  say "  ${BOLD}Agent tool policy${RESET} — can the agent actually USE the files this lane carries?"
+  note "A green file-lane test proves Conduck can store bytes; OpenClaw's tool policy"
+  note "decides whether the AGENT may read uploads and write output files back."
+
+  case "$status" in
+    ok)
+      ok "Tool policy is file-transfer-ready ($reason)."
+      return 0 ;;
+    none)
+      ok "$reason."
+      return 0 ;;
+    unreadable|"")
+      warn "Could not read the tool policy ($reason) — continuing, but if attachments later"
+      warn "fail agent-side, check tools.deny / tools.allow in openclaw.json by hand."
+      return 0 ;;
+  esac
+
+  # status = fix | manual — the policy would break agent file transfer.
+  warn "This tool policy would break agent file transfer:"
+  say  "    $reason"
+  local applied=false
+  if [ "$status" = "fix" ]; then
+    say ""
+    say "  The fix — ONLY these keys change; edit, apply_patch, exec and everything"
+    say "  else keep their current policy:"
+    local c; for c in "${changes[@]}"; do say "    ${BOLD}$c${RESET}"; done
+    say "  Plain words: this lets the agent READ the files Conduck uploads and WRITE"
+    say "  output files back (that is what download chips are). 'write' also means it"
+    say "  can overwrite files inside its own workspace — inherent to the capability."
+    if $REUSE_ONLY; then
+      warn "(reuse-only: not offering the change — re-run without --reuse-only to apply it)"
+    else
+      local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
+      if [ -f "$compose_dir/docker-compose.yml" ] || [ -f "$compose_dir/compose.yaml" ]; then
+        if run_step "allow the agent's file tools in OpenClaw's tool policy" \
+          docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
+            dist/index.js config set --batch-json "$ops"; then
+          run_step "restart the gateway so the policy applies" \
+            docker compose --project-directory "$compose_dir" restart openclaw-gateway || true
+          applied=true
+        fi
+      else
+        local joined=""; local m
+        for m in "${cmds[@]}"; do joined="${joined:+$joined && }$m"; done
+        if print_and_wait "Not the standard Docker setup — apply the policy change with your install's CLI, then restart the gateway." \
+          "$joined"; then applied=true; fi
+      fi
+    fi
+    if $applied && ! $DRY_RUN; then
+      # Re-read rather than trust: config set can no-op silently (wrong CLI,
+      # wrong file) and verification below never exercises agent tools.
+      # awk -F'\t', not sed \t — BSD sed treats \t as a literal 't'.
+      local recheck; recheck=$(openclaw_tools_analysis "$cfg" | awk -F '\t' '$1=="status"{print $2; exit}')
+      if [ "$recheck" = "ok" ]; then
+        ok "Tool policy re-checked — now file-transfer-ready."
+        return 0
+      fi
+      warn "The policy still doesn't look file-transfer-ready after the change — re-check"
+      warn "tools.deny / tools.allow in openclaw.json by hand."
+    elif $applied; then
+      return 0   # dry-run: planned, nothing to re-check
+    fi
+  fi
+
+  # Declined / manual / unproven: loud consequence + explicit choice, and the
+  # informed "keep it" wins over silently stripping a capability the user chose.
+  warn "Without read+write, attachments will upload fine but the agent cannot OPEN"
+  warn "them, and it cannot produce files for you to download."
+  if $DRY_RUN || $REUSE_ONLY; then
+    note "(keeping the file lane in this read-only pass; a real run asks)"
+    return 0
+  fi
+  if confirm "  Keep the file lane anyway (fix the policy later, then re-run me)?"; then
+    return 0
+  fi
+  return 1
+}
+
+# Install/refresh a marker-delimited Conduck guidance block in the agent
+# workspace's TOOLS.md (OpenClaw reads workspace bootstrap files into every NEW
+# session's context). Idempotent: one block, replaced in place between its
+# markers on re-runs; the rest of the file is never touched. Scoped to Conduck
+# turns via the app's "[Conduck file transfer]" wire tag so the same agent's
+# messaging channels (where MEDIA: is the correct way to send a file) keep
+# their behavior.
+install_conduck_tools_block() { # install_conduck_tools_block <workspace-host-path>
+  local ws="$1"
+  if [ -z "$ws" ]; then
+    note "Workspace folder unknown (pre-existing file server) — skipping the agent-guidance"
+    note "block; the same guidance lives in the README's file-lane troubleshooting."
+    return 0
+  fi
+  local target="$ws/TOOLS.md"
+
+  # The path the AGENT sees: the standard Docker install mounts the host
+  # workspace at /home/node/.openclaw/workspace — the media/pdf absolute-path
+  # hint must name the CONTAINER path there, not the host one. A non-default
+  # workspace under Docker has an unknown mapping → generic wording only.
+  local agent_ws="$ws"
+  local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
+  if [ -f "$compose_dir/docker-compose.yml" ] || [ -f "$compose_dir/compose.yaml" ]; then
+    if [ "$ws" = "$HOME/.openclaw/workspace" ]; then
+      agent_ws="/home/node/.openclaw/workspace"
+    else
+      agent_ws=""
+    fi
+  fi
+
+  if $DRY_RUN; then
+    plan_add "INSTALL/refresh the Conduck agent-guidance block in $target (marker-delimited)"
+    note "(dry-run: would install the Conduck agent-guidance block in TOOLS.md)"
+    return 0
+  fi
+  if $REUSE_ONLY; then
+    note "(reuse-only: not touching $target — re-run without --reuse-only to install the agent-guidance block)"
+    return 0
+  fi
+
+  say ""
+  say "  OpenClaw loads ${BOLD}TOOLS.md${RESET} from the agent workspace into every NEW session."
+  say "  I can install a short, marker-delimited Conduck block there that teaches the agent:"
+  say "    - attached files: open them directly with file tools (never web-search for them)"
+  say "    - media/pdf tools: retry with the file's ABSOLUTE workspace path if a bare name fails"
+  say "    - returning files: write the file, then NAME it in plain reply text — never a"
+  say "      MEDIA: directive (Conduck turns only; your other channels are unaffected)"
+  if [ -f "$target" ]; then
+    say "  Your TOOLS.md exists — the block is appended (or refreshed in place between its"
+    say "  markers); everything else in the file stays byte-identical."
+  fi
+  if ! confirm "  Install/refresh the block?"; then
+    note "Skipped — the README's file-lane troubleshooting carries the same guidance for manual setup."
+    return 0
+  fi
+
+  if python3 - "$target" "$agent_ws" <<'PY'
+import os, sys
+
+target, agent_ws = sys.argv[1], sys.argv[2]
+BEGIN = "<!-- conduck-connect:begin -->"
+END = "<!-- conduck-connect:end -->"
+
+if agent_ws:
+    path_hint = ('If a media/PDF tool rejects that path ("not under an allowed directory"), '
+                 "retry with the absolute path: `%s/<saved-name>`." % agent_ws)
+else:
+    path_hint = ('If a media/PDF tool rejects that path ("not under an allowed directory"), '
+                 "retry with the file's ABSOLUTE path under your working directory "
+                 "(your session context names the workspace root).")
+
+block = BEGIN + "\n" + (
+    "## Conduck chat attachments (managed by conduck-connect)\n"
+    "\n"
+    'These rules apply ONLY to conversations whose user message contains '
+    '"[Conduck file transfer]" (turns from the Conduck app). Leave every other '
+    "channel's behavior unchanged.\n"
+    "\n"
+    "- Files the user attaches are ALREADY in your working directory, saved as "
+    "`<8-hex>__<original-name>` (usually inside a per-conversation subfolder; the "
+    "message names each file's exact saved path). Open them with your file tools — "
+    "never search the web for an attached file.\n"
+    "- Your `read` tool accepts the saved path as shown. " + path_hint + "\n"
+    "- To RETURN a file: write it to the ROOT of your working directory and state its "
+    "exact filename in plain text in your reply. Never use `MEDIA:` or other "
+    "attachment directives in these conversations — this endpoint strips them and "
+    "the file will not reach the user.\n"
+) + END
+
+if os.path.islink(target):
+    print("TOOLS.md is a symlink — refusing to edit through it", file=sys.stderr)
+    sys.exit(1)
+
+if os.path.exists(target):
+    s = open(target).read()
+    nb, ne = s.count(BEGIN), s.count(END)
+    if nb == 0 and ne == 0:
+        s2 = s.rstrip("\n") + ("\n\n" if s.strip() else "") + block + "\n"
+    elif nb == 1 and ne == 1 and s.index(BEGIN) < s.index(END):
+        s2 = s[:s.index(BEGIN)] + block + s[s.index(END) + len(END):]
+    else:
+        print("TOOLS.md has malformed conduck-connect markers — fix or remove them first",
+              file=sys.stderr)
+        sys.exit(1)
+else:
+    s2 = block + "\n"
+
+open(target, "w").write(s2)
+PY
+  then
+    ok "Conduck agent-guidance block installed in $target."
+    note "Bootstrap files load at session START — conversations already open will NOT see"
+    note "it; test in a NEW conversation."
+  else
+    warn "Could not update TOOLS.md — install the block by hand (the README's file-lane"
+    warn "troubleshooting has the same three rules)."
+  fi
+  return 0
+}
+
 setup_file_lane() {
   head_ "Step 4 — agent file lane (optional, recommended)"
   say "  Lets Conduck hand your agent real files (PDF/CSV/zip…) for its tools, and"
@@ -1947,6 +2357,16 @@ setup_file_lane() {
   say "  to read and write files over the web) over the agent's working folder,"
   say "  shared the same way as the gateway."
   if ! confirm "  Set it up?"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
+
+  # OpenClaw: check the agent-side half FIRST — before any unit or exposure
+  # work, so a user who bails out here leaves nothing behind. (Byte transport
+  # is only half the lane; the tool policy decides whether the agent may
+  # actually read/return the files.)
+  if [ "$GW_KIND" = "openclaw" ] && ! openclaw_tool_policy_step; then
+    note "Leaving the file lane out — fix the tool policy, then re-run me to add it."
+    FS_CRED=""; FS_URL=""
+    return 0
+  fi
 
   if ! have rclone; then
     warn "rclone isn't installed (single binary; https://rclone.org/install/ —"
@@ -2007,6 +2427,17 @@ setup_file_lane() {
       ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
       if [ "$OS" = "Linux" ]; then write_fs_unit_linux "$workspace"; else write_fs_unit_mac "$workspace"; fi
     fi
+  fi
+
+  # OpenClaw: teach the agent the Conduck attachment rules (session-start
+  # bootstrap). Runs for NEW and REUSED lanes alike — the folder is known
+  # either way (FS_FOLDER; empty for an unrecoverable legacy unit → the
+  # installer skips with a pointer instead). Placed BEFORE exposure so a
+  # decline/failure here can never leave a half-exposed lane behind. The
+  # `$DRY_RUN` arm: a planned NEW lane never sets FS_CRED, but the plan must
+  # still show the TOOLS.md line (every earlier bail-out already returned).
+  if [ "$GW_KIND" = "openclaw" ] && { [ -n "$FS_CRED" ] || $DRY_RUN; }; then
+    install_conduck_tools_block "$FS_FOLDER"
   fi
 
   # Expose the file lane. Prefer the file lane's OWN existing mapping over re-deriving
