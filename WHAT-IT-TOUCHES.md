@@ -10,7 +10,7 @@ bash conduck-connect.sh --dry-run
 
 | Path / command | Why |
 |---|---|
-| `~/.openclaw/openclaw.json` | OpenClaw: discover the local port and read the runtime bearer token (`gateway.auth.token`). |
+| `~/.openclaw/openclaw.json` | OpenClaw: discover the local port, read the runtime bearer token (`gateway.auth.token`), and — in the file-lane step — read the tool policy (`tools.profile/allow/alsoAllow/deny`) to grade it. |
 | `~/.hermes/.env` | Hermes: discover `API_SERVER_PORT` and read `API_SERVER_KEY`. |
 | `tailscale serve status --json` | Read current exposure mappings. Fail-closed: if it can't be read, the script refuses to guess rather than mutate. |
 | `~/.config/conduck/` | Reuse state from earlier runs: the saved non-secret profiles (`--show-qr`, drift check) and an existing file-lane credential file (reused, never rotated). |
@@ -23,6 +23,8 @@ bash conduck-connect.sh --dry-run
 | Change | Detail | How to undo |
 |---|---|---|
 | Enable OpenClaw chat endpoint | Sets `gateway.http.endpoints.chatCompletions.enabled = true` and restarts OpenClaw. | Set it back to `false` and restart. |
+| Fix OpenClaw tool policy (file lane only) | With your yes, updates `tools.deny` / `tools.allow` / `tools.alsoAllow` via OpenClaw's own `config set` so the agent's `read`/`write` file tools and the `pdf` tool are allowed, then restarts OpenClaw. The exact per-key before→after is shown first; wildcard entries and conflicting configs are flagged, never rewritten. | Restore the previous values shown in the before→after (they stay on your screen), or from OpenClaw's own config backup, and restart. |
+| Agent-guidance block in `TOOLS.md` (file lane only, OpenClaw) | Appends (or refreshes in place) one marker-delimited block — `<!-- conduck-connect:begin -->` … `<!-- conduck-connect:end -->` — in the agent workspace's `TOOLS.md`, teaching the agent how Conduck attachments work. Everything outside the markers is untouched; a symlinked or marker-mangled file is refused. | Delete the block between (and including) the two markers. |
 | Enable Hermes API server | Appends `API_SERVER_ENABLED` / `API_SERVER_HOST` / `API_SERVER_PORT` to `~/.hermes/.env`, then restarts `hermes-gateway`. An `API_SERVER_KEY` already present is reused, never rotated; a new one is generated only when none exists. If the file has to be created, it is created `0600` (the key lands inside it). | Remove the appended lines and restart. |
 | Tailscale exposure | `tailscale serve` (private) or `tailscale funnel` (public) on an auto-selected HTTPS port. If that port already maps to the same gateway with the *other* verb, the mapping is switched in place — going private drops the public Funnel flag first, so the port really stops being public. | `tailscale serve --https=<port> off` / `tailscale funnel --https=<port> off`. The script also prints the exact command to restore any prior mapping it replaced. |
 | Turn off a **stale public exposure it did not create** | When you choose a private path, the script looks for Tailscale **Funnels** (public) on *other* ports that still point at the same gateway or file-lane port from an earlier setup, tells you where they are, and offers to switch them off. It never does this without an explicit yes, and never touches a mapping for a different service. Declining leaves them running and says so. | Re-create it: `tailscale funnel --bg --https=<port> http://127.0.0.1:<local-port>`. Note this removal is treated as intentional, so the script's own rollback will not put it back for you. |

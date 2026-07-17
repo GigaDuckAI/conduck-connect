@@ -2,6 +2,16 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.9.0] — the agent side of the file lane
+
+The file lane's blind spot, closed at setup time: a green file-server test proves Conduck can *store* bytes — it has never proven the **agent** may read or return them. Three gateway-side traps (all hit live, all silent — every transport check stays green) now get checked and fixed where they live. No breaking changes — pairing codes, flags, and profiles from 0.8.0 keep working.
+
+### Added
+
+- **OpenClaw tool-policy check in the file-lane step (runs first, before any unit or exposure work).** The wizard reads `tools.{profile,allow,alsoAllow,deny}` from `openclaw.json` (comments and trailing commas fine) and grades it. A policy that denies the agent's file tools — most commonly `tools.deny` containing `group:fs`, which makes every uploaded file invisible to the agent — gets the exact per-key before→after fix, applied only with your yes through OpenClaw's own `config set`, then re-read from the file rather than trusted. The fix is the *minimum* relaxation: `group:fs` in the deny list is replaced by `edit` + `apply_patch`, so `read`/`write` come free while the mutating members stay denied; `exec` and everything else keep their current policy. It also enables the `pdf` tool (not part of the `coding` profile — without it PDFs get read as raw bytes and answered with plausible nonsense). Wildcard deny entries and an `allow`+`alsoAllow` conflict are flagged for you, never auto-rewritten. Declining the fix never silently drops the lane — the consequence is stated plainly and you choose.
+- **Agent guidance installed into the workspace `TOOLS.md`** (marker-delimited, refreshed in place on re-runs, everything else in the file untouched; symlinks and malformed markers refused). It teaches the agent three things it otherwise learns by failing: attached files are already on disk (open them — never web-search for them); media/PDF tools want the file's **absolute** workspace path when a bare name is rejected; and to *return* a file, write it to the working-directory root and **name it in plain reply text** — attachment directives like `MEDIA:` are stripped by the chat endpoint and never reach the app. The whole block is scoped to Conduck turns (they carry a `[Conduck file transfer]` marker), so the same agent's messaging channels — where `MEDIA:` is exactly right — behave as before. Guidance loads at session start; the wizard says so, and new conversations pick it up.
+- **README:** the file-lane contract gains the agent-tool-policy requirement, and troubleshooting gains the three matching symptoms (agent can't see uploaded files; PDF answered with generic content; "saved" file that never arrives).
+
 ## [0.8.0] — a doctor for adapters you built yourself
 
 New `--doctor` mode: a read-only check-up for adapters built for Conduck, graded against the rules at [conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/). No breaking changes — pairing codes, flags, and profiles from 0.7.0 keep working.
