@@ -2,6 +2,21 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.11.0] — the doctor grades the file lane (`--doctor --files`)
+
+The file lane — how files travel between you, your agent, and the app — was the one part of a setup the doctor could not check: every transport probe could be green while agent-written files silently never reached your phone (exactly the 0.10.0 cache bug). `--files` closes that blind spot. **One breaking change for scripts:** the machine summary line is now `schema=2`.
+
+### Added
+
+- **`--doctor --files` — the file-lane probes, graded as three independent meters.** `file_transport` checks this host's WebDAV↔disk lane itself: authentication on the routes that actually carry your bytes (GET and PUT — missing and wrong credentials must both be refused), write-through fidelity (a PUT must land byte-identical in the configured folder — catching a server that silently serves a *different* directory), **direct-write freshness** (a file written straight to disk, exactly how agents deliver output, must become visible over WebDAV within 2 seconds — the check is primed so a cold cache can't fake a pass; this is the 0.10.0 bug as a permanent, named regression), ranged-probe compatibility (the app's existence probe is `Range: bytes=0-0`; honoring it earns full marks, answering 200 is tolerated with a note), nested folders (a clean rejection is fine — the app falls back to flat names), and DELETE (with cleanup *verified*, not assumed). `file_access` runs one real chat turn: the selected model must copy a small input file — referenced with the app's exact wire text — byte-for-byte to the folder root, *finish before replying* (the app probes the instant the reply lands; no grace period), and name the output in plain reply text where the app's detector will find it. `file_e2e` then proves the combined delivery path with the app-shaped immediate probe plus a byte-faithful download.
+- **`--files` is the one doctor profile that changes anything**, and it says so up front: it writes and removes small `conduck-doctor-*` files in the configured shared folder. Artifact names carry a per-run random tag, targets are registered before creation and removed by exact name (never a pattern), the folder's identity is pinned before any direct-disk step, and cleanup that cannot be *proven* is reported as an error — never silence.
+- **Lane configuration, two ways:** on the machine where the wizard ran, `--files` finds the lane through the saved pairing profile matching the doctor's URL (and cross-checks it against the live service before trusting it). Anywhere else — CI, a hand-built setup — set `CONDUCK_FILES_URL` + `CONDUCK_FILES_DIR` + `CONDUCK_FILES_PASS` (all three; optional `CONDUCK_FILES_USER`, default `conduck`).
+
+### Changed
+
+- **Machine summary is now `schema=2`** (breaking for summary-parsing scripts): `file_access=NOT_RUN` is replaced by three fields — `file_transport=` / `file_access=` / `file_e2e=`, each `NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR`. `NOT_REQUESTED` means you didn't pass `--files`; `NOT_RUN` means you asked but a prerequisite stopped that tier — the distinction scripts previously could not see. File checks never flip `core=` (the file lane is an optional profile, not part of the adapter wire contract) but do count in `failed=` and force exit 1.
+- The regression suite gains hermetic file-lane fault fixtures, and a separate rclone integration suite proves the freshness check catches the real-world default-cache bug and passes the fixed configuration.
+
 ## [0.10.0] — the doctor grades contract 1.3, and agent-written files appear on time
 
 Two independent things: the `--doctor` now grades adapters against the current contract revision (1.3, published at [conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/)) with machine-readable output you can wire into a build loop — and a file-server default that silently hid your agent's output files is fixed. No breaking changes — pairing codes, flags, and profiles from 0.9.0 keep working.
