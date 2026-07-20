@@ -2,6 +2,20 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.10.0] — the doctor grades contract 1.3, and agent-written files appear on time
+
+Two independent things: the `--doctor` now grades adapters against the current contract revision (1.3, published at [conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/)) with machine-readable output you can wire into a build loop — and a file-server default that silently hid your agent's output files is fixed. No breaking changes — pairing codes, flags, and profiles from 0.9.0 keep working.
+
+### Fixed
+
+- **The file lane now shows agent-written files immediately.** The file server (rclone WebDAV) caches folder listings for 5 minutes by default. Files *uploaded* through it appeared instantly — but a file your **agent writes directly into the folder** (which is exactly how agents return files to you) stayed invisible to the server until that cache expired. Conduck checks for the file seconds after the agent's reply, found nothing, and the download chip silently never appeared — whether it worked was a coin flip on cache timing. New file servers are now created with `--dir-cache-time 1s`, so agent-written files appear within a second. **Existing setups:** the wizard only fixes servers it creates — for a file server you already have, add `--dir-cache-time 1s` to its rclone command (the LaunchAgent plist on macOS, the systemd unit on Linux) and restart it, or recreate the lane by re-running the wizard.
+- **The `--deep` image probe no longer fails honest vision models on rendering grounds.** The probe's digits were drawn too close together; a real vision model read the code reliably only when the glyphs got breathing room. Spacing widened — verified 10/10 against a live vision engine.
+
+### Changed
+
+- **`--doctor` grades adapter-contract revision 1.3.** New checks, all named: a **historical-image continuity** probe (a photo turn with no reply followed by a text turn must still answer — the "poisoned conversation" shape), `"stream": true` must get a synchronous JSON reply (not SSE, not a hang), the advertised model `id` must actually select (and a bogus id must get `400` with code `model_not_found`), `Content-Type` is checked on both routes, and error bodies must carry a non-empty `type`. The `--deep` image probe is now **semantic**: it renders a 4-digit code as a PNG and requires the answer to contain those digits (proving the image was *seen*, not just tolerated) — declining honestly with `400` + code `image_unsupported` still passes; silently ignoring the image now fails.
+- **Every doctor verdict line carries a stable `[CHECK_ID]`**, and the last line of every doctor run — including early exits and Ctrl-C — is a one-line machine summary (`CONDUCK_DOCTOR schema=1 ...`, unrun probes reported as `NOT_RUN`). Grep the id, or parse the summary from a build script; the human text above it can keep improving without breaking your tooling.
+
 ## [0.9.0] — the agent side of the file lane
 
 The file lane's blind spot, closed at setup time: a green file-server test proves Conduck can *store* bytes — it has never proven the **agent** may read or return them. Three gateway-side traps (all hit live, all silent — every transport check stays green) now get checked and fixed where they live. No breaking changes — pairing codes, flags, and profiles from 0.8.0 keep working.

@@ -69,16 +69,23 @@
 #                                           # when there's no saved profile yet (e.g. a
 #                                           # setup you built by hand)
 #   bash conduck-connect.sh --doctor [url]  # check an adapter built for Conduck against the rules
-#                                           # at conduck.com/setup/adapter/v1/ — a handful of real
-#                                           # requests, graded strictly; changes NOTHING. It also
-#                                           # proves what the wizard's verify step can't — that your
-#                                           # auth is actually ENFORCED (a missing or wrong token
-#                                           # must 401).
-#                                           # http:// is allowed toward 127.0.0.1/localhost only, so
-#                                           # you can test BEFORE exposing. Token comes from
-#                                           # $CONDUCK_TOKEN or a hidden prompt. Exit 0 = all green
-#                                           # (loop it from a shell while you iterate). Add --deep
-#                                           # for the image/parts tolerance test.
+#                                           # at conduck.com/setup/adapter/v1/ — real requests,
+#                                           # graded strictly; changes NOTHING. It also proves what
+#                                           # the wizard's verify step can't — that your auth is
+#                                           # actually ENFORCED (a missing or wrong token must 401),
+#                                           # that an image in an EARLIER message can't kill the
+#                                           # chat, and that "stream": true still gets one JSON
+#                                           # answer. Every check line carries a stable [CHECK_ID];
+#                                           # the last output line is always a machine summary
+#                                           # ("CONDUCK_DOCTOR schema=1 …") — scripts key on that
+#                                           # plus the exit code. http:// is allowed toward
+#                                           # 127.0.0.1/localhost only, so you can test BEFORE
+#                                           # exposing. Token comes from $CONDUCK_TOKEN or a hidden
+#                                           # prompt. Exit 0 = all green (loop it from a shell while
+#                                           # you iterate). Add --deep for the semantic image probe:
+#                                           # a generated PNG of 4 digits rides the newest message,
+#                                           # and the reply must read them back (an honest HTTP 400
+#                                           # decline with code "image_unsupported" also passes).
 #   bash conduck-connect.sh --allow-keyless-public   # expert: permit a keyless
 #                                           # gateway on a public transport
 #
@@ -88,7 +95,7 @@
 
 set -u -o pipefail
 
-VERSION="0.9.0"
+VERSION="0.10.0"
 PAYLOAD_VERSION=1
 
 # ---------------------------------------------------------------- utilities --
@@ -1751,6 +1758,13 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
   printf 'RCLONE_PASS=%s\n' "$FS_CRED" > "$envf"; chmod 600 "$envf"
   printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
   # systemd ExecStart: quote the workspace; rclone reads --user, pass via env.
+  # --dir-cache-time 1s: rclone's VFS caches directory listings (default 5m), so a
+  # file the AGENT writes directly into the folder (bypassing WebDAV) stays
+  # invisible to the server — Conduck's output-file probe fires seconds after the
+  # reply and would 404. 1s makes agent-written files appear immediately;
+  # re-listing a small local folder per request costs nothing. Keep the flag
+  # AFTER --user: the re-parse extracts the folder between `serve webdav` and
+  # `--addr` (systemd) / as the element after "webdav" (plist).
   cat > "$FS_UNIT" <<EOF
 [Unit]
 Description=Conduck agent file server ($GW_ID, rclone WebDAV)
@@ -1758,7 +1772,7 @@ After=network.target
 
 [Service]
 EnvironmentFile=$envf
-ExecStart=$(command -v rclone) serve webdav "$ws" --addr 127.0.0.1:$FS_LOCAL_PORT --user conduck
+ExecStart=$(command -v rclone) serve webdav "$ws" --addr 127.0.0.1:$FS_LOCAL_PORT --user conduck --dir-cache-time 1s
 Restart=on-failure
 
 [Install]
@@ -1788,7 +1802,8 @@ import os,plistlib
 d={
  "Label": os.environ["LABEL"],
  "ProgramArguments": [os.environ["RCLONE_BIN"],"serve","webdav",os.environ["WS"],
-                      "--addr","127.0.0.1:"+os.environ["PORT"],"--user","conduck"],
+                      "--addr","127.0.0.1:"+os.environ["PORT"],"--user","conduck",
+                      "--dir-cache-time","1s"],
  "EnvironmentVariables": {"RCLONE_PASS": os.environ["CRED"]},
  "RunAtLoad": True, "KeepAlive": True,
 }
@@ -2397,7 +2412,7 @@ setup_file_lane() {
       warn "No systemd user session here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
       warn "I can't keep a file server running in the background. Skipping the file lane; chat still works."
       note "If this box does run systemd, log in directly as this user (ssh, not 'su -') and re-run."
-      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:5006 --user conduck' with the app-generated password exported as RCLONE_PASS, under your own supervisor."
+      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:5006 --user conduck --dir-cache-time 1s' with the app-generated password exported as RCLONE_PASS, under your own supervisor."
       FS_CRED=""; return 0
     fi
     FS_LOCAL_PORT=5006
@@ -2575,6 +2590,12 @@ MODELS_HTTP_CODE=""     # HTTP status of the reply ("" when the transfer failed)
 MODELS_DATA_EMPTY=false # 200 + canonical envelope, but "data" is [] (valid, yet can't answer)
 MODELS_NO_VALID_ID=false # 200 + non-empty "data", but no entry has a usable string "id"
 MODELS_TIME=""          # curl %{time_total} for the models request (seconds, e.g. "0.123")
+MODELS_CONTENT_TYPE=""  # the reply's Content-Type header ("" when the transfer failed).
+                        # Captured for the DOCTOR only — the wizard mirrors the app, which
+                        # tolerates mislabelled third-party gateways, so nothing here may
+                        # tighten the wizard's grading.
+MODELS_ID_COUNT=0       # how many entries carried a usable string "id" (doctor: model-selection)
+MODELS_FIRST_ID=""      # the first usable id ("" when none) — the doctor's selection probe target
 
 models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canonical envelope
                    #   (JSON object with a top-level "data" ARRAY), not the Control-UI HTML.
@@ -2582,12 +2603,17 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canoni
                    # Sets MODELS_CURL_RC / MODELS_HTTP_CODE / MODELS_DATA_EMPTY /
                    # MODELS_NO_VALID_ID / MODELS_TIME either way.
   local out statusline body
-  MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false; MODELS_TIME=""
-  out=$(curl_gw -w '\n%{http_code} %{time_total}' "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
-  # The -w line is "<code> <seconds>"; the body is everything before that last
-  # newline (the `-w` prefix `\n` guarantees the split even for an empty body).
+  MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false
+  MODELS_TIME=""; MODELS_CONTENT_TYPE=""; MODELS_ID_COUNT=0; MODELS_FIRST_ID=""
+  out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
+  # The -w line is "<code> <seconds> <content-type>"; the body is everything
+  # before that last newline (the `-w` prefix `\n` guarantees the split even for
+  # an empty body). Content-Type may itself contain spaces ("…; charset=utf-8"),
+  # so it's split off LAST and keeps the remainder verbatim.
   statusline="${out##*$'\n'}"; body="${out%$'\n'*}"
-  MODELS_HTTP_CODE="${statusline%% *}"; MODELS_TIME="${statusline#* }"
+  MODELS_HTTP_CODE="${statusline%% *}"; statusline="${statusline#* }"
+  MODELS_TIME="${statusline%% *}"
+  MODELS_CONTENT_TYPE=""; [ "$statusline" != "${statusline#* }" ] && MODELS_CONTENT_TYPE="${statusline#* }"
   # HTML first: the endpoint-off page often comes back 200, and it deserves its
   # own diagnosis either way.
   case "$body" in *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;; esac
@@ -2609,7 +2635,10 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canoni
   # parse_constant: NaN/Infinity are REJECTED — python accepts them by default
   # but Apple Foundation's parsers do not, and the script must never be laxer
   # than the app it green-lights for.
-  printf '%s' "$body" | python3 -c '
+  # On the envelope-OK paths the classifier also prints "<id-count>\t<first-id>"
+  # for the doctor's model-selection probe; the wizard captures and ignores it.
+  local pyout prc
+  pyout=$(printf '%s' "$body" | python3 -c '
 import json, sys
 def bad(x): raise ValueError(x)
 try:
@@ -2619,11 +2648,17 @@ except Exception:
 if not (isinstance(d, dict) and isinstance(d.get("data"), list)):
     sys.exit(3)
 data = d["data"]
+ids = [x["id"] for x in data if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
+first = (ids[0] if ids else "").replace("\t", " ").replace("\n", " ").replace("\r", " ")
+print("%d\t%s" % (len(ids), first))
 if not data:
     sys.exit(4)
-has_id = any(isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"] for x in data)
-sys.exit(0 if has_id else 5)' 2>/dev/null
-  local prc=$?
+sys.exit(0 if ids else 5)' 2>/dev/null)
+  prc=$?
+  case "$pyout" in
+    *$'\t'*) MODELS_ID_COUNT="${pyout%%$'\t'*}"; MODELS_FIRST_ID="${pyout#*$'\t'}" ;;
+  esac
+  case "$MODELS_ID_COUNT" in ''|*[!0-9]*) MODELS_ID_COUNT=0 ;; esac
   case "$prc" in
     0) return 0 ;;
     4) MODELS_DATA_EMPTY=true; return 0 ;;
@@ -2798,21 +2833,42 @@ except Exception: pass' 2>/dev/null)
 # ------------------------------------------------------------------- doctor --
 #
 # --doctor: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/. Built for people whose adapter was
-# written for Conduck — by hand or by an AI coding tool — around Claude Code,
-# an agent framework, anything. It sends a handful of real requests and
-# grades the answers strictly; it never touches configs, saved state, or the
-# QR flow. (It will run against any OpenAI-compatible server, but grading
-# OpenClaw/Hermes with it invites false FAILs — they legitimately do things
-# the adapter rules forbid, e.g. keyless mode.)
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.3). Built for
+# people whose adapter was written for Conduck — by hand or by an AI coding
+# tool — around Claude Code, an agent framework, anything. It sends real
+# requests and grades the answers strictly; it never touches configs, saved
+# state, or the QR flow. (It will run against any OpenAI-compatible server,
+# but grading OpenClaw/Hermes with it invites false FAILs — they legitimately
+# do things the adapter rules forbid, e.g. keyless mode.)
 #
 # Why it exists next to verify_all: the wizard's verify step proves the HAPPY
 # path (right token, clean request). The doctor also proves what verify can't
 # without pretending to be an attacker or a sloppy client — that auth is
 # actually ENFORCED (a missing or wrong token must 401; the adapter that
 # forgot its token check passes verify and gets a green QR while sitting wide
-# open with tool access), that an ABSENT "model" field is tolerated, and that
-# unknown request fields are ignored.
+# open with tool access), that an ABSENT "model" field is tolerated, that
+# unknown request fields are ignored, that a supplied model id really selects
+# (or answers 400 + code "model_not_found"), that an image in an EARLIER
+# message can never poison the chat (forward it or replace it with the
+# contract's disclosure — never reject; one bad photo must not kill every
+# later turn), and that "stream": true still gets ONE synchronous JSON answer.
+# --deep adds the semantic image probe: a locally generated PNG showing 4
+# random digits (never named in the prompt or metadata) rides the newest
+# message — a reply carrying those digits proves the engine truly SAW the
+# image (VERIFIED); an honest HTTP 400 decline with code "image_unsupported"
+# also passes (DECLINED); a 200 that ignores the image is the forbidden
+# silent drop (UNVERIFIED → exit 1).
+#
+# Output contract: every check verdict line carries a stable [CHECK_ID], and
+# the LAST line on every exit — pass, fail, or an early die — is the machine
+# summary, schema=1 (fixed field order, ASCII enums, no ANSI):
+#   CONDUCK_DOCTOR schema=1 contract=v1 revision=1.3 harness=<ver>
+#     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN> history_image=<…>
+#     stream=<…> image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
+#     file_access=NOT_RUN checks=<n> failed=<n> exit=<n>
+# Scripts key on that line + the exit code, NEVER on check counts (they
+# change between harness versions). Any grammar change bumps schema=.
+# file_access stays NOT_RUN until the opt-in --files sentinel probe ships.
 #
 # Deliberately NOT here (they need a harness inside the adapter process, not
 # HTTP probes — they belong in an adapter's own tests): the 285-second
@@ -2820,24 +2876,69 @@ except Exception: pass' 2>/dev/null)
 # internals.
 #
 # Exit code: 0 = every check green, 1 = at least one failed — loop it from a
-# shell while iterating on an adapter.
+# shell while iterating on an adapter. The regression suite in
+# Conduck/connect/tests/ proves every check fails for its intended reason.
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-d_ok()  { DOCTOR_CHECKS=$((DOCTOR_CHECKS+1)); ok "$@"; }
-d_bad() { DOCTOR_CHECKS=$((DOCTOR_CHECKS+1)); DOCTOR_FAILS=$((DOCTOR_FAILS+1)); bad "$@"; }
+DOCTOR_CONTRACT_REV="1.3"
+# Machine-summary state. "Core" = every check except the deep image probe:
+# IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
+# an optional capability's honesty, not the core wire contract.
+DOCTOR_PROFILE="basic"
+DOCTOR_CORE_RAN=false
+DOCTOR_CORE_FAILS=0
+DOCTOR_HISTORY_IMAGE="NOT_RUN"
+DOCTOR_STREAM="NOT_RUN"
+DOCTOR_IMAGE_INPUT="NOT_RUN"
+
+d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
+  case "$1" in IMAGE_INPUT) return 0 ;; esac
+  DOCTOR_CORE_RAN=true
+  [ "$2" = "fail" ] && DOCTOR_CORE_FAILS=$((DOCTOR_CORE_FAILS+1))
+  return 0
+}
+d_ok()  { local id="$1"; shift; DOCTOR_CHECKS=$((DOCTOR_CHECKS+1)); d_core_mark "$id" pass; ok "[$id] $*"; }
+d_bad() { local id="$1"; shift; DOCTOR_CHECKS=$((DOCTOR_CHECKS+1)); DOCTOR_FAILS=$((DOCTOR_FAILS+1)); d_core_mark "$id" fail; bad "[$id] $*"; }
+# Explanatory detail under a verdict — same [CHECK_ID] on every line, so a
+# grep for one ID collects the whole story, not just the verdict.
+d_say() { local id="$1"; shift; say "    [$id] $*"; }
 
 # stdin: a response body -> 0 iff it's the contract's OpenAI error shape,
-# {"error": {"message": "<non-empty>", …}}. A bare {"error":{}} is NOT enough —
-# the contract requires a real message. Used by the 401 soft-warn and the
-# --deep image-refusal accept, so both judge "is this a real error body?" the
-# same way.
+# {"error": {"message": "<non-empty>", "type": "<non-empty>", …}}. A bare
+# {"error":{}} or a message-only body is NOT enough — the contract requires
+# both fields. Used by the 401 soft-warn and every decline/reject grader, so
+# all judge "is this a real error body?" the same way.
 doctor_is_openai_error() {
   python3 -c 'import json,sys
 try: d = json.load(sys.stdin)
 except Exception: sys.exit(1)
 e = d.get("error") if isinstance(d, dict) else None
-sys.exit(0 if isinstance(e, dict) and isinstance(e.get("message"), str) and e.get("message") else 1)' 2>/dev/null
+ok = (isinstance(e, dict)
+      and isinstance(e.get("message"), str) and e.get("message")
+      and isinstance(e.get("type"), str) and e.get("type"))
+sys.exit(0 if ok else 1)' 2>/dev/null
+}
+
+# stdin: a response body; $1: a required machine code -> 0 iff error.code is
+# EXACTLY that string. The stable codes are what clients key on (prose is
+# free-form) — "looks like it declined" is not machine-verifiable, the code is.
+doctor_error_code() {
+  python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+e = d.get("error") if isinstance(d, dict) else None
+sys.exit(0 if isinstance(e, dict) and e.get("code") == sys.argv[1] else 1)' "$1" 2>/dev/null
+}
+
+# 0 iff $1 is application/json — case-insensitive, parameters tolerated
+# ("application/json; charset=utf-8" passes; text/plain, text/event-stream,
+# and a missing header do not).
+ct_is_json() {
+  local ct; ct=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  ct="${ct%%;*}"
+  ct="${ct#"${ct%%[![:space:]]*}"}"; ct="${ct%"${ct##*[![:space:]]}"}"
+  [ "$ct" = "application/json" ]
 }
 
 # Accept an https URL anywhere, or plain http toward THIS machine only
@@ -2922,30 +3023,34 @@ doctor_models_check() {
   over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
   if [ "$rc" = "0" ]; then
     if $MODELS_DATA_EMPTY; then
-      d_bad "GET /v1/models — canonical envelope, but \"data\" is EMPTY"
-      say   '    (the contract requires at least one {"id": …} entry — the app has to offer a model)'
+      d_bad MODELS_ENVELOPE "GET /v1/models — canonical envelope, but \"data\" is EMPTY"
+      d_say MODELS_ENVELOPE '(the contract requires at least one {"id": …} entry — the app has to offer a model)'
     elif $MODELS_NO_VALID_ID; then
-      d_bad "GET /v1/models — \"data\" has entries, but none carry a usable \"id\" string"
-      say   '    (each entry must be {"id": "<model-name>"} with a non-empty string — the app names a'
-      say   '     model from this list; an entry with no id can'\''t be selected)'
+      d_bad MODELS_ENVELOPE "GET /v1/models — \"data\" has entries, but none carry a usable \"id\" string"
+      d_say MODELS_ENVELOPE '(each entry must be {"id": "<model-name>"} with a non-empty string — the app names a'
+      d_say MODELS_ENVELOPE ' model from this list; an entry with no id can'\''t be selected)'
     elif [ "$over" = "1" ]; then
       # A models answer past 15s is a hard FAIL, not a warning: the app's Test
       # Connection gives up at 15s, so this gateway simply won't connect.
-      d_bad "GET /v1/models — answered, but took ${secs}s (over the 15s limit)"
-      say   "    (the app's Test Connection gives up after 15s — answer from cache, never cold-start"
-      say   "     or lazy-load a model on this route)"
+      d_bad MODELS_ENVELOPE "GET /v1/models — answered, but took ${secs}s (over the 15s limit)"
+      d_say MODELS_ENVELOPE "(the app's Test Connection gives up after 15s — answer from cache, never cold-start"
+      d_say MODELS_ENVELOPE " or lazy-load a model on this route)"
+    elif ! ct_is_json "$MODELS_CONTENT_TYPE"; then
+      d_bad MODELS_ENVELOPE "GET /v1/models — canonical envelope, but Content-Type is '${MODELS_CONTENT_TYPE:0:60}'"
+      d_say MODELS_ENVELOPE "(answer with Content-Type: application/json — parameters like charset are fine;"
+      d_say MODELS_ENVELOPE " anything else, or no header at all, is a contract failure)"
     else
-      d_ok "GET /v1/models — canonical envelope (${secs}s)"
+      d_ok MODELS_ENVELOPE "GET /v1/models — canonical envelope (${secs}s)"
     fi
     return 0
   elif [ "$rc" = "2" ]; then
-    d_bad "GET /v1/models — returned an HTML page instead of JSON (HTTP ${MODELS_HTTP_CODE:-?})"
-    say   "    (something else answered — a reverse proxy, a login/access page, or a wrong base address)"
+    d_bad MODELS_ENVELOPE "GET /v1/models — returned an HTML page instead of JSON (HTTP ${MODELS_HTTP_CODE:-?})"
+    d_say MODELS_ENVELOPE "(something else answered — a reverse proxy, a login/access page, or a wrong base address)"
     return 1
   elif [ "$rc" = "3" ]; then
-    d_bad "GET /v1/models — answers, but not the canonical envelope"
-    say   '    (must be a JSON OBJECT whose top-level "data" is an ARRAY of {"id": …} — not a bare'
-    say   '     array, not {"models": …}. This is the app'\''s Test Connection rule, applied verbatim.)'
+    d_bad MODELS_ENVELOPE "GET /v1/models — answers, but not the canonical envelope"
+    d_say MODELS_ENVELOPE '(must be a JSON OBJECT whose top-level "data" is an ARRAY of {"id": …} — not a bare'
+    d_say MODELS_ENVELOPE ' array, not {"models": …}. This is the app'\''s Test Connection rule, applied verbatim.)'
     return 1
   fi
   if [ "$MODELS_CURL_RC" != "0" ]; then
@@ -2966,7 +3071,7 @@ doctor_models_check() {
       *)       why="HTTP $MODELS_HTTP_CODE" ;;
     esac
   fi
-  d_bad "GET /v1/models — $why"
+  d_bad MODELS_ENVELOPE "GET /v1/models — $why"
   return 1
 }
 
@@ -2975,34 +3080,34 @@ doctor_models_check() {
 # (URL for a GET; URL + `-H Content-Type` + `-d body` for the chat POST). The
 # real token never rides these — doctor_curl_negauth sends none, or the fixed
 # harmless wrong literal.
-doctor_auth_route() { # doctor_auth_route <route-label> <curl-args…>
-  local route="$1"; shift
+doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args…>
+  local idp="$1" route="$2"; shift 2
   local out rc code body
   out=$(doctor_curl_negauth none -w '\n%{http_code}' "$@" 2>/dev/null); rc=$?
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
   if [ "$rc" != "0" ] || [ -z "$code" ] || [ "$code" = "000" ]; then
-    d_bad "auth ($route): WITHOUT a token — no answer (the with-token request worked, so this looks like per-request trouble)"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token — no answer (the with-token request worked, so this looks like per-request trouble)"
   elif [ "$code" = "401" ]; then
-    d_ok "auth ($route): WITHOUT a token → 401 (enforced)"
+    d_ok "${idp}_MISSING" "auth ($route): WITHOUT a token → 401 (enforced)"
     # Soft check only — the status is the load-bearing part; the body shape
     # decides how nice the app's error message can be, not whether auth holds.
     if ! printf '%s' "$body" | doctor_is_openai_error; then
-      warn "  …its 401 body isn't the OpenAI error shape — send {\"error\": {\"message\": …, \"type\": …}} so the app can show a real message."
+      warn "  [${idp}_MISSING] …its 401 body isn't the OpenAI error shape — send {\"error\": {\"message\": …, \"type\": …}} (both non-empty) so the app can show a real message."
     fi
   elif [ "$code" = "200" ]; then
-    d_bad "auth ($route): WITHOUT a token → 200 — the server did the work anyway"
-    say   "    (this is the dangerous one: anyone who can reach this address can drive your AI and"
-    say   "     its tools. Check the Authorization header BEFORE doing anything else, on every route.)"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → 200 — the server did the work anyway"
+    d_say "${idp}_MISSING" "(this is the dangerous one: anyone who can reach this address can drive your AI and"
+    d_say "${idp}_MISSING" " its tools. Check the Authorization header BEFORE doing anything else, on every route.)"
   else
-    d_bad "auth ($route): WITHOUT a token → HTTP $code (the contract pins exactly 401)"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → HTTP $code (the contract pins exactly 401)"
   fi
   code=$(doctor_curl_negauth wrong -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || code=""
   case "$code" in
-    401) d_ok "auth ($route): WRONG token → 401 (enforced)" ;;
-    200) d_bad "auth ($route): WRONG token → 200 — the token isn't actually compared"
-         say  "    (compare byte-for-byte against the token you issued — e.g. hmac.compare_digest in Python)" ;;
-    ""|000) d_bad "auth ($route): WRONG token — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
-    *)   d_bad "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)" ;;
+    401) d_ok "${idp}_WRONG" "auth ($route): WRONG token → 401 (enforced)" ;;
+    200) d_bad "${idp}_WRONG" "auth ($route): WRONG token → 200 — the token isn't actually compared"
+         d_say "${idp}_WRONG" "(compare byte-for-byte against the token you issued — e.g. hmac.compare_digest in Python)" ;;
+    ""|000) d_bad "${idp}_WRONG" "auth ($route): WRONG token — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
+    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)" ;;
   esac
 }
 
@@ -3016,68 +3121,71 @@ doctor_auth_route() { # doctor_auth_route <route-label> <curl-args…>
 # failure (fail-safe, never a green pass).
 doctor_auth_checks() {
   if [ "$GW_AUTH" != "bearer" ]; then
-    d_bad "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
-    say   "    (the contract requires a bearer token on EVERY route — a keyless adapter that can run"
-    say   "     tools is wide open to whoever can reach it. Add a token check, then re-run me.)"
+    d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
+    d_say AUTH_NOT_ENFORCED "(the contract requires a bearer token on EVERY route — a keyless adapter that can run"
+    d_say AUTH_NOT_ENFORCED " tools is wide open to whoever can reach it. Add a token check, then re-run me.)"
     return 0
   fi
-  doctor_auth_route "/v1/models" "$GW_URL/v1/models"
-  doctor_auth_route "/v1/chat/completions" "$GW_URL/v1/chat/completions" \
+  doctor_auth_route AUTH_MODELS "/v1/models" "$GW_URL/v1/models"
+  doctor_auth_route AUTH_CHAT "/v1/chat/completions" "$GW_URL/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
 }
 
-# Check 4 (and --deep's check 5) — one real chat turn, graded against the
-# contract's response rules (strict JSON, exactly one choice, non-empty STRING
-# content, no tool_calls, no SSE). This is STRICTER than today's app decoder,
-# which reads choices[0].message.content leniently — deliberately: the contract
-# is the forward promise an adapter must meet, so the doctor holds that bar.
-# Never prints the reply's CONTENT (only its length): the doctor may be run
-# against a live personal agent, and this script never logs message content.
-doctor_chat_check() { # doctor_chat_check <label> <payload-json> [mode:image]
-  local label="$1" payload="$2" mode="${3:-}"
-  local out curl_rc tail_ code timing resp res verdict detail
-  out=$(curl_gw -w '\n%{http_code} %{time_total}' "$GW_URL/v1/chat/completions" --max-time 300 \
-        -H "Content-Type: application/json" -d "$payload" 2>/dev/null); curl_rc=$?
-  tail_="${out##*$'\n'}"; resp="${out%$'\n'*}"
-  code="${tail_%% *}"; timing="${tail_#* }"
-  timing=$(printf '%s' "$timing" | awk '{printf "%.1f", $1}' 2>/dev/null)
-  if [ "$curl_rc" != "0" ]; then
-    d_bad "$label — transfer failed (timed out or the connection dropped)"
-    return 1
+# ---- one real chat turn: transport + grading, shared by every chat probe ----
+#
+# doctor_chat_request does the POST with the REAL token and lands status /
+# content-type / timing / BODY in DCC_* globals (memory only: the body is
+# never printed — these probes may run against a live personal agent, and this
+# script never logs message content; graders emit verdict words and lengths).
+DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
+doctor_chat_request() { # doctor_chat_request <payload-json> -> 0 iff the transfer completed
+  local out tail_
+  DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
+  out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
+        --max-time 300 -H "Content-Type: application/json" -d "$1" 2>/dev/null) || return 1
+  tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
+  DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
+  DCC_TIME="${tail_%% *}"
+  [ "$tail_" != "${tail_#* }" ] && DCC_CT="${tail_#* }"
+  DCC_TIME=$(printf '%s' "$DCC_TIME" | awk '{printf "%.1f", $1}' 2>/dev/null)
+  return 0
+}
+
+# doctor_chat_eval grades the reply in DCC_* against the contract's response
+# rules (strict JSON, exactly one choice, non-empty STRING content, no
+# tool_calls, no SSE, Content-Type application/json). This is STRICTER than
+# today's app decoder, which reads choices[0].message.content leniently —
+# deliberately: the contract is the forward promise an adapter must meet, so
+# the doctor holds that bar. It PRINTS NOTHING (callers own the verdict
+# lines): failure lands in DCE_REASON/DCE_HINT, success in DCE_LEN — plus
+# DCE_TOKEN when an expected digit code was given (the --deep image probe's
+# semantic grading: the code must appear as a standalone digit-run in the
+# reply, so "The digits are 4827." passes while "48275" does not).
+DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
+doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
+  local exp="${2:--}" res verdict detail
+  DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
+  if ! doctor_chat_request "$1"; then
+    DCE_REASON="transfer failed (timed out or the connection dropped)"; DCE_HINT="transfer"; return 1
   fi
-  # SSE despite stream:false is its own diagnosis — a JSON parse error would
-  # bury the actual mistake.
-  case "$resp" in data:*)
-    d_bad "$label — the server STREAMED the reply despite \"stream\": false"
-    say   "    (when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)"
-    return 1 ;;
+  # SSE despite a synchronous request is its own diagnosis — a JSON parse
+  # error would bury the actual mistake.
+  case "$DCC_BODY" in data:*)
+    DCE_REASON="the server answered with SSE framing"; DCE_HINT="sse"; return 1 ;;
   esac
-  if [ "$code" != "200" ]; then
-    # Image probe (--deep): the contract EXPLICITLY allows a text-only adapter to
-    # decline an image with HTTP 400 + an OpenAI error body ("image-unsupported")
-    # instead of answering. That's a PASS, not a failure — the forbidden move is
-    # silently pretending no image was there, which a black-box probe can't see.
-    # ONLY a real 400 counts: a 401/429/503 here is an auth/overload problem, not
-    # an image-capability answer, so it must still fail like any other non-200.
-    if [ "$mode" = "image" ] && [ "$code" = "400" ] \
-       && printf '%s' "$resp" | doctor_is_openai_error; then
-      d_ok "$label — declined the image with HTTP 400 + an error body (honest refusal, allowed)"
-      return 0
-    fi
-    d_bad "$label — HTTP ${code:-?}"
-    case "$code" in
-      4??) say "    (a 4xx here usually means the request body was rejected — the contract requires"
-           say "     tolerating an ABSENT \"model\" field (pick your own default) and IGNORING unknown fields)" ;;
-      5??) say "    (the server errored — its own logs have the real story)" ;;
-    esac
-    return 1
+  if [ "$DCC_CODE" != "200" ]; then
+    DCE_REASON="HTTP ${DCC_CODE:-?}"; DCE_HINT="http"; return 1
+  fi
+  if ! ct_is_json "$DCC_CT"; then
+    DCE_REASON="HTTP 200, but Content-Type is '${DCC_CT:0:60}' (must be application/json)"; DCE_HINT="ct"; return 1
   fi
   # Strict parse (parse_constant: NaN/Infinity refused, matching the app's
   # decoder) + the contract's one-choice / non-empty-string rules on top.
-  res=$(printf '%s' "$resp" | python3 -c '
-import json, sys
+  res=$(printf '%s' "$DCC_BODY" | python3 -c '
+import json, sys, re
 def bad(x): raise ValueError(x)
+exp = sys.argv[1] if len(sys.argv) > 1 else "-"
 try:
     d = json.load(sys.stdin, parse_constant=bad)
 except Exception:
@@ -3097,30 +3205,248 @@ if not isinstance(c, str):
     print("notstring -"); sys.exit(0)
 if not c:
     print("empty -"); sys.exit(0)
-print("ok %d" % len(c))' 2>/dev/null)
+if exp != "-":
+    print(("token %d" if exp in re.findall(r"\d+", c) else "notoken %d") % len(c)); sys.exit(0)
+print("ok %d" % len(c))' "$exp" 2>/dev/null)
   verdict="${res%% *}"; detail="${res#* }"
   case "$verdict" in
-    ok)         d_ok "$label — one choice, non-empty string content ($detail chars, ${timing:-?}s)"; return 0 ;;
-    badjson)    d_bad "$label — HTTP 200, but the body isn't strict JSON"
-                say   "    (one complete JSON object; NaN/Infinity are refused by Conduck's decoder)" ;;
-    nochoices)  d_bad "$label — no usable \"choices\" array"
-                say   '    (the reply must carry choices[0].message.content — see the contract'\''s response shape)' ;;
-    manychoices) d_bad "$label — $detail choices in the reply (the contract pins exactly ONE)" ;;
-    toolcalls)  d_bad "$label — the reply carries tool_calls"
-                say   "    (never return tool_calls to Conduck — run your tools SERVER-side and answer with the final text)" ;;
-    notstring)  d_bad "$label — \"content\" isn't a plain string"
-                say   "    (in the RESPONSE, content must be a non-empty STRING — null or parts-form content is refused)" ;;
-    empty)      d_bad "$label — \"content\" is an empty string" ;;
-    *)          d_bad "$label — could not grade the reply" ;;
+    ok)      DCE_LEN="$detail"; return 0 ;;
+    token)   DCE_LEN="$detail"; DCE_TOKEN="yes"; return 0 ;;
+    notoken) DCE_LEN="$detail"; DCE_TOKEN="no";  return 0 ;;   # shape is fine; the digits aren't there
+    badjson)     DCE_REASON="HTTP 200, but the body isn't strict JSON"; DCE_HINT="badjson" ;;
+    nochoices)   DCE_REASON="no usable \"choices\" array"; DCE_HINT="nochoices" ;;
+    manychoices) DCE_REASON="$detail choices in the reply (the contract pins exactly ONE)" ;;
+    toolcalls)   DCE_REASON="the reply carries tool_calls"; DCE_HINT="toolcalls" ;;
+    notstring)   DCE_REASON="\"content\" isn't a plain string"; DCE_HINT="notstring" ;;
+    empty)       DCE_REASON="\"content\" is an empty string" ;;
+    *)           DCE_REASON="could not grade the reply" ;;
   esac
   return 1
 }
 
+# One graded chat check with its verdict line + failure hints. kind picks the
+# failure explanation: plain (the tolerance turn) · history (the
+# anti-poisoning turn) · stream ("stream": true).
+doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kind>
+  local id="$1" label="$2" payload="$3" kind="${4:-plain}"
+  if doctor_chat_eval "$payload"; then
+    d_ok "$id" "$label — one choice, non-empty string content (${DCE_LEN:-?} chars, ${DCC_TIME:-?}s)"
+    return 0
+  fi
+  d_bad "$id" "$label — $DCE_REASON"
+  case "$DCE_HINT" in
+    sse)
+      case "$kind" in
+        stream) d_say "$id" "(even when the request says \"stream\": true, answer ONE complete JSON object —"
+                d_say "$id" " Conduck never accepts SSE; it may set the flag, but reads a synchronous reply)" ;;
+        *)      d_say "$id" "(when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)" ;;
+      esac ;;
+    http)
+      case "$kind" in
+        history)
+          d_say "$id" "(the contract forbids rejecting a request because of an image in an EARLIER message —"
+          d_say "$id" " forward it to the engine, or replace it in place with the contract's disclosure text."
+          d_say "$id" " A text-only newest message must always get an answer: one rejected photo must never"
+          d_say "$id" " poison every later turn of the conversation.)" ;;
+        stream)
+          d_say "$id" "(\"stream\": true must not be rejected — ignore the flag and answer one synchronous"
+          d_say "$id" " JSON object, exactly as for stream:false)" ;;
+        *)
+          case "$DCC_CODE" in
+            4??) d_say "$id" "(a 4xx here usually means the request body was rejected — the contract requires"
+                 d_say "$id" " tolerating an ABSENT \"model\" field (pick your own default) and IGNORING unknown fields)" ;;
+            5??) d_say "$id" "(the server errored — its own logs have the real story)" ;;
+          esac ;;
+      esac ;;
+    badjson)   d_say "$id" "(one complete JSON object; NaN/Infinity are refused by Conduck's decoder)" ;;
+    nochoices) d_say "$id" "(the reply must carry choices[0].message.content — see the contract's response shape)" ;;
+    toolcalls) d_say "$id" "(never return tool_calls to Conduck — run your tools SERVER-side and answer with the final text)" ;;
+    notstring) d_say "$id" "(in the RESPONSE, content must be a non-empty STRING — null or parts-form content is refused)" ;;
+    ct)        d_say "$id" "(answer with Content-Type: application/json — parameters like charset are fine)" ;;
+  esac
+  return 1
+}
+
+# Model selection (one logical check, two requests). The app sends the model
+# id the user picked from YOUR /v1/models — so the first advertised id must
+# actually select (strict 200). And a made-up id must not silently succeed:
+# with 2+ advertised models it MUST answer HTTP 400 + an OpenAI error body
+# carrying code "model_not_found" (400, not 404 — the contract pins 404 to
+# unknown PATHS); a single-model adapter MAY ignore the field instead (it
+# advertises exactly one thing, so nothing is ambiguous).
+doctor_model_selection_check() {
+  local id="MODEL_SELECTION" payload count happy="skip" happy_reason="" bogus="" bogus_reason=""
+  count="${MODELS_ID_COUNT:-0}"
+  if [ -n "$MODELS_FIRST_ID" ]; then
+    payload=$(CONDUCK_DOCTOR_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
+print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+                  "model": os.environ["CONDUCK_DOCTOR_MODEL"], "stream": False}))') \
+      || die "Could not build the test request (python3 failed)."
+    if doctor_chat_eval "$payload"; then happy="ok"; else happy="fail"; happy_reason="$DCE_REASON"; fi
+  fi
+  payload=$(python3 -c 'import json
+print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+                  "model": "conduck-doctor-no-such-model", "stream": False}))') \
+    || die "Could not build the test request (python3 failed)."
+  if doctor_chat_eval "$payload"; then
+    if [ "$count" -gt 1 ]; then bogus="accepted"; else bogus="ignored"; fi
+  elif [ "$DCC_CODE" = "400" ] && printf '%s' "$DCC_BODY" | doctor_is_openai_error \
+       && printf '%s' "$DCC_BODY" | doctor_error_code "model_not_found"; then
+    bogus="rejected"
+  else
+    bogus="fail"; bogus_reason="$DCE_REASON"
+    [ "$DCC_CODE" = "400" ] && bogus_reason="HTTP 400, but the error body lacks code \"model_not_found\" (or isn't the full OpenAI error shape)"
+  fi
+  if [ "$happy" != "fail" ] && { [ "$bogus" = "rejected" ] || [ "$bogus" = "ignored" ]; }; then
+    local how="unknown id → 400 + \"model_not_found\""
+    [ "$bogus" = "ignored" ] && how="unknown id ignored (single-model adapter — allowed)"
+    d_ok "$id" "model selection — advertised id selects; $how"
+    return 0
+  fi
+  if [ "$happy" = "fail" ]; then
+    d_bad "$id" "model selection — asking for your OWN advertised id ('${MODELS_FIRST_ID:0:40}') failed: $happy_reason"
+    d_say "$id" "(the app sends the model id the user picked from your /v1/models list — a supplied"
+    d_say "$id" " advertised id must select and answer, exactly like an absent one)"
+    return 1
+  fi
+  case "$bogus" in
+    accepted)
+      d_bad "$id" "model selection — a made-up model id was ACCEPTED (you advertise $count models)"
+      d_say "$id" "(with more than one model advertised, the app can't tell which one answered. Reject an"
+      d_say "$id" " unknown id with HTTP 400 + an error body carrying code \"model_not_found\")" ;;
+    *)
+      d_bad "$id" "model selection — a made-up model id wasn't rejected the contract's way: ${bogus_reason:-HTTP ${DCC_CODE:-?}}"
+      d_say "$id" "(reject an unknown model id with HTTP 400 — not 404, that's for unknown paths — plus an"
+      d_say "$id" " OpenAI error body {\"error\": {\"message\": …, \"type\": …, \"code\": \"model_not_found\"}})" ;;
+  esac
+  return 1
+}
+
+# --deep's semantic image probe. A PNG rendered HERE (stdlib zlib/struct — 4
+# random digits as big block glyphs, black on white, ~632×232) rides the
+# newest message; the digits are never in the prompt, filename, or metadata,
+# so the ONLY way to answer them is to actually see the image. Outcomes:
+#   VERIFIED   — 200 and the reply contains the digits: the engine truly sees
+#                images (OCR tooling counts — this grades capability, not eyes).
+#   DECLINED   — HTTP 400 + OpenAI error body + code "image_unsupported": a
+#                text-only adapter refusing honestly. Allowed, passes.
+#   UNVERIFIED — 200 but the digits aren't in the reply: the image was
+#                silently dropped or hallucinated over — the one forbidden
+#                move. Fails the deep profile.
+# Anything else (wrong/missing decline code, other statuses, bad shape) FAILs:
+# clients key on the machine code, so "looks declined" isn't good enough.
+# ~1-in-9000 guess odds are accepted. The reply's content is never printed.
+doctor_image_input_check() {
+  local id="IMAGE_INPUT" gen code payload
+  gen=$(python3 -c '
+import json, zlib, struct, base64, random
+FONT = {
+    "0": [14, 17, 19, 21, 25, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
+    "2": [14, 17, 1, 2, 4, 8, 31],     "3": [31, 2, 4, 2, 1, 17, 14],
+    "4": [2, 6, 10, 18, 31, 2, 2],     "5": [31, 16, 30, 1, 1, 17, 14],
+    "6": [6, 8, 16, 30, 17, 17, 14],   "7": [31, 1, 2, 4, 8, 8, 8],
+    "8": [14, 17, 17, 14, 17, 17, 14], "9": [14, 17, 17, 15, 1, 2, 12],
+}
+SCALE, MARGIN, GAP = 16, 60, 64  # wide GAP is load-bearing: at GAP=24 real
+# vision models systematically misread adjacent glyphs (measured 1/6 correct
+# vs 8/8 at GAP=64 on gpt-5.6 — tight spacing reads as merged segments)
+GW, GH = 5 * SCALE, 7 * SCALE
+W, H = MARGIN * 2 + 4 * GW + 3 * GAP, MARGIN * 2 + GH
+code = str(random.randint(1, 9)) + "".join(str(random.randint(0, 9)) for _ in range(3))
+rows = [bytearray(b"\xff" * W) for _ in range(H)]
+for i, ch in enumerate(code):
+    x0 = MARGIN + i * (GW + GAP)
+    for r, bits in enumerate(FONT[ch]):
+        for c in range(5):
+            if bits & (1 << (4 - c)):
+                for y in range(MARGIN + r * SCALE, MARGIN + (r + 1) * SCALE):
+                    for x in range(x0 + c * SCALE, x0 + (c + 1) * SCALE):
+                        rows[y][x] = 0
+raw = b"".join(b"\x00" + bytes(r) for r in rows)
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 0, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+uri = "data:image/png;base64," + base64.b64encode(png).decode()
+print(code)
+print(json.dumps({"messages": [{"role": "user", "content": [
+    {"type": "text", "text": "Reply with exactly the digits shown in the image. No other text."},
+    {"type": "image_url", "image_url": {"url": uri}}]}], "stream": False}))') \
+    || die "Could not build the image test request (python3 failed)."
+  code="${gen%%$'\n'*}"; payload="${gen#*$'\n'}"
+  if doctor_chat_eval "$payload" "$code"; then
+    if [ "$DCE_TOKEN" = "yes" ]; then
+      DOCTOR_IMAGE_INPUT="VERIFIED"
+      d_ok "$id" "image input — the reply reads the digits back (VERIFIED, ${DCC_TIME:-?}s)"
+      return 0
+    fi
+    DOCTOR_IMAGE_INPUT="UNVERIFIED"
+    d_bad "$id" "image input — answered 200, but the reply doesn't contain the image's digits (${DCE_LEN:-?} chars)"
+    d_say "$id" "(the engine never saw the image — it was silently dropped somewhere, the one forbidden"
+    d_say "$id" " move. Forward images to the engine, or decline honestly with HTTP 400 + an error body"
+    d_say "$id" " carrying code \"image_unsupported\" — never answer as if no image was attached.)"
+    return 1
+  fi
+  if [ "$DCC_CODE" = "400" ] && printf '%s' "$DCC_BODY" | doctor_is_openai_error; then
+    if printf '%s' "$DCC_BODY" | doctor_error_code "image_unsupported"; then
+      DOCTOR_IMAGE_INPUT="DECLINED"
+      d_ok "$id" "image input — declined with HTTP 400 + code \"image_unsupported\" (honest refusal, allowed)"
+      return 0
+    fi
+    DOCTOR_IMAGE_INPUT="FAIL"
+    d_bad "$id" "image input — declined with HTTP 400, but without code \"image_unsupported\""
+    d_say "$id" "(the decline itself is allowed — but the app keys on the machine code to explain the"
+    d_say "$id" " refusal and offer recovery, so add \"code\": \"image_unsupported\" to the error object)"
+    return 1
+  fi
+  DOCTOR_IMAGE_INPUT="FAIL"
+  d_bad "$id" "image input — $DCE_REASON"
+  return 1
+}
+
+# The frozen machine line (schema=1) — printed as the LAST line of EVERY
+# doctor exit, green, red, or an early die: fixed field order, ASCII enums,
+# no ANSI. Consumers (build loops, CI, the builder guide's definition of
+# done) key on this + the exit code — never on check counts, which change
+# between harness versions. Any grammar change bumps schema=. file_access
+# stays NOT_RUN until the opt-in --files sentinel probe ships.
+doctor_summary() { # doctor_summary <exit-code>
+  local rc="${1:-1}" core="NOT_RUN"
+  if $DOCTOR_CORE_RAN; then
+    core="PASS"
+    [ "$DOCTOR_CORE_FAILS" -gt 0 ] && core="FAIL"
+  fi
+  printf 'CONDUCK_DOCTOR schema=1 contract=v1 revision=%s harness=%s profile=%s core=%s history_image=%s stream=%s image_input=%s file_access=NOT_RUN checks=%s failed=%s exit=%s\n' \
+    "$DOCTOR_CONTRACT_REV" "$VERSION" "$DOCTOR_PROFILE" "$core" \
+    "$DOCTOR_HISTORY_IMAGE" "$DOCTOR_STREAM" "$DOCTOR_IMAGE_INPUT" \
+    "$DOCTOR_CHECKS" "$DOCTOR_FAILS" "$rc"
+}
+
+# EXIT dispatcher: chained onto the wizard's on_exit backstop (a no-op for the
+# doctor, which never applies exposures — but replacing an armed trap silently
+# is how cleanups get lost). $? must be captured FIRST. INT/TERM/HUP are
+# routed through exit because macOS bash 3.2 skips the EXIT trap on an
+# unhandled signal — the summary line must ride even a Ctrl-C.
+doctor_on_exit() {
+  local rc=$?
+  on_exit
+  doctor_summary "$rc"
+}
+
 run_doctor() {
+  # The machine summary must ride EVERY exit (frozen schema=1 grammar) — arm
+  # it before anything can die. Flag-combination errors happen before this
+  # function and are non-runs by definition: no doctor started, no summary.
+  DOCTOR_PROFILE="basic"; $DOCTOR_DEEP && DOCTOR_PROFILE="deep"
+  trap doctor_on_exit EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+
   say "${BOLD}conduck-connect $VERSION — doctor${RESET}"
   say "Checks whether an adapter built for Conduck follows the rules at"
-  say "${BOLD}conduck.com/setup/adapter/v1/${RESET} — a handful of real requests. Changes NOTHING."
+  say "${BOLD}conduck.com/setup/adapter/v1/${RESET} — real requests, graded strictly against contract"
+  say "revision $DOCTOR_CONTRACT_REV. Changes NOTHING."
   note "Building your own adapter? Loop me from a shell — exit code 0 means every check passed."
+  note "The last line is always a machine summary (CONDUCK_DOCTOR schema=1 …) — scripts key on it."
 
   # Target: the positional URL if one was given, else ask.
   if [ -n "$DOCTOR_URL" ]; then
@@ -3159,34 +3485,60 @@ run_doctor() {
   doctor_auth_checks
 
   say ""
-  say "  Now one real chat turn — deliberately WITHOUT a \"model\" field, WITH an unknown extra"
-  say "  field, and \"stream\": false. The contract requires all three to be tolerated. Agents"
-  say "  can be slow; I wait up to 5 minutes…"
+  say "  Now the chat checks — several real turns, each graded against the contract's response"
+  say "  rules (strict JSON, one choice, string content, Content-Type application/json). The"
+  say "  first goes deliberately WITHOUT a \"model\" field, WITH an unknown extra field, and"
+  say "  \"stream\": false — all three must be tolerated. Agents can be slow; I wait up to 5"
+  say "  minutes per turn…"
   local payload
   payload=$(python3 -c 'import json
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                   "stream": False, "conduck_doctor_probe": True}))') \
     || die "Could not build the test request (python3 failed)."
-  doctor_chat_check "chat: absent model + unknown field + stream:false" "$payload" || true
+  doctor_chat_check CHAT_BASIC "chat: absent model + unknown field + stream:false" "$payload" plain || true
 
-  if $DOCTOR_DEEP; then
-    say ""
-    say "  --deep: the same turn again, but the content arrives as PARTS (text + a tiny image) —"
-    say "  the shape Conduck sends when a photo rides along. A conforming server either answers"
-    say "  200, OR declines with HTTP 400 + an image-unsupported error — both pass. (A server that"
-    say "  silently drops the image and answers anyway is forbidden by the contract, but a black-box"
-    say "  probe can't tell that apart from a real answer — so this checks TOLERANCE, not honesty.)"
-    payload=$(python3 -c 'import json, zlib, struct, base64
+  doctor_model_selection_check || true
+
+  # The anti-poisoning probe, in the REAL failure shape this rule exists for:
+  # a photo turn that got no assistant reply (two consecutive user messages),
+  # then a text-only follow-up. The adapter must answer — forward the earlier
+  # image, or swap in the contract's disclosure text; rejecting the request is
+  # how one bad photo used to kill every later turn of a conversation.
+  payload=$(python3 -c 'import json, zlib, struct, base64
 def chunk(t, d):
     return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
 ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
 png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00\xff")) + chunk(b"IEND", b"")
 uri = "data:image/png;base64," + base64.b64encode(png).decode()
-print(json.dumps({"messages": [{"role": "user", "content": [
-    {"type": "text", "text": "Reply with exactly: pong"},
-    {"type": "image_url", "image_url": {"url": uri}}]}], "stream": False}))') \
-      || die "Could not build the image test request (python3 failed)."
-    doctor_chat_check "chat (--deep): parts-form content with an image" "$payload" image || true
+print(json.dumps({"messages": [
+    {"role": "user", "content": [
+        {"type": "text", "text": "What is in this photo?"},
+        {"type": "image_url", "image_url": {"url": uri}}]},
+    {"role": "user", "content": "Reply with exactly: pong"}], "stream": False}))') \
+    || die "Could not build the history-image test request (python3 failed)."
+  if doctor_chat_check HISTORY_IMAGE "chat: image in an EARLIER message, newest turn text-only" "$payload" history; then
+    DOCTOR_HISTORY_IMAGE="PASS"
+  else
+    DOCTOR_HISTORY_IMAGE="FAIL"
+  fi
+
+  payload=$(python3 -c 'import json
+print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+                  "stream": True}))') \
+    || die "Could not build the stream test request (python3 failed)."
+  if doctor_chat_check STREAM_SYNC "chat: \"stream\": true still answers one JSON object" "$payload" stream; then
+    DOCTOR_STREAM="PASS"
+  else
+    DOCTOR_STREAM="FAIL"
+  fi
+
+  if $DOCTOR_DEEP; then
+    say ""
+    say "  --deep: the semantic image probe — a locally generated PNG showing 4 digits rides the"
+    say "  newest message. A reply carrying those digits proves the engine truly SAW it; an honest"
+    say "  HTTP 400 decline with code \"image_unsupported\" also passes. Answering while silently"
+    say "  ignoring the image is the one forbidden move."
+    doctor_image_input_check || true
   fi
 
   say ""
