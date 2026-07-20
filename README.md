@@ -17,7 +17,7 @@ Works on macOS and Linux. `-O` lands the full file on disk before anything runs,
 
 It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV) — on OpenClaw also checking the gateway's **tool policy** (a policy denying the agent's `read`/`write` breaks attachments agent-side while every transport test stays green) and installing a short agent-guidance block in the workspace `TOOLS.md` — verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
-> **Status: the script is at `v0.10.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
+> **Status: the script is at `v0.11.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
 
 ## Why a shell script?
 
@@ -63,6 +63,7 @@ No `chmod` needed. The one large block near the bottom of the script is a vendor
 | `--openclaw` · `--hermes` · `--generic` | Skip detection; target a specific gateway kind |
 | `--doctor [url]` | Check an adapter built for Conduck against the rules at [conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/) — real requests, graded strictly, changes nothing (see below) |
 | `--deep` | With `--doctor`: also test how the adapter handles a message with an image |
+| `--files` | With `--doctor`: also grade the file lane (three meters — transport, agent access, end-to-end delivery). The one doctor profile that changes anything: it writes and removes small `conduck-doctor-*` files in the configured shared folder |
 | `--allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
 | `--help` | All flags |
 
@@ -77,6 +78,12 @@ CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --doctor http://127.0.0.1:8080
 The script changes nothing. It sends a handful of real requests, grades the answers against the rules at **[conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/)** — including the one the pairing wizard can't prove: that your token check is actually **enforced** (a missing or a wrong token must both get `401`, on both routes) — and tells you what to fix. Exit code `0` means every check passed, so you can loop it from a build script while you iterate. Plain `http://` is accepted toward `127.0.0.1`/`localhost` only; the token comes from `$CONDUCK_TOKEN` or a hidden prompt, never the command line. Add `--deep` to also test a message with an image (an honest HTTP `400` "images unsupported" answer passes).
 
 One scope note: it grades the *adapter* rules. OpenClaw and Hermes legitimately do things those rules forbid (keyless mode, for one), so pointing the doctor at them produces failures that don't mean anything is wrong — use the normal wizard verification for those.
+
+### Grade the file lane too (`--doctor --files`)
+
+If your setup has a file lane (the shared folder the app and your agent exchange files through), `--files` grades it as three independent meters: **`file_transport`** — the WebDAV↔disk lane itself (auth on the routes that carry your bytes, byte-identical write-through, *direct-write freshness* — a file written straight to disk must be visible over WebDAV within 2 seconds, which is exactly how agent-written files went missing before `0.10.0` — ranged-probe compatibility, nested folders, verified DELETE); **`file_access`** — one real chat turn in which the selected model must copy a small input file byte-for-byte to the folder root, finish *before* replying, and name the output in plain reply text; **`file_e2e`** — the combined delivery path, probed the way the app actually probes it. Unlike the plain doctor, this profile **mutates**: it writes and removes small `conduck-doctor-*` files in the configured folder (registered before creation, removed by exact name, cleanup verified). On the machine where the wizard ran it finds the lane from your saved profile; elsewhere set `CONDUCK_FILES_URL` + `CONDUCK_FILES_DIR` + `CONDUCK_FILES_PASS`.
+
+The last line of every doctor run is a machine summary (`CONDUCK_DOCTOR schema=2 …`) — build scripts key on it plus the exit code. `schema=2` replaced `schema=1` in `v0.11.0` (the single `file_access` placeholder became the three meters above); if a script of yours parses that line, update it.
 
 ## Trust posture
 
