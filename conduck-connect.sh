@@ -4068,7 +4068,7 @@ print("YES" if os.environ["DF_OKEY"] in outputs else "NO")' 2>/dev/null)
 # artifact is gone. Unproven cleanup is ERROR on the owning meter — never
 # silence. Exact names only, never a glob.
 doctor_files_delete() {
-  local entry tier kind rel code webdav_ok=true del_unsupported=""
+  local entry kind rel code webdav_ok=true del_unsupported=""
   for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)
     [ "$kind" = "file" ] || continue
