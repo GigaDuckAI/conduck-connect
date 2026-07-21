@@ -2,6 +2,24 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.12.0] — `--compat`: the question for servers you didn't build
+
+**New mode: `bash conduck-connect.sh --compat [url]`** — read-only, like the plain doctor, but answering the OTHER question: does the Conduck **app** work with this existing OpenAI-compatible server (Ollama, LiteLLM, vLLM, LM Studio, a framework endpoint) as-is?
+
+The doctor grades the adapter contract — the forward promise for software **built for Conduck** — and generic servers rightly fail it on rules the app itself never exercises (honoring `stream: true` with SSE is *correct* OpenAI behavior; the doctor's negative-auth probes test enforcement the app never checks). That made a doctor FAIL on your existing stack look like "Conduck won't work here" when the app would run fine. `--compat` closes that trap by mirroring the app's own validation exactly:
+
+- **Four wire checks:** the `/v1/models` probe (JSON object with a top-level `data` array; empty is valid; ids never required; 15-second limit), the chat decode (strict JSON; the whole `choices` array must decode; `content` must be a string — an **empty** string is a valid reply; `tool_calls`/unknown fields tolerated; response `Content-Type` never read), advertised-model selection, and history-image tolerance (one earlier photo must never break later turns).
+- **`model=required` servers pass** — the probe retries with the first advertised id, exactly the request the app sends once a model is configured, and threads it through every later probe.
+- **Explicit keyless** (empty token at the prompt) mirrors the app's no-auth scheme; no negative-auth requests are ever sent.
+- **Informational image-capability probe** (`VERIFIED` / `DECLINED` / `IGNORED` / `OPAQUE`) that never flips the verdict — the app can't detect a silently dropped image either.
+- **Own machine summary, own grammar:** the last line is `CONDUCK_COMPAT schema=1 … wire=PASS|FAIL … exit=…`. Exit `0` = the app can use this server at the wire level. It never claims adapter conformance, and it can't see statefulness (Conduck resends full history each turn; a server keeping its own history double-counts context).
+
+Also in this release:
+
+- The manual file-lane recipe in this README now carries `--dir-cache-time 1s` on the `rclone serve webdav` line. It is **load-bearing**: rclone's default 5-minute directory cache makes agent-written files invisible to the app's instant pickup probe (`--doctor --files` catches this as `FILES_READ_FRESH`). The wizard's own units always set it; hand-rolled setups copied from older docs should add it.
+- `--compat` (like `--doctor`) no longer requires `openssl` in its preflight — it never uses it.
+- The doctor's machine summary is unchanged (`CONDUCK_DOCTOR schema=2`, same grammar); `--compat` adds a new line, it does not touch the existing one.
+
 ## [0.11.0] — the doctor grades the file lane (`--doctor --files`)
 
 The file lane — how files travel between you, your agent, and the app — was the one part of a setup the doctor could not check: every transport probe could be green while agent-written files silently never reached your phone (exactly the 0.10.0 cache bug). `--files` closes that blind spot. **One breaking change for scripts:** the machine summary line is now `schema=2`.
