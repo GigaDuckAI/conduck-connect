@@ -100,6 +100,21 @@
 #                                           # the target URL, or (CI/rigs) CONDUCK_FILES_URL +
 #                                           # CONDUCK_FILES_DIR + CONDUCK_FILES_PASS (all three, plus
 #                                           # optional CONDUCK_FILES_USER, default "conduck").
+#   bash conduck-connect.sh --compat [url]  # app-COMPATIBILITY probe (read-only): does the
+#                                           # Conduck APP work with this OpenAI-compatible server
+#                                           # AS-IS? Mirrors the app's Test Connection + reply
+#                                           # decoder exactly — neither stricter nor looser. This
+#                                           # is NOT the adapter contract: --doctor grades adapters
+#                                           # BUILT for Conduck, and generic servers (Ollama,
+#                                           # LiteLLM, vLLM, …) fail it on intentional
+#                                           # Conduck-specific rules the app itself never exercises
+#                                           # (stream:true override, negative-auth enforcement,
+#                                           # model_not_found vocabulary). Testing existing OpenAI
+#                                           # software? Use --compat. Building an adapter? Use
+#                                           # --doctor. Last line is a machine summary
+#                                           # ("CONDUCK_COMPAT schema=1 …"); exit 0 = the app can
+#                                           # use this server (wire level — statefulness is
+#                                           # invisible on the wire and needs its own test).
 #   bash conduck-connect.sh --allow-keyless-public   # expert: permit a keyless
 #                                           # gateway on a public transport
 #
@@ -109,7 +124,7 @@
 
 set -u -o pipefail
 
-VERSION="0.11.0"
+VERSION="0.12.0"
 PAYLOAD_VERSION=1
 
 # ---------------------------------------------------------------- utilities --
@@ -133,6 +148,7 @@ ALLOW_KEYLESS_PUBLIC=false
 DOCTOR=false
 DOCTOR_DEEP=false
 DOCTOR_FILES=false
+COMPAT=false
 DOCTOR_URL=""
 MODE=""            # openclaw | hermes | generic
 
@@ -148,6 +164,7 @@ for arg in "$@"; do
     --doctor)   DOCTOR=true ;;
     --deep)     DOCTOR_DEEP=true ;;
     --files)    DOCTOR_FILES=true ;;
+    --compat)   COMPAT=true ;;
     --version)  say "conduck-connect $VERSION"; exit 0 ;;
     -h|--help)  sed -n '2,${/^#/!q;s/^# \{0,1\}//p;}' "$0"; exit 0 ;;   # whole header comment, wherever it ends
     # The ONLY positional argument is --doctor's target URL. It's collected in
@@ -173,12 +190,23 @@ fi
 # a combination. REUSE_ONLY is forced on for the same belt-and-braces reason as
 # --show-qr: any mutation that somehow gets reached dies via mutate_guard.
 if $DOCTOR; then
+  $COMPAT   && die "--doctor and --compat don't combine: --doctor grades an adapter BUILT for Conduck against the contract; --compat asks whether the app works with a generic OpenAI server as-is. Pick the question you're asking."
   $DRY_RUN  && die "--doctor and --dry-run don't combine: the doctor changes nothing (--files is its own explicit opt-in)."
   $SHOW_QR  && die "--doctor and --show-qr don't combine: one checks an adapter, the other re-shows a code. Pick one."
   [ -n "$MODE" ] && die "--doctor doesn't combine with --openclaw/--hermes/--generic: it asks for a URL and tests it as-is."
   REUSE_ONLY=true
+elif $COMPAT; then
+  # --compat is read-only like the plain doctor: no wizard, no exposure, no
+  # saved state — same contradiction rules, same mutate_guard belt-and-braces.
+  $DRY_RUN  && die "--compat and --dry-run don't combine: the compat probe changes nothing anyway."
+  $SHOW_QR  && die "--compat and --show-qr don't combine: one probes a server, the other re-shows a code. Pick one."
+  [ -n "$MODE" ] && die "--compat doesn't combine with --openclaw/--hermes/--generic: it asks for a URL and tests it as-is."
+  $DOCTOR_DEEP && die "--deep only works together with --doctor (the compat probe always runs its image capability check)."
+  $DOCTOR_FILES && die "--files only works together with --doctor: the file lane is adapter-contract territory."
+  $ALLOW_KEYLESS_PUBLIC && die "--allow-keyless-public is a wizard flag — the compat probe never publishes anything (keyless here is just an empty token at the prompt)."
+  REUSE_ONLY=true
 else
-  [ -n "$DOCTOR_URL" ] && die "A bare URL argument only makes sense with --doctor (try --help)."
+  [ -n "$DOCTOR_URL" ] && die "A bare URL argument only makes sense with --doctor or --compat (try --help)."
   $DOCTOR_DEEP && die "--deep only works together with --doctor."
   $DOCTOR_FILES && die "--files only works together with --doctor: it adds the file-lane probes to a doctor run."
 fi
@@ -313,9 +341,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 preflight() {
   local missing=()
   # openssl is only used by the wizard's self-signed cert path (SPKI compute /
-  # pin); the doctor never reaches it, so don't gate a read-only conformance
-  # check on a tool it doesn't use.
-  local tools="curl python3"; $DOCTOR || tools="$tools openssl"
+  # pin); the doctor and the compat probe never reach it, so don't gate a
+  # read-only check on a tool it doesn't use.
+  local tools="curl python3"; { $DOCTOR || $COMPAT; } || tools="$tools openssl"
   for t in $tools; do need "$t" || missing+=("$t"); done
   if [ ${#missing[@]} -gt 0 ]; then
     bad "Missing required tool(s): ${missing[*]}"
@@ -3376,10 +3404,16 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 # Anything else (wrong/missing decline code, other statuses, bad shape) FAILs:
 # clients key on the machine code, so "looks declined" isn't good enough.
 # ~1-in-9000 guess odds are accepted. The reply's content is never printed.
-doctor_image_input_check() {
-  local id="IMAGE_INPUT" gen code payload
+# Build the semantic image probe (shared by --deep and --compat): sets
+# IPG_CODE (the 4 digits) and IPG_PAYLOAD (the chat request carrying the PNG).
+# $CONDUCK_PROBE_MODEL (optional, exported by the caller) adds a "model" field
+# — the compat probe threads the advertised id through once it learns the
+# server requires one; the doctor never sets it (contract: absent model must
+# be tolerated).
+image_probe_gen() {
+  local gen
   gen=$(python3 -c '
-import json, zlib, struct, base64, random
+import json, os, zlib, struct, base64, random
 FONT = {
     "0": [14, 17, 19, 21, 25, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
     "2": [14, 17, 1, 2, 4, 8, 31],     "3": [31, 2, 4, 2, 1, 17, 14],
@@ -3409,11 +3443,21 @@ png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 0,
        + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 uri = "data:image/png;base64," + base64.b64encode(png).decode()
 print(code)
-print(json.dumps({"messages": [{"role": "user", "content": [
+req = {"messages": [{"role": "user", "content": [
     {"type": "text", "text": "Reply with exactly the digits shown in the image. No other text."},
-    {"type": "image_url", "image_url": {"url": uri}}]}], "stream": False}))') \
+    {"type": "image_url", "image_url": {"url": uri}}]}], "stream": False}
+m = os.environ.get("CONDUCK_PROBE_MODEL", "")
+if m:
+    req["model"] = m
+print(json.dumps(req))') \
     || die "Could not build the image test request (python3 failed)."
-  code="${gen%%$'\n'*}"; payload="${gen#*$'\n'}"
+  IPG_CODE="${gen%%$'\n'*}"; IPG_PAYLOAD="${gen#*$'\n'}"
+}
+
+doctor_image_input_check() {
+  local id="IMAGE_INPUT" code payload
+  image_probe_gen
+  code="$IPG_CODE"; payload="$IPG_PAYLOAD"
   if doctor_chat_eval "$payload" "$code"; then
     if [ "$DCE_TOKEN" = "yes" ]; then
       DOCTOR_IMAGE_INPUT="VERIFIED"
@@ -4378,6 +4422,373 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   fi
   bad "Doctor verdict: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."
   say "  Every rule above, with a copy-paste self-test:  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+  exit 1
+}
+
+# ------------------------------------------------------------------- --compat --
+#
+# App-compatibility probe: does the Conduck APP work with this OpenAI-compatible
+# server AS-IS? Mirrors the app's Test Connection + reply decoder EXACTLY —
+# neither stricter nor looser (each check names its app rule). This is NOT the
+# adapter contract: --doctor grades adapters BUILT for Conduck, and generic
+# servers fail it on intentional Conduck-specific rules the app itself never
+# exercises on the wire (stream:true override, negative-auth enforcement,
+# model_not_found status vocabulary). Scoring checks: models envelope (the
+# app's probe), chat decode (the app's decoder), advertised-model selection
+# (when ids exist), history-image tolerance (the poisoned-chat rule). The
+# image-input capability probe INFORMS but never fails — the app can't detect
+# a silently-dropped image either. No negative-auth request is ever sent.
+# Semantic compatibility (client-owned history replay) is INVISIBLE here: a
+# stateful server passes this probe and still double-counts context — that
+# dimension needs its own test.
+COMPAT_RAN=false
+COMPAT_CHECKS=0; COMPAT_FAILS=0
+COMPAT_MODELS="NOT_RUN"; COMPAT_CHAT="NOT_RUN"; COMPAT_HISTORY_IMAGE="NOT_RUN"
+COMPAT_IMAGE_INPUT="NOT_RUN"; COMPAT_MODEL_FIELD="NOT_RUN"
+
+c_ok()  { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); ok "[$id] $*"; }
+c_bad() { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); COMPAT_FAILS=$((COMPAT_FAILS+1)); bad "[$id] $*"; }
+c_say() { local id="$1"; shift; say "    [$id] $*"; }
+
+# Grade a chat reply the way the APP does (RemoteAgentClient.decodeReply):
+# strict JSON (Foundation refuses NaN/Infinity) -> choices must be a non-empty
+# array -> EVERY choice must decode as {"message":{"content":"<string>"}} (the
+# Swift [Choice] array decodes eagerly, so one malformed later choice
+# invalidates the whole reply even when choices[0] is fine — Android is
+# lenient here; the probe follows Apple + the contract) -> the reply is
+# choices[0].message.content, and an EMPTY string is a VALID reply. Response
+# Content-Type is deliberately NOT checked (the app never reads it) and
+# tool_calls/extra fields are tolerated (unknown JSON is ignored). On non-200
+# the app keys on the error body's "code" field — captured in CCE_WIRE_CODE.
+CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+compat_chat_eval() { # compat_chat_eval <payload-json> [expected-digit-code]
+  local exp="${2:--}" res verdict detail
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  if ! doctor_chat_request "$1"; then
+    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
+  fi
+  if [ "$DCC_CODE" != "200" ]; then
+    CCE_WIRE_CODE=$(printf '%s' "$DCC_BODY" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+e = d.get("error") if isinstance(d, dict) else None
+c = e.get("code") if isinstance(e, dict) else None
+if isinstance(c, str) and c:
+    print(c[:64])' 2>/dev/null)
+    CCE_REASON="HTTP ${DCC_CODE:-?}${CCE_WIRE_CODE:+ (wire code \"$CCE_WIRE_CODE\")}"
+    return 1
+  fi
+  case "$DCC_BODY" in data:*)
+    CCE_REASON="SSE framing — the app never reads streams, so its JSON decoder fails on this"; return 1 ;;
+  esac
+  res=$(printf '%s' "$DCC_BODY" | python3 -c '
+import json, sys, re
+def bad(x): raise ValueError(x)
+exp = sys.argv[1] if len(sys.argv) > 1 else "-"
+try:
+    d = json.load(sys.stdin, parse_constant=bad)
+except Exception:
+    print("badjson -"); sys.exit(0)
+ch = d.get("choices") if isinstance(d, dict) else None
+if not isinstance(ch, list) or not ch:
+    print("nochoices -"); sys.exit(0)
+for c in ch:
+    if not (isinstance(c, dict) and isinstance(c.get("message"), dict)
+            and isinstance(c["message"].get("content"), str)):
+        print("badchoice -"); sys.exit(0)
+c = ch[0]["message"]["content"]
+if exp != "-":
+    print(("token %d" if exp in re.findall(r"\d+", c) else "notoken %d") % len(c)); sys.exit(0)
+print("ok %d" % len(c))' "$exp" 2>/dev/null)
+  verdict="${res%% *}"; detail="${res#* }"
+  case "$verdict" in
+    ok)      CCE_LEN="$detail"; return 0 ;;
+    token)   CCE_LEN="$detail"; CCE_TOKEN="yes"; return 0 ;;
+    notoken) CCE_LEN="$detail"; CCE_TOKEN="no";  return 0 ;;
+    badjson)   CCE_REASON="HTTP 200, but the body isn't the strict JSON the app's decoder accepts" ;;
+    nochoices) CCE_REASON="no usable \"choices\" array (the app reads choices[0].message.content)" ;;
+    badchoice) CCE_REASON="a choice doesn't decode as {\"message\":{\"content\":\"<string>\"}} — the app rejects the whole reply" ;;
+    *)         CCE_REASON="could not grade the reply" ;;
+  esac
+  return 1
+}
+
+# The app's vision-decline classifier, mirrored: a structured code
+# "image_unsupported" at any error status; ANY 413 on an image turn (the app
+# maps it to image-too-large unconditionally); or — gated to 400/404 — the
+# app's four vision regexes applied to error.message when the OpenAI envelope
+# is present (the app deliberately scopes there to dodge metadata false
+# matches), else to the whole body.
+compat_image_declined_detectable() {
+  [ "$CCE_WIRE_CODE" = "image_unsupported" ] && return 0
+  [ "$DCC_CODE" = "413" ] && return 0
+  case "$DCC_CODE" in 400|404) ;; *) return 1 ;; esac
+  printf '%s' "$DCC_BODY" | python3 -c '
+import json, sys, re
+body = sys.stdin.read()
+text = body
+try:
+    d = json.loads(body)
+    e = d.get("error") if isinstance(d, dict) else None
+    m = e.get("message") if isinstance(e, dict) else None
+    if isinstance(m, str) and m:
+        text = m
+except Exception:
+    pass
+pats = (r"support.*image", r"image.*input", r"unsupported.*content", r"image.*not.*support")
+sys.exit(0 if any(re.search(p, text, re.I | re.S) for p in pats) else 1)' 2>/dev/null
+}
+
+compat_summary() { # compat_summary <exit-code>
+  local rc="${1:-1}" wire="NOT_RUN"
+  if $COMPAT_RAN; then
+    wire="PASS"; [ "$COMPAT_FAILS" -gt 0 ] && wire="FAIL"
+  fi
+  printf 'CONDUCK_COMPAT schema=1 harness=%s wire=%s models=%s chat=%s history_image=%s image_input=%s model=%s model_ids=%s auth=%s checks=%s failed=%s exit=%s\n' \
+    "$VERSION" "$wire" "$COMPAT_MODELS" "$COMPAT_CHAT" "$COMPAT_HISTORY_IMAGE" \
+    "$COMPAT_IMAGE_INPUT" "$COMPAT_MODEL_FIELD" "${MODELS_ID_COUNT:-0}" \
+    "${GW_AUTH:-NOT_RUN}" "$COMPAT_CHECKS" "$COMPAT_FAILS" "$rc"
+}
+
+compat_on_exit() {
+  local rc=$?
+  on_exit
+  compat_summary "$rc"
+}
+
+run_compat() {
+  trap compat_on_exit EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+
+  say "${BOLD}conduck-connect $VERSION — compat${RESET}"
+  say "Asks ONE question, read-only: can the Conduck app use this OpenAI-compatible server"
+  say "as-is? Every check mirrors the app's own Test Connection and reply decoder — no more,"
+  say "no less. This is NOT the adapter contract: ${BOLD}--doctor${RESET} grades adapters built FOR Conduck,"
+  say "and generic servers fail it on rules the app never exercises. A pass here does NOT"
+  say "make this server a Conduck adapter."
+  note "The last line is always a machine summary (CONDUCK_COMPAT schema=1 …) — scripts key on it."
+  note "What this can't see: a server that keeps its OWN chat history will pass and still"
+  note "double-count context — Conduck resends the full history every turn (client-owned)."
+
+  if [ -n "$DOCTOR_URL" ]; then
+    GW_URL=$(doctor_accept_url "$DOCTOR_URL") \
+      || die "Can't test '$DOCTOR_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+  else
+    say ""
+    GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
+  fi
+  apply_gateway_url_normalization
+
+  # Token: bearer from $CONDUCK_TOKEN / prompt; a deliberate empty answer means
+  # keyless — the app's explicit .none auth scheme (never inferred, and this
+  # probe sends NO negative-auth requests either way).
+  if [ -n "${CONDUCK_TOKEN:-}" ]; then
+    GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
+    note "Using the bearer token from \$CONDUCK_TOKEN."
+  else
+    say ""
+    note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
+    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter for keyless — the app's explicit no-auth mode)")
+    if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
+      GW_AUTH="none"
+      note "Keyless: mirroring the app's explicit no-auth scheme — sensible only on an isolated network."
+    fi
+  fi
+  TRANSPORT=""; GW_CERT_FP=""
+
+  head_ "Compat — $GW_URL"
+  COMPAT_RAN=true
+
+  # -- models: the app's Test Connection, verbatim (validateProbeBody) --------
+  local rc=0 secs over
+  models_is_json "$GW_URL" || rc=$?
+  secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
+  over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
+  if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
+    COMPAT_MODELS="PASS"
+    c_ok COMPAT_MODELS "GET /v1/models — the app's Test Connection passes (${secs}s)"
+    # Content-Type is NOT graded: the app parses the bytes and never reads the
+    # header (this is a deliberate divergence from the adapter contract).
+    if $MODELS_DATA_EMPTY; then
+      c_say COMPAT_MODELS "(\"data\" is empty — the app reports \"connected, no models yet\"; chat needs the"
+      c_say COMPAT_MODELS " server to answer without a model field)"
+    elif $MODELS_NO_VALID_ID; then
+      c_say COMPAT_MODELS "(entries carry no usable \"id\" string — the app can't offer a model picker;"
+      c_say COMPAT_MODELS " fine as long as the server answers without a model field)"
+    fi
+  else
+    COMPAT_MODELS="FAIL"
+    if [ "$rc" = "0" ]; then
+      c_bad COMPAT_MODELS "GET /v1/models — answered, but took ${secs}s (the app's Test Connection gives up at 15s)"
+    elif [ "$rc" = "2" ]; then
+      c_bad COMPAT_MODELS "GET /v1/models — an HTML page (HTTP ${MODELS_HTTP_CODE:-?}), not JSON"
+      c_say COMPAT_MODELS "(something else answered — a login page, a reverse proxy, or a wrong base address)"
+    elif [ "$rc" = "3" ]; then
+      c_bad COMPAT_MODELS "GET /v1/models — answers, but not the shape the app requires"
+      c_say COMPAT_MODELS "(the app needs a JSON OBJECT whose top-level \"data\" is an ARRAY — a bare array or"
+      c_say COMPAT_MODELS " {\"models\": …} fails its Test Connection; some servers have a separate OpenAI-compatible"
+      c_say COMPAT_MODELS " path that answers correctly — point the app at THAT base URL)"
+    else
+      local why=""
+      if [ "${MODELS_CURL_RC:-0}" != "0" ]; then
+        case "$MODELS_CURL_RC" in
+          6)  why="DNS lookup failed — that hostname doesn't resolve" ;;
+          7)  why="connection refused — nothing is listening there (wrong port? not started?)" ;;
+          28) why="timed out — no answer from the host" ;;
+          35|60) why="TLS problem — the app requires a certificate this machine would trust too" ;;
+          *)  why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
+        esac
+      else
+        case "$MODELS_HTTP_CODE" in
+          401|403) why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way" ;;
+          404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
+          5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
+          200)     why="answered 200, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
+          *)       why="HTTP ${MODELS_HTTP_CODE:-?}" ;;
+        esac
+      fi
+      c_bad COMPAT_MODELS "GET /v1/models — $why"
+    fi
+    say ""
+    bad "Compat verdict: FAIL — the app's Test Connection fails here, so nothing else can work."
+    say "  Fix that first, then re-run me. Testing an adapter you BUILT? That's ${BOLD}--doctor${RESET}."
+    exit 1
+  fi
+
+  say ""
+  say "  Now the chat turns — graded with the app's actual decoder (empty-string replies are"
+  say "  VALID, extra fields like tool_calls are tolerated, Content-Type is never read). Agents"
+  say "  can be slow; I wait up to 5 minutes per turn…"
+
+  # -- chat, the app's default shape: model OMITTED (dedicated + fresh custom) --
+  local payload_a payload_b="" a_ok=false a_reason="" a_code="" b_ok="" b_reason=""
+  payload_a=$(python3 -c 'import json
+print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+                  "stream": False}))') \
+    || die "Could not build the test request (python3 failed)."
+  if compat_chat_eval "$payload_a"; then a_ok=true; else a_reason="$CCE_REASON"; a_code="$DCC_CODE"; fi
+
+  # One turn WITH the first advertised id (when one exists): the app sends the
+  # model the user picked from THIS server's /v1/models, so named selection
+  # must work too. Also the rescue path for servers that REQUIRE the field.
+  if [ -n "$MODELS_FIRST_ID" ]; then
+    payload_b=$(CONDUCK_COMPAT_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
+print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+                  "model": os.environ["CONDUCK_COMPAT_MODEL"], "stream": False}))') \
+      || die "Could not build the test request (python3 failed)."
+    if compat_chat_eval "$payload_b"; then b_ok=true; else b_ok=false; b_reason="$CCE_REASON"; fi
+  fi
+
+  if $a_ok; then
+    COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="optional"
+    c_ok COMPAT_CHAT "chat without a \"model\" field — decoded by the app's rules (${CCE_LEN:-?} chars)"
+  elif [ "$b_ok" = "true" ]; then
+    # Only the statuses the app's own model-required heuristics accept
+    # (400/404/413/422) may be read as "needs a model" — a transient 429/5xx
+    # that happened to clear by the second turn must not claim that.
+    case "$a_code" in
+      400|404|413|422)
+        COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="required"
+        c_ok COMPAT_CHAT "chat works once a model is set — this server REQUIRES the \"model\" field"
+        c_say COMPAT_CHAT "(without one it answered: $a_reason. In the app, pick a model in the gateway's"
+        c_say COMPAT_CHAT " settings — a model-less request only happens when none is configured)" ;;
+      *)
+        COMPAT_CHAT="FAIL"; COMPAT_MODEL_FIELD="required"
+        c_bad COMPAT_CHAT "chat without a \"model\" field — $a_reason"
+        c_say COMPAT_CHAT "(the model-named turn worked, but this failure isn't the missing-model kind —"
+        c_say COMPAT_CHAT " something else is wrong; the app would hit it too)" ;;
+    esac
+  else
+    COMPAT_CHAT="FAIL"
+    [ "$COMPAT_MODEL_FIELD" = "NOT_RUN" ] && [ -z "$MODELS_FIRST_ID" ] && COMPAT_MODEL_FIELD="none_advertised"
+    c_bad COMPAT_CHAT "chat — $a_reason"
+    case "$a_code" in
+      401|403) c_say COMPAT_CHAT "(auth works on /v1/models but not on chat — two different credential checks?)" ;;
+    esac
+  fi
+
+  # -- named selection as its own verdict (when a model id exists) -------------
+  if [ -n "$MODELS_FIRST_ID" ]; then
+    if [ "$b_ok" = "true" ]; then
+      c_ok COMPAT_MODEL_SELECT "the first advertised model id selects (the app sends what the user picked)"
+    else
+      c_bad COMPAT_MODEL_SELECT "a request naming the first advertised id fails — $b_reason"
+      c_say COMPAT_MODEL_SELECT "(the app's model picker is fed from YOUR /v1/models — a listed id that can't"
+      c_say COMPAT_MODEL_SELECT " be used breaks every user who picks it)"
+    fi
+  fi
+
+  # -- history image: the poisoned-chat rule (a REAL app requirement) ----------
+  # Once the server is known to REQUIRE a model, every later probe carries the
+  # advertised id — the app sends the user's configured model on EVERY turn,
+  # so a model-less later probe would fail a server real app traffic works on.
+  local probe_model=""
+  [ "$COMPAT_MODEL_FIELD" = "required" ] && probe_model="$MODELS_FIRST_ID"
+  local payload_h
+  payload_h=$(CONDUCK_PROBE_MODEL="$probe_model" python3 -c 'import json, os, zlib, struct, base64
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0)
+png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(b"\x00\xff")) + chunk(b"IEND", b"")
+uri = "data:image/png;base64," + base64.b64encode(png).decode()
+req = {"messages": [
+    {"role": "user", "content": [
+        {"type": "text", "text": "What is in this photo?"},
+        {"type": "image_url", "image_url": {"url": uri}}]},
+    {"role": "user", "content": "Reply with exactly: pong"}], "stream": False}
+m = os.environ.get("CONDUCK_PROBE_MODEL", "")
+if m:
+    req["model"] = m
+print(json.dumps(req))') \
+    || die "Could not build the history-image test request (python3 failed)."
+  if compat_chat_eval "$payload_h"; then
+    COMPAT_HISTORY_IMAGE="PASS"
+    c_ok COMPAT_HISTORY_IMAGE "an image in an EARLIER message doesn't break a text-only turn (${CCE_LEN:-?} chars)"
+  else
+    COMPAT_HISTORY_IMAGE="FAIL"
+    c_bad COMPAT_HISTORY_IMAGE "history image — $CCE_REASON"
+    c_say COMPAT_HISTORY_IMAGE "(Conduck resends the full history, so ONE photo anywhere in a conversation would"
+    c_say COMPAT_HISTORY_IMAGE " permanently break every later turn of that chat in the app)"
+  fi
+
+  # -- image input: capability, informational — never fails the wire verdict ---
+  say ""
+  say "  Last, the image capability probe (informational — the app can't detect a silently"
+  say "  dropped image either, so this never changes the verdict)…"
+  CONDUCK_PROBE_MODEL="$probe_model" image_probe_gen
+  if compat_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
+    if [ "$CCE_TOKEN" = "yes" ]; then
+      COMPAT_IMAGE_INPUT="VERIFIED"
+      say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
+    else
+      COMPAT_IMAGE_INPUT="IGNORED"
+      warn "image input: IGNORED — answered 200 while ignoring the image. In the app, photos"
+      say "    are silently unseen: users get confident answers about images the engine never saw."
+    fi
+  elif compat_image_declined_detectable; then
+    COMPAT_IMAGE_INPUT="DECLINED"
+    say "  ${GREEN}•${RESET} image input: DECLINED, detectably — the app recognizes this refusal and shows its"
+    say "    pictures-unsupported message (text chats are unaffected)"
+  else
+    COMPAT_IMAGE_INPUT="OPAQUE"
+    warn "image input: image turns fail with an error the app can't classify ($CCE_REASON) —"
+    say "    users see a generic failure instead of \"pictures aren't supported here\""
+  fi
+
+  say ""
+  if [ "$COMPAT_FAILS" = "0" ]; then
+    ok "Compat verdict: PASS — the Conduck app can use this server as-is ($COMPAT_CHECKS/$COMPAT_CHECKS wire checks green)."
+    say "  Two honest limits: this probe can't see STATEFULNESS (a server that keeps its own"
+    say "  history will double-count context — Conduck resends the full history every turn),"
+    say "  and a pass here does NOT make this server a Conduck adapter (that's ${BOLD}--doctor${RESET})."
+    exit 0
+  fi
+  bad "Compat verdict: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
+  say "  The app would hit the same walls. Building your own adapter instead? ${BOLD}--doctor${RESET} grades that:"
+  say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
   exit 1
 }
 
@@ -5977,6 +6388,12 @@ if $DOCTOR; then
   run_doctor
   # run_doctor exits on every path; if a refactor ever makes it RETURN, the
   # doctor must neither fall into the wizard nor read as a pass — so fail.
+  exit 1
+fi
+
+# --compat: app-compatibility fast path — same contract as --doctor above.
+if $COMPAT; then
+  run_compat
   exit 1
 fi
 
