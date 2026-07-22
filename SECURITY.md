@@ -48,11 +48,11 @@ Every release also publishes `conduck-connect.sh.sha256` for an optional integri
 shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-connect.sh.sha256
 ```
 
-This confirms the bytes arrived intact, but the checksum rides the same release channel as the script — so it catches a **corrupted** download, not a **swapped or tampered** release. Reading the script is what catches that. Release tags are protected and are not moved after publication, so a given version's bytes never change underneath you.
+This confirms the bytes arrived intact, but the checksum rides the same release channel as the script — so it catches a **corrupted** download, not a **swapped or tampered** release. Reading the script is what catches that. Release tags are protected and are not moved after publication, and the release workflow refuses to overwrite an existing release's assets — a changed byte always means a new version and tag.
 
 ## The pairing code is a secret
 
-The QR / paste code contains your gateway URL and token. Treat it like a password — it is scannable by anyone who can see your screen. The script warns you of this when it emits the code.
+The QR / paste code contains your gateway URL and its access token — and, when the file lane is set up, the file-server URL and its credential too. Treat it like a password: it is scannable by anyone who can see your screen, and whoever holds it can talk to your gateway and read or change files in the shared folder until you rotate those secrets. The script warns you of this when it emits the code.
 
 ## Embedded component
 

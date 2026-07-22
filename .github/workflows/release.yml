@@ -32,9 +32,11 @@ jobs:
         run: |
           prerelease=()
           case "$TAG" in *-rc*|*-alpha*|*-beta*) prerelease=(--prerelease) ;; esac
+          # No overwrite path: an existing release is an error, never a re-upload.
+          # Published bytes are immutable — a changed byte gets a new version + tag
+          # (the immutability promise in SECURITY.md).
           gh release create "$TAG" \
             conduck-connect.sh conduck-connect.sh.sha256 \
             --title "$TAG" \
             --notes-file CHANGELOG.md \
-            --verify-tag "${prerelease[@]}" \
-          || gh release upload "$TAG" conduck-connect.sh conduck-connect.sh.sha256 --clobber
+            --verify-tag "${prerelease[@]}"
