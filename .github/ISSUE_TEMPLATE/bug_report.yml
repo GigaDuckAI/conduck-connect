@@ -1,0 +1,83 @@
+name: Bug report
+description: Report a problem with conduck-connect
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. For setup questions or help getting paired, the [Discord](https://discord.gg/HqVwTmM7) is usually faster.
+
+        **Do not report security vulnerabilities here.** See [SECURITY.md](https://github.com/gigaduckai/conduck-connect/blob/main/SECURITY.md) — a public issue discloses the problem before a fix exists.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps that trigger the problem, including the exact command line you ran (e.g. `bash conduck-connect.sh --doctor http://127.0.0.1:8080`). For intermittent issues, describe when it tends to occur.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Script version, OS, and shell
+      description: 'Run `grep "^VERSION=" conduck-connect.sh` and give your OS and shell, e.g. "0.12.0 on Ubuntu 24.04, bash 5.2" or "0.12.0 on macOS 15, bash 3.2".'
+    validations:
+      required: true
+  - type: dropdown
+    id: gateway
+    attributes:
+      label: Gateway kind
+      options:
+        - OpenClaw
+        - Hermes
+        - Custom or adapter
+        - Not gateway-related
+    validations:
+      required: true
+  - type: dropdown
+    id: exposure
+    attributes:
+      label: Exposure path
+      description: How the gateway (or file lane) is reached, if the problem involves reachability.
+      options:
+        - Tailscale Serve (tailnet-only)
+        - Tailscale Funnel (public)
+        - Cloudflare Tunnel
+        - Own reverse proxy or cert
+        - Self-signed
+        - Not applicable
+    validations:
+      required: false
+  - type: textarea
+    id: machine-summary
+    attributes:
+      label: Doctor / compat machine summary
+      description: 'If the problem involves `--doctor` or `--compat`, paste the run output — at minimum the final CONDUCK_DOCTOR / CONDUCK_COMPAT machine-summary line and the failing [CHECK_ID] lines. The check output never contains your token, but the target URL can appear in it — replace it with a placeholder if your gateway hostname is private.'
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Other terminal output
+      description: 'Any other terminal output. Before pasting, remove anything private: pairing codes (`conduck-setup:...`), bearer tokens, API keys, gateway URLs or tailnet hostnames you consider private, and file-lane credentials. A pairing code grants full access to your agent — never paste it into a public issue, chat, log, or anywhere untrusted.'
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Screenshots or additional context
+      description: Drag in screenshots or a screen recording, and add anything else that helps.
+    validations:
+      required: false

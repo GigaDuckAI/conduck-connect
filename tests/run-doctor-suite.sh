@@ -436,17 +436,6 @@ COMPAT_SUMMARY_RE='^CONDUCK_COMPAT schema=1 harness=[0-9][0-9.]* wire=(PASS|FAIL
 # against the fixture's open mode — the app's explicit .none auth scheme; NO
 # negative-auth request is sent either way. Names are compat- prefixed so they
 # never collide with the doctor case names when the positional filter is used.
-#
-# KNOWN DISCREPANCY — compat-require-model asserts the DESIRED contract the
-# founder verified (wire=PASS model=required chat=PASS): a server that merely
-# REQUIRES a model should be usable by the app, which carries the configured
-# model on every turn. The probe as written only threads the discovered model
-# through the two chat turns, NOT the history-image turn or the image probe —
-# both send no "model" field, so require-model 400s them (history_image=FAIL,
-# image_input=OPAQUE) and the real summary is wire=FAIL failed=1 exit=1. This
-# row therefore FAILS today; it pins the contract until the probe carries the
-# required model through those turns. Left asserting the intended outcome on
-# purpose (not fudged to the buggy actual) — see the report to the founder.
 COMPAT_CASES='
 compat-good|good|no|0|wire=PASS models=PASS chat=PASS history_image=PASS image_input=VERIFIED model=optional model_ids=2 auth=bearer checks=4 failed=0 exit=0
 compat-keyless|open|yes|0|wire=PASS auth=none exit=0

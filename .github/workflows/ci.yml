@@ -10,7 +10,7 @@ jobs:
   static:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: shellcheck
         run: shellcheck --severity=warning conduck-connect.sh scripts/*.sh
@@ -26,3 +26,15 @@ jobs:
 
       - name: /v1/models probe classification (live local mock server)
         run: bash scripts/test-models-probe.sh
+
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Self-contained: 76 checks against local fixture servers over loopback.
+      # Needs only bash + python3 (stdlib) + curl, all preinstalled on the
+      # runner. The rclone integration suite is NOT run here — it has an
+      # external dependency and stays manual.
+      - name: doctor regression suite (76 checks, no external deps)
+        run: bash tests/run-doctor-suite.sh

@@ -1,5 +1,7 @@
 # Security Policy
 
+The canonical vulnerability disclosure policy — including the full scope rules and safe-harbor terms — is published at **<https://conduck.com/security/>**. A machine-readable summary lives at [`/.well-known/security.txt`](https://conduck.com/.well-known/security.txt). This file is the short version for people arriving via GitHub.
+
 `conduck-connect` is a setup script you run on your own gateway host, often over SSH with root-capable rights. It is designed to be **read before it is run** — that is why it ships as a plain, unminified shell script.
 
 ## Reporting a vulnerability
@@ -9,7 +11,15 @@ Please report security issues **privately**, not as a public issue:
 - **GitHub private vulnerability reporting** — the repository's **Security** tab → **Report a vulnerability**.
 - Or email **security@gigaduck.ai**.
 
-We aim to acknowledge within 5 business days. Please include the script version (`grep '^VERSION=' conduck-connect.sh`), your OS and shell, and a reproduction.
+Please include the script version (`grep '^VERSION=' conduck-connect.sh`), your OS and shell, and a reproduction.
+
+## What to expect
+
+- **Acknowledgment within 3 business days** of your report.
+- **An initial assessment within 10 business days**, with updates as the fix progresses.
+- Confirmed vulnerabilities are addressed without delay. For critical issues, 90 days is the outer bound, not the plan — most fixes ship much faster.
+- Coordinated disclosure: please hold public disclosure until a fix has shipped or 90 days have passed since your report, whichever comes first.
+- Once a fix is available, an advisory is published; with your permission you are credited for the discovery. There is no monetary bug bounty at this time.
 
 ## Supported versions
 
@@ -26,15 +36,15 @@ The latest tagged release is supported. Older tags are not patched — re-downlo
 - **Enables** the gateway's OpenAI-compatible chat endpoint if it is off — with your confirmation.
 - **Creates** exposure mappings using tools you already run (`tailscale serve` / `funnel`), and optionally a file-server service it owns (`conduck-files-<id>`, rclone WebDAV bound to `127.0.0.1`).
 - **Stores** a file-lane credential in a `0600` file under `~/.config/conduck/`.
-- **Sends** requests only to your own gateway, to verify it works.
+- **Sends** its own HTTP probes only to your configured gateway and file lane, to verify they work.
 
 See [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md) for the exhaustive list and how to undo each change.
 
 ## What the script never does
 
-- **No telemetry, ever.** It makes no outbound request to anything except your own gateway. There is no GigaDuck server.
+- **No GigaDuck telemetry, ever. There is no GigaDuck server.** The script's own HTTP probes target only your configured gateway and file lane. Approved Tailscale or Cloudflare commands — run by the script with your consent, or by you — may contact those providers' control planes as part of exposing your gateway.
 - **Never installs** your gateway, Tailscale, cloudflared, or rclone — it works with what you already have, and exits cleanly with instructions if a prerequisite is missing.
-- **Never elevates silently.** Where `sudo` is required (e.g. Tailscale operator rights, `loginctl enable-linger`), it prints the exact command for you to review and run yourself.
+- **Never elevates silently.** Every `sudo` command is shown in full first. Most it prints for you to review and run yourself (Tailscale operator rights, `pmset`). The one it can run for you — `loginctl enable-linger`, so your file server survives logout — runs only after you approve the exact command at a `y/N` prompt; decline and it prints the command as a tip instead.
 - **Never changes a config it didn't create** without showing you the exact change first.
 - **Never makes your gateway public** without telling you, in plain words, that it will — and refuses to publish a **keyless** gateway on a public transport unless you explicitly pass `--allow-keyless-public`.
 

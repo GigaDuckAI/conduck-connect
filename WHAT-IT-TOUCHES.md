@@ -29,13 +29,14 @@ bash conduck-connect.sh --dry-run
 | Tailscale exposure | `tailscale serve` (private) or `tailscale funnel` (public) on an auto-selected HTTPS port. If that port already maps to the same gateway with the *other* verb, the mapping is switched in place — going private drops the public Funnel flag first, so the port really stops being public. | `tailscale serve --https=<port> off` / `tailscale funnel --https=<port> off`. The script also prints the exact command to restore any prior mapping it replaced. |
 | Turn off a **stale public exposure it did not create** | When you choose a private path, the script looks for Tailscale **Funnels** (public) on *other* ports that still point at the same gateway or file-lane port from an earlier setup, tells you where they are, and offers to switch them off. It never does this without an explicit yes, and never touches a mapping for a different service. Declining leaves them running and says so. | Re-create it: `tailscale funnel --bg --https=<port> http://127.0.0.1:<local-port>`. Note this removal is treated as intentional, so the script's own rollback will not put it back for you. |
 | File-server service (optional) | rclone WebDAV bound to `127.0.0.1:<port>`, as a service the script owns: Linux `~/.config/systemd/user/conduck-files-<id>.service`; macOS `~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist`. | Linux: `systemctl --user disable --now conduck-files-<id>` then delete the unit. macOS: `launchctl unload <plist>` then delete it. |
+| Enable user-service linger (systemd/Linux, file lane only) | `sudo loginctl enable-linger <user>` so the file server keeps running after you log out. The one `sudo` step the script runs itself: it shows the exact command and asks `y/N` first — on yes it runs it, on no it prints the command as a tip. | `sudo loginctl disable-linger <user>`. |
 | File-lane credential | A 32-hex secret written to a `0600` file under `~/.config/conduck/`. | Delete the file. |
 | Setup profile (non-secret) | A successful wizard run writes `~/.config/conduck/profile-<gateway>.json` (`0600`): routing facts only — gateway kind, URLs, ports, transport — **never a token or credential**. `--show-qr` reads it and never rewrites it. | Delete the file. |
 
 ## Composes for you to run — it never runs these itself
 
 - **Cloudflare Tunnel** config / DNS — the script prints the exact commands; you run them; it re-verifies.
-- Anything needing `sudo` (Tailscale operator rights, `loginctl enable-linger`, `pmset`) — printed for you to review and run.
+- Anything needing `sudo` **except** the linger step above (Tailscale operator rights, `pmset`) — printed for you to review and run.
 
 ## When it cannot prove what it did
 
@@ -43,7 +44,7 @@ Every exposure change is re-checked against `tailscale serve status --json` afte
 
 ## Network
 
-Outbound requests go **only** to your own gateway and file server: a local health check, `/v1/models`, a live `/v1/chat/completions` pong, and (if the file lane is set up) a PUT→GET→DELETE probe. Nothing else leaves the host.
+The script's own HTTP probes go **only** to your own gateway and file server: a local health check, `/v1/models`, a live `/v1/chat/completions` pong, and (if the file lane is set up) a PUT→GET→DELETE probe. No GigaDuck telemetry — there is no GigaDuck server — while approved Tailscale or Cloudflare commands may contact those providers' control planes.
 
 ## Prerequisites it will not install
 

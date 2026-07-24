@@ -12,7 +12,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Verify before releasing
         run: |
@@ -21,6 +21,7 @@ jobs:
           bash scripts/verify-vendored-encoder.sh
           bash scripts/test-url-normalization.sh
           bash scripts/test-models-probe.sh
+          bash tests/run-doctor-suite.sh
 
       - name: Generate checksum
         run: sha256sum conduck-connect.sh > conduck-connect.sh.sha256
@@ -37,6 +38,7 @@ jobs:
           # (the immutability promise in SECURITY.md).
           gh release create "$TAG" \
             conduck-connect.sh conduck-connect.sh.sha256 \
+            LICENSE NOTICE THIRD_PARTY_NOTICES.md \
             --title "$TAG" \
             --notes-file CHANGELOG.md \
             --verify-tag "${prerelease[@]}"

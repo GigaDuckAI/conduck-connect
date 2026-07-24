@@ -2,6 +2,16 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [Unreleased]
+
+Repository governance and licensing. No change to the script's behavior, flags, pairing payload, or machine summaries.
+
+- **License change:** Conduck-authored code moves from MIT to the **Apache License 2.0**. Existing releases and tags (through 0.12.0) remain MIT — history is not rewritten; the first Apache-licensed release will carry a new version. The vendored Project Nayuki QR block stays MIT and is unchanged.
+- **License paperwork added:** `NOTICE`, `THIRD_PARTY_NOTICES.md` (the full Nayuki MIT notice), and `TRADEMARKS.md` (name/branding policy, separate from and adding no restrictions to Apache-2.0). The script now carries an `SPDX-License-Identifier: Apache-2.0 AND MIT` header.
+- **Contribution files added:** `CONTRIBUTING.md`, plus issue and pull-request templates.
+- **Security policy aligned** with the Conduck project's disclosure terms in `SECURITY.md`.
+- **CI now runs the doctor suite**, and releases ship the license files (`LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`) alongside the script and checksum.
+
 ## [0.12.0] — `--compat`: the question for servers you didn't build
 
 **New mode: `bash conduck-connect.sh --compat [url]`** — read-only, like the plain doctor, but answering the OTHER question: does the Conduck **app** work with this existing OpenAI-compatible server (Ollama, LiteLLM, vLLM, LM Studio, a framework endpoint) as-is?

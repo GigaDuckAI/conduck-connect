@@ -211,6 +211,8 @@ Nothing fails, so no message prints — but the result quietly isn't what you wa
 
 Security issues: see **[SECURITY.md](SECURITY.md)** (private vulnerability reporting — please don't open a public issue). Bugs and questions: open an issue.
 
-## Third-party code
+## License
 
-The terminal QR renderer embeds the [Project Nayuki QR Code generator](https://www.nayuki.io/page/qr-code-generator-library) (Python, MIT), unmodified, with its license header preserved in-file. CI verifies that block against a pinned checksum and asserts it imports only the standard library. Everything else is © 2026 GigaDuck OÜ under the [MIT License](LICENSE).
+`conduck-connect` is © 2026 GigaDuck OÜ and licensed under the [Apache License 2.0](LICENSE). The one exception is the terminal QR renderer, which embeds the [Project Nayuki QR Code generator](https://www.nayuki.io/page/qr-code-generator-library) (Python), used unmodified under the MIT License with its license header preserved in-file; CI verifies that block against a pinned checksum and asserts it imports only the standard library. Both are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+The Conduck name isn't covered by the code license — see [TRADEMARKS.md](TRADEMARKS.md). Truthful references are always fine; just don't pass a modified fork off as the official `conduck-connect`.

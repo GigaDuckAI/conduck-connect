@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 #
+# SPDX-License-Identifier: Apache-2.0 AND MIT
+# Copyright 2026 GigaDuck OÜ
+# Conduck-authored portions are Apache-2.0. The marked Project Nayuki
+# QR generator block is MIT; see THIRD_PARTY_NOTICES.md.
+#
 # conduck-connect — pair your self-hosted AI gateway with the Conduck app.
 #
 # How to run (no install, nothing to compile — this is a readable shell script
