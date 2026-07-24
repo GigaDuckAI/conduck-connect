@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """fixture-adapter.py — known-good / deliberately-broken adapter for the doctor's
-regression suite (run-doctor-suite.sh). stdlib only, loopback only.
+regression suite (run-checks-suite.sh). stdlib only, loopback only.
 
 This is NOT a production adapter. It exists so every doctor check can be proven
 to fail for its intended reason: `--mode good` (and the `single-model` /
@@ -33,7 +33,16 @@ Modes ("good" behavior unless listed):
     models-no-id         /v1/models entries carry no usable "id" string
     models-html          /v1/models returns an HTML page
     models-slow          /v1/models answers after 16s (over the app's 15s limit)
+    app-success-2xx      models answers 203 and chat answers 201; valid for the
+                         Apple app, deliberately invalid for the strict contract
+    chat-success-201     models answers 200 and chat answers 201, isolating the
+                         doctor's exact-200 response requirement on chat
+    models-redirect-307  /v1/models redirects to a valid final models route
+    chat-redirect-308    chat redirects to a valid final chat route
+    require-accept       authenticated routes require Accept: application/json
     require-model        400 when the request has no "model" field
+    require-long-model   same, but its only advertised model id is over 100
+                         characters (opaque ids must survive pairing exactly)
     reject-unknown-field 400 when the request carries an unknown field
     bogus-model-200      accepts an unknown model id while advertising two
     sse-despite-false    streams SSE when "stream" is false (correct on true)
@@ -126,7 +135,7 @@ def handle_file_turn(mode, files_dir, text):
     if mode == "files-no-write":
         return named
     if mode == "files-wrong-bytes":
-        write(b"conduck-doctor-TAMPERED\n" + data)
+        write(b"conduck-check-TAMPERED\n" + data)
         return named
     if mode == "files-no-reference":
         write(data)
@@ -276,6 +285,14 @@ def make_handler(mode, token, models):
             self.end_headers()
             self.wfile.write(body)
 
+        def send_redirect(self, status, location):
+            self.send_response(status)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
         def err(self, status, message, code=None, etype="invalid_request_error"):
             e = {"message": message, "type": etype}
             if mode == "error-missing-type":
@@ -306,10 +323,17 @@ def make_handler(mode, token, models):
 
         # ---- routes ----
         def do_GET(self):
-            if self.path.split("?")[0] != "/v1/models":
+            path = self.path.split("?")[0]
+            final = path == "/final/v1/models"
+            if path not in ("/v1/models", "/final/v1/models"):
                 return self.err(404, "Unknown path.")
             if not self.auth_ok("models"):
                 return
+            if mode == "models-redirect-307" and not final:
+                return self.send_redirect(307, "/final/v1/models")
+            if mode == "require-accept" and \
+                    self.headers.get("Accept") != "application/json":
+                return self.err(406, "Accept: application/json is required.")
             if mode == "models-slow":
                 time.sleep(16)
             if mode == "models-html":
@@ -321,15 +345,23 @@ def make_handler(mode, token, models):
             if mode == "models-no-id":
                 return self.send_json(200, {"object": "list", "data": [{"name": "x"}]})
             ct = "text/plain" if mode == "wrong-content-type-models" else "application/json"
-            return self.send_json(200, {"object": "list",
-                                        "data": [{"id": m, "object": "model"} for m in models]},
+            status = 203 if mode == "app-success-2xx" else 200
+            return self.send_json(status, {"object": "list",
+                                           "data": [{"id": m, "object": "model"} for m in models]},
                                   content_type=ct)
 
         def do_POST(self):
-            if self.path.split("?")[0] != "/v1/chat/completions":
+            path = self.path.split("?")[0]
+            final = path == "/final/v1/chat/completions"
+            if path not in ("/v1/chat/completions", "/final/v1/chat/completions"):
                 return self.err(404, "Unknown path.")
             if not self.auth_ok("chat"):
                 return
+            if mode == "chat-redirect-308" and not final:
+                return self.send_redirect(308, "/final/v1/chat/completions")
+            if mode == "require-accept" and \
+                    self.headers.get("Accept") != "application/json":
+                return self.err(406, "Accept: application/json is required.")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 req = json.loads(self.rfile.read(length))
@@ -350,7 +382,7 @@ def make_handler(mode, token, models):
                 return self.err(400, "Final message must have role user.")
 
             model = req.get("model")
-            if mode == "require-model" and model is None:
+            if mode in ("require-model", "require-long-model") and model is None:
                 return self.err(400, "model is required.")
             if model is not None and model not in models:
                 ignore = (mode == "bogus-model-200"
@@ -441,7 +473,8 @@ def make_handler(mode, token, models):
             resp = {"id": "chatcmpl-fixture", "object": "chat.completion",
                     "created": int(time.time()), "model": sel, "choices": choices}
             ct = "text/plain" if mode == "wrong-content-type" else "application/json"
-            return self.send_json(200, resp, content_type=ct)
+            status = 201 if mode in ("app-success-2xx", "chat-success-201") else 200
+            return self.send_json(status, resp, content_type=ct)
 
         def do_PUT(self):
             self.err(405, "Method not allowed.")
@@ -462,8 +495,12 @@ def main():
         print("CONDUCK_TOKEN is required", file=sys.stderr)
         sys.exit(2)
 
-    models = ["fixture-echo"] if args.mode == "single-model" \
-        else ["fixture-echo", "fixture-echo-2"]
+    if args.mode == "single-model":
+        models = ["fixture-echo"]
+    elif args.mode == "require-long-model":
+        models = ["org/route-" + ("opaque-model-segment-" * 8) + "final"]
+    else:
+        models = ["fixture-echo", "fixture-echo-2"]
     server = HTTPServer(("127.0.0.1", args.port),
                         make_handler(args.mode, token, models))
     print("READY %d" % server.server_address[1], flush=True)

@@ -19,7 +19,7 @@ body:
     id: repro
     attributes:
       label: Steps to reproduce
-      description: Numbered steps that trigger the problem, including the exact command line you ran (e.g. `bash conduck-connect.sh --doctor http://127.0.0.1:8080`). For intermittent issues, describe when it tends to occur.
+      description: Numbered steps that trigger the problem, including the exact command line you ran (e.g. `bash conduck-connect.sh --check-adapter http://127.0.0.1:8080`). For intermittent issues, describe when it tends to occur.
       placeholder: |
         1.
         2.
@@ -30,7 +30,7 @@ body:
     id: version
     attributes:
       label: Script version, OS, and shell
-      description: 'Run `grep "^VERSION=" conduck-connect.sh` and give your OS and shell, e.g. "0.12.0 on Ubuntu 24.04, bash 5.2" or "0.12.0 on macOS 15, bash 3.2".'
+      description: 'Run `grep "^VERSION=" conduck-connect.sh` and give your OS and shell, e.g. "0.13.0 on Ubuntu 24.04, bash 5.2" or "0.13.0 on macOS 15, bash 3.2".'
     validations:
       required: true
   - type: dropdown
@@ -61,8 +61,8 @@ body:
   - type: textarea
     id: machine-summary
     attributes:
-      label: Doctor / compat machine summary
-      description: 'If the problem involves `--doctor` or `--compat`, paste the run output — at minimum the final CONDUCK_DOCTOR / CONDUCK_COMPAT machine-summary line and the failing [CHECK_ID] lines. The check output never contains your token, but the target URL can appear in it — replace it with a placeholder if your gateway hostname is private.'
+      label: Check machine summary
+      description: 'If the problem involves `--check-adapter` or `--check-server`, paste the run output — at minimum the final CONDUCK_CHECK_ADAPTER / CONDUCK_CHECK_SERVER machine-summary line and the failing [CHECK_ID] lines. The check output never contains your token, but the target URL can appear in it — replace it with a placeholder if your gateway hostname is private.'
       render: shell
     validations:
       required: false

@@ -2,15 +2,128 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
-## [Unreleased]
+## [0.13.0] — one command surface, and checks that hand off to setup
 
-Repository governance and licensing. No change to the script's behavior, flags, pairing payload, or machine summaries.
+An intentional public CLI simplification, Apple-client parity,
+diagnostics hardening, and repository governance. The pairing payload is
+unchanged. **Two breaking changes for scripts** — both machine-summary schemas
+bump; see [Migrating](#migrating) below.
+
+- **One clear command surface:** no arguments opens a welcome action menu.
+  `--setup`, `--check-server [url]`, `--check-adapter [url]`, and
+  `--show-code` go directly to those actions. `--doctor`, `--compat`,
+  `--show-qr`, `--openclaw`, `--hermes`, and the temporary subcommand forms are
+  removed and now fail with a named error pointing at the replacement.
+  `--generic` is the single exception: it stays **functional** as a
+  compatibility alias for custom-server setup, because shipped Conduck app
+  builds emit it (see [Migrating](#migrating)).
+- **The menu asks the decisive provenance question:** option 2 is existing
+  OpenAI-compatible software **not built for Conduck**; option 3 is an adapter
+  built specifically for Conduck. This keeps generic servers out of the
+  intentionally stricter adapter grader.
+- **Stable exit-status split:** `0` is success/PASS, `1` is a setup/runtime
+  failure or completed-check FAIL, and `2` is command-line misuse. Unknown or
+  retired spellings, incompatible flags, extra positional arguments, and an
+  invalid direct URL now identify themselves as usage errors and exit `2`.
+  Both checks arm their machine-summary trap before runtime preflight, so a
+  missing `curl` or `python3` exits `1` and still emits a final `NOT_RUN`
+  summary instead of disappearing before the machine contract starts.
+- **Detection informs; the user decides:** setup reports any OpenClaw or Hermes
+  install it finds, then always requires an explicit OpenClaw, Hermes, or
+  another-server choice. Pressing Enter never silently selects a detected tool.
+- **Checks hand off to setup:** after an interactive PASS, both checks offer to
+  continue directly into setup and pairing. The checked URL, authentication,
+  token, and any proven required model remain in memory; the gateway menu is
+  skipped. Setup still verifies the final app-facing HTTPS route before it
+  emits a pairing code. Noninteractive and CI runs never prompt and retain a
+  final machine summary plus process exit code.
+- **Long required model IDs stay exact:** server-owned model identifiers are
+  opaque. A required ID longer than 100 characters now survives the
+  check-to-setup handoff and pairing JSON byte-for-byte; the obsolete
+  100-character warning is gone.
+- **Fresh machine vocabulary:** summaries are
+  `CONDUCK_CHECK_SERVER schema=2 …` and
+  `CONDUCK_CHECK_ADAPTER schema=3 …`. Probe artifacts use
+  `conduck-check-*`; test/module filenames use check-server/check-adapter terms.
+- **One Apple-compatible response evaluator:** normal setup and `--check-server`
+  now share the same current-Apple-app request/body rules at the directly
+  addressed endpoint—any 2xx status, strict JSON, eager decoding of every
+  choice, string content with an empty string allowed, unknown fields
+  tolerated, and `Accept: application/json`. Diagnostics deliberately do not
+  follow redirects or forward credentials to `Location` targets; 3xx failures
+  point to the final URL. The strict adapter check remains exactly-200 and
+  contract-specific. Android is still work in progress and is not yet the
+  compatibility authority.
+- **One versioned reply corpus across implementations:** the Apple app owns the
+  canonical public cases; the connector and Android WIP client consume
+  byte-identical vendored snapshots. Standalone CI runs locally without a
+  network fetch, while embedded URL/revision metadata keeps provenance visible.
+- **More precise compatibility verdict:** PASS means core text-chat wire
+  compatibility. Image capability remains separately reported and
+  informational; setup separately verifies HTTPS, certificate trust/pinning,
+  and reachability.
+- **Transport hardening:** every connector curl call ignores curl config files,
+  so an unrelated include/proxy/output/redirect directive cannot reroute a
+  secret or add undeclared file access. `--check-server` and
+  `--check-adapter` additionally refuse proxy environment variables so
+  credentials go directly to the explicitly supplied address.
+- **Honest effects wording:** plain checks change no host configuration but do
+  send live requests that may consume compute or enter server-side history;
+  `--check-adapter --files` remains explicitly mutating. `--show-code` changes no
+  configuration but its live verification can briefly write/delete a small
+  file-lane probe.
+- **Release/portability safeguards:** CI exercises the regression suite on both
+  Ubuntu and macOS, and the release workflow refuses a tag that does not match
+  the script's `VERSION`.
+- **Modular source, single release artifact:** maintainers edit responsibility-
+  scoped files under `src/`; a Bash 3.2-compatible deterministic builder
+  assembles the same plain `conduck-connect.sh` users download. CI and release
+  gates reject source/artifact byte drift.
 
 - **License change:** Conduck-authored code moves from MIT to the **Apache License 2.0**. Existing releases and tags (through 0.12.0) remain MIT — history is not rewritten; the first Apache-licensed release will carry a new version. The vendored Project Nayuki QR block stays MIT and is unchanged.
 - **License paperwork added:** `NOTICE`, `THIRD_PARTY_NOTICES.md` (the full Nayuki MIT notice), and `TRADEMARKS.md` (name/branding policy, separate from and adding no restrictions to Apache-2.0). The script now carries an `SPDX-License-Identifier: Apache-2.0 AND MIT` header.
 - **Contribution files added:** `CONTRIBUTING.md`, plus issue and pull-request templates.
 - **Security policy aligned** with the Conduck project's disclosure terms in `SECURITY.md`.
-- **CI now runs the doctor suite**, and releases ship the license files (`LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`) alongside the script and checksum.
+- **CI runs `tests/run-checks-suite.sh`** — the adapter/server/menu/command regression matrix — on both Ubuntu and macOS, after proving `src/` still assembles byte-for-byte into the checked-in `conduck-connect.sh`. Releases ship the license files (`LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`) alongside the script and checksum.
+
+### Migrating
+
+**Both machine-summary schemas bump.** Renaming the line prefix is a grammar
+change, and the script's own contract bumps `schema=` on any grammar change —
+so a parser that keyed on the prefix alone cannot silently misread the new
+line.
+
+| Before (≤ 0.12.0) | Now (0.13.0) |
+|---|---|
+| `CONDUCK_DOCTOR schema=2 …` | `CONDUCK_CHECK_ADAPTER schema=3 …` |
+| `CONDUCK_COMPAT schema=1 …` | `CONDUCK_CHECK_SERVER schema=2 …` |
+
+**Key on the new prefix + `schema=` + the process exit code.** The retired
+prefixes are **not** dual-emitted — there is no transition window, and a script
+grepping for `CONDUCK_DOCTOR` now matches nothing. Exactly **one** summary line
+is still printed, as the last line of every noninteractive run, so a `tail -1`
+consumer keeps working unchanged.
+
+**`--generic` survives as a functional compatibility alias.** It maps to
+custom-server setup and keeps its original meaning: it skips gateway detection,
+so an unrelated OpenClaw or Hermes install on the same host can never become
+the default for someone who never asked for it. It is deliberately absent from
+`--help` and the welcome menu — use `--setup`. It cannot be dropped in a later
+release either: Conduck app builds already on the App Store emit `--generic`
+verbatim, and every client resolves `releases/latest`, so an old install always
+downloads the *newest* script.
+
+**Flags that now fail with a named error**, each naming its replacement —
+`--doctor` → `--check-adapter`, `--compat` → `--check-server`, `--show-qr` →
+`--show-code`, `--openclaw` / `--hermes` → `--setup` and pick the gateway from
+the list. These were only ever typed by a person reading docs, so no behavior
+is preserved for them.
+
+**`CONDUCK_TOKEN` is now explicit for both checks.** Set-but-empty
+(`CONDUCK_TOKEN=`) is a deliberate keyless declaration. Unset with no answer
+possible — piped or closed stdin — now fails fast with that instruction
+instead of quietly grading the target as keyless, which graded the wrong thing
+and reported it as a pass.
 
 ## [0.12.0] — `--compat`: the question for servers you didn't build
 
@@ -101,7 +214,7 @@ Every decision prompt now explains itself in plain words on request, and a cross
 - The macOS sleep warning no longer fires on every Mac (it also matched `disksleep`/`displaysleep`).
 - Bracketed IPv6 gateway URLs pin correctly (portless `https://[::1]` defaults to `:443`; no SNI is sent for IP literals), and `--show-qr` accepts IPv6 profiles.
 - The advanced rclone one-liner now names `RCLONE_PASS` — run bare, it served with an *empty* password.
-- Piped or exhausted input can no longer mark a press-Enter step as done; failed file-lane probes clean up their test file; `--dry-run` stopped promising a verification it never runs; a model name over 100 characters gets a warning (the app stores only the first 100).
+- Piped or exhausted input can no longer mark a press-Enter step as done; failed file-lane probes clean up their test file; `--dry-run` stopped promising a verification it never runs; a model name over 100 characters got a warning. **Historical correction:** that warning really shipped, but its premise was wrong — the pairing/app wire does not cap model IDs at 100 characters. Version 0.13.0 removes it and preserves the exact ID.
 
 ## [0.6.0] — failures that name themselves, and a README that decodes them
 

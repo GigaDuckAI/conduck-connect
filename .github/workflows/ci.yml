@@ -12,11 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      - name: source reproduces the single-file release artifact
+        run: /bin/bash scripts/build-release.sh --check
+
       - name: shellcheck
-        run: shellcheck --severity=warning conduck-connect.sh scripts/*.sh
+        run: shellcheck --severity=warning conduck-connect.sh scripts/*.sh tests/*.sh
 
       - name: bash syntax (parse-only, never executes the wizard)
-        run: bash -n conduck-connect.sh
+        run: bash -n conduck-connect.sh scripts/*.sh tests/*.sh
 
       - name: verify vendored QR encoder (pinned checksum + stdlib-only imports)
         run: bash scripts/verify-vendored-encoder.sh
@@ -24,17 +27,26 @@ jobs:
       - name: URL-normalization parity fixtures (mirror of the app's Swift suite)
         run: bash scripts/test-url-normalization.sh
 
+      - name: Apple-authoritative response compatibility corpus
+        run: bash scripts/test-response-fixtures.sh
+
       - name: /v1/models probe classification (live local mock server)
         run: bash scripts/test-models-probe.sh
 
-  doctor:
-    runs-on: ubuntu-latest
+  connector-checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # Self-contained: 76 checks against local fixture servers over loopback.
-      # Needs only bash + python3 (stdlib) + curl, all preinstalled on the
-      # runner. The rclone integration suite is NOT run here — it has an
-      # external dependency and stays manual.
-      - name: doctor regression suite (76 checks, no external deps)
-        run: bash tests/run-doctor-suite.sh
+      # Self-contained adapter/server/menu/command matrix against local fixture
+      # servers over loopback. macos-latest intentionally exercises Apple's
+      # system Bash 3.2, the oldest supported shell. The rclone integration
+      # suite has an external dependency and stays manual.
+      - name: adapter, server, menu, and command regression suite
+        run: |
+          /bin/bash scripts/build-release.sh --check
+          /bin/bash tests/run-checks-suite.sh

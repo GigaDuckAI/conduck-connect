@@ -1,6 +1,6 @@
 # Contributing to conduck-connect
 
-`conduck-connect` is one readable shell script that pairs a self-hosted AI
+`conduck-connect` ships as one readable shell script that pairs a self-hosted AI
 gateway with the [Conduck](https://conduck.com) app. Contributions are welcome:
 bug fixes, clearer diagnostics, new gateway support, tests, and documentation
 improvements alike. Thanks for taking the time.
@@ -19,9 +19,13 @@ otherwise have the right to submit it under the repository's license
 (Apache-2.0). That's the whole agreement: there is **no CLA** and no copyright
 assignment.
 
-Sign-off is a **required check** — a DCO bot verifies every commit on a pull
-request, and the branch will not merge until it passes (alongside CI). Forgot to
-sign off? `git commit --amend -s` fixes the last commit;
+Sign-off is the one **branch-protection–required check**: a DCO bot verifies
+every commit on a pull request, and `main` will not accept the merge until it
+passes. CI (`static`, `connector-checks`) runs on every pull request and is
+expected to be green — maintainers don't merge a red PR — but it is not
+currently wired as a hard protection gate, so treat it as review policy rather
+than a mechanical block. Forgot to sign off? `git commit --amend -s` fixes the
+last commit;
 `git rebase --signoff <base>` fixes a whole branch. Push the corrected history
 and the check re-runs.
 
@@ -32,15 +36,35 @@ that is the `bash` macOS still ships, so no `declare -A`, no `${var^^}`, no
 `mapfile`. Its hard requirements beyond a POSIX shell are `python3`, `curl`, and
 `openssl`; the optional path tools it integrates — Tailscale, `cloudflared`,
 `rclone` — it uses only when already present and never installs. Keep both lists
-as they are (see invariants below). Edit `conduck-connect.sh` directly — there
-is no build step.
+as they are (see invariants below).
+
+The maintainable source lives in [`src/`](src/) and is assembled
+deterministically into the checked-in `conduck-connect.sh` release artifact.
+Edit the relevant `*.inc.sh` module, then run:
+
+```bash
+bash scripts/build-release.sh
+bash scripts/build-release.sh --check
+```
+
+Never hand-edit only the generated artifact: CI rejects source/artifact drift.
 
 ## Running tests
 
-- **`bash tests/run-doctor-suite.sh`** — 76 checks, no external dependencies.
+- **`bash scripts/build-release.sh --check`** — proves the checked-in release
+  artifact is byte-identical to the modular source.
+- **`bash scripts/build-release.sh --map`** — prints `module -> start_line`.
+  CI lints the ~6.5k-line generated artifact, not `src/*.inc.sh` (the modules
+  share variables across file boundaries, so linting them standalone reports
+  ~50 spurious "appears unused" findings). Use `--map` to translate a reported
+  artifact line back to its module and offset.
+- **`bash scripts/test-response-fixtures.sh`** — runs the generated script's
+  pure reply evaluator against the vendored Apple-authoritative corpus.
+- **`bash tests/run-checks-suite.sh`** — the adapter/server/command regression
+  matrix, with no external dependencies.
   Run it before every PR; behavioral changes must keep it green and add or
   update cases for what changed.
-- **`bash tests/run-doctor-rclone-integration.sh`** — optional, needs `rclone`
+- **`bash tests/run-check-adapter-rclone-integration.sh`** — optional, needs `rclone`
   installed. It proves the file-lane freshness check against a real WebDAV
   server; run it by hand when you touch the file lane.
 
@@ -51,9 +75,10 @@ CI runs the same suite on every pull request.
 These are the constraints the script exists to keep. A change that breaks one is
 not a bug fix — it needs prior discussion in an issue.
 
-- **One readable main script.** The whole tool is `conduck-connect.sh`, meant to
-  be audited before it is run. Keep it readable; don't split it into sourced
-  fragments or an opaque helper.
+- **One readable release artifact.** Users download and run only
+  `conduck-connect.sh`. The repository source is modular, but the generated
+  script never sources fragments or helpers at runtime. Keep the generated
+  artifact plain, unminified, and byte-reproducible from `src/`.
 - **Zero telemetry.** The script's only outbound requests go to the user's own
   gateway and file lane. It never phones home; there is no GigaDuck server.
 - **No silent privilege elevation.** Any `sudo` is shown in full first and runs
@@ -77,20 +102,28 @@ Several things in this script are a contract shared with the Conduck app, and
 the two must not drift independently. Open an issue before changing any of them:
 
 - the **`conduck-setup:v1`** pairing payload (see `PAYLOAD.md`);
-- the doctor and compat **`[CHECK_ID]`** verdict identifiers;
-- the **machine-summary schemas** (`CONDUCK_DOCTOR schema=2 …`,
-  `CONDUCK_COMPAT schema=1 …`) that build scripts parse;
+- the adapter/server **`[CHECK_ID]`** verdict identifiers;
+- the **machine-summary schemas** (`CONDUCK_CHECK_ADAPTER schema=3 …`,
+  `CONDUCK_CHECK_SERVER schema=2 …`) that build scripts parse. The grammar is
+  frozen per schema number — field order, names, and enum values included — so
+  *any* change to it, renaming the prefix included, must bump `schema=`;
 - **URL normalization**, which is pinned to the app's own fixtures;
-- any behavior the app **mirrors** — its Test Connection probe and reply
-  decoder, which `--compat` reproduces exactly.
+- any current-Apple-app request/body acceptance rule used by
+  `--check-server`. This parity is scoped to the directly addressed endpoint:
+  diagnostics intentionally do not follow redirects or forward credentials to
+  `Location` targets. Android is still work in progress and is not the
+  compatibility authority yet. Reply-shape changes start in the versioned
+  Apple corpus; the connector and Android vendor byte-identical snapshots.
 
 ## Pull requests
 
 - Keep PRs **small and focused** — one change per PR reviews and lands faster.
 - In the description, say what a **user sees differently** after the change, not
   just what the code does.
-- **Add or update tests** where behavior changes; keep `run-doctor-suite.sh`
+- **Add or update tests** where behavior changes; keep `run-checks-suite.sh`
   green.
+- Rebuild `conduck-connect.sh` after every source edit and keep
+  `build-release.sh --check` green.
 - Update **README.md**, **SECURITY.md**, and **WHAT-IT-TOUCHES.md** whenever the
   script's **privilege, network, or persistent-state** behavior changes — those
   docs are the audit surface and must stay accurate.
@@ -111,8 +144,8 @@ the script.
 ## Bugs, questions, and security
 
 - **Bugs:** open a [GitHub issue](../../issues) using the bug form. Include the
-  script version, your OS and shell, and the machine-summary line if a doctor or
-  compat run is involved.
+  script version, your OS and shell, and the machine-summary line if a server or
+  adapter check is involved.
 - **Questions and setup help:** the [Discord](https://discord.gg/HqVwTmM7) is
   usually faster.
 - **Security vulnerabilities:** never in a public issue. See

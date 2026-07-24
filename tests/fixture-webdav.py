@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """fixture-webdav.py — a minimal WebDAV-ish file server for the doctor's
-regression suite (run-doctor-suite.sh --files cases). stdlib only, loopback
+regression suite (run-checks-suite.sh --files cases). stdlib only, loopback
 only. NOT a production server: it serves ONE directory over the exact HTTP
 verbs the doctor's file lane uses (GET incl. Range: bytes=0-0, PUT, DELETE,
 MKCOL) with HTTP Basic auth, and every `--mode` deliberately sabotages one

@@ -1,0 +1,4 @@
+# This module contains an exact, checksum-pinned Project Nayuki source block.
+# Preserve its upstream trailing whitespace; scripts/verify-vendored-encoder.sh
+# protects the embedded bytes and its allowed imports.
+src/80-pairing.inc.sh whitespace=-blank-at-eol

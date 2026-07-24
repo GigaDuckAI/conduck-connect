@@ -7,24 +7,26 @@
 #
 # conduck-connect — pair your self-hosted AI gateway with the Conduck app.
 #
-# How to run (no install, nothing to compile — this is a readable shell script
-# on purpose, so you can audit it before running):
+# How to run (no install, nothing to compile — this is a plain, unminified shell
+# script on purpose, so you can inspect it before running):
 #
 # Where this should come from:
 #   1. Get it over HTTPS from the official release — not forwarded to you by
 #      someone else:  https://github.com/gigaduckai/conduck-connect/releases
-#   2. Skim this file before running it; it's short and meant to be read. That,
-#      plus the HTTPS download, is your real protection.
+#   2. Inspect this plain, unminified file before running it when your threat
+#      model calls for source review. The release tests the exact shipped artifact.
 #   3. Optional integrity check: the release also ships a checksum
 #        sha256sum -c conduck-connect.sh.sha256
 #        # macOS: shasum -a 256 -c conduck-connect.sh.sha256
 #      It catches a corrupted download, but it rides the same release channel —
-#      so it can't prove the release itself wasn't swapped. Reading the script can.
+#      so it can't prove the release itself wasn't swapped.
 #   If you got this script any other way, get it from the link above first.
 #
-#     bash conduck-connect.sh --dry-run  # START HERE: shows your setup + exactly what a
-#                                        #   real run would change. Changes nothing.
-#     bash conduck-connect.sh            # the real interactive wizard (asks before every change)
+#     bash conduck-connect.sh            # welcome menu: setup, check a server,
+#                                        #   check an adapter, or re-show a code
+#     bash conduck-connect.sh --setup    # go straight to the setup wizard
+#     bash conduck-connect.sh --setup --dry-run
+#                                        # preview setup; changes nothing
 #
 # What this script DOES (always with your confirmation, step by step):
 #   1. Finds your gateway (OpenClaw, Hermes, or any OpenAI-compatible server).
@@ -56,87 +58,68 @@
 # The pairing string is always printed too, so the QR is never required.
 #
 # Usage:
-#   bash conduck-connect.sh                 # interactive: detect + wizard
-#   bash conduck-connect.sh --openclaw      # skip detection, configure OpenClaw
-#   bash conduck-connect.sh --hermes        # skip detection, configure Hermes
-#   bash conduck-connect.sh --generic       # any OpenAI-compatible server
-#   bash conduck-connect.sh --dry-run       # show state + plan; mutate nothing
-#   bash conduck-connect.sh --show-qr       # re-show a SAVED pairing QR — skips the setup
-#                                           # questions and changes NOTHING (needs one prior
-#                                           # successful run; may still ask you to pick a
-#                                           # profile, re-enter a custom gateway's token, or
-#                                           # confirm a gateway-only code; verification still
-#                                           # makes its real requests)
-#   bash conduck-connect.sh --reuse-only    # advanced: run the FULL wizard, but refuse
-#                                           # every change (a read-only walk of your live
-#                                           # setup). To just re-show a saved code,
-#                                           # --show-qr is the normal way — use --reuse-only
-#                                           # when there's no saved profile yet (e.g. a
-#                                           # setup you built by hand)
-#   bash conduck-connect.sh --doctor [url]  # check an adapter built for Conduck against the rules
-#                                           # at conduck.com/setup/adapter/v1/ — real requests,
-#                                           # graded strictly; changes NOTHING. It also proves what
-#                                           # the wizard's verify step can't — that your auth is
-#                                           # actually ENFORCED (a missing or wrong token must 401),
-#                                           # that an image in an EARLIER message can't kill the
-#                                           # chat, and that "stream": true still gets one JSON
-#                                           # answer. Every check line carries a stable [CHECK_ID];
-#                                           # the last output line is always a machine summary
-#                                           # ("CONDUCK_DOCTOR schema=2 …") — scripts key on that
-#                                           # plus the exit code. http:// is allowed toward
-#                                           # 127.0.0.1/localhost only, so you can test BEFORE
-#                                           # exposing. Token comes from $CONDUCK_TOKEN or a hidden
-#                                           # prompt. Exit 0 = all green (loop it from a shell while
-#                                           # you iterate). Add --deep for the semantic image probe:
-#                                           # a generated PNG of 4 digits rides the newest message,
-#                                           # and the reply must read them back (an honest HTTP 400
-#                                           # decline with code "image_unsupported" also passes).
-#   bash conduck-connect.sh --doctor --files [url]   # ALSO grade the file lane, three meters:
-#                                           # file_transport (WebDAV <-> disk: auth on the routes that
-#                                           # carry bytes, write-through, direct-write freshness — the
-#                                           # dir-cache trap —, ranged-probe compatibility, nested
-#                                           # folders, DELETE), file_access (the selected agent copies
-#                                           # a sentinel byte-for-byte and names it in its reply), and
-#                                           # file_e2e (the app-shaped immediate ranged probe + a full
-#                                           # byte-compare download). UNLIKE the plain doctor this
-#                                           # profile MUTATES: it writes + removes small
-#                                           # conduck-doctor-* files in the configured shared folder.
-#                                           # Lane config comes from the saved pairing profile matching
-#                                           # the target URL, or (CI/rigs) CONDUCK_FILES_URL +
-#                                           # CONDUCK_FILES_DIR + CONDUCK_FILES_PASS (all three, plus
-#                                           # optional CONDUCK_FILES_USER, default "conduck").
-#   bash conduck-connect.sh --compat [url]  # app-COMPATIBILITY probe (read-only): does the
-#                                           # Conduck APP work with this OpenAI-compatible server
-#                                           # AS-IS? Mirrors the app's Test Connection + reply
-#                                           # decoder exactly — neither stricter nor looser. This
-#                                           # is NOT the adapter contract: --doctor grades adapters
-#                                           # BUILT for Conduck, and generic servers (Ollama,
-#                                           # LiteLLM, vLLM, …) fail it on intentional
-#                                           # Conduck-specific rules the app itself never exercises
-#                                           # (stream:true override, negative-auth enforcement,
-#                                           # model_not_found vocabulary). Testing existing OpenAI
-#                                           # software? Use --compat. Building an adapter? Use
-#                                           # --doctor. Last line is a machine summary
-#                                           # ("CONDUCK_COMPAT schema=1 …"); exit 0 = the app can
-#                                           # use this server (wire level — statefulness is
-#                                           # invisible on the wire and needs its own test).
-#   bash conduck-connect.sh --allow-keyless-public   # expert: permit a keyless
-#                                           # gateway on a public transport
+#   bash conduck-connect.sh                 # welcome menu
+#   bash conduck-connect.sh --setup         # setup + verify + pair
+#   bash conduck-connect.sh --check-server [url]
+#                                           # software NOT built for Conduck:
+#                                           # check it against the app's core wire
+#   bash conduck-connect.sh --check-adapter [url]
+#                                           # check software built specifically
+#                                           # for Conduck against its adapter contract
+#   bash conduck-connect.sh --show-code     # re-show a SAVED pairing code; no
+#                                           # configuration changes, but live
+#                                           # verification sends requests and a
+#                                           # configured file lane gets one small
+#                                           # PUT -> GET -> DELETE probe
+#
+# Modifiers:
+#   bash conduck-connect.sh --setup --dry-run
+#                                           # show setup state + plan; change nothing
+#   bash conduck-connect.sh --setup --reuse-only
+#                                           # advanced: walk setup but refuse host
+#                                           # configuration changes; verification
+#                                           # still sends requests and may run a
+#                                           # small file probe
+#   bash conduck-connect.sh --check-adapter --deep [url]
+#                                           # add a semantic image-input check
+#   bash conduck-connect.sh --check-adapter --files [url]
+#                                           # also grade the configured file lane;
+#                                           # writes and removes small probe files
+#   bash conduck-connect.sh --setup --allow-keyless-public
+#                                           # expert: permit a keyless
+#                                           # gateway on a public transport during setup
+#
+# Information:
+#   bash conduck-connect.sh --help            # show this complete public command reference
+#   bash conduck-connect.sh --version         # print the connector version and exit
+#
+# Exit status:
+#   0  requested action succeeded (or a check passed)
+#   1  setup/runtime failure, or a completed check failed
+#   2  command-line usage error (unknown/retired flag, invalid combination or URL)
+#   128+signal  interrupted by HUP/INT/TERM
 #
 # Re-running is safe: every step detects existing state and reuses what's done.
-# Run it again any time you just want the QR code back — or --show-qr to re-show a
-# saved gateway's code, skipping the setup questions (handy for pairing a second device).
+# Use --show-code to re-show a saved gateway's code, skipping setup questions
+# (handy for pairing a second device).
+
+# GENERATED FILE — edit src/*.inc.sh and run scripts/build-release.sh; direct edits are overwritten
 
 set -u -o pipefail
 
-VERSION="0.12.0"
+VERSION="0.13.0"
 PAYLOAD_VERSION=1
-
 # ---------------------------------------------------------------- utilities --
 
-BOLD=$(tput bold 2>/dev/null || true); DIM=$(tput dim 2>/dev/null || true)
-RED=$(tput setaf 1 2>/dev/null || true); GREEN=$(tput setaf 2 2>/dev/null || true)
-YELLOW=$(tput setaf 3 2>/dev/null || true); RESET=$(tput sgr0 2>/dev/null || true)
+# Colour is keyed on stdout being a terminal, not on $TERM alone: a redirected or
+# piped run (CI parsing [CHECK_ID] lines) must get clean text, never escape soup.
+if [ -t 1 ]; then
+  BOLD=$(tput bold 2>/dev/null || true); DIM=$(tput dim 2>/dev/null || true)
+  RED=$(tput setaf 1 2>/dev/null || true); GREEN=$(tput setaf 2 2>/dev/null || true)
+  YELLOW=$(tput setaf 3 2>/dev/null || true); RESET=$(tput sgr0 2>/dev/null || true)
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; RESET=""
+fi
 
 say()  { printf '%s\n' "$*"; }
 head_() { printf '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
@@ -145,6 +128,7 @@ bad()  { printf '  %s✗%s %s\n' "$RED" "$RESET" "$*"; }
 note() { printf '  %s%s%s\n' "$DIM" "$*" "$RESET"; }
 warn() { printf '%s! %s%s\n' "$YELLOW" "$*" "$RESET"; }
 die()  { printf '%sError:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+usage_die() { printf '%sUsage error:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 2; }
 
 DRY_RUN=false
 REUSE_ONLY=false
@@ -154,67 +138,174 @@ DOCTOR=false
 DOCTOR_DEEP=false
 DOCTOR_FILES=false
 COMPAT=false
-DOCTOR_URL=""
-MODE=""            # openclaw | hermes | generic
+CHECK_URL=""
+COMMAND=""         # menu | setup | check-server | check-adapter | show-code
+SETUP_FROM_CHECK=false
+CLI_ARG_COUNT=$#
+# Legacy compatibility (see the --generic arm below). SETUP_GATEWAY_HINT skips
+# gateway detection entirely; it is set ONLY by --generic and never by the new CLI.
+SETUP_GATEWAY_HINT=""
+LEGACY_GENERIC=false
+
+set_command() { # set_command <command>
+  if [ -n "$COMMAND" ]; then
+    usage_die "Choose one action only: --setup, --check-server, --check-adapter, or --show-code."
+  fi
+  COMMAND="$1"
+}
+
+# Temporary pre-0.13 subcommand spellings were published briefly. They do not
+# remain aliases, but people following an old instruction deserve the exact
+# replacement instead of a generic positional-argument failure.
+case "${1:-}:${2:-}" in
+  setup:*)       usage_die "The retired setup subcommand is now --setup (try --help)." ;;
+  show-code:*)   usage_die "The retired show-code subcommand is now --show-code (try --help)." ;;
+  check:server)  usage_die "The retired check server form is now --check-server [url] (try --help)." ;;
+  check:adapter) usage_die "The retired check adapter form is now --check-adapter [url] (try --help)." ;;
+esac
 
 for arg in "$@"; do
   case "$arg" in
-    --openclaw) MODE="openclaw" ;;
-    --hermes)   MODE="hermes" ;;
-    --generic)  MODE="generic" ;;
+    --setup)         set_command "setup" ;;
+    --check-server)  set_command "check-server" ;;
+    --check-adapter) set_command "check-adapter" ;;
+    --show-code)     set_command "show-code" ;;
     --dry-run)  DRY_RUN=true ;;
-    --show-qr)  SHOW_QR=true ;;
     --reuse-only) REUSE_ONLY=true ;;
     --allow-keyless-public) ALLOW_KEYLESS_PUBLIC=true ;;
-    --doctor)   DOCTOR=true ;;
     --deep)     DOCTOR_DEEP=true ;;
     --files)    DOCTOR_FILES=true ;;
-    --compat)   COMPAT=true ;;
-    --version)  say "conduck-connect $VERSION"; exit 0 ;;
-    -h|--help)  sed -n '2,${/^#/!q;s/^# \{0,1\}//p;}' "$0"; exit 0 ;;   # whole header comment, wherever it ends
-    # The ONLY positional argument is --doctor's target URL. It's collected in
-    # either order ("--doctor url" or "url --doctor") but validated after the
-    # loop: a bare word WITHOUT --doctor still dies, so a stray argument can
-    # never silently pick a mode.
-    -*) die "Unknown argument: $arg (try --help)" ;;
-    *)  if [ -z "$DOCTOR_URL" ]; then DOCTOR_URL="$arg"
-        else die "Unknown argument: $arg (try --help)"; fi ;;
+    --version)
+      [ "$CLI_ARG_COUNT" = "1" ] || usage_die "--version must be used by itself."
+      say "conduck-connect $VERSION"; exit 0 ;;
+    -h|--help)
+      [ "$CLI_ARG_COUNT" = "1" ] || usage_die "$arg must be used by itself."
+      sed -n '2,${/^#/!q;s/^# \{0,1\}//p;}' "$0"; exit 0 ;;   # whole header comment, wherever it ends
+    # --- compatibility with pre-0.13.0 spellings -------------------------------
+    # Conduck app builds already on the App Store emit `--generic` verbatim, and
+    # every client resolves releases/latest, so an old install always downloads the
+    # newest script. --generic therefore stays FUNCTIONAL (not merely diagnosed) and
+    # cannot be removed on a later release while those builds exist. It is
+    # compatibility plumbing: deliberately absent from --help and the welcome menu.
+    # It preserves its original meaning — skip gateway detection so a stray OpenClaw
+    # or Hermes install on the same host can never become the default.
+    --generic)
+      set_command "setup"
+      SETUP_GATEWAY_HINT="custom"
+      LEGACY_GENERIC=true ;;
+    # The rest were only ever typed by a human from docs, so a named error that
+    # points at the replacement is enough — no behavior is preserved.
+    --doctor)   usage_die "--doctor is now --check-adapter (try --help)." ;;
+    --compat)   usage_die "--compat is now --check-server (try --help)." ;;
+    --show-qr)  usage_die "--show-qr is now --show-code (try --help)." ;;
+    --openclaw|--hermes)
+      usage_die "$arg is gone — run --setup and pick your gateway from the list (try --help)." ;;
+    -*) usage_die "Unknown argument: $arg (try --help)" ;;
+    *)  if [ -z "$CHECK_URL" ]; then CHECK_URL="$arg"
+        else usage_die "Unknown argument: $arg (try --help)"; fi ;;
   esac
 done
 
-# --show-qr re-emits a SAVED profile's QR: reads only, changes nothing. It cannot
-# combine with --dry-run (which plans a fresh run and emits no QR). REUSE_ONLY is
-# forced on so any mutation that gets accidentally reached dies via mutate_guard.
-if $SHOW_QR; then
-  $DRY_RUN && die "--show-qr and --dry-run don't combine: --show-qr re-emits a saved gateway's QR and changes nothing, while --dry-run plans a fresh run and emits no QR. Pick one."
-  REUSE_ONLY=true
+if [ -z "$COMMAND" ]; then
+  if [ "$CLI_ARG_COUNT" = "0" ]; then
+    COMMAND="menu"
+  else
+    usage_die "Choose an action: --setup, --check-server, --check-adapter, or --show-code (try --help)."
+  fi
 fi
 
-# --doctor is a pure read-over-HTTP conformance check: no wizard, no exposure,
-# no QR, no saved state — so every wizard-shaping flag is a contradiction, not
-# a combination. REUSE_ONLY is forced on for the same belt-and-braces reason as
-# --show-qr: any mutation that somehow gets reached dies via mutate_guard.
-if $DOCTOR; then
-  $COMPAT   && die "--doctor and --compat don't combine: --doctor grades an adapter BUILT for Conduck against the contract; --compat asks whether the app works with a generic OpenAI server as-is. Pick the question you're asking."
-  $DRY_RUN  && die "--doctor and --dry-run don't combine: the doctor changes nothing (--files is its own explicit opt-in)."
-  $SHOW_QR  && die "--doctor and --show-qr don't combine: one checks an adapter, the other re-shows a code. Pick one."
-  [ -n "$MODE" ] && die "--doctor doesn't combine with --openclaw/--hermes/--generic: it asks for a URL and tests it as-is."
-  REUSE_ONLY=true
-elif $COMPAT; then
-  # --compat is read-only like the plain doctor: no wizard, no exposure, no
-  # saved state — same contradiction rules, same mutate_guard belt-and-braces.
-  $DRY_RUN  && die "--compat and --dry-run don't combine: the compat probe changes nothing anyway."
-  $SHOW_QR  && die "--compat and --show-qr don't combine: one probes a server, the other re-shows a code. Pick one."
-  [ -n "$MODE" ] && die "--compat doesn't combine with --openclaw/--hermes/--generic: it asks for a URL and tests it as-is."
-  $DOCTOR_DEEP && die "--deep only works together with --doctor (the compat probe always runs its image capability check)."
-  $DOCTOR_FILES && die "--files only works together with --doctor: the file lane is adapter-contract territory."
-  $ALLOW_KEYLESS_PUBLIC && die "--allow-keyless-public is a wizard flag — the compat probe never publishes anything (keyless here is just an empty token at the prompt)."
-  REUSE_ONLY=true
-else
-  [ -n "$DOCTOR_URL" ] && die "A bare URL argument only makes sense with --doctor or --compat (try --help)."
-  $DOCTOR_DEEP && die "--deep only works together with --doctor."
-  $DOCTOR_FILES && die "--files only works together with --doctor: it adds the file-lane probes to a doctor run."
-fi
+# Is this a real person at a terminal? Checks use this to offer setup after a
+# PASS. A CI job or redirected/piped invocation must always print its summary
+# and exit without waiting for an answer.
+interactive_terminal() {
+  case "${CI:-}" in 1|true|TRUE|yes|YES) return 1 ;; esac
+  [ -t 0 ] && [ -t 1 ]
+}
+
+# True only when a profile this version can actually use exists. The validator
+# is defined in the --show-code module and shared with its picker/loader, so the
+# menu can never advertise an entry those paths would reject moments later.
+saved_profile_exists() {
+  local p
+  for p in "$STATE_DIR"/profile-*.json; do
+    [ -f "$p" ] || continue
+    show_qr_validate_profile "$p" && return 0
+  done
+  return 1
+}
+
+choose_main_action() {
+  say "${BOLD}Welcome to Conduck Connect${RESET}"
+  if saved_profile_exists; then
+    say "Set up a gateway, check one before pairing, or re-show a saved setup code."
+  else
+    say "Set up a gateway, or check one before pairing."
+  fi
+  say ""
+  say "  What would you like to do?"
+  say "    1) Set up and pair a gateway"
+  say "    2) Check existing OpenAI-compatible software (not built for Conduck)"
+  say "    3) Check an adapter built specifically for Conduck"
+  if saved_profile_exists; then
+    say "    4) Show a saved setup code"
+  fi
+  say "    q) Exit"
+  say ""
+  local choice regex='^([1-3]|[qQ])$'
+  saved_profile_exists && regex='^([1-4]|[qQ])$'
+  choice=$(require_choice "Choose an option" "$regex") || die "$NO_ANSWER"
+  case "$choice" in
+    1) COMMAND="setup" ;;
+    2) COMMAND="check-server" ;;
+    3) COMMAND="check-adapter" ;;
+    4) COMMAND="show-code" ;;
+    q|Q) COMMAND="exit" ;;
+  esac
+}
+
+validate_cli() {
+  DOCTOR=false; COMPAT=false; SHOW_QR=false
+  case "$COMMAND" in
+    setup)
+      [ -z "$CHECK_URL" ] || usage_die "A URL argument only works with --check-server or --check-adapter."
+      $DOCTOR_DEEP && usage_die "--deep only works with --check-adapter."
+      $DOCTOR_FILES && usage_die "--files only works with --check-adapter."
+      ;;
+    check-server)
+      COMPAT=true
+      if [ -n "$CHECK_URL" ] && ! doctor_accept_url "$CHECK_URL" >/dev/null; then
+        usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+      fi
+      $DRY_RUN && usage_die "--check-server sends live requests, so it doesn't combine with --dry-run."
+      $REUSE_ONLY && usage_die "--reuse-only is a setup modifier; --check-server already changes no host configuration."
+      $DOCTOR_DEEP && usage_die "--deep only works with --check-adapter; --check-server already reports image capability."
+      $DOCTOR_FILES && usage_die "--files only works with --check-adapter."
+      $ALLOW_KEYLESS_PUBLIC && usage_die "--allow-keyless-public is a setup modifier; --check-server never publishes anything."
+      REUSE_ONLY=true
+      ;;
+    check-adapter)
+      DOCTOR=true
+      if [ -n "$CHECK_URL" ] && ! doctor_accept_url "$CHECK_URL" >/dev/null; then
+        usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+      fi
+      $DRY_RUN && usage_die "--check-adapter sends live requests, so it doesn't combine with --dry-run."
+      $REUSE_ONLY && usage_die "--reuse-only is a setup modifier; --check-adapter already changes no host configuration unless --files is requested."
+      $ALLOW_KEYLESS_PUBLIC && usage_die "--allow-keyless-public is a setup modifier; --check-adapter never publishes anything."
+      REUSE_ONLY=true
+      ;;
+    show-code)
+      SHOW_QR=true
+      [ -z "$CHECK_URL" ] || usage_die "A URL argument only works with --check-server or --check-adapter."
+      $DRY_RUN && usage_die "--show-code changes no configuration but performs live verification; it doesn't combine with --dry-run."
+      $DOCTOR_DEEP && usage_die "--deep only works with --check-adapter."
+      $DOCTOR_FILES && usage_die "--files only works with --check-adapter."
+      $ALLOW_KEYLESS_PUBLIC && usage_die "--allow-keyless-public is a setup modifier."
+      REUSE_ONLY=true
+      ;;
+    exit) ;;
+    *) die "Internal error: unknown action '$COMMAND'." ;;
+  esac
+}
 
 # PLAN[] accumulates human-readable "would do" lines for --dry-run.
 PLAN=()
@@ -222,7 +313,7 @@ plan_add() { PLAN+=("$*"); }
 
 confirm() {  # confirm "question" -> 0 yes / 1 no
   local reply
-  read -r -p "$1 [y/N] " reply
+  read -r -p "$1 [y/N] " reply || return 1
   case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
 }
 
@@ -244,11 +335,17 @@ ask_default() {  # ask_default "prompt" "default" -> echoes resolved value
 }
 
 # Secret prompt — never echoes the input to the terminal.
-ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden)
-  local reply
-  read -rs -p "  $1: " reply
+# Returns NONZERO when the input ended (EOF) rather than when the user chose an
+# empty answer. The two are not the same: a deliberate Enter is the app's explicit
+# keyless scheme, while EOF means nobody was asked at all. Callers that treat an
+# empty token as "keyless" MUST pair this with `|| die`, or a redirected run would
+# infer no-auth from a missing answer — the fail-closed-auth invariant.
+ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden); 1 on EOF
+  local reply rc=0
+  read -rs -p "  $1: " reply || rc=1
   printf '\n' >&2
   printf '%s' "$reply"
+  return $rc
 }
 
 # A choice with NO Enter-default — loops until the answer matches the regex.
@@ -346,8 +443,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 preflight() {
   local missing=()
   # openssl is only used by the wizard's self-signed cert path (SPKI compute /
-  # pin); the doctor and the compat probe never reach it, so don't gate a
-  # read-only check on a tool it doesn't use.
+  # pin); the two standalone checks never reach it, so don't gate a
+  # live diagnostic on a tool it doesn't use.
   local tools="curl python3"; { $DOCTOR || $COMPAT; } || tools="$tools openssl"
   for t in $tools; do need "$t" || missing+=("$t"); done
   if [ ${#missing[@]} -gt 0 ]; then
@@ -375,7 +472,7 @@ b64_nowrap() { # stdin -> single-line base64
 #   get      -> a scalar leaf value; empty for absent/null/non-scalar
 #   classify -> "absent" | "ref" (an object/array or a "${…}" placeholder — an
 #               indirect secret we must NOT use) | "literal\t<value>"
-json_query() { # json_query <file> <op:get|classify> <dotted.path>  (empty output when absent)
+json_query() { # json_query <file> <op:get|classify|type> <dotted.path>  (empty output when absent)
   python3 - "$1" "$2" "$3" <<'PY'
 import json, sys
 
@@ -438,14 +535,23 @@ path, op, dotted = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     obj = load(path)
 except Exception:
-    if op == "classify": sys.stdout.write("absent")
+    if op == "classify" or op == "type": sys.stdout.write("absent")
     sys.exit(0)
 cur = obj
 try:
     for part in dotted.split('.'):
         cur = cur[part]
 except Exception:
-    if op == "classify": sys.stdout.write("absent")
+    if op == "classify" or op == "type": sys.stdout.write("absent")
+    sys.exit(0)
+if op == "type":
+    if cur is None: sys.stdout.write("null")
+    elif isinstance(cur, bool): sys.stdout.write("boolean")
+    elif isinstance(cur, dict): sys.stdout.write("object")
+    elif isinstance(cur, list): sys.stdout.write("array")
+    elif isinstance(cur, str): sys.stdout.write("string")
+    elif isinstance(cur, (int, float)): sys.stdout.write("number")
+    else: sys.stdout.write("unknown")
     sys.exit(0)
 if op == "classify":
     if isinstance(cur, (dict, list)):
@@ -464,6 +570,7 @@ PY
 }
 
 json_get() { json_query "$1" "get" "$2"; }   # scalar leaf value (empty when absent)
+json_type() { json_query "$1" "type" "$2"; } # JSON type, or "absent"
 
 env_get() { # env_get <file> <KEY>  (last assignment wins; strips quotes)
   [ -f "$1" ] || return 0
@@ -509,13 +616,10 @@ apply_gateway_url_normalization() { # rewrites GW_URL in place; says so when it 
 }
 
 OS="$(uname -s)"   # Linux | Darwin
-# ${HOME:-} so a doctor run in a HOME-less environment (a bare CI shell) doesn't
+# ${HOME:-} so a check run in a HOME-less environment (a bare CI shell) doesn't
 # abort here under `set -u` on a path it never uses; the wizard would fail later
 # anyway if it genuinely needed a state dir, which is the correct place to notice.
 STATE_DIR="${XDG_CONFIG_HOME:-${HOME:-}/.config}/conduck"
-
-preflight
-
 # ------------------------------------------------------------- gateway phase --
 
 GW_KIND=""         # openclaw | hermes | custom
@@ -531,26 +635,25 @@ GW_CERT_FP=""      # SPKI SHA-256 hex, self-signed path only
 
 detect_gateway() {
   head_ "Step 1 — find your gateway"
+  # Legacy --generic: the caller already declared "a server I configured myself",
+  # so detection is skipped entirely. Without this, an unrelated OpenClaw install
+  # on the same host would appear as "1) OpenClaw (detected)" to someone who never
+  # asked about OpenClaw, and pairing the wrong service is a silent mis-setup.
+  if [ "$SETUP_GATEWAY_HINT" = "custom" ]; then
+    GW_KIND="custom"
+    say "  Configuring a server you set up yourself (skipping gateway detection)."
+    return 0
+  fi
   local found=()
   [ -f "$HOME/.openclaw/openclaw.json" ] && found+=("openclaw")
   { [ -f "$HOME/.hermes/.env" ] || [ -d "$HOME/.hermes" ]; } && found+=("hermes")
 
-  if [ -n "$MODE" ]; then
-    GW_KIND=$([ "$MODE" = "generic" ] && echo "custom" || echo "$MODE")
-    ok "Using --$MODE as requested."
-    return
-  fi
-
   if [ ${#found[@]} -gt 0 ]; then
-    say "  Detected on this machine: ${BOLD}${found[*]}${RESET}"
+    say "  We found these on this machine: ${BOLD}${found[*]}${RESET}"
+    say "  You can choose one of them, or configure a different server."
   else
     say "  No OpenClaw or Hermes install detected in the usual places."
-  fi
-
-  # One detected → default to it. Zero or several → require an explicit pick.
-  local default_choice=""
-  if [ ${#found[@]} -eq 1 ]; then
-    case "${found[0]}" in openclaw) default_choice=1 ;; hermes) default_choice=2 ;; esac
+    say "  You can still choose either one or configure a different server."
   fi
 
   say ""
@@ -559,15 +662,7 @@ detect_gateway() {
   say "    2) Hermes   $( [[ " ${found[*]-} " == *" hermes "* ]] && echo '(detected)' )"
   say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, your own adapter, …)"
   local choice
-  if [ -n "$default_choice" ]; then
-    # Enter takes the detected default; a typo re-prompts (never aborts).
-    while true; do
-      choice=$(ask "  Choose 1-3" "$default_choice")
-      case "$choice" in [123]) break ;; *) warn "Please enter 1, 2, or 3 (or press Enter for $default_choice)." ;; esac
-    done
-  else
-    choice=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
-  fi
+  choice=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
   case "$choice" in
     1) GW_KIND="openclaw" ;;
     2) GW_KIND="hermes" ;;
@@ -578,7 +673,7 @@ detect_gateway() {
 
 # Resolve OpenClaw's loopback port. Precedence: a live --port override (unknowable from
 # outside the process, so unread) > OPENCLAW_GATEWAY_PORT in the compose .env > gateway.port
-# in openclaw.json > 18789. Shared by the wizard AND --show-qr so the two never disagree.
+# in openclaw.json > 18789. Shared by setup AND --show-code so the two never disagree.
 # A config gateway.port is validated as a real 1-65535 port (like the interactive prompt);
 # garbage is noted (stderr — this runs under $()) and skipped so it can't interpolate into
 # a probe URL or the exposure commands.
@@ -611,7 +706,7 @@ _openclaw_prompt_secret() { # _openclaw_prompt_secret <ctx> <ask-prompt> <die-ms
 }
 
 # Resolve OpenClaw's gateway credential from openclaw.json's auth.mode. Shared by the wizard
-# (configure_openclaw) and the --show-qr re-emit so BOTH resolve IDENTICALLY. Sets GW_AUTH +
+# (configure_openclaw) and the --show-code re-emit so BOTH resolve IDENTICALLY. Sets GW_AUTH +
 # GW_TOKEN. mode ""/token → gateway.auth.token; password → gateway.auth.password (rides as the
 # bearer credential); none → keyless; trusted-proxy/unknown → prompt. A literal value is used
 # as-is; an indirect value (an "${ENV}" placeholder or a SecretRef object) is NEVER embedded —
@@ -695,7 +790,7 @@ configure_openclaw() {
     note "If I enable the chat endpoint, OpenClaw's 'config set' rewrites the file as plain JSON and drops any comments — back it up first if you want to keep them." >&2
   fi
 
-  # Loopback port + its precedence live in openclaw_local_port (shared with --show-qr).
+  # Loopback port + its precedence live in openclaw_local_port (shared with --show-code).
   local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"   # still needed for the enable-endpoint check below
   GW_LOCAL_PORT=$(openclaw_local_port)
   GW_HEALTH_PATH="/healthz"
@@ -729,7 +824,7 @@ configure_openclaw() {
 
   # The REAL runtime credential lives in openclaw.json (the .env value is only an onboarding
   # seed and can drift from what the gateway actually checks). Resolution — mode → classify →
-  # literal | env-fallback | prompt — is shared with --show-qr so the two never diverge.
+  # literal | env-fallback | prompt — is shared with --show-code so the two never diverge.
   openclaw_resolve_secret "wizard"
 }
 
@@ -821,9 +916,9 @@ probe_single_model() { # probe_single_model <local_port>
     # Same stdin-config idiom as curl_gw: the token never rides argv (`ps`).
     local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
     body=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
-      | curl -sS --max-time 5 --config - "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+      | curl -q -sS --max-time 5 --config - "http://127.0.0.1:$1/v1/models" 2>/dev/null)
   else
-    body=$(curl -sS --max-time 5 "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+    body=$(curl -q -sS --max-time 5 "http://127.0.0.1:$1/v1/models" 2>/dev/null)
   fi
   printf '%s' "$body" | python3 -c '
 import json,sys
@@ -873,11 +968,7 @@ configure_generic() {
   else
     GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
   fi
-  if [ "${#GW_MODEL}" -gt 100 ]; then
-    warn "That model name is over 100 characters — the app stores only the first 100, which will break chats. Double-check the exact ID."
-  fi
 }
-
 # ------------------------------------------------------------ exposure phase --
 
 TRANSPORT=""       # tailscale | funnel | cloudflare | public | selfsigned
@@ -1353,13 +1444,19 @@ choose_exposure() {
   say "  4) ${BOLD}I already run my own HTTPS for it${RESET}"
   say "     You give the https:// address; I check its certificate and set up the app's trust."
   say ""
-  say "  ${DIM}b) go back to the gateway choice${RESET}"
+  if $SETUP_FROM_CHECK; then
+    say "  ${DIM}b) stop this setup (the completed check remains unchanged)${RESET}"
+  else
+    say "  ${DIM}b) go back to the gateway choice${RESET}"
+  fi
   say ""
   say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
   say "  only if that address is reachable from anywhere."
   say ""
-  local choice; choice=$(require_choice "Choose 1-4 ('?' compares them in plain words, 'b' goes back)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
-  [[ "$choice" =~ ^[bB]$ ]] && return 10   # back — main re-runs gateway selection (nothing applied yet)
+  local back_word="goes back"
+  $SETUP_FROM_CHECK && back_word="stops setup"
+  local choice; choice=$(require_choice "Choose 1-4 ('?' compares them in plain words, 'b' $back_word)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
+  [[ "$choice" =~ ^[bB]$ ]] && return 10   # back/stop — no exposure change has happened yet
   $DRY_RUN || note "From here I may apply changes to this machine; to change an earlier choice, stop (Ctrl-C) and re-run."
 
   case "$choice" in
@@ -1613,7 +1710,7 @@ classify_own_https() {  # GW_URL + SCOPE already set
   # Capture curl's exit code directly — `$?` read after a completed `if` would be
   # the if-statement's own status (always 0 here), never curl's.
   local rc=0
-  curl -sS --max-time 15 -o /dev/null "$GW_URL/v1/models" 2>/dev/null || rc=$?
+  curl -q -sS --max-time 15 -o /dev/null "$GW_URL/v1/models" 2>/dev/null || rc=$?
   if [ "$rc" = "0" ]; then
     TRANSPORT="public"
     ok "Its certificate is trusted normally — the app needs no pin."
@@ -1673,13 +1770,12 @@ hex_to_b64() { # hex_to_b64 <64-hex>
 h=sys.stdin.read().strip()
 sys.stdout.write(base64.b64encode(binascii.unhexlify(h)).decode() if h else "")' 2>/dev/null
 }
-
 # ----------------------------------------------------------- file-lane phase --
 
 FS_URL=""; FS_CRED=""; FS_CERT_FP=""
 FS_LOCAL_PORT=""
 FS_REACH=""         # the file lane's OWN reach (public|private) — can differ from the gateway's
-                    # SCOPE in a mixed-scope setup; recorded as fileServer.reach for --show-qr
+                    # SCOPE in a mixed-scope setup; recorded as fileServer.reach for --show-code
 FS_UNIT=""          # resolved unit/plist path actually in use (existing or new)
 FS_FOLDER=""        # served workspace path — for the non-secret profile only; "" when unknown
 FS_CRED_LEGACY_ARGV=false   # true when a reused unit keeps the password on argv (ps-visible)
@@ -2596,7 +2692,6 @@ setup_file_lane() {
       ;;
   esac
 }
-
 # ---------------------------------------------------------- verification phase --
 
 VERIFY_FAILED=false
@@ -2615,21 +2710,19 @@ curl_gw() { # curl_gw <curl args…>
     local b64; b64=$(hex_to_b64 "$GW_CERT_FP")     # pin the QR's fingerprint, not a re-fetch
     [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64")
   fi
-  # Doctor hardening: `-q` (MUST be curl's first arg) ignores ~/.curlrc, so a
-  # stray `proxy`/`output`/redirect line there can neither reroute the request
-  # nor write a file; `--noproxy '*'` refuses ALL proxies, so a $http_proxy in
-  # the environment can't carry the bearer token (in cleartext, for a plain-http
-  # loopback target) to a host the user never named. The doctor's whole promise
-  # is "direct to the server you gave me, nothing else" — enforce it. Scoped to
-  # $DOCTOR so the wizard's shipped behavior is untouched.
-  local pre=() ; $DOCTOR && pre=(-q) && extra+=(--noproxy '*')
+  # `-q` MUST be curl's first arg. Every connector request ignores curl config,
+  # so a stray `proxy`/`output`/redirect/include line there can neither reroute
+  # a secret nor make curl read/write files absent from our effects manifest.
+  # Diagnostics additionally refuse ALL proxy environment variables because
+  # they promise "direct to the server you gave me, nothing else".
+  if $DOCTOR || $COMPAT; then extra+=(--noproxy '*'); fi
   # ${extra[@]+…} guard: expanding an empty array under `set -u` is an error in bash 3.2.
   if [ "$GW_AUTH" = "bearer" ]; then
     local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"   # curl-config quoting
     printf 'header = "Authorization: Bearer %s"\n' "$tok" \
-      | curl ${pre[@]+"${pre[@]}"} -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
+      | curl -q -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
   else
-    curl ${pre[@]+"${pre[@]}"} -sS --max-time 30 ${extra[@]+"${extra[@]}"} "$@"
+    curl -q -sS --max-time 30 ${extra[@]+"${extra[@]}"} "$@"
   fi
 }
 
@@ -2647,7 +2740,7 @@ MODELS_CONTENT_TYPE=""  # the reply's Content-Type header ("" when the transfer 
 MODELS_ID_COUNT=0       # how many entries carried a usable string "id" (doctor: model-selection)
 MODELS_FIRST_ID=""      # the first usable id ("" when none) — the doctor's selection probe target
 
-models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canonical envelope
+models_is_json() { # 1 arg: base URL — /v1/models must answer success + the canonical envelope
                    #   (JSON object with a top-level "data" ARRAY), not the Control-UI HTML.
                    # Return codes: 0 ok · 1 unreachable/rejected/non-JSON · 2 HTML · 3 wrong shape.
                    # Sets MODELS_CURL_RC / MODELS_HTTP_CODE / MODELS_DATA_EMPTY /
@@ -2655,7 +2748,8 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canoni
   local out statusline body
   MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false
   MODELS_TIME=""; MODELS_CONTENT_TYPE=""; MODELS_ID_COUNT=0; MODELS_FIRST_ID=""
-  out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
+  out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' \
+        -H "Accept: application/json" "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
   # The -w line is "<code> <seconds> <content-type>"; the body is everything
   # before that last newline (the `-w` prefix `\n` guarantees the split even for
   # an empty body). Content-Type may itself contain spaces ("…; charset=utf-8"),
@@ -2667,9 +2761,14 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer 200 + the canoni
   # HTML first: the endpoint-off page often comes back 200, and it deserves its
   # own diagnosis either way.
   case "$body" in *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;; esac
-  # Status must be green — a 401/500 JSON error body is a FAILURE, not "answers
-  # with JSON" (wrong token was the false-green case).
-  [ "$MODELS_HTTP_CODE" = "200" ] || return 1
+  # The Apple app accepts every 2xx response and then validates the body.
+  # Adapter conformance deliberately stays stricter: the contract requires 200.
+  # A 401/500 JSON error body is always a FAILURE, not "answers with JSON".
+  if $DOCTOR; then
+    [ "$MODELS_HTTP_CODE" = "200" ] || return 1
+  else
+    case "$MODELS_HTTP_CODE" in 2??) ;; *) return 1 ;; esac
+  fi
   # Canonical envelope: the app's Test Connection needs a JSON OBJECT whose
   # top-level "data" is an ARRAY. A bare array, a {"models":…} shape, or "data"
   # that isn't a list parses as JSON but fails the app's stricter probe — flag
@@ -2727,12 +2826,12 @@ curl_fs() { # curl_fs <curl args…>
   fi
   local cred="$FS_CRED"; cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"   # curl-config quoting
   printf 'user = "conduck:%s"\n' "$cred" \
-    | curl -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
+    | curl -q -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
 }
 
 local_health_ok() { # local_health_ok <url> -> 0 when the server answered with < 500
   local code
-  code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
+  code=$(curl -q -sS --max-time 10 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
   case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
 }
 
@@ -2792,9 +2891,10 @@ verify_all() {
     else
       case "$MODELS_HTTP_CODE" in
         401|403) why="HTTP $MODELS_HTTP_CODE — token rejected (or an access layer in front wants a login)" ;;
+        3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward credentials across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
         5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
-        200)     why="answered 200, but the body isn't JSON" ;;
+        2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON" ;;
         *)       why="HTTP $MODELS_HTTP_CODE" ;;
       esac
     fi
@@ -2805,7 +2905,7 @@ verify_all() {
   # A real round-trip. Agents can be slow; give it time. Servers like
   # Ollama/vLLM/LiteLLM need the model named — include it exactly as the app will.
   say "  Asking the gateway for a one-word reply (can take a few minutes on modest hardware or a busy agent)…"
-  local reply body out code resp curl_rc
+  local body
   # Build the JSON with a real encoder — a quote/backslash in a model name must
   # not silently break the request body.
   body=$(GW_MODEL="$GW_MODEL" python3 -c '
@@ -2815,35 +2915,14 @@ m = os.environ.get("GW_MODEL", "")
 if m: p["model"] = m
 print(json.dumps(p))') || die "Could not build the test request (python3 failed)."
   [ -n "$body" ] || die "Could not build the test request."
-  # Status AND shape must both be green — mirror the app's decoder exactly:
-  # a non-200, or a 200 whose "content" isn't a non-empty STRING (a tool_calls
-  # reply carries content:null, which python would happily print as "None"),
-  # must not pass as a live round-trip.
-  out=$(curl_gw -w '\n%{http_code}' "$GW_URL/v1/chat/completions" --max-time 300 \
-      -H "Content-Type: application/json" \
-      -d "$body" 2>/dev/null); curl_rc=$?
-  code="${out##*$'\n'}"; resp="${out%$'\n'*}"
-  reply=""
-  # Parse ONLY a clean transfer: a curl that timed out or dropped mid-body can
-  # still hand back a 200 + parseable prefix — that must not pass. Same strict
-  # parse_constant as models_is_json (NaN/Infinity would crash the app's decode).
-  if [ "$curl_rc" = "0" ] && [ "$code" = "200" ]; then
-    reply=$(printf '%s' "$resp" | python3 -c 'import json,sys
-def bad(x): raise ValueError(x)
-try:
-    c = json.load(sys.stdin, parse_constant=bad)["choices"][0]["message"]["content"]
-    if isinstance(c, str): sys.stdout.write(c)
-except Exception: pass' 2>/dev/null)
-  fi
-  if [ -n "$reply" ]; then ok "live round-trip: gateway replied (${reply%% *}…)"
-  elif [ "$curl_rc" != "0" ]; then
-    bad "live round-trip failed (transfer error — timed out or the connection dropped)"; VERIFY_FAILED=true
-  elif [ -z "$code" ] || [ "$code" = "000" ]; then
-    bad "live round-trip failed (no answer from the gateway)"; VERIFY_FAILED=true
-  elif [ "$code" != "200" ]; then
-    bad "live round-trip failed (HTTP $code)"; VERIFY_FAILED=true
+  # Use the SAME Apple-compatible evaluator as `--check-server`: every 2xx is a
+  # success status, strict JSON is required, the whole Choice array decodes
+  # eagerly, and an empty String is valid. Doctor keeps its separate, stricter
+  # adapter-contract evaluator.
+  if app_chat_eval "$body"; then
+    ok "live round-trip: response decoded the way the Conduck app does (${CCE_LEN:-0} chars)"
   else
-    bad 'live round-trip failed (HTTP 200, but no usable text — "content" must be a non-empty string)'
+    bad "live round-trip failed ($CCE_REASON)"
     VERIFY_FAILED=true
   fi
 
@@ -2858,7 +2937,7 @@ except Exception: pass' 2>/dev/null)
         ok "file lane: write → read green (delete probe left a stray file: $probe)"
       fi
     elif $SHOW_QR; then
-      # --show-qr never rewrites the saved profile (write_profile guards on $SHOW_QR),
+      # --show-code never rewrites the saved profile (write_profile guards on $SHOW_QR),
       # so dropping the lane here only affects THIS emission — the saved lane is untouched.
       bad "the saved profile's file lane failed live verification — a transient outage or a real breakage."
       if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
@@ -2867,9 +2946,11 @@ except Exception: pass' 2>/dev/null)
       else
         # Best-effort probe cleanup before dying: the PUT may have landed even though
         # the GET failed, and die would also skip the rm -f below.
-        curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true
+        if ! curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1; then
+          warn "Could not confirm removal of the live file-lane probe: $probe"
+        fi
         rm -f "$tmp"
-        die "Stopped — nothing changed. Fix the file server (or re-run the wizard: bash conduck-connect.sh), then try --show-qr again."
+        die "Stopped — no configuration changed. Fix the file server (or re-run setup: bash conduck-connect.sh --setup), then try --show-code again."
       fi
     else
       bad "file lane probe failed — leaving it out of the QR (re-run me after fixing)"
@@ -2879,10 +2960,9 @@ except Exception: pass' 2>/dev/null)
     rm -f "$tmp"
   fi
 }
-
-# ------------------------------------------------------------------- doctor --
+# ------------------------------------------------------------- check-adapter --
 #
-# --doctor: a black-box check of an adapter built for Conduck against the
+# --check-adapter: a black-box check of an adapter built for Conduck against the
 # rules at conduck.com/setup/adapter/v1/ (contract revision 1.3). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
@@ -2892,7 +2972,7 @@ except Exception: pass' 2>/dev/null)
 # do things the adapter rules forbid, e.g. keyless mode.)
 #
 # Why it exists next to verify_all: the wizard's verify step proves the HAPPY
-# path (right token, clean request). The doctor also proves what verify can't
+# path (right token, clean request). The adapter check also proves what verify can't
 # without pretending to be an attacker or a sloppy client — that auth is
 # actually ENFORCED (a missing or wrong token must 401; the adapter that
 # forgot its token check passes verify and gets a green QR while sitting wide
@@ -2909,20 +2989,20 @@ except Exception: pass' 2>/dev/null)
 # also passes (DECLINED); a 200 that ignores the image is the forbidden
 # silent drop (UNVERIFIED → exit 1).
 #
-# --files adds the file-lane probes (MUTATING — the one doctor profile that
-# is: it writes + removes small conduck-doctor-* files in the configured
+# --files adds the file-lane probes (MUTATING — the one adapter-check profile that
+# is: it writes + removes small conduck-check-* files in the configured
 # shared folder, and asks the selected agent to copy one). Three meters,
 # graded independently: file_transport (this host's WebDAV <-> disk lane),
 # file_access (the selected engine can read/write the shared folder and
 # names its output detectably), file_e2e (the combined output-delivery path,
 # probed exactly the way the app probes it). It does NOT prove public
 # exposure or remote-device reachability — the wizard verifies the
-# app-facing lane during setup; plain doctor proves adapter conformance.
+# app-facing lane during setup; the plain adapter check proves conformance.
 #
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
-# summary, schema=2 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_DOCTOR schema=2 contract=v1 revision=1.3 harness=<ver>
+# summary, schema=3 (fixed field order, ASCII enums, no ANSI):
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.3 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN> history_image=<…>
 #     stream=<…> image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
 #     file_transport=<…> file_access=<…> file_e2e=<…>
@@ -2940,9 +3020,9 @@ except Exception: pass' 2>/dev/null)
 # cancellation kill, concurrency/queue behaviour, and session or permission
 # internals.
 #
-# Exit code: 0 = every check green, 1 = at least one failed — loop it from a
-# shell while iterating on an adapter. The regression suite in
-# Conduck/connect/tests/ proves every check fails for its intended reason.
+# Exit code: 0 = every check green, 1 = runtime/preflight/check failure,
+# 2 = command-line usage error. Loop it from a shell while iterating.
+# This repo's tests prove every check fails for its intended reason.
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
@@ -3020,14 +3100,16 @@ ct_is_json() {
 # people to expose first and test second. Echoes the normalized URL (trimmed,
 # trailing slashes stripped, scheme lowercased); rc 1 when unacceptable.
 doctor_accept_url() { # doctor_accept_url <candidate>
-  local reply="$1" low rest hostport host
+  local reply="$1" rest hostport host
   reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
   while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done
   [ -n "$reply" ] || return 1
-  low=$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')
-  case "$low" in
-    https://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
-    http://?*) ;;   # maybe-loopback — fall through to the strict host check
+  # Pure Bash on purpose: validate_cli calls this before runtime preflight, so
+  # a missing python3/curl (or any other executable) can never turn a runtime
+  # dependency failure into exit-2 command misuse.
+  case "$reply" in
+    [Hh][Tt][Tt][Pp][Ss]://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
+    [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-loopback
     *) return 1 ;;
   esac
   # A prefix glob is NOT enough to prove loopback: "http://127.0.0.1@evil.com"
@@ -3035,16 +3117,16 @@ doctor_accept_url() { # doctor_accept_url <candidate>
   # "http://127.0.0.1.evil.com" (attacker's wildcard DNS) both start with
   # "http://127." — and would carry the REAL bearer token in cleartext to a
   # remote host. Parse out the authority and validate it strictly.
-  rest="${low#http://}"; hostport="${rest%%/*}"
+  hostport="${rest%%/*}"
   case "$hostport" in *@*|*' '*) return 1 ;; esac    # userinfo/junk → refuse
   case "$hostport" in
     '[::1]'|'[::1]:'*) ;;                            # IPv6 loopback (+ optional port)
-    localhost|localhost:*) ;;
+    [Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]:*) ;;
     127.*) host="${hostport%%:*}"
            case "$host" in *[!0-9.]*) return 1 ;; esac ;;  # 127.x must be a pure dotted quad
     *) return 1 ;;
   esac
-  printf 'http://%s' "${reply#*://}"; return 0
+  printf 'http://%s' "$rest"; return 0
 }
 
 doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stderr)
@@ -3076,7 +3158,7 @@ doctor_curl_negauth() { # doctor_curl_negauth <none|wrong> <curl args…>
   # refuses every proxy — a proxy answering these probes could otherwise forge a
   # 401 and make the doctor report auth as "enforced" when the server is open.
   if [ "$kind" = "wrong" ]; then
-    printf 'header = "Authorization: Bearer conduck-doctor-wrong-token"\n' \
+    printf 'header = "Authorization: Bearer conduck-check-wrong-token"\n' \
       | curl -q -sS --max-time 30 --noproxy '*' --config - "$@"
   else
     curl -q -sS --max-time 30 --noproxy '*' "$@"
@@ -3137,7 +3219,12 @@ doctor_models_check() {
     esac
   else
     case "$MODELS_HTTP_CODE" in
-      401|403) why="HTTP $MODELS_HTTP_CODE with the token you gave me — the server rejected it (typo? or an access layer in front wants its own login)" ;;
+      401|403) if [ "${GW_AUTH:-}" = "none" ]; then
+                 why="HTTP $MODELS_HTTP_CODE and no token was sent — this run is keyless, so the server is asking for auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+               else
+                 why="HTTP $MODELS_HTTP_CODE with the token you gave me — the server rejected it (typo? or an access layer in front wants its own login)"
+               fi ;;
+      3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (the check does not forward credentials across redirects)" ;;
       404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
       5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
       200)     why="answered 200, but the body isn't strict JSON (NaN/Infinity also count as not-JSON — Conduck's decoder refuses them)" ;;
@@ -3216,7 +3303,8 @@ doctor_chat_request() { # doctor_chat_request <payload-json> -> 0 iff the transf
   local out tail_
   DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
-        --max-time 300 -H "Content-Type: application/json" -d "$1" 2>/dev/null) || return 1
+        --max-time 300 -H "Accept: application/json" \
+        -H "Content-Type: application/json" -d "$1" 2>/dev/null) || return 1
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
   DCC_TIME="${tail_%% *}"
@@ -3248,7 +3336,11 @@ doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
     DCE_REASON="the server answered with SSE framing"; DCE_HINT="sse"; return 1 ;;
   esac
   if [ "$DCC_CODE" != "200" ]; then
-    DCE_REASON="HTTP ${DCC_CODE:-?}"; DCE_HINT="http"; return 1
+    case "$DCC_CODE" in
+      3??) DCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (the check does not forward credentials across redirects)" ;;
+      *)   DCE_REASON="HTTP ${DCC_CODE:-?}" ;;
+    esac
+    DCE_HINT="http"; return 1
   fi
   if ! ct_is_json "$DCC_CT"; then
     DCE_REASON="HTTP 200, but Content-Type is '${DCC_CT:0:60}' (must be application/json)"; DCE_HINT="ct"; return 1
@@ -3351,15 +3443,15 @@ doctor_model_selection_check() {
   local id="MODEL_SELECTION" payload count happy="skip" happy_reason="" bogus="" bogus_reason=""
   count="${MODELS_ID_COUNT:-0}"
   if [ -n "$MODELS_FIRST_ID" ]; then
-    payload=$(CONDUCK_DOCTOR_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
+    payload=$(CONDUCK_CHECK_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
-                  "model": os.environ["CONDUCK_DOCTOR_MODEL"], "stream": False}))') \
+                  "model": os.environ["CONDUCK_CHECK_MODEL"], "stream": False}))') \
       || die "Could not build the test request (python3 failed)."
     if doctor_chat_eval "$payload"; then happy="ok"; else happy="fail"; happy_reason="$DCE_REASON"; fi
   fi
   payload=$(python3 -c 'import json
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
-                  "model": "conduck-doctor-no-such-model", "stream": False}))') \
+                  "model": "conduck-check-no-such-model", "stream": False}))') \
     || die "Could not build the test request (python3 failed)."
   if doctor_chat_eval "$payload"; then
     if [ "$count" -gt 1 ]; then bogus="accepted"; else bogus="ignored"; fi
@@ -3409,7 +3501,7 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 # Anything else (wrong/missing decline code, other statuses, bad shape) FAILs:
 # clients key on the machine code, so "looks declined" isn't good enough.
 # ~1-in-9000 guess odds are accepted. The reply's content is never printed.
-# Build the semantic image probe (shared by --deep and --compat): sets
+# Build the semantic image probe (shared by --deep and --check-server): sets
 # IPG_CODE (the 4 digits) and IPG_PAYLOAD (the chat request carrying the PNG).
 # $CONDUCK_PROBE_MODEL (optional, exported by the caller) adds a "model" field
 # — the compat probe threads the advertised id through once it learns the
@@ -3492,10 +3584,9 @@ doctor_image_input_check() {
   d_bad "$id" "image input — $DCE_REASON"
   return 1
 }
-
-# ------------------------------------------------------------ doctor --files --
+# ----------------------------------------------------- check-adapter --files --
 #
-# The file-lane probes: the ONE doctor profile that mutates. Three independent
+# The file-lane probes: the ONE adapter-check profile that mutates. Three independent
 # tiers, three independent meters:
 #   tier 1  file_transport — this host's WebDAV <-> disk lane: auth on the
 #           routes that actually carry user bytes, write-through fidelity,
@@ -3516,7 +3607,7 @@ doctor_image_input_check() {
 # remote-device reachability, other models, or folder confinement.
 #
 # Safety: every artifact name carries a per-run nonce and the recognizable
-# conduck-doctor- prefix; targets are REGISTERED before creation and removed
+# conduck-check- prefix; targets are REGISTERED before creation and removed
 # by exact name only (never a glob); direct-disk operations revalidate the
 # folder's pinned device+inode first; cleanup failure is ERROR, not silence.
 
@@ -3541,7 +3632,7 @@ doctor_curl_fs() { # doctor_curl_fs <real|wrong|none> <curl args…>
       user="${user//\\/\\\\}"; user="${user//\"/\\\"}"
       printf 'user = "%s:%s"\n' "$user" "$cred" \
         | curl -q -sS --max-time 30 --noproxy '*' --config - "$@" ;;
-    wrong) curl -q -sS --max-time 30 --noproxy '*' -u "$DF_USER:conduck-doctor-wrong-cred" "$@" ;;
+    wrong) curl -q -sS --max-time 30 --noproxy '*' -u "$DF_USER:conduck-check-wrong-cred" "$@" ;;
     none)  curl -q -sS --max-time 30 --noproxy '*' "$@" ;;
   esac
 }
@@ -3711,14 +3802,14 @@ PY
 # Tier 1 — transport. Sets DOCTOR_FILE_TRANSPORT.
 doctor_files_transport() {
   local tfail=0 terr=0 disk_ok=true code out body tmp
-  local wkey="conduck-doctor-$DF_RUN-wt.txt"
-  local fkey="conduck-doctor-$DF_RUN-fresh.txt"
-  local ukey1="conduck-doctor-$DF_RUN-unauth-none.txt"
-  local ukey2="conduck-doctor-$DF_RUN-unauth-wrong.txt"
-  local nkey="conduck-doctor-$DF_RUN-dir"
+  local wkey="conduck-check-$DF_RUN-wt.txt"
+  local fkey="conduck-check-$DF_RUN-fresh.txt"
+  local ukey1="conduck-check-$DF_RUN-unauth-none.txt"
+  local ukey2="conduck-check-$DF_RUN-unauth-wrong.txt"
+  local nkey="conduck-check-$DF_RUN-dir"
   local wt_nonce
-  wt_nonce=$(python3 -c 'import secrets; print("conduck-doctor write-through " + secrets.token_hex(16))' 2>/dev/null)
-  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-doctor.XXXXXX" 2>/dev/null) || tmp=""
+  wt_nonce=$(python3 -c 'import secrets; print("conduck-check write-through " + secrets.token_hex(16))' 2>/dev/null)
+  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmp=""
   if [ -z "$wt_nonce" ] || [ -z "$tmp" ]; then
     d_bad FILES_CONFIG "could not stage transport probes (python3/mktemp failed)"
     DOCTOR_FILE_TRANSPORT="ERROR"; return 0
@@ -3769,7 +3860,7 @@ doctor_files_transport() {
     note "  [FILES_AUTH_READ_MISSING] [FILES_AUTH_READ_WRONG] skipped — need the write-through file to probe against."
   fi
   df_register T file "$ukey1"
-  printf 'conduck-doctor unauth probe\n' > "$tmp.u"
+  printf 'conduck-check unauth probe\n' > "$tmp.u"
   code=$(doctor_fs_code none -T "$tmp.u" "$DF_URL/$ukey1")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without credentials is refused (HTTP $code)" ;;
@@ -3800,7 +3891,7 @@ doctor_files_transport() {
 import os, secrets, sys
 p = os.path.join(sys.argv[1], sys.argv[2])
 fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o644)
-os.write(fd, ("conduck-doctor freshness " + secrets.token_hex(16) + "\n").encode())
+os.write(fd, ("conduck-check freshness " + secrets.token_hex(16) + "\n").encode())
 os.fsync(fd)
 os.close(fd)
 print("OK")
@@ -3840,7 +3931,7 @@ PY
         d_bad FILES_READ_FRESH "could not create the freshness file directly on disk"; terr=$((terr+1))
       fi
     elif [ "$code" = "200" ] || [ "$code" = "206" ]; then
-      d_bad FILES_READ_FRESH "a file with the doctor's random name already exists — collision, refusing"; terr=$((terr+1))
+      d_bad FILES_READ_FRESH "a file with the check's random name already exists — collision, refusing"; terr=$((terr+1))
     else
       d_bad FILES_READ_FRESH "the priming request answered HTTP $code (expected 404 for a not-yet-created name)"; tfail=$((tfail+1))
     fi
@@ -3876,10 +3967,10 @@ PY
   code=$(doctor_fs_code real -X MKCOL "$DF_URL/$nkey/")
   case "$code" in
     201)
-      printf 'conduck-doctor nested probe\n' > "$tmp"
+      printf 'conduck-check nested probe\n' > "$tmp"
       code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$nkey/n.txt")
       body=$(doctor_curl_fs real "$DF_URL/$nkey/n.txt" 2>/dev/null) || body=""
-      if [ "${code#2}" != "$code" ] && [ "$body" = "conduck-doctor nested probe" ]; then
+      if [ "${code#2}" != "$code" ] && [ "$body" = "conduck-check nested probe" ]; then
         d_ok FILES_NESTED "nested folders SUPPORTED (MKCOL + PUT + GET round-trip)"
       else
         d_bad FILES_NESTED "MKCOL succeeded but a file inside would not round-trip (HTTP $code)"; tfail=$((tfail+1))
@@ -3912,26 +4003,26 @@ doctor_files_agent() {
   local ih okey ikey used_key content tmp code out
   ih=$(python3 -c 'import secrets; print(secrets.token_hex(4))' 2>/dev/null)
   content=$(python3 -c 'import secrets; print(secrets.token_hex(32))' 2>/dev/null)
-  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-doctor.XXXXXX" 2>/dev/null) || tmp=""
+  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmp=""
   if [ -z "$ih" ] || [ -z "$content" ] || [ -z "$tmp" ]; then
     d_bad FILE_COPY_BYTES "could not stage the sentinel (python3/mktemp failed)"
     DOCTOR_FILE_ACCESS="ERROR"; return 0
   fi
   okey="output-$DF_RUN.txt"
-  ikey="conduck-doctor-$DF_RUN/${ih}__input-$DF_RUN.txt"
+  ikey="conduck-check-$DF_RUN/${ih}__input-$DF_RUN.txt"
   printf '%s\n' "$content" > "$tmp"
 
   # Input rides the REAL lane shape: a per-conversation folder + the
   # <8hex>__<name> stored-key form. MKCOL unsupported -> the app's flat
   # fallback, and the doctor follows it.
-  df_register A dir "conduck-doctor-$DF_RUN"
+  df_register A dir "conduck-check-$DF_RUN"
   used_key="$ikey"
-  code=$(doctor_fs_code real -X MKCOL "$DF_URL/conduck-doctor-$DF_RUN/")
+  code=$(doctor_fs_code real -X MKCOL "$DF_URL/conduck-check-$DF_RUN/")
   if [ "$code" = "201" ]; then
     df_register A file "$ikey"
     code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$ikey")
   else
-    used_key="conduck-doctor-$DF_RUN-${ih}__input-$DF_RUN.txt"
+    used_key="conduck-check-$DF_RUN-${ih}__input-$DF_RUN.txt"
     df_register A file "$used_key"
     code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$used_key")
   fi
@@ -4149,7 +4240,7 @@ for line in sys.stdin.read().splitlines():
         tier, kind, rel = line.split("\t", 2)
     except ValueError:
         continue
-    if not rel.split("/", 1)[0].startswith(("conduck-doctor-", "output-")):
+    if not rel.split("/", 1)[0].startswith(("conduck-check-", "output-")):
         left.append(tier + " " + rel); continue
     p = os.path.join(root, rel)
     rp = os.path.realpath(p)
@@ -4188,17 +4279,17 @@ print("VERIFIED")' "$DF_DIR" 2>/dev/null)
   fi
   if [ -z "$leftovers" ]; then
     if $webdav_ok; then
-      d_ok FILES_DELETE "WebDAV DELETE works — every doctor artifact removed and verified gone"
+      d_ok FILES_DELETE "WebDAV DELETE works — every check artifact removed and verified gone"
     elif [ -n "$del_unsupported" ]; then
       d_ok FILES_DELETE "DELETE unsupported (HTTP $del_unsupported) — artifacts removed directly on disk instead"
       d_say FILES_DELETE "(the app treats WebDAV deletion as best-effort, so this is a degradation, not a failure)"
     else
-      d_ok FILES_DELETE "doctor artifacts removed (some DELETE requests failed; direct disk cleanup covered them)"
+      d_ok FILES_DELETE "check artifacts removed (some DELETE requests failed; direct disk cleanup covered them)"
     fi
     DF_ARTS=()
   else
-    d_bad FILES_DELETE "doctor artifacts could NOT all be removed"
-    d_say FILES_DELETE "(remove anything starting with 'conduck-doctor-$DF_RUN' — and 'output-$DF_RUN.txt' — from the shared folder by hand)"
+    d_bad FILES_DELETE "check artifacts could NOT all be removed"
+    d_say FILES_DELETE "(remove anything starting with 'conduck-check-$DF_RUN' — and 'output-$DF_RUN.txt' — from the shared folder by hand)"
     case "$leftovers" in *"T "*|\?*) DOCTOR_FILE_TRANSPORT="ERROR" ;; esac
     case "$leftovers" in *"A "*|\?*)
       DOCTOR_FILE_ACCESS="ERROR"
@@ -4238,15 +4329,15 @@ doctor_files_cleanup_backstop() {
     if [ "$kind" = "dir" ]; then doctor_curl_fs real -X DELETE "$DF_URL/$rel/" >/dev/null 2>&1 || true
     else doctor_curl_fs real -X DELETE "$DF_URL/$rel" >/dev/null 2>&1 || true; fi
   done
-  warn "Doctor exited mid-flight — attempted removal of its conduck-doctor-$DF_RUN files; check the shared folder if any remain."
+  warn "Adapter check exited mid-flight — attempted removal of its conduck-check-$DF_RUN files; check the shared folder if any remain."
 }
 
 run_doctor_files() {
   say ""
   say "  ${BOLD}--files — the file-lane probes.${RESET} Three meters: file_transport (this host's WebDAV <->"
   say "  disk lane), file_access (the selected agent copies a sentinel and names it), file_e2e"
-  say "  (the app-shaped immediate delivery probe). This is the one doctor profile that MUTATES:"
-  say "  small conduck-doctor-* files are written to and removed from the shared folder."
+  say "  (the app-shaped immediate delivery probe). This is the one adapter-check profile that MUTATES:"
+  say "  small conduck-check-* files are written to and removed from the shared folder."
   DF_RUN=$(python3 -c 'import secrets; print(secrets.token_hex(4))' 2>/dev/null)
   if [ -z "$DF_RUN" ]; then
     d_bad FILES_CONFIG "could not generate a run nonce (python3 failed)"
@@ -4262,11 +4353,14 @@ run_doctor_files() {
   return 0
 }
 
-# The frozen machine line (schema=2) — printed as the LAST line of EVERY
-# doctor exit, green, red, or an early die: fixed field order, ASCII enums,
+# The frozen machine line (schema=3) — printed as the LAST line of EVERY
+# adapter-check exit, green, red, or an early die: fixed field order, ASCII enums,
 # no ANSI. Consumers (build loops, CI, the builder guide's definition of
 # done) key on this + the exit code — never on check counts, which change
-# between harness versions. Any grammar change bumps schema=. The three file
+# between harness versions. Any grammar change bumps schema=; renaming the
+# prefix CONDUCK_DOCTOR -> CONDUCK_CHECK_ADAPTER is such a change, which is why
+# schema went 2 -> 3. Exactly ONE summary line is emitted (consumers use
+# `tail -1`), so the retired prefix is never dual-emitted. The three file
 # meters are NOT_REQUESTED without --files; with it they grade independently
 # (NOT_RUN|PASS|FAIL|ERROR — see the --files block above).
 doctor_summary() { # doctor_summary <exit-code>
@@ -4275,7 +4369,7 @@ doctor_summary() { # doctor_summary <exit-code>
     core="PASS"
     [ "$DOCTOR_CORE_FAILS" -gt 0 ] && core="FAIL"
   fi
-  printf 'CONDUCK_DOCTOR schema=2 contract=v1 revision=%s harness=%s profile=%s core=%s history_image=%s stream=%s image_input=%s file_transport=%s file_access=%s file_e2e=%s checks=%s failed=%s exit=%s\n' \
+  printf 'CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=%s harness=%s profile=%s core=%s history_image=%s stream=%s image_input=%s file_transport=%s file_access=%s file_e2e=%s checks=%s failed=%s exit=%s\n' \
     "$DOCTOR_CONTRACT_REV" "$VERSION" "$DOCTOR_PROFILE" "$core" \
     "$DOCTOR_HISTORY_IMAGE" "$DOCTOR_STREAM" "$DOCTOR_IMAGE_INPUT" \
     "$DOCTOR_FILE_TRANSPORT" "$DOCTOR_FILE_ACCESS" "$DOCTOR_FILE_E2E" \
@@ -4295,7 +4389,7 @@ doctor_on_exit() {
 }
 
 run_doctor() {
-  # The machine summary must ride EVERY exit (frozen schema=2 grammar) — arm
+  # The machine summary must ride EVERY exit (frozen schema=3 grammar) — arm
   # it before anything can die. Flag-combination errors happen before this
   # function and are non-runs by definition: no doctor started, no summary.
   DOCTOR_PROFILE="basic"; $DOCTOR_DEEP && DOCTOR_PROFILE="deep"
@@ -4306,25 +4400,34 @@ run_doctor() {
   fi
   trap doctor_on_exit EXIT
   trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  # Runtime dependencies are checked only AFTER the summary trap is armed.
+  # A missing curl/python3 is exit 1 + a final NOT_RUN machine line, never a
+  # silent pre-check exit and never an exit-2 CLI usage error.
+  preflight
 
-  say "${BOLD}conduck-connect $VERSION — doctor${RESET}"
+  say "${BOLD}conduck-connect $VERSION — --check-adapter${RESET}"
   say "Checks whether an adapter built for Conduck follows the rules at"
   say "${BOLD}conduck.com/setup/adapter/v1/${RESET} — real requests, graded strictly against contract"
   if $DOCTOR_FILES; then
-    say "revision $DOCTOR_CONTRACT_REV. The chat checks change nothing; --files then writes and"
-    say "removes small conduck-doctor-* files in the configured shared folder, and asks the"
+    say "revision $DOCTOR_CONTRACT_REV. The chat checks change no host configuration; --files then writes and"
+    say "removes small conduck-check-* files in the configured shared folder, and asks the"
     say "selected agent to copy one — I clean up after myself, but I can't promise a"
     say "MISBEHAVING agent touches nothing else."
   else
-    say "revision $DOCTOR_CONTRACT_REV. Changes NOTHING."
+    say "revision $DOCTOR_CONTRACT_REV. Changes no host configuration; sends live adapter turns"
+    say "that may consume compute or enter server-side history."
   fi
   note "Building your own adapter? Loop me from a shell — exit code 0 means every check passed."
-  note "The last line is always a machine summary (CONDUCK_DOCTOR schema=2 …) — scripts key on it."
+  if interactive_terminal; then
+    note "A CONDUCK_CHECK_ADAPTER machine summary prints before the optional setup handoff."
+  else
+    note "The last line is always a CONDUCK_CHECK_ADAPTER machine summary — scripts key on it."
+  fi
 
   # Target: the positional URL if one was given, else ask.
-  if [ -n "$DOCTOR_URL" ]; then
-    GW_URL=$(doctor_accept_url "$DOCTOR_URL") \
-      || die "Can't test '$DOCTOR_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+  if [ -n "$CHECK_URL" ]; then
+    GW_URL=$(doctor_accept_url "$CHECK_URL") \
+      || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
   else
     say ""
     GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
@@ -4332,24 +4435,32 @@ run_doctor() {
   apply_gateway_url_normalization
 
   # Token: $CONDUCK_TOKEN (scripted re-runs) or a hidden prompt. Never argv.
-  if [ -n "${CONDUCK_TOKEN:-}" ]; then
+  # Set-but-empty is an EXPLICIT keyless declaration; unset means "ask". A
+  # redirected run must never infer no-auth from a missing answer, or the adapter
+  # gets graded keyless and every AUTH_* check reports a failure the operator
+  # never chose.
+  if [ -n "${CONDUCK_TOKEN+set}" ] && [ -z "$CONDUCK_TOKEN" ]; then
+    GW_AUTH="none"; GW_TOKEN=""
+    note "Keyless by explicit \$CONDUCK_TOKEN=."
+  elif [ -n "${CONDUCK_TOKEN:-}" ]; then
     GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
     note "Using the bearer token from \$CONDUCK_TOKEN."
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter if it has none)")
+    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter if it has none)") \
+      || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi
   # Plain TLS validation; the doctor has no pairing profile to pin from. For a
   # self-signed cert, run it on the server itself against http://127.0.0.1.
   TRANSPORT=""; GW_CERT_FP=""
 
-  head_ "Doctor — $GW_URL"
+  head_ "Adapter check — $GW_URL"
 
   if ! doctor_models_check; then
     say ""
-    bad "Doctor verdict: FAIL — /v1/models isn't answering correctly, so I stopped here."
+    bad "Adapter check: FAIL — /v1/models isn't answering correctly, so I stopped here."
     say "  Fix that first (every other check would only fail the same way), then re-run me."
     say "  The contract, with a copy-paste self-test: ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
     exit 1
@@ -4366,7 +4477,7 @@ run_doctor() {
   local payload
   payload=$(python3 -c 'import json
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
-                  "stream": False, "conduck_doctor_probe": True}))') \
+                  "stream": False, "conduck_check_probe": True}))') \
     || die "Could not build the test request (python3 failed)."
   doctor_chat_check CHAT_BASIC "chat: absent model + unknown field + stream:false" "$payload" plain || true
 
@@ -4418,24 +4529,24 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 
   say ""
   if [ "$DOCTOR_FAILS" = "0" ]; then
-    ok "Doctor verdict: PASS — $DOCTOR_CHECKS/$DOCTOR_CHECKS checks green. This adapter follows Conduck's rules."
-    case "$GW_URL" in
-      http://*) say "  Next: expose it over HTTPS and pair — run me again without --doctor." ;;
-      *)        say "  Next: pair it — run me again without --doctor (or scan an existing code)." ;;
-    esac
-    exit 0
+    ok "Adapter check: PASS — $DOCTOR_CHECKS/$DOCTOR_CHECKS checks green. This adapter follows Conduck's rules."
+    if ! interactive_terminal; then
+      say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
+    fi
+    return 0
   fi
-  bad "Doctor verdict: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."
+  bad "Adapter check: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."
   say "  Every rule above, with a copy-paste self-test:  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
   exit 1
 }
-
-# ------------------------------------------------------------------- --compat --
+# -------------------------------------------------------------- --check-server --
 #
-# App-compatibility probe: does the Conduck APP work with this OpenAI-compatible
-# server AS-IS? Mirrors the app's Test Connection + reply decoder EXACTLY —
-# neither stricter nor looser (each check names its app rule). This is NOT the
-# adapter contract: --doctor grades adapters BUILT for Conduck, and generic
+# App-compatibility probe: does this OpenAI-compatible server speak the core wire
+# the current Apple Conduck app needs? It matches request/response acceptance at
+# the directly addressed endpoint. It deliberately does not follow redirects:
+# forwarding a user credential to a Location target is outside this diagnostic's
+# promise, so users must supply the final server URL. This is NOT the
+# adapter contract: --check-adapter grades adapters BUILT for Conduck, and generic
 # servers fail it on intentional Conduck-specific rules the app itself never
 # exercises on the wire (stream:true override, negative-auth enforcement,
 # model_not_found status vocabulary). Scoring checks: models envelope (the
@@ -4455,41 +4566,25 @@ c_ok()  { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); ok "[$id] $*
 c_bad() { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); COMPAT_FAILS=$((COMPAT_FAILS+1)); bad "[$id] $*"; }
 c_say() { local id="$1"; shift; say "    [$id] $*"; }
 
-# Grade a chat reply the way the APP does (RemoteAgentClient.decodeReply):
+# Grade a chat reply the way the current APP does
+# (RemoteAgentClient.decodeReply). This is the single Apple-compatible response
+# evaluator used by both normal setup verification and `--check-server`:
 # strict JSON (Foundation refuses NaN/Infinity) -> choices must be a non-empty
 # array -> EVERY choice must decode as {"message":{"content":"<string>"}} (the
 # Swift [Choice] array decodes eagerly, so one malformed later choice
-# invalidates the whole reply even when choices[0] is fine — Android is
-# lenient here; the probe follows Apple + the contract) -> the reply is
+# invalidates the whole reply even when choices[0] is fine) -> the reply is
 # choices[0].message.content, and an EMPTY string is a VALID reply. Response
 # Content-Type is deliberately NOT checked (the app never reads it) and
-# tool_calls/extra fields are tolerated (unknown JSON is ignored). On non-200
+# tool_calls/extra fields are tolerated (unknown JSON is ignored). On non-2xx
 # the app keys on the error body's "code" field — captured in CCE_WIRE_CODE.
 CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
-compat_chat_eval() { # compat_chat_eval <payload-json> [expected-digit-code]
-  local exp="${2:--}" res verdict detail
+app_chat_body_eval() { # app_chat_body_eval <response-body> [expected-digit-code]
+  local body="$1" exp="${2:--}" res verdict detail
   CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
-  if ! doctor_chat_request "$1"; then
-    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
-  fi
-  if [ "$DCC_CODE" != "200" ]; then
-    CCE_WIRE_CODE=$(printf '%s' "$DCC_BODY" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-e = d.get("error") if isinstance(d, dict) else None
-c = e.get("code") if isinstance(e, dict) else None
-if isinstance(c, str) and c:
-    print(c[:64])' 2>/dev/null)
-    CCE_REASON="HTTP ${DCC_CODE:-?}${CCE_WIRE_CODE:+ (wire code \"$CCE_WIRE_CODE\")}"
-    return 1
-  fi
-  case "$DCC_BODY" in data:*)
+  case "$body" in data:*)
     CCE_REASON="SSE framing — the app never reads streams, so its JSON decoder fails on this"; return 1 ;;
   esac
-  res=$(printf '%s' "$DCC_BODY" | python3 -c '
+  res=$(printf '%s' "$body" | python3 -c '
 import json, sys, re
 def bad(x): raise ValueError(x)
 exp = sys.argv[1] if len(sys.argv) > 1 else "-"
@@ -4513,12 +4608,42 @@ print("ok %d" % len(c))' "$exp" 2>/dev/null)
     ok)      CCE_LEN="$detail"; return 0 ;;
     token)   CCE_LEN="$detail"; CCE_TOKEN="yes"; return 0 ;;
     notoken) CCE_LEN="$detail"; CCE_TOKEN="no";  return 0 ;;
-    badjson)   CCE_REASON="HTTP 200, but the body isn't the strict JSON the app's decoder accepts" ;;
+    badjson)   CCE_REASON="the 2xx body isn't the strict JSON the app's decoder accepts" ;;
     nochoices) CCE_REASON="no usable \"choices\" array (the app reads choices[0].message.content)" ;;
     badchoice) CCE_REASON="a choice doesn't decode as {\"message\":{\"content\":\"<string>\"}} — the app rejects the whole reply" ;;
     *)         CCE_REASON="could not grade the reply" ;;
   esac
   return 1
+}
+
+app_chat_eval() { # app_chat_eval <payload-json> [expected-digit-code]
+  local exp="${2:--}"
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  if ! doctor_chat_request "$1"; then
+    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
+  fi
+  case "$DCC_CODE" in
+    2??) ;;
+    3??)
+      CCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)"
+      return 1
+      ;;
+    *)
+      CCE_WIRE_CODE=$(printf '%s' "$DCC_BODY" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+e = d.get("error") if isinstance(d, dict) else None
+c = e.get("code") if isinstance(e, dict) else None
+if isinstance(c, str) and c:
+    print(c[:64])' 2>/dev/null)
+      CCE_REASON="HTTP ${DCC_CODE:-?}${CCE_WIRE_CODE:+ (wire code \"$CCE_WIRE_CODE\")}"
+      return 1
+      ;;
+  esac
+  app_chat_body_eval "$DCC_BODY" "$exp"
 }
 
 # The app's vision-decline classifier, mirrored: a structured code
@@ -4552,7 +4677,7 @@ compat_summary() { # compat_summary <exit-code>
   if $COMPAT_RAN; then
     wire="PASS"; [ "$COMPAT_FAILS" -gt 0 ] && wire="FAIL"
   fi
-  printf 'CONDUCK_COMPAT schema=1 harness=%s wire=%s models=%s chat=%s history_image=%s image_input=%s model=%s model_ids=%s auth=%s checks=%s failed=%s exit=%s\n' \
+  printf 'CONDUCK_CHECK_SERVER schema=2 harness=%s wire=%s models=%s chat=%s history_image=%s image_input=%s model=%s model_ids=%s auth=%s checks=%s failed=%s exit=%s\n' \
     "$VERSION" "$wire" "$COMPAT_MODELS" "$COMPAT_CHAT" "$COMPAT_HISTORY_IMAGE" \
     "$COMPAT_IMAGE_INPUT" "$COMPAT_MODEL_FIELD" "${MODELS_ID_COUNT:-0}" \
     "${GW_AUTH:-NOT_RUN}" "$COMPAT_CHECKS" "$COMPAT_FAILS" "$rc"
@@ -4567,20 +4692,31 @@ compat_on_exit() {
 run_compat() {
   trap compat_on_exit EXIT
   trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  # Arm the machine contract before runtime dependency checks. This guarantees
+  # missing curl/python3 exits 1 with the summary as the final line.
+  preflight
 
-  say "${BOLD}conduck-connect $VERSION — compat${RESET}"
-  say "Asks ONE question, read-only: can the Conduck app use this OpenAI-compatible server"
-  say "as-is? Every check mirrors the app's own Test Connection and reply decoder — no more,"
-  say "no less. This is NOT the adapter contract: ${BOLD}--doctor${RESET} grades adapters built FOR Conduck,"
+  say "${BOLD}conduck-connect $VERSION — --check-server${RESET}"
+  say "Asks ONE question: does this OpenAI-compatible server speak the core wire the"
+  say "current Apple Conduck app needs? It changes no host configuration. It sends live"
+  say "model/chat/image requests that may consume compute or enter server-side history."
+  say "The check matches the app's request/response acceptance at the directly addressed"
+  say "endpoint. It does not follow redirects or forward credentials to Location targets;"
+  say "use the final server URL directly. This is NOT the adapter contract:"
+  say "${BOLD}--check-adapter${RESET} grades adapters built FOR Conduck,"
   say "and generic servers fail it on rules the app never exercises. A pass here does NOT"
   say "make this server a Conduck adapter."
-  note "The last line is always a machine summary (CONDUCK_COMPAT schema=1 …) — scripts key on it."
+  if interactive_terminal; then
+    note "A CONDUCK_CHECK_SERVER machine summary prints before the optional setup handoff."
+  else
+    note "The last line is always a CONDUCK_CHECK_SERVER machine summary — scripts key on it."
+  fi
   note "What this can't see: a server that keeps its OWN chat history will pass and still"
   note "double-count context — Conduck resends the full history every turn (client-owned)."
 
-  if [ -n "$DOCTOR_URL" ]; then
-    GW_URL=$(doctor_accept_url "$DOCTOR_URL") \
-      || die "Can't test '$DOCTOR_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+  if [ -n "$CHECK_URL" ]; then
+    GW_URL=$(doctor_accept_url "$CHECK_URL") \
+      || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
   else
     say ""
     GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
@@ -4590,13 +4726,19 @@ run_compat() {
   # Token: bearer from $CONDUCK_TOKEN / prompt; a deliberate empty answer means
   # keyless — the app's explicit .none auth scheme (never inferred, and this
   # probe sends NO negative-auth requests either way).
-  if [ -n "${CONDUCK_TOKEN:-}" ]; then
+  # CONDUCK_TOKEN set-but-empty is an EXPLICIT keyless declaration for scripted
+  # runs; unset means "ask". Never infer keyless from absence.
+  if [ -n "${CONDUCK_TOKEN+set}" ] && [ -z "$CONDUCK_TOKEN" ]; then
+    GW_AUTH="none"; GW_TOKEN=""
+    note "Keyless by explicit \$CONDUCK_TOKEN= — mirroring the app's no-auth scheme."
+  elif [ -n "${CONDUCK_TOKEN:-}" ]; then
     GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
     note "Using the bearer token from \$CONDUCK_TOKEN."
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter for keyless — the app's explicit no-auth mode)")
+    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter for keyless — the app's explicit no-auth mode)") \
+      || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
       GW_AUTH="none"
       note "Keyless: mirroring the app's explicit no-auth scheme — sensible only on an isolated network."
@@ -4604,38 +4746,38 @@ run_compat() {
   fi
   TRANSPORT=""; GW_CERT_FP=""
 
-  head_ "Compat — $GW_URL"
+  head_ "Server check — $GW_URL"
   COMPAT_RAN=true
 
-  # -- models: the app's Test Connection, verbatim (validateProbeBody) --------
+  # -- models: direct-endpoint acceptance from Test Connection ----------------
   local rc=0 secs over
   models_is_json "$GW_URL" || rc=$?
   secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
   over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
   if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
     COMPAT_MODELS="PASS"
-    c_ok COMPAT_MODELS "GET /v1/models — the app's Test Connection passes (${secs}s)"
+    c_ok SERVER_MODELS "GET /v1/models — the app's Test Connection passes (${secs}s)"
     # Content-Type is NOT graded: the app parses the bytes and never reads the
     # header (this is a deliberate divergence from the adapter contract).
     if $MODELS_DATA_EMPTY; then
-      c_say COMPAT_MODELS "(\"data\" is empty — the app reports \"connected, no models yet\"; chat needs the"
-      c_say COMPAT_MODELS " server to answer without a model field)"
+      c_say SERVER_MODELS "(\"data\" is empty — the app reports \"connected, no models yet\"; chat needs the"
+      c_say SERVER_MODELS " server to answer without a model field)"
     elif $MODELS_NO_VALID_ID; then
-      c_say COMPAT_MODELS "(entries carry no usable \"id\" string — the app can't offer a model picker;"
-      c_say COMPAT_MODELS " fine as long as the server answers without a model field)"
+      c_say SERVER_MODELS "(entries carry no usable \"id\" string — the app can't offer a model picker;"
+      c_say SERVER_MODELS " fine as long as the server answers without a model field)"
     fi
   else
     COMPAT_MODELS="FAIL"
     if [ "$rc" = "0" ]; then
-      c_bad COMPAT_MODELS "GET /v1/models — answered, but took ${secs}s (the app's Test Connection gives up at 15s)"
+      c_bad SERVER_MODELS "GET /v1/models — answered, but took ${secs}s (the app's Test Connection gives up at 15s)"
     elif [ "$rc" = "2" ]; then
-      c_bad COMPAT_MODELS "GET /v1/models — an HTML page (HTTP ${MODELS_HTTP_CODE:-?}), not JSON"
-      c_say COMPAT_MODELS "(something else answered — a login page, a reverse proxy, or a wrong base address)"
+      c_bad SERVER_MODELS "GET /v1/models — an HTML page (HTTP ${MODELS_HTTP_CODE:-?}), not JSON"
+      c_say SERVER_MODELS "(something else answered — a login page, a reverse proxy, or a wrong base address)"
     elif [ "$rc" = "3" ]; then
-      c_bad COMPAT_MODELS "GET /v1/models — answers, but not the shape the app requires"
-      c_say COMPAT_MODELS "(the app needs a JSON OBJECT whose top-level \"data\" is an ARRAY — a bare array or"
-      c_say COMPAT_MODELS " {\"models\": …} fails its Test Connection; some servers have a separate OpenAI-compatible"
-      c_say COMPAT_MODELS " path that answers correctly — point the app at THAT base URL)"
+      c_bad SERVER_MODELS "GET /v1/models — answers, but not the shape the app requires"
+      c_say SERVER_MODELS "(the app needs a JSON OBJECT whose top-level \"data\" is an ARRAY — a bare array or"
+      c_say SERVER_MODELS " {\"models\": …} fails its Test Connection; some servers have a separate OpenAI-compatible"
+      c_say SERVER_MODELS " path that answers correctly — point the app at THAT base URL)"
     else
       local why=""
       if [ "${MODELS_CURL_RC:-0}" != "0" ]; then
@@ -4648,18 +4790,23 @@ run_compat() {
         esac
       else
         case "$MODELS_HTTP_CODE" in
-          401|403) why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way" ;;
+          401|403) if [ "${GW_AUTH:-}" = "none" ]; then
+                     why="HTTP $MODELS_HTTP_CODE and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+                   else
+                     why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way"
+                   fi ;;
+          3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
           404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
           5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
-          200)     why="answered 200, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
+          2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
           *)       why="HTTP ${MODELS_HTTP_CODE:-?}" ;;
         esac
       fi
-      c_bad COMPAT_MODELS "GET /v1/models — $why"
+      c_bad SERVER_MODELS "GET /v1/models — $why"
     fi
     say ""
-    bad "Compat verdict: FAIL — the app's Test Connection fails here, so nothing else can work."
-    say "  Fix that first, then re-run me. Testing an adapter you BUILT? That's ${BOLD}--doctor${RESET}."
+    bad "Server check: FAIL — the app's Test Connection fails here, so nothing else can work."
+    say "  Fix that first, then re-run me. Testing an adapter you BUILT? Use ${BOLD}--check-adapter${RESET}."
     exit 1
   fi
 
@@ -4674,22 +4821,22 @@ run_compat() {
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                   "stream": False}))') \
     || die "Could not build the test request (python3 failed)."
-  if compat_chat_eval "$payload_a"; then a_ok=true; else a_reason="$CCE_REASON"; a_code="$DCC_CODE"; fi
+  if app_chat_eval "$payload_a"; then a_ok=true; else a_reason="$CCE_REASON"; a_code="$DCC_CODE"; fi
 
   # One turn WITH the first advertised id (when one exists): the app sends the
   # model the user picked from THIS server's /v1/models, so named selection
   # must work too. Also the rescue path for servers that REQUIRE the field.
   if [ -n "$MODELS_FIRST_ID" ]; then
-    payload_b=$(CONDUCK_COMPAT_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
+    payload_b=$(CONDUCK_CHECK_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
-                  "model": os.environ["CONDUCK_COMPAT_MODEL"], "stream": False}))') \
+                  "model": os.environ["CONDUCK_CHECK_MODEL"], "stream": False}))') \
       || die "Could not build the test request (python3 failed)."
-    if compat_chat_eval "$payload_b"; then b_ok=true; else b_ok=false; b_reason="$CCE_REASON"; fi
+    if app_chat_eval "$payload_b"; then b_ok=true; else b_ok=false; b_reason="$CCE_REASON"; fi
   fi
 
   if $a_ok; then
     COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="optional"
-    c_ok COMPAT_CHAT "chat without a \"model\" field — decoded by the app's rules (${CCE_LEN:-?} chars)"
+    c_ok SERVER_CHAT "chat without a \"model\" field — decoded by the app's rules (${CCE_LEN:-?} chars)"
   elif [ "$b_ok" = "true" ]; then
     # Only the statuses the app's own model-required heuristics accept
     # (400/404/413/422) may be read as "needs a model" — a transient 429/5xx
@@ -4697,32 +4844,32 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     case "$a_code" in
       400|404|413|422)
         COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="required"
-        c_ok COMPAT_CHAT "chat works once a model is set — this server REQUIRES the \"model\" field"
-        c_say COMPAT_CHAT "(without one it answered: $a_reason. In the app, pick a model in the gateway's"
-        c_say COMPAT_CHAT " settings — a model-less request only happens when none is configured)" ;;
+        c_ok SERVER_CHAT "chat works once a model is set — this server REQUIRES the \"model\" field"
+        c_say SERVER_CHAT "(without one it answered: $a_reason. In the app, pick a model in the gateway's"
+        c_say SERVER_CHAT " settings — a model-less request only happens when none is configured)" ;;
       *)
         COMPAT_CHAT="FAIL"; COMPAT_MODEL_FIELD="required"
-        c_bad COMPAT_CHAT "chat without a \"model\" field — $a_reason"
-        c_say COMPAT_CHAT "(the model-named turn worked, but this failure isn't the missing-model kind —"
-        c_say COMPAT_CHAT " something else is wrong; the app would hit it too)" ;;
+        c_bad SERVER_CHAT "chat without a \"model\" field — $a_reason"
+        c_say SERVER_CHAT "(the model-named turn worked, but this failure isn't the missing-model kind —"
+        c_say SERVER_CHAT " something else is wrong; the app would hit it too)" ;;
     esac
   else
     COMPAT_CHAT="FAIL"
     [ "$COMPAT_MODEL_FIELD" = "NOT_RUN" ] && [ -z "$MODELS_FIRST_ID" ] && COMPAT_MODEL_FIELD="none_advertised"
-    c_bad COMPAT_CHAT "chat — $a_reason"
+    c_bad SERVER_CHAT "chat — $a_reason"
     case "$a_code" in
-      401|403) c_say COMPAT_CHAT "(auth works on /v1/models but not on chat — two different credential checks?)" ;;
+      401|403) c_say SERVER_CHAT "(auth works on /v1/models but not on chat — two different credential checks?)" ;;
     esac
   fi
 
   # -- named selection as its own verdict (when a model id exists) -------------
   if [ -n "$MODELS_FIRST_ID" ]; then
     if [ "$b_ok" = "true" ]; then
-      c_ok COMPAT_MODEL_SELECT "the first advertised model id selects (the app sends what the user picked)"
+      c_ok SERVER_MODEL_SELECT "the first advertised model id selects (the app sends what the user picked)"
     else
-      c_bad COMPAT_MODEL_SELECT "a request naming the first advertised id fails — $b_reason"
-      c_say COMPAT_MODEL_SELECT "(the app's model picker is fed from YOUR /v1/models — a listed id that can't"
-      c_say COMPAT_MODEL_SELECT " be used breaks every user who picks it)"
+      c_bad SERVER_MODEL_SELECT "a request naming the first advertised id fails — $b_reason"
+      c_say SERVER_MODEL_SELECT "(the app's model picker is fed from YOUR /v1/models — a listed id that can't"
+      c_say SERVER_MODEL_SELECT " be used breaks every user who picks it)"
     fi
   fi
 
@@ -4749,14 +4896,14 @@ if m:
     req["model"] = m
 print(json.dumps(req))') \
     || die "Could not build the history-image test request (python3 failed)."
-  if compat_chat_eval "$payload_h"; then
+  if app_chat_eval "$payload_h"; then
     COMPAT_HISTORY_IMAGE="PASS"
-    c_ok COMPAT_HISTORY_IMAGE "an image in an EARLIER message doesn't break a text-only turn (${CCE_LEN:-?} chars)"
+    c_ok SERVER_HISTORY_IMAGE "an image in an EARLIER message doesn't break a text-only turn (${CCE_LEN:-?} chars)"
   else
     COMPAT_HISTORY_IMAGE="FAIL"
-    c_bad COMPAT_HISTORY_IMAGE "history image — $CCE_REASON"
-    c_say COMPAT_HISTORY_IMAGE "(Conduck resends the full history, so ONE photo anywhere in a conversation would"
-    c_say COMPAT_HISTORY_IMAGE " permanently break every later turn of that chat in the app)"
+    c_bad SERVER_HISTORY_IMAGE "history image — $CCE_REASON"
+    c_say SERVER_HISTORY_IMAGE "(Conduck resends the full history, so ONE photo anywhere in a conversation would"
+    c_say SERVER_HISTORY_IMAGE " permanently break every later turn of that chat in the app)"
   fi
 
   # -- image input: capability, informational — never fails the wire verdict ---
@@ -4764,7 +4911,7 @@ print(json.dumps(req))') \
   say "  Last, the image capability probe (informational — the app can't detect a silently"
   say "  dropped image either, so this never changes the verdict)…"
   CONDUCK_PROBE_MODEL="$probe_model" image_probe_gen
-  if compat_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
+  if app_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
     if [ "$CCE_TOKEN" = "yes" ]; then
       COMPAT_IMAGE_INPUT="VERIFIED"
       say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
@@ -4785,30 +4932,33 @@ print(json.dumps(req))') \
 
   say ""
   if [ "$COMPAT_FAILS" = "0" ]; then
-    ok "Compat verdict: PASS — the Conduck app can use this server as-is ($COMPAT_CHECKS/$COMPAT_CHECKS wire checks green)."
+    ok "Server check: PASS — core text-chat compatibility is green ($COMPAT_CHECKS/$COMPAT_CHECKS wire checks)."
+    say "  Image input is separate and informational: ${BOLD}$COMPAT_IMAGE_INPUT${RESET}."
     say "  Two honest limits: this probe can't see STATEFULNESS (a server that keeps its own"
     say "  history will double-count context — Conduck resends the full history every turn),"
-    say "  and a pass here does NOT make this server a Conduck adapter (that's ${BOLD}--doctor${RESET})."
-    exit 0
+    say "  and a pass here does NOT make this server a Conduck adapter (that's ${BOLD}--check-adapter${RESET})."
+    if ! interactive_terminal; then
+      say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
+    fi
+    return 0
   fi
-  bad "Compat verdict: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
-  say "  The app would hit the same walls. Building your own adapter instead? ${BOLD}--doctor${RESET} grades that:"
+  bad "Server check: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
+  say "  The app would hit the same walls. Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
   say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
   exit 1
 }
-
 # -------------------------------------------------------------- pairing emit --
 
-# Write a NON-SECRET pairing profile so a later `--show-qr` can re-emit without
+# Write a NON-SECRET pairing profile so a later `--show-code` can re-emit without
 # re-answering the wizard. NEVER holds tokens/credentials — only the routing facts
 # needed to reconstruct + re-verify. 0600, umask 077, built with a real JSON
 # encoder (never hand-quoted). Refreshed on every successful WIZARD emit (incl.
-# --reuse-only) but NEVER under --show-qr: that mode is a pure read of saved state,
+# --reuse-only) but NEVER under --show-code: that mode never rewrites saved state,
 # and a transient probe failure there can drop a file lane from this one emission —
 # rewriting the profile would make that drop permanent. A failure here only WARNs —
 # it must not sink a completed pairing.
 write_profile() {
-  # --show-qr is a pure read of saved state; rewriting here could permanently strip a
+  # --show-code never rewrites saved state; rewriting here could permanently strip a
   # file lane that a transient probe failure dropped from this one emission. Guard first.
   $SHOW_QR && return 0
   $DRY_RUN && return 0                       # emit_payload never runs in dry-run, but stay explicit
@@ -4846,38 +4996,27 @@ print(json.dumps(p, indent=1))
 PY
 ) || { warn "Couldn't build the pairing profile to save — pairing is still complete."; return 0; }
   [ -n "$out" ] || { warn "Couldn't build the pairing profile to save — pairing is still complete."; return 0; }
-  if ( umask 077; printf '%s\n' "$out" > "$pf" ) 2>/dev/null; then
+  # Write-then-rename: a plain redirect truncates in place, so an interrupt mid-write
+  # leaves a half-profile that the menu would offer and --show-code would reject.
+  # rename(2) within the same directory is atomic, so readers see old or new, never half.
+  if ( umask 077; printf '%s\n' "$out" > "$pf.tmp" && mv -f "$pf.tmp" "$pf" ) 2>/dev/null; then
     chmod 600 "$pf" 2>/dev/null || true       # belt-and-suspenders; umask 077 already made it 0600
-    note "Saved a non-secret pairing profile (no token) — re-show this QR later with:  bash conduck-connect.sh --show-qr"
+    note "Saved a non-secret pairing profile (no token) — re-show this code later with:  bash conduck-connect.sh --show-code"
   else
+    rm -f "$pf.tmp" 2>/dev/null || true        # never leave a partial temp behind
     warn "Couldn't save the pairing profile to $pf — pairing is still complete."
   fi
 }
 
-emit_payload() {
-  head_ "Step 6 — pair with the Conduck app"
-  if $VERIFY_FAILED; then
-    cleanup_exposures
-    warn "Some checks failed above — fix those first, then re-run me."
-    warn "I only hand you a setup code that is known to work."
-    # Custom targets only: the doctor is for adapters written for Conduck, and
-    # pointing OpenClaw/Hermes users at it would hand them false FAILs.
-    if [ "$GW_KIND" = "custom" ]; then
-      local dt="$GW_URL"
-      [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
-      say ""
-      say "  If this adapter was built for Conduck, run:  ${BOLD}bash conduck-connect.sh --doctor $dt${RESET}"
-      say "  That checks it directly, so you can tell an adapter problem from a connection problem."
-    fi
-    exit 1
-  fi
-
-  local payload
-  payload=$(GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_URL="$GW_URL" GW_AUTH="$GW_AUTH" \
-            GW_TOKEN="$GW_TOKEN" GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
-            FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_CERT_FP="$FS_CERT_FP" \
-            TRANSPORT="$TRANSPORT" PV="$PAYLOAD_VERSION" \
-            python3 - <<'PY'
+# Build the exact JSON that rides inside `conduck-setup:v1`. Kept as a small
+# function so regression tests can prove opaque server-owned values (especially
+# long model ids) survive setup byte-for-byte before QR/base64 encoding.
+build_pairing_payload_json() {
+  GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_URL="$GW_URL" GW_AUTH="$GW_AUTH" \
+  GW_TOKEN="$GW_TOKEN" GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
+  FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_CERT_FP="$FS_CERT_FP" \
+  TRANSPORT="$TRANSPORT" PV="$PAYLOAD_VERSION" \
+  python3 - <<'PY'
 import json, os
 e = os.environ.get
 gw = {"kind": e("GW_KIND"), "url": e("GW_URL"), "auth": e("GW_AUTH")}
@@ -4892,7 +5031,31 @@ if e("FS_URL") and e("FS_CRED"):
     p["fileServer"] = fs
 print(json.dumps(p, separators=(",", ":")))
 PY
-) || die "Could not build the pairing payload (python3 failed)."
+}
+
+emit_payload() {
+  head_ "Step 6 — pair with the Conduck app"
+  if $VERIFY_FAILED; then
+    cleanup_exposures
+    warn "Some checks failed above — fix those first, then re-run me."
+    warn "I only hand you a setup code that is known to work."
+    # Custom targets only. Route by provenance: existing OpenAI-compatible
+    # software uses the app-compatibility grader; adapters written for Conduck
+    # use the stricter contract grader. OpenClaw/Hermes users need neither hint.
+    if [ "$GW_KIND" = "custom" ]; then
+      local dt="$GW_URL"
+      [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
+      say ""
+      say "  Existing OpenAI-compatible server? Check app compatibility:"
+      say "    ${BOLD}bash conduck-connect.sh --check-server $dt${RESET}"
+      say "  Adapter built for Conduck? Check the stricter adapter contract:"
+      say "    ${BOLD}bash conduck-connect.sh --check-adapter $dt${RESET}"
+    fi
+    exit 1
+  fi
+
+  local payload
+  payload=$(build_pairing_payload_json) || die "Could not build the pairing payload (python3 failed)."
   [ -n "$payload" ] || die "Could not build the pairing payload."
   local encoded; encoded=$(printf '%s' "$payload" | b64_nowrap)
   [ -n "$encoded" ] || die "Could not base64-encode the pairing payload."
@@ -4925,7 +5088,8 @@ PY
   if [ "$GW_KIND" = "custom" ]; then
     local dt="$GW_URL"
     [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
-    say "  If this adapter was built for Conduck, check it directly with:  ${BOLD}bash conduck-connect.sh --doctor $dt${RESET}"
+    say "  Existing OpenAI-compatible server? Re-check it with:  ${BOLD}bash conduck-connect.sh --check-server $dt${RESET}"
+    say "  Adapter built for Conduck? Grade it with:             ${BOLD}bash conduck-connect.sh --check-adapter $dt${RESET}"
   fi
   if $FS_ROLLBACK_INCOMPLETE; then
     say ""
@@ -4934,7 +5098,7 @@ PY
     warn "commands print below — run them, then check 'tailscale funnel status'."
   fi
   EMITTED=true   # success — the EXIT backstop prints undo hints only for an unconfirmed rollback
-  write_profile  # refresh the non-secret profile so a later --show-qr needs no questions
+  write_profile  # refresh the non-secret profile so a later --show-code needs no questions
 }
 
 # =============================================================================
@@ -5933,7 +6097,6 @@ if __name__ == "__main__":
     _main()
 CONDUCK_QR_PY
 }
-
 # ------------------------------------------------------------- dry-run plan --
 
 print_plan() {
@@ -5982,8 +6145,7 @@ print_plan() {
   note "No secrets were prompted, no credentials minted, no requests sent, no QR emitted (the QR appears only on a real run)."
   say "  Re-run without --dry-run to apply and show the QR (each change still asks first)."
 }
-
-# --------------------------------------------------------------- --show-qr fast path --
+# ------------------------------------------------------------- --show-code fast path --
 # Re-emit a SAVED profile's QR while skipping the SETUP questions and making ZERO
 # configuration changes. It is NOT question-free: it may still ask you to pick a profile
 # (when several are saved), re-enter a custom gateway's token, or confirm a gateway-only
@@ -6021,35 +6183,21 @@ url_host_lc() { # url_host_lc <https-url>
   printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
 }
 
-# Does a saved profile's gateway.kind match an explicit --openclaw/--hermes/--generic?
-# No mode flag → every profile matches.
-profile_matches_mode() { # profile_matches_mode <kind>
-  case "$MODE" in
-    "")       return 0 ;;
-    openclaw) [ "$1" = "openclaw" ] ;;
-    hermes)   [ "$1" = "hermes" ] ;;
-    generic)  [ "$1" = "custom" ] ;;
-    *)        return 0 ;;
-  esac
-}
-
-# Discover saved profiles and set PROFILE_FILE. None → friendly die; one (or one
-# matching the mode flag) → use it; several → numbered pick via require_choice.
+# Discover saved profiles and set PROFILE_FILE. None → friendly die; one → use
+# it; several → numbered pick via require_choice.
 # Dies directly (not via $()) so a "no profile" die halts the whole script.
 PROFILE_FILE=""
 show_qr_pick_profile() {
-  local pf; local all=(); local cand=()
+  local pf; local cand=()
   for pf in "$STATE_DIR"/profile-*.json; do
     [ -e "$pf" ] || continue          # no matches → the literal glob; skip it
-    all+=("$pf")
+    # Use the exact validator the loader uses. Corrupt/partial files are neither
+    # listed nor selectable, so a menu option can never lead straight to a
+    # validation dead end.
+    show_qr_validate_profile "$pf" && cand+=("$pf")
   done
-  [ ${#all[@]} -gt 0 ] || die "No saved pairing profile on this machine yet — run the wizard once (bash conduck-connect.sh) to pair and save one; add --reuse-only if you don't want it changing anything on this machine. From then on, --show-qr re-shows the code, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code)."
+  [ ${#cand[@]} -gt 0 ] || die "No usable saved pairing profile on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
   local k
-  for pf in "${all[@]}"; do
-    k=$(json_get "$pf" "gateway.kind")
-    profile_matches_mode "$k" && cand+=("$pf")
-  done
-  [ ${#cand[@]} -gt 0 ] || die "No saved pairing profile matches --$MODE on this machine. Re-run --show-qr without the mode flag to pick from all saved profiles, or run the wizard to create one."
   if [ ${#cand[@]} -eq 1 ]; then PROFILE_FILE="${cand[0]}"; return 0; fi
   say ""
   say "  ${BOLD}Saved pairing profiles on this machine:${RESET}"
@@ -6069,7 +6217,7 @@ show_qr_pick_profile() {
   PROFILE_FILE="${cand[$((pick-1))]}"
 }
 
-# --show-qr profile-validation helpers (bash 3.2-safe, secret-free — they inspect only
+# --show-code profile-validation helpers (bash 3.2-safe, secret-free — they inspect only
 # routing facts, never tokens). Used by show_qr_load_profile to reject a hand-edited or
 # corrupted profile up front, before any secret recovery or live probe.
 show_qr_is_https_host() { # show_qr_is_https_host <url> -> 0 iff https:// + sane authority
@@ -6104,6 +6252,178 @@ show_qr_is_certfp() { # show_qr_is_certfp <str> -> 0 if 64 lowercase SPKI-sha256
   case "$1" in *[!0-9a-f]*) return 1 ;; esac
   [ "${#1}" -eq 64 ]
 }
+show_qr_authority_key() { # normalized https authority: lowercase host + effective port
+  printf '%s:%s' "$(url_host_lc "$1")" "$(url_https_port "$1")"
+}
+show_qr_resolve_file_reach() { # saved file reach (possibly empty), gateway reach
+  if [ -n "$1" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
+
+# One secret-free profile validator shared by the welcome menu, profile picker,
+# and --show-code loader. A partial schema-1 file must never be advertised and
+# then rejected only after the user chooses it.
+PROFILE_VALIDATION_ERROR=""
+show_qr_profile_invalid() { PROFILE_VALIDATION_ERROR="$1"; return 1; }
+show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
+  local pf="$1" sv kind id name auth transport reach url port certfp
+  local gateway_type file_type fsurl fsreach fsport fsfp
+  PROFILE_VALIDATION_ERROR=""
+  [ -f "$pf" ] || {
+    show_qr_profile_invalid "That saved profile is missing — run setup again (bash conduck-connect.sh --setup) to recreate it."
+    return 1
+  }
+
+  sv=$(json_get "$pf" "schemaVersion")
+  if [ "$sv" != "1" ]; then
+    show_qr_profile_invalid "That saved profile uses schema version '${sv:-unknown}', which this script ($VERSION) doesn't understand — a newer conduck-connect wrote it. Update this script, then try again (or run setup once to rewrite it)."
+    return 1
+  fi
+  gateway_type=$(json_type "$pf" "gateway")
+  file_type=$(json_type "$pf" "fileServer")
+  if [ "$gateway_type" != "object" ]; then
+    show_qr_profile_invalid "That saved profile has no usable gateway object — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  case "$file_type" in
+    null|object) ;;
+    *)
+      show_qr_profile_invalid "That saved profile's fileServer value must be either an object or null — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      return 1 ;;
+  esac
+
+  kind=$(json_get "$pf" "gateway.kind")
+  id=$(json_get "$pf" "gateway.id")
+  name=$(json_get "$pf" "gateway.name")
+  auth=$(json_get "$pf" "gateway.auth")
+  transport=$(json_get "$pf" "gateway.transport")
+  reach=$(json_get "$pf" "gateway.reach")
+  url=$(json_get "$pf" "gateway.url")
+  port=$(json_get "$pf" "gateway.localPort")
+  certfp=$(json_get "$pf" "gateway.certFP")
+
+  if [ -z "$kind" ] || [ -z "$id" ] || [ -z "$url" ] || [ -z "$transport" ] ||
+     [ -z "$reach" ] || [ -z "$auth" ]; then
+    show_qr_profile_invalid "That saved profile is missing required fields (kind/id/url/transport/reach/auth) — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  case "$kind" in
+    openclaw|hermes|custom) ;;
+    *)
+      show_qr_profile_invalid "That saved profile names an unknown gateway kind '$kind' — this tool pairs only openclaw, hermes, or custom gateways. Re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      return 1 ;;
+  esac
+  case "$id" in
+    *[!a-z0-9-]*|'')
+      show_qr_profile_invalid "That saved profile's gateway id isn't a safe lowercase id — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      return 1 ;;
+  esac
+  case "$kind:$id" in
+    openclaw:openclaw|hermes:hermes|custom:custom-*) ;;
+    *)
+      show_qr_profile_invalid "That saved profile's gateway kind and id don't agree — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      return 1 ;;
+  esac
+  if [ "$kind" = "custom" ] && [ -z "$(printf '%s' "$name" | tr -d '[:space:]')" ]; then
+    show_qr_profile_invalid "That saved profile is a custom gateway but stores no name (or only whitespace) — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  case "$auth" in
+    bearer|none) ;;
+    *)
+      show_qr_profile_invalid "That saved profile has an unknown auth mode '$auth' — it must be 'bearer' or 'none'. Re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      return 1 ;;
+  esac
+  show_qr_is_https_host "$url" || {
+    show_qr_profile_invalid "That saved profile's gateway URL isn't a valid https:// address with a host — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  }
+  case "$transport" in
+    tailscale|funnel|cloudflare|public|selfsigned) ;;
+    *)
+      show_qr_profile_invalid "That saved profile has an unrecognized transport '$transport' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      return 1 ;;
+  esac
+  case "$reach" in
+    private|public) ;;
+    *)
+      show_qr_profile_invalid "That saved profile has an unrecognized gateway reach '$reach' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      return 1 ;;
+  esac
+  if { [ "$transport" = "tailscale" ] && [ "$reach" != "private" ]; } ||
+     { case "$transport" in funnel|cloudflare) true ;; *) false ;; esac &&
+       [ "$reach" != "public" ]; }; then
+    show_qr_profile_invalid "That saved profile's gateway transport and reach don't agree — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  if [ "$transport" = "selfsigned" ] && [ -z "$certfp" ]; then
+    show_qr_profile_invalid "That saved profile uses a self-signed certificate but stores no fingerprint — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  if [ "$transport" != "selfsigned" ] && [ -n "$certfp" ]; then
+    show_qr_profile_invalid "That saved profile pins a certificate but doesn't use the self-signed path — the app would import a wrong pin. Re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  if [ -n "$port" ] && ! show_qr_is_port "$port"; then
+    show_qr_profile_invalid "That saved profile's gateway local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  # A Tailscale mapping is compared with its loopback target. OpenClaw/Hermes
+  # can re-derive a missing localPort from their canonical config (legacy
+  # schema-1 profiles rely on that), but a custom gateway has no such source.
+  if [ "$kind" = "custom" ] && [ -z "$port" ]; then
+    case "$transport" in
+      tailscale|funnel)
+        show_qr_profile_invalid "That saved custom gateway uses Tailscale but stores no local port, so its live mapping cannot be verified — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+        return 1 ;;
+    esac
+  fi
+  if [ -n "$certfp" ] && ! show_qr_is_certfp "$certfp"; then
+    show_qr_profile_invalid "That saved profile's gateway certificate fingerprint isn't a 64-character lowercase hex value — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+
+  fsurl=$(json_get "$pf" "fileServer.url")
+  fsreach=$(json_get "$pf" "fileServer.reach")
+  fsport=$(json_get "$pf" "fileServer.localPort")
+  fsfp=$(json_get "$pf" "fileServer.certFP")
+  if [ "$file_type" = "object" ] && [ -z "$fsurl" ]; then
+    show_qr_profile_invalid "That saved profile's file-server object is missing its URL — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  if [ -n "$fsurl" ] && ! show_qr_is_https_host "$fsurl"; then
+    show_qr_profile_invalid "That saved profile's file-server URL isn't a valid https:// address with a host — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  if [ -n "$fsreach" ]; then
+    case "$fsreach" in
+      private|public) ;;
+      *)
+        show_qr_profile_invalid "That saved profile has an unrecognized file-server reach '$fsreach' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+        return 1 ;;
+    esac
+  fi
+  if [ -n "$fsport" ] && ! show_qr_is_port "$fsport"; then
+    show_qr_profile_invalid "That saved profile's file-server local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  if [ -n "$fsfp" ] && ! show_qr_is_certfp "$fsfp"; then
+    show_qr_profile_invalid "That saved profile's file-server certificate fingerprint isn't a 64-character lowercase hex value — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  if [ "$transport" != "selfsigned" ] && [ -n "$fsfp" ]; then
+    show_qr_profile_invalid "That saved profile pins a file-server certificate but doesn't use the self-signed path — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  # The file lane may inherit the gateway pin only when both URLs reach the same
+  # authority. A different host or port presents an independent certificate and
+  # therefore needs the fileServer.certFP that the writer normally records.
+  if [ "$transport" = "selfsigned" ] && [ -n "$fsurl" ] && [ -z "$fsfp" ] &&
+     [ "$(show_qr_authority_key "$fsurl")" != "$(show_qr_authority_key "$url")" ]; then
+    show_qr_profile_invalid "That saved self-signed file server uses a different host or port but stores no certificate fingerprint — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    return 1
+  fi
+  return 0
+}
 
 # Is <host-lc> one of the hostnames THIS machine currently serves (TS_HOSTS)? Compares
 # case-insensitively and FAILS CLOSED when TS_HOSTS is empty (host state unknown).
@@ -6120,9 +6440,7 @@ ts_host_known() { # ts_host_known <host> — lowercases BOTH sides before compar
 # Reconstruct the GW_* vars from PROFILE_FILE. Health path + (missing) local port are
 # re-derived exactly as the wizard does, never trusted blindly from the file.
 show_qr_load_profile() {
-  local sv; sv=$(json_get "$PROFILE_FILE" "schemaVersion")
-  [ "$sv" = "1" ] || die "That saved profile uses schema version '${sv:-unknown}', which this script ($VERSION) doesn't understand — a newer conduck-connect wrote it. Update this script, then try again (or run the wizard once to rewrite it)."
-
+  show_qr_validate_profile "$PROFILE_FILE" || die "$PROFILE_VALIDATION_ERROR"
   GW_KIND=$(json_get "$PROFILE_FILE" "gateway.kind")
   GW_ID=$(json_get "$PROFILE_FILE" "gateway.id")
   GW_NAME=$(json_get "$PROFILE_FILE" "gateway.name")
@@ -6133,54 +6451,6 @@ show_qr_load_profile() {
   GW_LOCAL_PORT=$(json_get "$PROFILE_FILE" "gateway.localPort")
   GW_MODEL=$(json_get "$PROFILE_FILE" "gateway.model")
   GW_CERT_FP=$(json_get "$PROFILE_FILE" "gateway.certFP")
-  [ -n "$GW_KIND" ] && [ -n "$GW_ID" ] && [ -n "$GW_URL" ] && [ -n "$TRANSPORT" ] && [ -n "$GW_AUTH" ] \
-    || die "That saved profile is missing required fields (kind/id/url/transport/auth) — re-run the wizard (bash conduck-connect.sh) to refresh it."
-
-  # ---- Schema validation. A hand-edited or corrupted profile (http:// URL, a kind the
-  # apps reject, a garbage port) must die HERE with a friendly, secret-free message —
-  # not sail through verification and hand the app a code it silently rejects. ----
-  case "$GW_KIND" in
-    openclaw|hermes|custom) ;;
-    *) die "That saved profile names an unknown gateway kind '$GW_KIND' — this tool pairs only openclaw, hermes, or custom gateways. Re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
-  esac
-  # tr -d [:space:]: a whitespace-only name passes -n but the app trims and rejects it.
-  [ "$GW_KIND" != "custom" ] || [ -n "$(printf '%s' "$GW_NAME" | tr -d '[:space:]')" ] \
-    || die "That saved profile is a custom gateway but stores no name (or only whitespace) — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  case "$GW_AUTH" in
-    bearer|none) ;;
-    *) die "That saved profile has an unknown auth mode '$GW_AUTH' — it must be 'bearer' or 'none'. Re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
-  esac
-  show_qr_is_https_host "$GW_URL" \
-    || die "That saved profile's gateway URL isn't a valid https:// address with a host — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  case "$TRANSPORT" in
-    tailscale|funnel|cloudflare|public|selfsigned) ;;
-    *) die "That saved profile has an unrecognized transport '$TRANSPORT' — re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
-  esac
-  [ "$TRANSPORT" != "selfsigned" ] || [ -n "$GW_CERT_FP" ] \
-    || die "That saved profile uses a self-signed certificate but stores no fingerprint — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  # The wizard writes a certFP ONLY on the self-signed path; anywhere else it would
-  # import a WRONG pin into the app.
-  [ "$TRANSPORT" = "selfsigned" ] || [ -z "$GW_CERT_FP" ] \
-    || die "That saved profile pins a certificate but doesn't use the self-signed path — the app would import a wrong pin. Re-run the wizard (bash conduck-connect.sh) to refresh it."
-  [ -z "$GW_LOCAL_PORT" ] || show_qr_is_port "$GW_LOCAL_PORT" \
-    || die "That saved profile's gateway local port isn't a number in 1-65535 — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  [ -z "$GW_CERT_FP" ] || show_qr_is_certfp "$GW_CERT_FP" \
-    || die "That saved profile's gateway certificate fingerprint isn't a 64-character lowercase hex value — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  # File-lane half (read straight from the profile — the credential itself is never stored).
-  local _fsurl _fsport _fsfp
-  _fsurl=$(json_get "$PROFILE_FILE" "fileServer.url")
-  _fsport=$(json_get "$PROFILE_FILE" "fileServer.localPort")
-  _fsfp=$(json_get "$PROFILE_FILE" "fileServer.certFP")
-  if [ -n "$_fsurl" ]; then
-    show_qr_is_https_host "$_fsurl" \
-      || die "That saved profile's file-server URL isn't a valid https:// address with a host — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  fi
-  [ -z "$_fsport" ] || show_qr_is_port "$_fsport" \
-    || die "That saved profile's file-server local port isn't a number in 1-65535 — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  [ -z "$_fsfp" ] || show_qr_is_certfp "$_fsfp" \
-    || die "That saved profile's file-server certificate fingerprint isn't a 64-character lowercase hex value — re-run the wizard (bash conduck-connect.sh) to refresh it."
-  [ "$TRANSPORT" = "selfsigned" ] || [ -z "$_fsfp" ] \
-    || die "That saved profile pins a file-server certificate but doesn't use the self-signed path — the app would import a wrong pin. Re-run the wizard (bash conduck-connect.sh) to refresh it."
 
   # Health path is derived from kind (not stored), exactly as the wizard sets it.
   case "$GW_KIND" in
@@ -6216,7 +6486,7 @@ show_qr_recover_gateway_secret() {
     openclaw)
       # Same mode-aware resolution as the wizard: honours auth.mode, reads the right key
       # (token vs password), and NEVER embeds an indirect "${ENV}"/SecretRef value — it
-      # prompts for the real secret instead (the --show-qr "may still ask" contract).
+      # prompts for the real secret instead (the --show-code "may still ask" contract).
       openclaw_resolve_secret "showqr"
       ;;
     hermes)
@@ -6336,8 +6606,9 @@ show_qr_check_live() {
         # The lane can legitimately ride a DIFFERENT reach than the gateway (a mixed-scope
         # setup the wizard allows). Assert the LANE's own verb from its saved reach; fall
         # back to the gateway's scope only for older profiles with no fileServer.reach.
-        local fs_reach; fs_reach=$(json_get "$PROFILE_FILE" "fileServer.reach")
-        [ -n "$fs_reach" ] || fs_reach="$SCOPE"
+        local fs_reach
+        fs_reach=$(show_qr_resolve_file_reach \
+          "$(json_get "$PROFILE_FILE" "fileServer.reach")" "$SCOPE")
         local fs_verb="serve"; [ "$fs_reach" = "public" ] && fs_verb="funnel"
         show_qr_assert_mapping "$fs_host" "$(url_https_port "$FS_URL")" "$FS_LOCAL_PORT" "$fs_verb" "file lane" || show_qr_stale
       fi
@@ -6372,11 +6643,12 @@ show_qr_check_live() {
   esac
 }
 
-# Orchestrate the --show-qr path: pick → load → secrets → live-match gate, then the
-# UNCHANGED verify_all + emit_payload. Nothing here mutates (REUSE_ONLY is forced on),
-# so APPLIED/FS_APPLIED stay empty and cleanup_exposures has nothing to undo.
+# Orchestrate the --show-code path: pick → load → secrets → live-match gate, then the
+# UNCHANGED verify_all + emit_payload. No configuration/exposure mutates
+# (REUSE_ONLY is forced on), so APPLIED/FS_APPLIED stay empty. Verification can
+# still write and delete one small probe on an already-configured file lane.
 run_show_qr() {
-  head_ "Re-show your pairing code (--show-qr) — skips the setup questions, changes nothing"
+  head_ "Re-show your pairing code — skips setup and changes no configuration"
   show_qr_pick_profile
   show_qr_load_profile
   show_qr_recover_gateway_secret
@@ -6385,62 +6657,187 @@ run_show_qr() {
   verify_all
   emit_payload
 }
-
 # ----------------------------------------------------------------------- main --
 
-# --doctor: conformance fast path — its own banner, its own exit; no wizard.
-if $DOCTOR; then
-  run_doctor
-  # run_doctor exits on every path; if a refactor ever makes it RETURN, the
-  # doctor must neither fall into the wizard nor read as a pass — so fail.
-  exit 1
-fi
+prepare_setup_from_check() {
+  local checked_kind="$1" checked_url="$GW_URL" checked_path="" parsed=""
+  SETUP_FROM_CHECK=true
+  GW_KIND="custom"
+  GW_HEALTH_PATH=""
+  GW_CERT_FP=""
+  TRANSPORT=""
+  SCOPE=""
 
-# --compat: app-compatibility fast path — same contract as --doctor above.
-if $COMPAT; then
-  run_compat
-  exit 1
-fi
+  if [ "$checked_kind" = "adapter" ]; then
+    GW_NAME=$(ask "  A short name for this adapter (shown in the app)" "My Conduck adapter")
+  else
+    GW_NAME=$(ask "  A short name for this server (shown in the app)" "My gateway")
+  fi
+  GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
 
-say "${BOLD}conduck-connect $VERSION${RESET} — pair your self-hosted AI gateway with Conduck."
-$DRY_RUN && note "(dry-run: nothing will be changed)"
-# --show-qr forces REUSE_ONLY on, so print its OWN banner instead of the reuse-only one.
-if $SHOW_QR; then note "(--show-qr: re-showing a saved pairing code — skips the setup questions, changes nothing; may still ask you to pick a profile or re-enter a custom token)"
-elif $REUSE_ONLY; then note "(reuse-only: I'll reuse what's set up and refuse any change — safe to run on a gateway you don't want touched)"; fi
-say "Every change asks first, and you see the exact command before it happens. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
-note "Some commands I offer to run for you (you say yes or no to each); the rest you copy-paste and run yourself while I wait."
+  # A server check only proves a specific model is required when the model-less
+  # request failed and an advertised model succeeded. Reuse that proven model;
+  # otherwise leave selection open for the app instead of guessing among ids.
+  GW_MODEL=""
+  if [ "$checked_kind" = "server" ] &&
+     [ "${COMPAT_MODEL_FIELD:-}" = "required" ] &&
+     [ -n "${MODELS_FIRST_ID:-}" ]; then
+    GW_MODEL="$MODELS_FIRST_ID"
+    # Model ids are opaque server-owned strings. Preserve the exact advertised id:
+    # LiteLLM routes and Hugging Face repository names can legitimately be long.
+    ok "Reusing the exact model ID the successful check required: $GW_MODEL"
+  fi
 
-# --show-qr: skip the whole wizard — reconstruct from a saved profile, then verify + emit.
-if $SHOW_QR; then
-  run_show_qr
-  exit 0
-fi
-
-# Gateway selection → configure → transport, looped so the transport menu's "b"
-# can return to the gateway choice. No EXPOSURE change has happened before the
-# menu; Step-2 gateway-config changes are detect-and-reuse on re-entry. Globals
-# reset each pass so "b" never leaks one gateway's answers (name/model/URL)
-# into the next pick's payload.
-while true; do
-  GW_KIND=""; GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
-  GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""; GW_CERT_FP=""
-  detect_gateway
-  case "$GW_KIND" in
-    openclaw) configure_openclaw ;;
-    hermes)   configure_hermes ;;
-    custom)   configure_generic ;;
+  case "$checked_url" in
+    http://*)
+      # A local check can continue into exposure without asking for the same
+      # port/token again. Keep a legitimate base-path prefix so the eventual
+      # HTTPS address still reaches the exact endpoint that passed.
+      parsed=$(CHECKED_URL="$checked_url" python3 -c '
+import os
+from urllib.parse import urlsplit
+u = urlsplit(os.environ["CHECKED_URL"])
+print("%s\t%s" % (u.port or 80, u.path.rstrip("/")))' 2>/dev/null) \
+        || die "Could not reuse the checked local URL."
+      GW_LOCAL_PORT="${parsed%%$'\t'*}"
+      checked_path="${parsed#*$'\t'}"
+      GW_URL=""
+      ;;
+    *)
+      GW_LOCAL_PORT=""
+      GW_URL="$checked_url"
+      ;;
   esac
-  choose_exposure && break
-  rc=$?
-  [ "$rc" = "10" ] || break   # 10 = user chose "back"; any other non-zero already died
-  say ""; note "↩ Back to the gateway choice."
-done
-setup_file_lane
 
-if $DRY_RUN; then
-  print_plan
-  exit 0
+  CHECKED_PATH_PREFIX="$checked_path"
+  note "Reusing the checked address and authentication in memory; your token is not saved."
+}
+
+apply_checked_path_prefix() {
+  [ -n "${CHECKED_PATH_PREFIX:-}" ] || return 0
+  case "$GW_URL" in
+    *"$CHECKED_PATH_PREFIX") ;;
+    *) GW_URL="${GW_URL%/}$CHECKED_PATH_PREFIX" ;;
+  esac
+  note "Keeping the checked server's base path: $GW_URL"
+}
+
+run_setup() {
+  say "${BOLD}conduck-connect $VERSION${RESET} — pair your self-hosted AI gateway with Conduck."
+  if $LEGACY_GENERIC; then
+    warn "--generic is the older name for custom-server setup. Continuing with custom-server setup."
+  fi
+  $DRY_RUN && note "(dry-run: nothing will be changed)"
+  if $REUSE_ONLY; then
+    note "(reuse-only: I'll reuse what's set up and refuse configuration changes; live verification still sends requests and may write/delete a file probe)"
+  fi
+  say "Every change asks first, and you see the exact command before it happens. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
+  note "Some commands I offer to run for you (you say yes or no to each); the rest you copy-paste and run yourself while I wait."
+
+  if $SETUP_FROM_CHECK; then
+    choose_exposure
+    local exposure_rc=$?
+    if [ "$exposure_rc" = "10" ]; then
+      note "Setup stopped. The completed check changed nothing on your server."
+      exit 0
+    fi
+    [ "$exposure_rc" = "0" ] || exit "$exposure_rc"
+    apply_checked_path_prefix
+  else
+    # Gateway selection → configure → transport, looped so the transport menu's
+    # "b" can return to the gateway choice. Detection informs the menu but never
+    # selects a gateway: the user always makes an explicit 1/2/3 choice.
+    while true; do
+      GW_KIND=""; GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
+      GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""; GW_CERT_FP=""
+      detect_gateway
+      case "$GW_KIND" in
+        openclaw) configure_openclaw ;;
+        hermes)   configure_hermes ;;
+        custom)   configure_generic ;;
+      esac
+      choose_exposure && break
+      local rc=$?
+      [ "$rc" = "10" ] || break
+      say ""; note "↩ Back to the gateway choice."
+    done
+  fi
+
+  setup_file_lane
+  if $DRY_RUN; then
+    print_plan
+    exit 0
+  fi
+
+  # This is intentionally repeated even after a standalone check: setup must
+  # verify the FINAL app-facing HTTPS route, not only the local/direct address.
+  verify_all
+  emit_payload
+}
+
+finish_successful_check() { # finish_successful_check <server|adapter>
+  local kind="$1"
+  if ! interactive_terminal; then
+    # The check's EXIT trap prints the machine summary as the final line.
+    exit 0
+  fi
+
+  # Interactive runs print the summary before offering another action. Replace
+  # the check trap so a later setup error cannot rewrite a successful check as
+  # failed. The optional file profile also gets its cleanup backstop now.
+  if [ "$kind" = "adapter" ]; then
+    $DOCTOR_FILES && doctor_files_cleanup_backstop
+    doctor_summary 0
+  else
+    compat_summary 0
+  fi
+  trap on_exit EXIT
+
+  say ""
+  if ! confirm "  Would you like to continue with setup and pairing?"; then
+    note "Check complete. No setup changes were made."
+    exit 0
+  fi
+
+  prepare_setup_from_check "$kind"
+  DOCTOR=false
+  COMPAT=false
+  DOCTOR_DEEP=false
+  DOCTOR_FILES=false
+  SHOW_QR=false
+  REUSE_ONLY=false
+  CHECK_URL=""
+
+  # The standalone checks do not need openssl; setup might need it for
+  # certificate trust/pinning, so run the setup preflight after transitioning.
+  preflight
+  run_setup
+}
+
+if [ "$COMMAND" = "menu" ]; then
+  choose_main_action
 fi
+validate_cli
+[ "$COMMAND" = "exit" ] && { note "Nothing changed."; exit 0; }
 
-verify_all
-emit_payload
+case "$COMMAND" in
+  check-adapter)
+    run_doctor
+    finish_successful_check "adapter"
+    ;;
+  check-server)
+    run_compat
+    finish_successful_check "server"
+    ;;
+  show-code)
+    preflight
+    say "${BOLD}conduck-connect $VERSION${RESET} — re-show a saved setup code."
+    note "(changes no configuration; live gateway checks run, and a configured file lane gets one small PUT → GET → DELETE probe)"
+    run_show_qr
+    exit 0
+    ;;
+  setup)
+    preflight
+    run_setup
+    ;;
+esac

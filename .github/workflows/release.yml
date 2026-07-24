@@ -14,14 +14,36 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      - name: Verify tag matches script version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          bash scripts/build-release.sh --check
+          script_version=$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' conduck-connect.sh)
+          test -n "$script_version"
+          test "$TAG" = "v$script_version" || {
+            echo "release tag $TAG does not match conduck-connect VERSION $script_version" >&2
+            exit 1
+          }
+          grep -qF "source is at \`v$script_version\`" README.md || {
+            echo "README source status does not name v$script_version" >&2
+            exit 1
+          }
+          grep -qF "## [$script_version]" CHANGELOG.md || {
+            echo "CHANGELOG has no release heading for $script_version" >&2
+            exit 1
+          }
+
       - name: Verify before releasing
         run: |
-          shellcheck --severity=warning conduck-connect.sh scripts/*.sh
-          bash -n conduck-connect.sh
+          bash scripts/build-release.sh --check
+          shellcheck --severity=warning conduck-connect.sh scripts/*.sh tests/*.sh
+          bash -n conduck-connect.sh scripts/*.sh tests/*.sh
           bash scripts/verify-vendored-encoder.sh
           bash scripts/test-url-normalization.sh
+          bash scripts/test-response-fixtures.sh
           bash scripts/test-models-probe.sh
-          bash tests/run-doctor-suite.sh
+          bash tests/run-checks-suite.sh
 
       - name: Generate checksum
         run: sha256sum conduck-connect.sh > conduck-connect.sh.sha256

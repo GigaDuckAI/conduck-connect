@@ -1,29 +1,36 @@
 # conduck-connect
 
-Pair your self-hosted AI gateway with the **[Conduck](https://conduck.com)** app — one readable script you audit before you run. Zero telemetry.
+Pair your self-hosted AI gateway with the **[Conduck](https://conduck.com)** app — one plain-text script you can inspect before you run. Zero telemetry.
 
 ## Quick start
 
-One command — downloads the script from GitHub Releases to disk over HTTPS, then launches the setup wizard. The wizard still **asks before every change**, so nothing touches your server without a y/N:
+One command — downloads the script from GitHub Releases to disk over HTTPS, then opens the welcome menu:
 
 ```bash
 curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh && bash conduck-connect.sh
 ```
 
-- **Preview first, change nothing?** Append ` --dry-run` to the trailing `bash conduck-connect.sh`.
-- **Read it before running?** Drop the trailing `&& bash conduck-connect.sh` — the rest still downloads the file — then `less conduck-connect.sh` and run it when you're happy. It's a plain, readable script on purpose ([why](#why-a-shell-script)).
+- **Go straight to setup?** Append ` --setup` to the trailing `bash conduck-connect.sh`.
+- **Preview setup, change nothing?** Append ` --setup --dry-run` instead.
+- **Read it before running?** Drop the trailing `&& bash conduck-connect.sh` — the rest still downloads the file — then `less conduck-connect.sh` and run it when you're happy. It stays plain text on purpose ([why](#why-a-shell-script)).
 
-Works on macOS and Linux. `-O` lands the full file on disk before anything runs, so reading it first is one `less` away — that, plus the HTTPS download from GitHub, is your real protection. (An optional same-release checksum is [below](#what-each-step-does); it confirms the download arrived intact but is not a tamper-proof signature.)
+Works on macOS and Linux. `-O` lands the full file on disk before anything runs, so inspecting it is one `less` away. An optional same-release checksum is [below](#what-each-step-does); it confirms the download arrived intact but is not a tamper-proof signature.
 
 It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV) — on OpenClaw also checking the gateway's **tool policy** (a policy denying the agent's `read`/`write` breaks attachments agent-side while every transport test stays green) and installing a short agent-guidance block in the workspace `TOOLS.md` — verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
 
-> **Status: the script is at `v0.12.0`; the Conduck app is not yet public.** This repository is open early on purpose — so the script can be **read and audited before you ever run it.** That is the whole point of shipping it as a plain shell script.
+> **Status: this source is at `v0.13.0`.** The Quick start downloads the latest *published* release, which can briefly lag `main` right after a version bump — the [releases page](https://github.com/gigaduckai/conduck-connect/releases) is the authority on what is live. The Conduck app is already available on the App Store. Every release artifact is plain, unminified shell that can be inspected before it runs.
 
 ## Why a shell script?
 
-Because you can read exactly what would run on your server — it's a plain, auditable script, not an opaque binary or installer. The Quick start writes it to a file **before** anything runs, so reading it yourself is one `less` away — always encouraged for a tool that touches your gateway.
+Because you can inspect exactly what would run on your server — it is plain text, not an opaque binary or installer. The Quick start writes it to a file **before** anything runs, so review is one `less` away — always encouraged for a tool that touches your gateway.
 
 This is deliberately *not* `curl | bash` — that pipes unverified code straight into your shell, unread (and would break this script's interactive prompts anyway). Here the file lands on disk, remains available to inspect, and only then runs.
+
+For maintainers, the source is split by responsibility under [`src/`](src/) and
+assembled deterministically. CI proves those modules reproduce the checked-in
+`conduck-connect.sh` byte for byte. That keeps development navigable without
+turning the user-facing tool into a runtime bundle: the release is still one
+plain, unminified script.
 
 ## What each step does
 
@@ -36,14 +43,17 @@ curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/downlo
 # 2. Read it — that is the point
 less conduck-connect.sh
 
-# 3. See what it WOULD do, changing nothing
-bash conduck-connect.sh --dry-run
+# 3. See what setup WOULD do, changing nothing
+bash conduck-connect.sh --setup --dry-run
 
-# 4. Run it for real (every change still asks first)
+# 4. Open the welcome menu
 bash conduck-connect.sh
+
+# Or go straight to setup (every change still asks first)
+bash conduck-connect.sh --setup
 ```
 
-**Optional integrity check.** Each release also ships a checksum. It confirms the file downloaded intact — it is **not** a signature and can't prove the release wasn't swapped (it rides the same release channel); reading the script is what catches that:
+**Optional integrity check.** Each release also ships a checksum. It confirms the file downloaded intact—it is **not** a signature and cannot prove the release was not swapped because it rides the same release channel:
 
 ```bash
 curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/download/conduck-connect.sh.sha256
@@ -52,51 +62,73 @@ shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-
 
 No `chmod` needed. The one large block near the bottom of the script is a vendored, unmodified QR-code encoder (Project Nayuki, MIT) used to draw the QR locally. It is inert — Python standard library only, no network, file, or process access — and safe to skip when reading.
 
-## Flags
+## Public commands and flags
 
-| Flag | Effect |
+| Command | Effect |
 |---|---|
-| _(none)_ | Interactive wizard — detects what you run |
-| `--dry-run` | Baseline + plan: show current state and the exact actions a real run would take, then stop. Never prompts for secrets, mints credentials, sends requests, or emits a code. |
-| `--reuse-only` | Reuse existing config; refuse any mutation. Safe to point at a **live** gateway. |
-| `--show-qr` | Re-show a saved gateway's pairing code — reads only, changes nothing (uses the non-secret profile a successful run saves; may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code). Verification still makes its real requests. |
-| `--openclaw` · `--hermes` · `--generic` | Skip detection; target a specific gateway kind |
-| `--doctor [url]` | Check an adapter built for Conduck against the rules at [conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/) — real requests, graded strictly, changes nothing (see below) |
-| `--deep` | With `--doctor`: also test how the adapter handles a message with an image |
-| `--files` | With `--doctor`: also grade the file lane (three meters — transport, agent access, end-to-end delivery). The one doctor profile that changes anything: it writes and removes small `conduck-doctor-*` files in the configured shared folder |
-| `--compat [url]` | The OTHER question, for servers you did NOT build for Conduck (Ollama, LiteLLM, vLLM, LM Studio, …): does the Conduck **app** work with this OpenAI-compatible server as-is? Mirrors the app's own validation exactly — read-only (see below) |
-| `--allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
-| `--help` | All flags |
+| _(none)_ | Welcome menu: setup, check a server, check an adapter, or re-show a saved code |
+| `--setup` | Go straight to setup. Detection reports OpenClaw/Hermes installs, but you always explicitly choose OpenClaw, Hermes, or another server |
+| `--check-server [url]` | Existing OpenAI-compatible software **not built for Conduck**: check core compatibility with the current Apple Conduck app |
+| `--check-adapter [url]` | An adapter built specifically for Conduck: grade the stricter adapter contract |
+| `--show-code` | Re-show a saved gateway's pairing code without configuration changes. Live verification sends gateway requests and, when configured, one small file-lane PUT→GET→DELETE probe |
+| `--setup --dry-run` | Show setup state and the exact actions a real run would take, then stop. Never prompts for secrets, mints credentials, sends requests, or emits a code |
+| `--setup --reuse-only` | Walk setup while refusing host configuration changes. Live verification still sends gateway requests and may write/delete one small file-lane probe |
+| `--check-adapter --deep [url]` | Also test how the adapter handles a message with an image |
+| `--check-adapter --files [url]` | Also grade the file lane. This explicitly mutating check writes and removes small named artifacts — `conduck-check-*` plus one `output-*.txt` — in the configured shared folder |
+| `--setup --allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
+| `--help` / `-h` | The script's whole header: what it does, what it never does, and every public flag |
+| `--version` | Print `conduck-connect <version>` and exit — nothing else runs |
 
-## Check your own adapter (`--doctor`)
+Exit status is deliberately small and stable: `0` means success (or a passing
+check), `1` means setup/runtime failure or a completed check that failed, and
+`2` means the command line itself is invalid—an unknown or retired spelling,
+incompatible flags, an extra positional argument, or an invalid direct URL.
+Signal interruptions retain their conventional `128 + signal` status. Once a
+noninteractive check has passed command validation, its machine summary remains
+the final line even if runtime preflight fails—for example, missing `curl` or
+`python3` reports `exit=1` with all check meters still `NOT_RUN`.
+
+The public setup command is `--setup`; there is no second public “generic”
+mode. One older spelling, `--generic`, remains functional but intentionally
+hidden from the menu and `--help` because App Store builds already in users'
+hands still invoke it. It goes directly to custom-server setup and skips
+OpenClaw/Hermes detection, preserving those clients' original behavior.
+
+After either check passes in a real terminal, the script asks whether you want to continue directly into setup and pairing. It reuses the checked URL and authentication in memory, skips the gateway-choice question, and verifies the final app-facing HTTPS route again before printing a code. In CI or any noninteractive run, it never asks: it prints the machine summary as the final line and exits.
+
+## Check your own adapter (`--check-adapter`)
 
 Have an adapter built for Conduck — by hand or by an AI coding tool? Before exposing or pairing it, run the check on the machine where it listens:
 
 ```bash
-CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --doctor http://127.0.0.1:8080
+CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --check-adapter http://127.0.0.1:8080
 ```
 
-The script changes nothing. It sends a handful of real requests, grades the answers against the rules at **[conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/)** — including the one the pairing wizard can't prove: that your token check is actually **enforced** (a missing or a wrong token must both get `401`, on both routes) — and tells you what to fix. Exit code `0` means every check passed, so you can loop it from a build script while you iterate. Plain `http://` is accepted toward `127.0.0.1`/`localhost` only; the token comes from `$CONDUCK_TOKEN` or a hidden prompt, never the command line. Add `--deep` to also test a message with an image (an honest HTTP `400` "images unsupported" answer passes).
+The check changes no host configuration. It sends a handful of real requests—which may consume compute or enter server-side history—and grades the answers against the rules at **[conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/)**. That includes the one the pairing wizard cannot prove: your token check is actually **enforced** (a missing or wrong token must get `401` on both routes). Exit code `0` means every check passed. Plain `http://` is accepted toward `127.0.0.1`/`localhost` only; the token comes from `$CONDUCK_TOKEN` or a hidden prompt, never the command line (`argv` is visible to `ps`). For a scripted run with no keys at all, export `CONDUCK_TOKEN=` **empty** — that is an explicit keyless declaration. Leaving it unset where no prompt is possible (piped or closed input) fails fast instead of grading the target as keyless, because a silently-assumed keyless run grades the wrong thing and calls it a pass. Add `--deep` to test a message with an image (an honest HTTP `400` "images unsupported" answer passes).
 
-One scope note: it grades the *adapter* rules. Generic OpenAI-compatible software — OpenClaw, Hermes, Ollama, LiteLLM, vLLM — legitimately does things those rules forbid (honoring `stream: true` with SSE is correct OpenAI behavior; keyless modes are fine app-side), so pointing the doctor at it produces failures that don't mean anything is wrong. **That's what `--compat` is for** (next section): the doctor asks "is this a correct Conduck adapter?", `--compat` asks "will the app work with this server?" — two different questions, deliberately two different graders.
+One scope note: it grades the *adapter* rules. Generic OpenAI-compatible software — OpenClaw, Hermes, Ollama, LiteLLM, vLLM — legitimately does things those rules forbid (honoring `stream: true` with SSE is correct OpenAI behavior; keyless modes are fine app-side), so using this strict adapter check on them produces failures that don't mean anything is wrong. **That's what `--check-server` is for** (next section): if the software was built specifically for Conduck, use `--check-adapter`; if it was not, use `--check-server`.
 
-### Grade the file lane too (`--doctor --files`)
+### Grade the file lane too (`--check-adapter --files`)
 
-If your setup has a file lane (the shared folder the app and your agent exchange files through), `--files` grades it as three independent meters: **`file_transport`** — the WebDAV↔disk lane itself (auth on the routes that carry your bytes, byte-identical write-through, *direct-write freshness* — a file written straight to disk must be visible over WebDAV within 2 seconds, which is exactly how agent-written files went missing before `0.10.0` — ranged-probe compatibility, nested folders, verified DELETE); **`file_access`** — one real chat turn in which the selected model must copy a small input file byte-for-byte to the folder root, finish *before* replying, and name the output in plain reply text; **`file_e2e`** — the combined delivery path, probed the way the app actually probes it. Unlike the plain doctor, this profile **mutates**: it writes and removes small `conduck-doctor-*` files in the configured folder (registered before creation, removed by exact name, cleanup verified). On the machine where the wizard ran it finds the lane from your saved profile; elsewhere set `CONDUCK_FILES_URL` + `CONDUCK_FILES_DIR` + `CONDUCK_FILES_PASS`.
+If your setup has a file lane (the shared folder the app and your agent exchange files through), `--files` grades it as three independent meters: **`file_transport`** — the WebDAV↔disk lane itself (auth on the routes that carry your bytes, byte-identical write-through, *direct-write freshness* — a file written straight to disk must be visible over WebDAV within 2 seconds, ranged-probe compatibility, nested folders, verified DELETE); **`file_access`** — one real chat turn in which the selected model must copy a small input file byte-for-byte to the folder root, finish *before* replying, and name the output in plain reply text; **`file_e2e`** — the combined delivery path. This profile **mutates**: it writes and removes small named artifacts in the configured folder — a `conduck-check-<run>/` folder with its input file, plus `output-<run>.txt` at the folder root, which is the file the agent itself is asked to write and so carries no `conduck-check-` prefix (`<run>` is a random per-run tag). Every target is registered before creation, removed by exact name — never by pattern — and cleanup that cannot be *proven* is reported by exact name rather than assumed. On the machine where setup ran it finds the lane from your saved profile; elsewhere set `CONDUCK_FILES_URL` + `CONDUCK_FILES_DIR` + `CONDUCK_FILES_PASS`.
 
-The last line of every doctor run is a machine summary (`CONDUCK_DOCTOR schema=2 …`) — build scripts key on it plus the exit code. `schema=2` replaced `schema=1` in `v0.11.0` (the single `file_access` placeholder became the three meters above); if a script of yours parses that line, update it.
+The last line of every noninteractive adapter check is a machine summary (`CONDUCK_CHECK_ADAPTER schema=3 …`) — build scripts key on the prefix, the `schema=`, and the exit code. The grammar is frozen per schema number; any change to it bumps `schema=`, so pin the number you parse.
 
-## Testing existing OpenAI software (`--compat`)
+## Testing existing OpenAI software (`--check-server`)
 
-Pointing Conduck at something you already run — Ollama, LiteLLM, vLLM, LM Studio, a framework's OpenAI-compatible endpoint? Don't use `--doctor` (it will fail software that never claimed to be a Conduck adapter). Use:
+Pointing Conduck at something you already run — Ollama, LiteLLM, vLLM, LM Studio, a framework's OpenAI-compatible endpoint? Use:
 
 ```bash
-CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --compat http://127.0.0.1:11434
+CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --check-server http://127.0.0.1:11434
 ```
 
-Read-only, like the plain doctor. It mirrors the Conduck app's OWN wire validation — the Test Connection probe and the reply decoder, neither stricter nor looser: response `Content-Type` is never read, an empty-string reply is valid, extra fields like `tool_calls` are tolerated, `stream: true` is never sent, and no negative-auth requests are made (an empty token at the prompt means the app's explicit keyless mode). Four wire checks (models envelope + 15s limit, chat decode, advertised-model selection, and history-image tolerance — one earlier photo must never break a conversation), plus an informational image-capability probe (`VERIFIED` / `DECLINED` / `IGNORED`) that never changes the verdict. Servers that *require* a `model` field pass with a `model=required` note — in the app, just pick a model in the gateway settings.
+The check changes no host configuration, but it sends several real model/chat/image requests that may consume compute or enter server-side history. At the **directly addressed endpoint**, it matches the current Apple app's request and response acceptance: any 2xx response is decoded, response `Content-Type` is not graded, the full `choices` array must decode, an empty-string reply is valid, extra fields such as `tool_calls` are tolerated, `stream: true` is never sent, and no negative-auth requests are made. An empty answer at the prompt — or an exported but empty `CONDUCK_TOKEN=` — means the app's explicit keyless mode.
 
-The last line is a machine summary (`CONDUCK_COMPAT schema=1 … wire=PASS|FAIL …`); exit `0` means the app can use this server at the wire level. Two honest limits: a pass does **not** make the server a Conduck adapter (that's `--doctor`), and statefulness is invisible on the wire — Conduck resends the full conversation every turn, so a server that also keeps its *own* history will silently double-count context.
+The diagnostic deliberately does not follow HTTP redirects or forward your credential to a `Location` target. A 3xx result tells you to use the final server URL directly. Conduck's Apple networking stack may follow an allowed redirect, but redirect policy is not part of this check's promise.
+
+Four wire checks cover core text-chat compatibility: models envelope + 15-second limit, chat decode, advertised-model selection, and history-image tolerance. The image-capability result (`VERIFIED` / `DECLINED` / `IGNORED` / `OPAQUE`) is separate and informational; it never changes the core PASS/FAIL verdict. Servers that require a `model` field pass with a `model=required` note—in the app, pick a model in gateway settings. Android is still a work-in-progress client and is not the compatibility authority yet.
+
+The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_SERVER schema=2 … wire=PASS|FAIL …`); exit `0` means core text-chat compatibility is green. It does **not** certify image understanding, public reachability, HTTPS certificate trust/pinning, or make the server a Conduck adapter (that is `--check-adapter`). Statefulness is also invisible on the wire: Conduck resends the full conversation every turn, so a server that keeps its own history will silently double-count context.
 
 ## Trust posture
 
@@ -104,8 +136,8 @@ The last line is a machine summary (`CONDUCK_COMPAT schema=1 … wire=PASS|FAIL 
 - Never installs gateways, Tailscale, cloudflared, rclone, or any daemon it didn't create.
 - Asks before every change. Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
 - Never elevates silently — where `sudo` is needed it prints the exact command for you to review and run.
-- Never makes your gateway public without telling you, in plain words, that it will — and refuses to publish a keyless gateway unless you pass `--allow-keyless-public`.
-- Re-running is safe; `--show-qr` re-shows your saved pairing code without touching anything.
+- Never makes your gateway public without telling you, in plain words, that it will — and refuses to publish a keyless gateway unless you run setup with `--setup --allow-keyless-public`.
+- Re-running is safe; `--show-code` re-shows your saved pairing code without changing configuration. Its live verification still sends gateway requests and briefly writes/removes a small probe when a file lane is configured.
 
 See **[WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md)** for the exact files, services, and ports it reads or changes — and how to undo each.
 
@@ -183,7 +215,7 @@ The wizard's Step 5 verifies with real requests and names what failed. What each
 | `live round-trip failed (no answer from the gateway)` | The request went out, but nothing came back — no status, no body. | Usually a tunnel or proxy swallowing the request — check the rail the gateway rides, then the gateway's own logs. |
 | `live round-trip failed (HTTP …)` | The chat endpoint rejected the request. | A 404 here usually means the named model isn't available on the server; a 400 often means the server requires a `model` field — set one when the wizard asks. |
 | `live round-trip failed (HTTP 200, but no usable text — "content" must be a non-empty string)` | The reply's `content` wasn't plain text — e.g. a tool-call turn, or a streaming-only adapter. | The endpoint must honor `stream: false` and return the final answer as a plain string — see the adapter contract. |
-| `This gateway has NO authentication, and this transport is publicly reachable.` | Keyless + public would put an unauthenticated, tool-capable agent on the open internet. The script refuses. | Keep it private (Tailscale), put a token on the gateway — or, expert-only, re-run with `--allow-keyless-public`. |
+| `This gateway has NO authentication, and this transport is publicly reachable.` | Keyless + public would put an unauthenticated, tool-capable agent on the open internet. The script refuses. | Keep it private (Tailscale), put a token on the gateway — or, expert-only, re-run with `--setup --allow-keyless-public`. |
 
 ### Other endpoint gotchas
 
