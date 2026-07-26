@@ -79,7 +79,7 @@ No `chmod` needed. The one large block near the bottom of the script is a vendor
 | `--check-adapter [url]` | An adapter built specifically for Conduck: grade the stricter adapter contract |
 | `--show-code` | Re-show a saved gateway's pairing code without configuration changes. Live verification sends gateway requests and, when configured, one small file-lane PUT→GET→DELETE probe; OpenClaw/Hermes lanes also get a real agent file-tool sentinel |
 | `--setup --dry-run` | Show setup state and the exact actions a real run would take, then stop. Never prompts for secrets, mints credentials, sends requests, or emits a code |
-| `--setup --reuse-only` | Walk setup while refusing host configuration changes. Live verification still sends gateway requests and may write/delete the normal byte probe; a configured OpenClaw/Hermes lane also runs the real agent read→write→reply sentinel |
+| `--setup --reuse-only` | Walk setup using only what already exists. It does not apply host configuration changes — the first step that would need one stops the run and names it, rather than skipping past it. Live verification still sends gateway requests and may write/delete the normal byte probe; a configured OpenClaw/Hermes lane also runs the real agent read→write→reply sentinel |
 | `--check-adapter --deep [url]` | Also test how the adapter handles a message with an image |
 | `--check-adapter --files [url]` | Also grade the file lane. This explicitly mutating check writes and removes small named artifacts — `conduck-check-*` plus one `output-*.txt` — in the configured shared folder |
 | `--setup --allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
@@ -139,10 +139,10 @@ The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_S
 
 ## Trust posture
 
-- Runs on **your** gateway host. Sends nothing anywhere except to your own gateway. **No telemetry, ever.** The QR is generated locally.
+- Runs on **your** gateway host. **No telemetry, ever — there is no GigaDuck server.** Its own HTTP probes go only to the gateway and file lane you name, and the QR is generated locally. The exception is the exposure path you choose: `tailscale serve` / `tailscale funnel` and `cloudflared tunnel list` are that vendor's own commands, and running them contacts that vendor's control plane.
 - Never installs gateways, Tailscale, cloudflared, rclone, or any daemon it didn't create.
 - Asks before every change. Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
-- Never elevates silently — where `sudo` is needed it prints the exact command for you to review and run.
+- Never elevates silently. Every `sudo` command is shown in full first, and all but one are printed for you to review and run yourself (Tailscale operator rights, `pmset`). The exception is `sudo loginctl enable-linger <user>` in the file-lane step — lingering is what keeps your file server running after you log out. The script runs that one itself, and only after you approve the exact command at a `y/N` prompt; decline and it prints it as a tip instead.
 - Never makes your gateway public without telling you, in plain words, that it will — and refuses to publish a keyless gateway unless you run setup with `--setup --allow-keyless-public`.
 - Re-running is safe; `--show-code` re-shows your saved pairing code without changing configuration. Its live verification still sends gateway requests and briefly writes/removes small randomized probes when a file lane is configured (including a real OpenClaw/Hermes agent file turn).
 
@@ -162,6 +162,8 @@ Conduck needs the gateway at an `https://` URL. The wizard walks four paths and 
 - **Tailscale Funnel** — public, end-to-end encrypted.
 - **Cloudflare Tunnel** — public; needs a domain and `cloudflared`.
 - **I already run my own HTTPS** — give the address; the script trusts a publicly-valid cert (e.g. Let's Encrypt) or pins a self-signed one for you. A broken cert (expired / wrong host) stops the run rather than getting silently pinned.
+
+Whichever path you pick, every address you type — gateway or file lane — has to be a plain URL. One carrying `user:pass@` credentials is refused, by the wizard and by both check commands: that password would otherwise be echoed on screen, saved into the profile, and ride inside the pairing code. Credentials belong in the token prompt, not the address.
 
 ## Set up the file lane by hand (any WebDAV server)
 
@@ -215,8 +217,9 @@ The wizard's Step 5 verifies with real requests and names what failed. What each
 | `…failed: pinned key mismatch` | The server's certificate is not the one this run pinned. | Re-run the wizard so it pins the current cert (it never re-pins silently). |
 | `…failed: HTTP 401 — token rejected` | Wrong or stale bearer token — or an access layer in front wants its own login. (A 403 prints the same shape.) | Re-read the token from the gateway's config (OpenClaw: `gateway.auth.token` · Hermes: `API_SERVER_KEY`); check any proxy access policy. |
 | `…failed: HTTP 404 — nothing at that path` | No `/v1/models` at that base address. | Give the server's *base* address — the script and the app append `/v1/…` themselves. (A pasted `…/v1` is normalized away automatically.) |
+| `…failed: HTTP 3xx redirect — enter the final gateway base URL directly` | The address you gave redirects elsewhere. The wizard stops rather than forwarding your token to the `Location` target. | Use the address the redirect lands on as the gateway URL. |
 | `…failed: HTTP 5xx — the server errored` | The gateway itself failed. | Read the gateway's own logs. |
-| `…failed: answered 200, but the body isn't JSON` | Something replied OK — but not with JSON (a proxy's plaintext page, or malformed JSON the strict parser refuses). | Check what actually answers at that address; the reply contract lives at https://conduck.com/setup/adapter/v1/. |
+| `…failed: answered HTTP 200, but the body isn't strict JSON` | Something replied OK — but not with JSON the strict parser accepts: a proxy's plaintext page, malformed JSON, or `NaN`/`Infinity`, which Conduck's own decoder refuses too. | Check what actually answers at that address; the reply contract lives at https://conduck.com/setup/adapter/v1/. |
 | `…but its model list is EMPTY` | The endpoint is real, yet advertises no models — it can't answer a chat. | Pull/load a model (e.g. `ollama pull …`, load one in LM Studio), or set the model name your gateway expects. |
 | `live round-trip failed (transfer error — timed out or the connection dropped)` | The test chat request didn't complete within 300 s (the app's own limit), or the connection broke mid-reply. | Modest hardware and busy agents are slow — try again; check server load and any proxy read-timeout in front. |
 | `live round-trip failed (no answer from the gateway)` | The request went out, but nothing came back — no status, no body. | Usually a tunnel or proxy swallowing the request — check the rail the gateway rides, then the gateway's own logs. |

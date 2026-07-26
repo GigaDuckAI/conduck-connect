@@ -45,6 +45,47 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   mapping keys) are never mistaken for missing sections or duplicated with
   plain block keys; anchors, aliases, and merge keys are globally refused
   because they can change the effective target paths.
+- Security-review hardening. An endpoint URL carrying `user:pass@` userinfo is
+  now refused at every prompt and on both check commands, so a password can
+  never be echoed to the terminal, saved into the pairing profile, or ride
+  inside a pairing code. Gateway-supplied strings — model ids, `Content-Type`,
+  wire error codes — are stripped of C0 control bytes and DEL where they leave
+  their parser, so a hostile server cannot forge extra `[CHECK_ID]` transcript
+  lines or repaint the screen with ANSI. Every loopback probe now passes
+  `--noproxy '*'`: `-q` suppresses `~/.curlrc` but not `$http_proxy`/`$ALL_PROXY`,
+  which could otherwise receive a bearer token or forge an "it's up" answer
+  about a local service. `OPENCLAW_GATEWAY_PORT` and `API_SERVER_PORT` are
+  validated as whole 1–65535 ports, so an ordinary dotenv trailing comment can
+  no longer word-split into an exposure command.
+- Tighter permissions on everything the connector creates that can hold a
+  secret. `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/` is created `0700` — it
+  holds the file-lane credential files and the saved profiles. A shared agent
+  folder the connector creates is `0700`; one that already exists keeps its own
+  mode and is reported rather than silently re-permissioned. An existing
+  `~/.hermes/.env` that other accounts can read is tightened to `0600` after the
+  append you approved — your gateway key is inside it — and the change is stated
+  on screen. `--check-adapter --files` stages its transport probes inside one
+  `0700` `mktemp -d` rather than a `mktemp` file plus sibling names built by
+  string concatenation.
+- Documentation corrected against the code rather than the intent.
+  `WHAT-IT-TOUCHES.md` no longer claims connector temp files live in a private
+  per-run directory (they do not); it gains the missing row for the shared agent
+  folder — the directory that receives every attachment you send and every file
+  the agent writes back; it names `$HOME/.openclaw/openclaw.json` as the fixed
+  path it is (`OPENCLAW_CONFIG_PATH` was documented but never honoured); and it
+  states the real OpenClaw precedence, where the compose `.env` port wins over
+  the config while its token is only a fallback. `README.md` no longer says every
+  `sudo` is merely printed for you: `loginctl enable-linger` is run by the script
+  itself after a `y/N` approval, and that is now named as the one exception; its
+  "sends nothing anywhere" line carves out the Tailscale and Cloudflare commands
+  the script runs on your behalf, matching what `SECURITY.md` already said.
+  `PAYLOAD.md` describes when `model` is actually present.
+- Added a regression guard for the pairing profile's "never a token or
+  credential" invariant (`profile-never-carries-secrets`): `write_profile` is
+  driven with sentinel values in `GW_TOKEN`/`FS_CRED`, and neither may appear
+  anywhere under the state directory. It runs a control against a deliberately
+  leaking copy of the same function, so a guard that stopped biting fails the
+  suite rather than passing quietly.
 
 ## [0.13.0] — one command surface, and checks that hand off to setup
 

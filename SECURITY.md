@@ -34,8 +34,8 @@ The latest tagged release is supported. Older tags are not patched — re-downlo
 
 - **Reads** your gateway's own config to discover ports and the existing token (OpenClaw `~/.openclaw/openclaw.json`; Hermes `~/.hermes/.env`).
 - **Enables** the gateway's OpenAI-compatible chat endpoint if it is off — with your confirmation.
-- **Creates** exposure mappings using tools you already run (`tailscale serve` / `funnel`), and optionally a file-server service it owns (`conduck-files-<id>`, rclone WebDAV bound to `127.0.0.1`).
-- **Stores** the file-lane credential in `0600` files under `~/.config/conduck/` — and, on **macOS only**, a second cleartext copy inside the `0600` LaunchAgent plist it creates, because launchd has no environment-file equivalent. Removing the credential therefore takes a different step per platform; [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md) lists every location and the exact undo.
+- **Creates** exposure mappings using tools you already run (`tailscale serve` / `funnel`), and optionally a file-server service it owns (`conduck-files-<id>`, rclone WebDAV bound to `127.0.0.1`) together with the shared folder that service serves — the folder your attachments and the agent's output files pass through. A folder it creates is `0700`; one that already exists keeps its own permissions, and it tells you when those let other accounts read it.
+- **Stores** the file-lane credential in `0600` files under `~/.config/conduck/` (a `0700` directory) — and, on **macOS only**, a second cleartext copy inside the `0600` LaunchAgent plist it creates, because launchd has no environment-file equivalent. Removing the credential therefore takes a different step per platform; [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md) lists every location and the exact undo.
 - **Sends** its own HTTP probes only to your configured gateway and file lane,
   to verify they work. `--show-code` changes no configuration, but
   still performs live verification; with a configured file lane that includes
@@ -49,7 +49,7 @@ See [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md) for the exhaustive list and how to 
 - **No GigaDuck telemetry, ever. There is no GigaDuck server.** The script's own HTTP probes target only your configured gateway and file lane. Approved Tailscale or Cloudflare commands — run by the script with your consent, or by you — may contact those providers' control planes as part of exposing your gateway.
 - **Never installs** your gateway, Tailscale, cloudflared, or rclone — it works with what you already have, and exits cleanly with instructions if a prerequisite is missing.
 - **Never elevates silently.** Every `sudo` command is shown in full first. Most it prints for you to review and run yourself (Tailscale operator rights, `pmset`). The one it can run for you — `loginctl enable-linger`, so your file server survives logout — runs only after you approve the exact command at a `y/N` prompt; decline and it prints the command as a tip instead.
-- **Never changes a config it didn't create** without showing you the exact change first.
+- **Never changes a config it didn't create** without showing you the exact change first. That covers permissions as well as content: after you approve the Hermes `~/.hermes/.env` append, an `.env` left readable by other accounts is tightened to `0600` — your gateway key is inside it — but only after the exact `chmod` is shown at a `y/N` prompt. Decline and it prints the command as a tip instead.
 - **Never makes your gateway public** without telling you, in plain words, that it will — and refuses to publish a **keyless** gateway on a public transport unless you explicitly run `--setup --allow-keyless-public`. The flag is a setup modifier and is rejected on its own or with any other action, so it can never be passed by reflex.
 
 ## Verifying your download
