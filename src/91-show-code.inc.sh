@@ -373,7 +373,9 @@ show_qr_recover_file_lane() {
     FS_URL="$fsurl"
     [ -n "$saved_port" ] && FS_LOCAL_PORT="$saved_port"
     FS_CERT_FP="$saved_fp"
-    [ -n "$saved_folder" ] && FS_FOLDER="$saved_folder"
+    if [ -n "$saved_folder" ] && [ "$saved_folder" != "$FS_FOLDER" ]; then
+      note "The saved profile's informational folder differs from the live service definition; using the structurally parsed live folder."
+    fi
     ok "Recovered the file-lane credential from this machine (not shown)."
     if $FS_CRED_LEGACY_ARGV; then
       note "Heads-up: that file-server unit keeps its password on the command line (visible via 'ps'). The QR is still correct."

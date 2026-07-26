@@ -24,6 +24,7 @@ curl_gw() { # curl_gw <curl args…>
   if $DOCTOR || $COMPAT; then extra+=(--noproxy '*'); fi
   # ${extra[@]+…} guard: expanding an empty array under `set -u` is an error in bash 3.2.
   if [ "$GW_AUTH" = "bearer" ]; then
+    credential_value_safe "$GW_TOKEN" || return 2
     local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"   # curl-config quoting
     printf 'header = "Authorization: Bearer %s"\n' "$tok" \
       | curl -q -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
@@ -124,21 +125,57 @@ sys.exit(0 if ids else 5)' 2>/dev/null)
 
 # A self-signed-aware curl for the FILE lane (its own pin if set, else gateway's).
 # The credential rides a stdin curl config, never argv (argv shows in `ps`).
-curl_fs() { # curl_fs <curl args…>
+curl_fs_with_timeout() { # curl_fs_with_timeout <max-seconds> <curl args…>
+  local max_time="$1"; shift
   local extra=()
   if [ "$TRANSPORT" = "selfsigned" ]; then
     local fp="$GW_CERT_FP"; [ -n "$FS_CERT_FP" ] && fp="$FS_CERT_FP"   # file's own pin if it has one
     if [ -n "$fp" ]; then local b64; b64=$(hex_to_b64 "$fp"); [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64"); fi
   fi
+  credential_value_safe "$FS_CRED" || return 2
   local cred="$FS_CRED"; cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"   # curl-config quoting
   printf 'user = "conduck:%s"\n' "$cred" \
-    | curl -q -sS --max-time 30 --config - ${extra[@]+"${extra[@]}"} "$@"
+    | curl -q -sS --max-time "$max_time" --config - ${extra[@]+"${extra[@]}"} "$@"
 }
+curl_fs() { curl_fs_with_timeout 30 "$@"; }
 
 local_health_ok() { # local_health_ok <url> -> 0 when the server answered with < 500
   local code
   code=$(curl -q -sS --max-time 10 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
   case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
+}
+
+agent_file_lane_gate() {
+  local agent_name fix_hint
+  case "$GW_KIND" in
+    openclaw)
+      agent_name="OpenClaw"
+      fix_hint="OpenClaw's workspace/tool policy" ;;
+    hermes)
+      agent_name="Hermes"
+      fix_hint="Hermes file tools/terminal.cwd" ;;
+    *) return 0 ;;
+  esac
+
+  say "  Asking $agent_name to read and copy a randomized sentinel with its file tools (up to 5 minutes)…"
+  if agent_file_probe; then
+    ok "$agent_name agent file lane: tool read + byte-identical write + reply discovery all green"
+    return 0
+  fi
+
+  bad "$agent_name agent file lane failed: $AGENT_FILE_PROBE_REASON"
+  if $SHOW_QR; then
+    if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+      drop_file_lane
+      return 1
+    fi
+    die "Stopped before emitting a new code. Any separately approved host edits from this run remain in place; fix $fix_hint, then re-run --show-code."
+  fi
+  note "The WebDAV transport worked, but $agent_name itself did not complete the file turn."
+  note "Leaving file transfer out of this setup code; fix $fix_hint, then re-run setup."
+  hermes_residual_state_note
+  drop_file_lane
+  return 1
 }
 
 verify_all() {
@@ -232,15 +269,27 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
     VERIFY_FAILED=true
   fi
 
-  # File lane: PUT → GET → DELETE a throwaway.
+  # File transport first. For known agent gateways, a second real agent turn
+  # below is the launch gate: WebDAV plus static config inspection must never
+  # produce an end-to-end green claim by themselves.
   if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
-    local probe="conduck-connect-probe-$$.txt" tmp; tmp=$(mktemp); echo "probe" > "$tmp"
+    local probe="conduck-connect-probe-$$.txt" tmp transport_ok=false
+    local delete_code="" gone_code=""
+    tmp=$(mktemp); echo "probe" > "$tmp"
     if curl_fs -T "$tmp" "$FS_URL/$probe" >/dev/null 2>&1 \
        && [ "$(curl_fs "$FS_URL/$probe" 2>/dev/null)" = "probe" ]; then
-      if curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1; then
-        ok "file lane: write → read → delete all green"
+      delete_code=$(curl_fs -X DELETE -o /dev/null -w '%{http_code}' \
+        "$FS_URL/$probe" 2>/dev/null || true)
+      gone_code=$(curl_fs -o /dev/null -w '%{http_code}' \
+        "$FS_URL/$probe" 2>/dev/null || true)
+      if [[ "$delete_code" == 2?? || "$delete_code" = "404" ]] \
+         && [ "$gone_code" = "404" ]; then
+        transport_ok=true
+        ok "file transport: authenticated write → read → delete all green"
       else
-        ok "file lane: write → read green (delete probe left a stray file: $probe)"
+        bad "file transport cleanup was not proven (DELETE HTTP ${delete_code:-000}; follow-up GET HTTP ${gone_code:-000})"
+        warn "The exact probe $probe may remain. Leaving file transfer out of this setup code."
+        drop_file_lane
       fi
     elif $SHOW_QR; then
       # --show-code never rewrites the saved profile (write_profile guards on $SHOW_QR),
@@ -264,5 +313,11 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
       drop_file_lane
     fi
     rm -f "$tmp"
+
+    if $transport_ok && [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+      case "$GW_KIND" in
+        openclaw|hermes) agent_file_lane_gate || true ;;
+      esac
+    fi
   fi
 }

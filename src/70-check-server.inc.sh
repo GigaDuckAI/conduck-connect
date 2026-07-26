@@ -75,12 +75,8 @@ print("ok %d" % len(c))' "$exp" 2>/dev/null)
   return 1
 }
 
-app_chat_eval() { # app_chat_eval <payload-json> [expected-digit-code]
-  local exp="${2:--}"
-  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
-  if ! doctor_chat_request "$1"; then
-    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
-  fi
+app_chat_loaded_eval() { # app_chat_loaded_eval [expected-digit-code] — grades current DCC_*
+  local exp="${1:--}"
   case "$DCC_CODE" in
     2??) ;;
     3??)
@@ -103,6 +99,15 @@ if isinstance(c, str) and c:
       ;;
   esac
   app_chat_body_eval "$DCC_BODY" "$exp"
+}
+
+app_chat_eval() { # app_chat_eval <payload-json> [expected-digit-code]
+  local exp="${2:--}"
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  if ! doctor_chat_request "$1"; then
+    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
+  fi
+  app_chat_loaded_eval "$exp"
 }
 
 # The app's vision-decline classifier, mirrored: a structured code

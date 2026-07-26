@@ -16,9 +16,16 @@ curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/downlo
 
 Works on macOS and Linux. `-O` lands the full file on disk before anything runs, so inspecting it is one `less` away. An optional same-release checksum is [below](#what-each-step-does); it confirms the download arrived intact but is not a tamper-proof signature.
 
-It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV) — on OpenClaw also checking the gateway's **tool policy** (a policy denying the agent's `read`/`write` breaks attachments agent-side while every transport test stays green) and installing a short agent-guidance block in the workspace `TOOLS.md` — verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan.
+It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan. Agent-side checks are gateway-aware: OpenClaw gets a tool-policy check plus workspace `TOOLS.md` guidance; Hermes gets its API-server file toolset and exact `terminal.cwd` checked plus verified Hermes context guidance. Both must then pass a real read→byte-identical-write→reply-discovery sentinel before the file lane reaches the code.
 
-> **Status: this source is at `v0.13.0`.** The Quick start downloads the latest *published* release, which can briefly lag `main` right after a version bump — the [releases page](https://github.com/gigaduckai/conduck-connect/releases) is the authority on what is live. The Conduck app is already available on the App Store. Every release artifact is plain, unminified shell that can be inspected before it runs.
+> **Release boundary:** the script's `VERSION` remains `0.13.0`, while `main`
+> may also contain entries under **Unreleased** that are not in the published
+> `v0.13.0` asset. The Quick start always downloads the latest *published*
+> release—not `main`; the [releases page](https://github.com/gigaduckai/conduck-connect/releases)
+> is the authority on what is live. Rebuilding or testing the local artifact
+> does not publish it. The Conduck app is already available on the App Store.
+> Every release artifact is plain, unminified shell that can be inspected
+> before it runs.
 
 ## Why a shell script?
 
@@ -70,9 +77,9 @@ No `chmod` needed. The one large block near the bottom of the script is a vendor
 | `--setup` | Go straight to setup. Detection reports OpenClaw/Hermes installs, but you always explicitly choose OpenClaw, Hermes, or another server |
 | `--check-server [url]` | Existing OpenAI-compatible software **not built for Conduck**: check core compatibility with the current Apple Conduck app |
 | `--check-adapter [url]` | An adapter built specifically for Conduck: grade the stricter adapter contract |
-| `--show-code` | Re-show a saved gateway's pairing code without configuration changes. Live verification sends gateway requests and, when configured, one small file-lane PUT→GET→DELETE probe |
+| `--show-code` | Re-show a saved gateway's pairing code without configuration changes. Live verification sends gateway requests and, when configured, one small file-lane PUT→GET→DELETE probe; OpenClaw/Hermes lanes also get a real agent file-tool sentinel |
 | `--setup --dry-run` | Show setup state and the exact actions a real run would take, then stop. Never prompts for secrets, mints credentials, sends requests, or emits a code |
-| `--setup --reuse-only` | Walk setup while refusing host configuration changes. Live verification still sends gateway requests and may write/delete one small file-lane probe |
+| `--setup --reuse-only` | Walk setup while refusing host configuration changes. Live verification still sends gateway requests and may write/delete the normal byte probe; a configured OpenClaw/Hermes lane also runs the real agent read→write→reply sentinel |
 | `--check-adapter --deep [url]` | Also test how the adapter handles a message with an image |
 | `--check-adapter --files [url]` | Also grade the file lane. This explicitly mutating check writes and removes small named artifacts — `conduck-check-*` plus one `output-*.txt` — in the configured shared folder |
 | `--setup --allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
@@ -137,7 +144,7 @@ The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_S
 - Asks before every change. Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
 - Never elevates silently — where `sudo` is needed it prints the exact command for you to review and run.
 - Never makes your gateway public without telling you, in plain words, that it will — and refuses to publish a keyless gateway unless you run setup with `--setup --allow-keyless-public`.
-- Re-running is safe; `--show-code` re-shows your saved pairing code without changing configuration. Its live verification still sends gateway requests and briefly writes/removes a small probe when a file lane is configured.
+- Re-running is safe; `--show-code` re-shows your saved pairing code without changing configuration. Its live verification still sends gateway requests and briefly writes/removes small randomized probes when a file lane is configured (including a real OpenClaw/Hermes agent file turn).
 
 See **[WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md)** for the exact files, services, and ports it reads or changes — and how to undo each.
 
@@ -158,7 +165,7 @@ Conduck needs the gateway at an `https://` URL. The wizard walks four paths and 
 
 ## Set up the file lane by hand (any WebDAV server)
 
-**The easy path is to re-run `conduck-connect`.** It's the supported way to add file transfer after chat is already paired: it detects an existing `conduck-files-<gwid>` server, reuses its folder, port, and credential, reconciles the lane's reach against the gateway's, verifies a `PUT` → `GET` → `DELETE` round-trip, and emits a fresh pairing code. Reach for the manual path below only when you run your own topology — Caddy, nginx, a NAS appliance, containers, or rclone under your own supervisor — anything that already speaks WebDAV.
+**The easy path is to re-run `conduck-connect`.** It's the supported way to add file transfer after chat is already paired: it detects an existing `conduck-files-<gwid>` server, reuses its stable folder/port/credential, allocates a different free loopback port when another gateway already owns the default, checks the local service before exposing it, reconciles the lane's reach against the gateway's, and emits a fresh pairing code only after live verification. Reach for the manual path below only when you run your own topology — Caddy, nginx, a NAS appliance, containers, or rclone under your own supervisor — anything that already speaks WebDAV.
 
 Conduck doesn't care *how* the endpoint is built, only that it satisfies the contract the in-app **Test Connection** stages check. Serve that contract with whatever you already run.
 
@@ -166,11 +173,11 @@ Conduck doesn't care *how* the endpoint is built, only that it satisfies the con
 
 - **HTTPS, not HTTP.** The app rejects an `http://` file URL outright. Terminate TLS with a real or self-signed certificate (see security notes).
 - **HTTP Basic auth, username `conduck`.** The password is generated *in the app* — **Settings → your gateway → File transfer → Generate credential** — and pasted into your server's config. Conduck never accepts a password you invent; the app is the source of truth for that credential.
-- **Serve the folder the agent actually reads and writes.** The WebDAV root must be the agent's working directory — for OpenClaw its workspace (`~/.openclaw/workspace` by default), for Hermes the folder `terminal.cwd` points at in `~/.hermes/config.yaml`. No test can catch this: point the root at the wrong folder and uploads land on disk, every check goes green, and your agent still never sees the file.
-- **The agent must be ALLOWED to use its file tools.** Byte transport is only half the lane: the gateway's tool policy decides whether the agent may open uploads and write output files. On OpenClaw, `tools.deny` containing `group:fs` (a common hardening move) breaks every attachment turn while every transport check stays green — `read` and `write` must be allowed (keep `edit`/`apply_patch`/`exec` denied if you like), and native PDF analysis additionally needs `tools.alsoAllow: ["pdf"]` (the `pdf` tool is not in the `coding` profile). The wizard checks this and offers the exact fix; hand-built setups must mind it themselves. No test can catch this one either.
+- **Serve the folder the agent actually reads and writes.** The WebDAV root must be the agent's working directory — for OpenClaw its workspace (`~/.openclaw/workspace` by default), for Hermes the folder `terminal.cwd` points at in `~/.hermes/config.yaml`. The wizard aligns the Hermes root and live-proves both OpenClaw and Hermes lanes before including them. For a custom/manual adapter, `--check-adapter --files` runs the same decisive kind of agent-side copy test; the in-app WebDAV test alone cannot prove the agent's working root.
+- **The agent must be ALLOWED to use its file tools.** Byte transport is only half the lane: the gateway's tool policy decides whether the agent may open uploads and write output files. On OpenClaw, `tools.deny` containing `group:fs` (a common hardening move) breaks every attachment turn while transport stays green — `read` and `write` must be allowed (keep `edit`/`apply_patch`/`exec` denied if you like), and native PDF analysis additionally needs `tools.alsoAllow: ["pdf"]` (the `pdf` tool is not in the `coding` profile). The wizard checks this and offers the exact fix. On Hermes, an explicit `platform_toolsets.api_server` must retain the file toolset; the wizard offers only that narrow addition and refuses global-disable or non-local-backend cases it cannot safely map. `--check-adapter --files` is the end-to-end proof for hand-built adapters.
 - **Same reach as the gateway.** Expose the file server on the same rail you exposed the gateway on. If the gateway is public but the file server is tailnet-only, a standalone Apple Watch can still chat but silently can't send or open attachments.
 
-Then, in the app: paste the file-lane URL and run **Test Connection**. The staged test proves reachability, auth, and a byte-faithful `PUT` → `GET` → `DELETE` round-trip — everything except whether the root is the *right* folder, which only you can confirm.
+Then, in the app: paste the file-lane URL and run **Test Connection**. The staged app test proves reachability, auth, and a byte-faithful `PUT` → `GET` → `DELETE` round-trip. It does not execute your agent's tools; use the wizard's OpenClaw/Hermes sentinel or `--check-adapter --files` to prove that final half.
 
 **Security**
 
@@ -227,10 +234,13 @@ Nothing fails, so no message prints — but the result quietly isn't what you wa
 
 ### File-lane problems
 
-- `file lane probe failed` / `the saved profile's file lane failed live verification` — the WebDAV server didn't complete the PUT → GET → DELETE round-trip: wrong credential (regenerate it in the app and update the server), server not running, or its HTTPS front broken.
-- **Every check green, but the agent never sees uploaded files** — two known causes, neither detectable by any test:
+- `The file-server service exists but is not active` / `did not answer with its saved credential` / `did not reject both missing and wrong credentials` — the local service behind the planned exposure is stopped, shadowed, or insecure. The wizard leaves it out rather than putting an unproved lane in the code. Repair/restart that exact `conduck-files-<gateway>` unit and re-run. If two pre-existing per-gateway units claim the same loopback port, only the exact unit that is active and passes the authenticated byte probe can be used; the connector intentionally does not rewrite or rebind either existing definition. Stop/repair/remove the stale duplicate, or assign it a different port, then re-run.
+- `OpenClaw agent file lane failed: …` / `Hermes agent file lane failed: …` — WebDAV worked, but the full agent did not read the randomized input, finish a byte-identical output at the shared root, or name it in the reply. The lane is omitted. For OpenClaw, check the workspace/tool policy/`TOOLS.md`; for Hermes, check `terminal.cwd`, the API-server `file` toolset, and `.hermes.md` / `HERMES.md`. Re-run after fixing it.
+- `file lane probe failed` / `the saved profile's file lane failed live verification` — the WebDAV server didn't complete the PUT → GET → DELETE round-trip: wrong credential, server not running, or its HTTPS front broken.
+- **Transport is green, but the agent never sees uploaded files** — two known causes:
   1. the WebDAV root points at the wrong folder — it must be the agent's *working directory*; see the contract in "Set up the file lane by hand" above;
   2. the gateway's **tool policy denies the agent's file tools** — on OpenClaw, `tools.deny` containing `group:fs` (or `read`) makes every upload invisible to the agent; the typical symptom is the agent web-searching for the filename, claiming it can't access files, or the first attachment turn timing out into a "no response" placeholder while the agent flails. Re-run the wizard (its file-lane step checks the policy and offers the exact fix), or allow `read`/`write` yourself and restart the gateway.
+  The current OpenClaw/Hermes setup sentinel and `--check-adapter --files` detect these end to end. The app's own File transfer test intentionally grades only transport, so a manually paired lane can still need the deeper check.
 - **A PDF "answers" but with generic or wrong content** — the agent read the PDF's raw bytes instead of analyzing it natively. On OpenClaw the `pdf` tool is not in the `coding` profile (`tools.alsoAllow: ["pdf"]` enables it), and it wants the file's **absolute** workspace path — a bare filename fails its allowed-directory check even where `read` succeeds. The wizard's `TOOLS.md` block teaches the agent the absolute-path retry.
 - **The agent says it saved/sent a file, but no download chip appears** — the agent delivered it as a channel-attachment directive (e.g. a `MEDIA:<path>` line), which the OpenAI-compatible endpoint strips; the reply reaches Conduck without the filename, so nothing can be offered for download. The rule (installed into `TOOLS.md` by the wizard, scoped to Conduck turns): write the file to the working-directory root and **name it in plain reply text**. Agent guidance loads at session start — test in a **new** conversation. If the file was really written, asking "what is the exact filename of the file you saved?" in the same conversation makes the chip appear on the answer.
 - **Chat works everywhere, but attachments fail on a standalone Apple Watch** — the file lane rides a narrower rail than the gateway (say, a tailnet-only lane behind a public gateway). Expose both on the same rail; re-running the wizard reconciles the two.

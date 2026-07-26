@@ -1,0 +1,1112 @@
+# --- Hermes agent-side readiness ---------------------------------------------
+# Current Hermes API-server releases expose the full toolset by default. A
+# user-supplied `platform_toolsets.api_server` narrows that default, though, and
+# an explicit list without `file` removes read_file/write_file while chat stays
+# perfectly green. `terminal.cwd` independently decides where those tools land.
+# We inspect only these narrow YAML paths with a conservative stdlib parser.
+# Anchors, flow maps, non-local backends, and global file-tool disables are
+# deliberately "manual": guessing at them would broaden privileges silently.
+HERMES_CONFIG_CHANGED_THIS_RUN=false
+HERMES_GUIDANCE_CHANGED_THIS_RUN=false
+HERMES_GUIDANCE_TARGET_THIS_RUN=""
+HERMES_RESIDUAL_REPORTED=false
+
+hermes_residual_state_note() {
+  [ "${GW_KIND:-}" = "hermes" ] || return 0
+  $HERMES_RESIDUAL_REPORTED && return 0
+  local changed=false
+  if $HERMES_CONFIG_CHANGED_THIS_RUN; then
+    note "The narrow Hermes config.yaml edit approved earlier remains in place (terminal.cwd / API-server file toolset only)."
+    changed=true
+  fi
+  if $HERMES_GUIDANCE_CHANGED_THIS_RUN; then
+    note "The marker-delimited Conduck guidance block remains in ${HERMES_GUIDANCE_TARGET_THIS_RUN:-the Hermes workspace}."
+    changed=true
+  fi
+  if $changed; then
+    note "Those independent host edits are not transactionally rolled back when a later optional file-lane step fails or is declined."
+    HERMES_RESIDUAL_REPORTED=true
+  fi
+}
+
+hermes_config_analysis() { # hermes_config_analysis <config> <workspace> [apply]
+  python3 - "$1" "$2" "${3:-analyze}" <<'PY'
+import json, os, re, stat, sys, tempfile
+
+path, workspace, action = sys.argv[1:4]
+workspace = os.path.realpath(os.path.expanduser(workspace))
+if os.path.lexists(path) and os.path.islink(path):
+    print("status\tmanual")
+    print("reason\tconfig.yaml is a symlink; refusing to edit through it")
+    sys.exit(0)
+try:
+    raw = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+except Exception as exc:
+    print("status\tmanual")
+    print("reason\tcould not read config.yaml: %s" % type(exc).__name__)
+    sys.exit(0)
+lines = raw.splitlines(True)
+
+KEY = re.compile(r"^([A-Za-z0-9_-]+):(?:[ \t]*(.*?))?[ \t]*(?:\n)?$")
+CHILD = re.compile(r"^([ ]+)([A-Za-z0-9_-]+):(?:[ \t]*(.*?))?[ \t]*(?:\n)?$")
+SPACED_KEY = re.compile(r"^([A-Za-z0-9_-]+)[ \t]+:")
+
+def content(line):
+    # Config keys/lists in the paths we edit must not rely on YAML comments,
+    # anchors, tags, or multiline scalars. Values we write are JSON-quoted,
+    # which is valid YAML and makes spaces/# unambiguous.
+    return line.rstrip("\r\n")
+
+def quoted_mapping_key(s):
+    """Decode a simple quoted YAML mapping key; None means not safely decoded."""
+    if s.startswith('"'):
+        try:
+            key, end = json.JSONDecoder().raw_decode(s)
+        except Exception:
+            return None
+        if isinstance(key, str) and s[end:].lstrip().startswith(":"):
+            return key
+        return None
+    if s.startswith("'"):
+        m = re.match(r"^'((?:[^']|'')*)'[ \t]*:", s)
+        if m:
+            return m.group(1).replace("''", "'")
+    return None
+
+def top_section(name, src=None):
+    src = lines if src is None else src
+    hit = None
+    for i, line in enumerate(src):
+        s = content(line)
+        if not s or s.lstrip().startswith("#") or s[:1].isspace():
+            continue
+        # A top-level flow mapping can carry every authoritative section on one
+        # line (valid YAML/JSON). This block editor intentionally does not
+        # rewrite flow documents; seeing one makes every queried section
+        # ambiguous so apply can never append duplicate block sections.
+        if s.startswith(("{", "[")):
+            return ("AMBIG", None, None)
+        # Quoted YAML keys are semantically the same keys, but this deliberately
+        # small editor never rewrites them. Treat a quoted authoritative section
+        # as ambiguous rather than appending a duplicate plain-key section.
+        alternative = quoted_mapping_key(s)
+        spaced = SPACED_KEY.match(s)
+        if alternative == name or (spaced and spaced.group(1) == name):
+            return ("AMBIG", None, None)
+        m = KEY.match(s)
+        if m and m.group(1) == name:
+            if hit is not None:
+                return ("AMBIG", None, None)
+            if (m.group(2) or "").strip():
+                return ("FLOW", i, None)
+            hit = i
+    if hit is None:
+        return ("MISSING", None, None)
+    end = len(src)
+    for j in range(hit + 1, len(src)):
+        s = content(src[j])
+        if not s or s.lstrip().startswith("#"):
+            continue
+        if not s[:1].isspace():
+            end = j
+            break
+    return ("OK", hit, end)
+
+def unsupported_root_form(src=None):
+    """True when the document root is outside the block-map subset we edit."""
+    src = lines if src is None else src
+    saw_document_start = False
+    saw_root_entry = False
+    for line in src:
+        s = content(line)
+        if not s or s.lstrip().startswith("#") or s[:1].isspace():
+            continue
+        # One plain document-start marker before the mapping is harmless. Tags,
+        # directives, explicit keys, document-end markers, quoted/spaced keys,
+        # and whole-document flow collections remain deliberately unsupported.
+        if s == "---" and not saw_document_start and not saw_root_entry:
+            saw_document_start = True
+            continue
+        saw_root_entry = True
+        if not KEY.match(s):
+            return True
+    return False
+
+def child(section, name, src=None):
+    src = lines if src is None else src
+    st, start, end = top_section(section, src)
+    if st != "OK":
+        return (st, None, None, None, None)
+    # YAML permits any positive direct-child indentation, not just two spaces.
+    # The FIRST content line establishes that direct-map indentation: a valid
+    # mapping cannot begin with a deeper child and later outdent to its actual
+    # first key. Validate subsequent indentation as a conservative map/list
+    # tree so unrelated malformed/deeper keys cannot be ignored while a target
+    # key at another indentation is edited. Tabs, quoted child keys, complex
+    # list-of-map forms, and inconsistent levels fail closed.
+    entries = []
+    for i in range(start + 1, end):
+        s = content(src[i])
+        if not s or s.lstrip().startswith("#"):
+            continue
+        prefix = s[:len(s) - len(s.lstrip(" \t"))]
+        if "\t" in prefix:
+            return ("AMBIG", None, None, None, None)
+        lead = len(prefix)
+        if lead <= 0:
+            return ("AMBIG", None, None, None, None)
+        entries.append((i, lead, s))
+    direct_indent = entries[0][1] if entries else None
+    levels, level_kinds = [], {}
+    previous_indent, previous_opens = None, False
+    for _, lead, s in entries:
+        m = CHILD.match(s)
+        stripped = s.strip()
+        if m:
+            node_kind = "map"
+            node_opens = not (m.group(3) or "").strip()
+        elif stripped == "-" or stripped.startswith("- "):
+            item = stripped[1:].strip()
+            # Scalar block-sequence items are supported. A list item that opens
+            # another mapping/list is outside this editor's safe subset.
+            node_kind = "list"
+            node_opens = not item
+        else:
+            return ("AMBIG", None, None, None, None)
+        if previous_indent is None:
+            levels = [lead]
+        elif lead > previous_indent:
+            if not previous_opens:
+                return ("AMBIG", None, None, None, None)
+            levels.append(lead)
+        elif lead < previous_indent:
+            while levels and levels[-1] > lead:
+                levels.pop()
+            if not levels or levels[-1] != lead:
+                return ("AMBIG", None, None, None, None)
+        expected_kind = level_kinds.get(lead)
+        if expected_kind is None:
+            level_kinds[lead] = node_kind
+        elif expected_kind != node_kind:
+            return ("AMBIG", None, None, None, None)
+        if lead == direct_indent and node_kind != "map":
+            return ("AMBIG", None, None, None, None)
+        previous_indent, previous_opens = lead, node_opens
+    found = None
+    for i, indent, s in entries:
+        m = CHILD.match(s)
+        if not m:
+            continue
+        if m.group(2) == name and indent != direct_indent:
+            return ("AMBIG", None, None, None, None)
+        if indent != direct_indent:
+            continue
+        if m.group(2) == name:
+            if found is not None:
+                return ("AMBIG", None, None, None, None)
+            found = (i, (m.group(3) or "").strip(), indent, end)
+    if found is None:
+        return ("MISSING", None, None, direct_indent, end)
+    return ("OK",) + found
+
+NON_STRING = re.compile(
+    r"(?ix)^(?:~|null|true|false|yes|no|on|off|"
+    r"[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:e[-+]?[0-9]+)?|"
+    r"[-+]?\.[0-9_]+(?:e[-+]?[0-9]+)?|"
+    r"[-+]?\.?(?:inf|nan)|0x[0-9a-f_]+|0o[0-7_]+|0b[01_]+|"
+    r"[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[tT ].*)?|[0-9]+:[0-9:]+)$")
+
+def split_comment(value):
+    """Strip a YAML plain comment, but never a # inside a JSON string."""
+    quoted, escaped = False, False
+    for i, ch in enumerate(value):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                quoted = False
+            continue
+        if ch == '"':
+            quoted = True
+            continue
+        if ch == "#" and (i == 0 or value[i - 1].isspace()):
+            return value[:i].rstrip()
+    if quoted or escaped:
+        raise ValueError("unterminated JSON quote")
+    return value.strip()
+
+def unquoted_yaml_code(line):
+    """Return only syntax outside YAML quote spans/comments for hazard scans."""
+    out, double, single, escaped = [], False, False, False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if double:
+            out.append(" ")
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                double = False
+            i += 1
+            continue
+        if single:
+            out.append(" ")
+            if ch == "'" and i + 1 < len(line) and line[i + 1] == "'":
+                out.append(" "); i += 2; continue
+            if ch == "'":
+                single = False
+            i += 1
+            continue
+        if ch == '"':
+            double = True; out.append(" "); i += 1; continue
+        if ch == "'":
+            single = True; out.append(" "); i += 1; continue
+        if ch == "#" and (i == 0 or line[i - 1].isspace()):
+            break
+        out.append(ch); i += 1
+    return "".join(out)
+
+ANCHOR_OR_ALIAS = re.compile(r"(?:^|[\s\[\]{},:?])(?:&|\*)[A-Za-z0-9_-]+")
+MERGE_KEY = re.compile(r"(?:^|\s)<<[ \t]*:")
+
+def string_value(value):
+    try:
+        value = split_comment(value)
+    except ValueError:
+        return "AMBIG", None
+    if not value or not all(ch.isprintable() for ch in value):
+        return "AMBIG", None
+    # This subset deliberately accepts JSON double-quoted strings, not YAML
+    # single-quoted strings. JSON decoding preserves commas, hashes, and
+    # backslash escapes exactly instead of hand-stripping their delimiters.
+    if value.startswith('"'):
+        try:
+            decoded = json.loads(value)
+        except Exception:
+            return "AMBIG", None
+        if not isinstance(decoded, str) or not all(ch.isprintable() for ch in decoded):
+            return "AMBIG", None
+        return "OK", decoded
+    if value.startswith("'") or value.endswith("'"):
+        return "AMBIG", None
+    if value[:1] in "|>&*!{[" or value.startswith("- ") \
+       or ": " in value or NON_STRING.fullmatch(value):
+        return "AMBIG", None
+    return "OK", value
+
+def scalar(section, name):
+    st, i, value, indent, end = child(section, name)
+    if st != "OK":
+        return st, None
+    return string_value(value)
+
+def sequence(section, name):
+    st, i, value, indent, end = child(section, name)
+    if st != "OK":
+        return st, None, None
+    if value:
+        try:
+            v = split_comment(value)
+        except ValueError:
+            return "AMBIG", None, None
+        if v.startswith("[") and v.endswith("]"):
+            try:
+                vals = json.loads(v)
+            except Exception:
+                return "AMBIG", None, None
+            if not isinstance(vals, list) or not all(
+                    isinstance(item, str) and item and
+                    all(ch.isprintable() for ch in item)
+                    for item in vals):
+                return "AMBIG", None, None
+            return "OK", vals, ("inline", i, indent, end)
+        vst, decoded = string_value(v)
+        if vst != "OK":
+            return "AMBIG", None, None
+        return "OK", [decoded], ("inline", i, indent, end)
+    vals, j, item_indent = [], i + 1, None
+    while j < end:
+        s = content(lines[j])
+        if not s or s.lstrip().startswith("#"):
+            j += 1; continue
+        lead = len(s) - len(s.lstrip(" "))
+        if lead <= indent:
+            break
+        t = s.strip()
+        if not t.startswith("- "):
+            return "AMBIG", None, None
+        if item_indent is None:
+            item_indent = lead
+        elif lead != item_indent:
+            return "AMBIG", None, None
+        ist, item = string_value(t[2:])
+        if ist != "OK":
+            return "AMBIG", None, None
+        vals.append(item); j += 1
+    return "OK", vals, ("block", i, indent, j, item_indent)
+
+manual = []
+changes = []
+
+if unsupported_root_form():
+    manual.append("config.yaml uses a document-root YAML form outside this connector's conservative plain block-map subset")
+
+if any(ANCHOR_OR_ALIAS.search(unquoted_yaml_code(content(line))) or
+       MERGE_KEY.search(unquoted_yaml_code(content(line)))
+       for line in lines):
+    manual.append("YAML anchors, aliases, or merge keys can change the effective target paths; this connector will not edit through them")
+
+bst, backend = scalar("terminal", "backend")
+if bst == "OK" and backend not in ("", "local"):
+    manual.append("terminal.backend is %r; a host WebDAV folder is not proven inside that backend" % backend)
+elif bst in ("AMBIG", "FLOW"):
+    manual.append("terminal.backend uses YAML syntax this connector will not guess at")
+
+cst, cwd = scalar("terminal", "cwd")
+if cst == "OK":
+    effective = os.path.realpath(os.path.expanduser(cwd))
+    if not os.path.isabs(os.path.expanduser(cwd)) or effective != workspace:
+        changes.append(("cwd", "terminal.cwd: %s -> %s" % (json.dumps(cwd), json.dumps(workspace))))
+elif cst in ("MISSING",):
+    changes.append(("cwd", "terminal.cwd: (absent) -> %s" % json.dumps(workspace)))
+else:
+    manual.append("terminal.cwd uses YAML syntax this connector will not guess at")
+
+pst, pvals, pmeta = sequence("platform_toolsets", "api_server")
+file_bundles = {"file", "all", "*", "hermes-api-server", "hermes-cli"}
+if pst == "OK" and not file_bundles.intersection(pvals):
+    changes.append(("toolset", "platform_toolsets.api_server: %s -> %s" %
+                    (json.dumps(pvals), json.dumps(pvals + ["file"]))))
+elif pst in ("AMBIG", "FLOW"):
+    manual.append("platform_toolsets.api_server uses YAML syntax this connector will not guess at")
+# Missing api_server (or the whole map) means Hermes's own full API-server
+# default remains authoritative. The live sentinel still proves the installed
+# version rather than trusting that default on faith.
+
+for key, blocked in (("disabled_toolsets", {"file", "hermes-api-server"}),
+                     ("disabled_tools", {"read_file", "write_file"})):
+    st, vals, meta = sequence("agent", key)
+    if st == "OK" and blocked.intersection(vals):
+        manual.append("agent.%s globally disables %s; removing it would broaden other Hermes platforms" %
+                      (key, ", ".join(sorted(blocked.intersection(vals)))))
+    elif st in ("AMBIG", "FLOW"):
+        manual.append("agent.%s uses YAML syntax this connector will not guess at" % key)
+
+if manual:
+    print("status\tmanual")
+    for reason in manual: print("reason\t" + reason)
+    sys.exit(0)
+if not changes:
+    print("status\tready")
+    print("reason\tfile toolset is not explicitly restricted and terminal.cwd matches the shared folder")
+    sys.exit(0)
+if action != "apply":
+    print("status\tfix")
+    for _, change in changes: print("change\t" + change)
+    sys.exit(0)
+
+def ensure_terminal(src):
+    st, start, end = top_section("terminal", src)
+    q = json.dumps(workspace)
+    if st == "MISSING":
+        if src and not src[-1].endswith(("\n", "\r")): src[-1] += "\n"
+        if src and any(x.strip() for x in src): src.append("\n")
+        src.extend(["terminal:\n", "  cwd: %s\n" % q])
+        return src
+    if st != "OK":
+        raise ValueError("terminal section became ambiguous")
+    cst, i, value, indent, cend = child("terminal", "cwd", src)
+    if cst == "MISSING":
+        child_indent = indent if indent is not None else 2
+        src.insert(start + 1, " " * child_indent + "cwd: %s\n" % q)
+    elif cst == "OK":
+        src[i] = " " * indent + "cwd: %s\n" % q
+    else:
+        raise ValueError("terminal.cwd became ambiguous")
+    return src
+
+def ensure_api_file(src):
+    global lines
+    lines = src
+    st, vals, meta = sequence("platform_toolsets", "api_server")
+    if st != "OK" or file_bundles.intersection(vals):
+        return src
+    kind, i, indent, end = meta[:4]
+    if kind == "inline":
+        prefix = " " * indent + "api_server: "
+        src[i] = prefix + json.dumps(vals + ["file"]) + "\n"
+    else:
+        item_indent = meta[4] if len(meta) > 4 and meta[4] is not None else indent + 2
+        src.insert(end, " " * item_indent + "- file\n")
+    return src
+
+try:
+    lines = ensure_terminal(lines)
+    if any(kind == "toolset" for kind, _ in changes):
+        lines = ensure_api_file(lines)
+    data = "".join(lines)
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
+    fd, tmp = tempfile.mkstemp(prefix=".conduck-config.", dir=parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+except Exception as exc:
+    print("status\tmanual")
+    print("reason\tcould not apply the narrow config edit: %s" % type(exc).__name__)
+    sys.exit(0)
+print("status\tapplied")
+PY
+}
+
+restart_hermes_for_file_config() {
+  if [ "$OS" = "Linux" ] && have systemctl \
+     && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
+    run_step "restart Hermes so its file-only config change applies" \
+      systemctl --user restart hermes-gateway.service
+  else
+    print_and_wait "Restart Hermes however it runs on this machine so terminal.cwd and its API-server file toolset take effect." \
+      "systemctl --user restart hermes-gateway.service   # or your own restart method"
+  fi
+}
+
+hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
+  local workspace="$1" cfg="$HOME/.hermes/config.yaml"
+  local tab line body status="" reasons=() changes=()
+  tab=$(printf '\t')
+  while IFS= read -r line; do
+    case "$line" in
+      "status$tab"*) status="${line#status$tab}" ;;
+      "reason$tab"*) reasons+=("${line#reason$tab}") ;;
+      "change$tab"*) changes+=("${line#change$tab}") ;;
+    esac
+  done < <(hermes_config_analysis "$cfg" "$workspace")
+
+  say ""
+  say "  ${BOLD}Hermes file readiness${RESET} — can the API-server agent use this exact folder?"
+  case "$status" in
+    ready)
+      ok "Hermes config is file-lane-ready (${reasons[0]:-working root and file tools})."
+      return 0 ;;
+    manual|"")
+      warn "I cannot prove a safe Hermes file configuration:"
+      local r; for r in ${reasons[@]+"${reasons[@]}"}; do say "    $r"; done
+      warn "I will leave file transfer out rather than broaden Hermes privileges or guess at a remote/sandbox mount."
+      return 1 ;;
+    fix) ;;
+    *)
+      warn "Unexpected Hermes readiness result '$status' — leaving file transfer out."
+      return 1 ;;
+  esac
+
+  warn "Hermes needs these narrow changes before its API-server agent can use the lane:"
+  local c; for c in "${changes[@]}"; do say "    ${BOLD}$c${RESET}"; done
+  say "  Only the API-server's file toolset and this working-folder path are in scope;"
+  say "  no terminal, web, memory, or messaging-platform permissions are added."
+  if $DRY_RUN; then
+    for c in "${changes[@]}"; do plan_add "EDIT $cfg — $c"; done
+    note "(dry-run: a real run asks before editing Hermes config)"
+    return 0
+  fi
+  if $REUSE_ONLY; then
+    warn "(reuse-only: not changing Hermes config; leaving the file lane out)"
+    return 1
+  fi
+  if ! confirm "  Apply exactly these Hermes file-lane changes?"; then
+    note "Leaving the file lane out — chat is unaffected."
+    return 1
+  fi
+  mutate_guard "edit only terminal.cwd / platform_toolsets.api_server in $cfg" || return 1
+  status=$(hermes_config_analysis "$cfg" "$workspace" apply \
+    | awk -F '\t' '$1=="status"{print $2; exit}')
+  if [ "$status" != "applied" ]; then
+    warn "The Hermes config edit could not be applied safely — leaving the file lane out."
+    return 1
+  fi
+  HERMES_CONFIG_CHANGED_THIS_RUN=true
+  status=$(hermes_config_analysis "$cfg" "$workspace" \
+    | awk -F '\t' '$1=="status"{print $2; exit}')
+  if [ "$status" != "ready" ]; then
+    warn "Hermes config did not re-check as file-ready — leaving the file lane out."
+    return 1
+  fi
+  ok "Hermes config re-checked — file toolset + working folder are aligned."
+  if ! restart_hermes_for_file_config; then
+    warn "Hermes was not restarted, so the file change is not active — leaving the lane out."
+    return 1
+  fi
+  return 0
+}
+
+hermes_guidance_target() { # hermes_guidance_target <workspace>
+  local ws="$1"
+  [ -e "$ws/.hermes.md" ] && { printf '%s' "$ws/.hermes.md"; return 0; }
+  [ -e "$ws/HERMES.md" ] && { printf '%s' "$ws/HERMES.md"; return 0; }
+  # Hermes gives .hermes.md/HERMES.md priority over other project context.
+  # Creating one beside an existing AGENTS.md/CLAUDE.md/.cursorrules would
+  # silently stop that lower-priority file from loading, so refuse rather than
+  # change unrelated agent behavior.
+  if [ -e "$ws/AGENTS.md" ] || [ -e "$ws/CLAUDE.md" ] || [ -e "$ws/.cursorrules" ]; then
+    return 1
+  fi
+  printf '%s' "$ws/HERMES.md"
+}
+
+hermes_guidance_edit() { # hermes_guidance_edit <target> <check|apply>
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+target, action = sys.argv[1:3]
+BEGIN = "<!-- conduck-connect:begin -->"
+END = "<!-- conduck-connect:end -->"
+block = BEGIN + """
+## Conduck chat attachments (managed by conduck-connect)
+
+These rules apply only when a user message contains `[Conduck file transfer]`.
+
+- The exact uploaded path named in the message is already under this working directory. Use `read_file` on that path; never search the web for an attached file.
+- To return a file, finish writing it at the working-directory root before replying, then state its exact filename in plain reply text.
+- Do not use `MEDIA:` or another channel attachment directive for a Conduck turn; the OpenAI-compatible response does not deliver those directives to Conduck.
+""" + END
+if os.path.islink(target):
+    print("symlink"); sys.exit(0)
+try:
+    old = open(target, encoding="utf-8").read() if os.path.exists(target) else ""
+except Exception:
+    print("unreadable"); sys.exit(0)
+nb, ne = old.count(BEGIN), old.count(END)
+if nb == 1 and ne == 1 and old.index(BEGIN) < old.index(END):
+    managed = old[old.index(BEGIN):old.index(END)+len(END)]
+    if managed == block:
+        print("ready"); sys.exit(0)
+    state = "stale"
+elif nb == 0 and ne == 0:
+    state = "missing"
+else:
+    print("malformed"); sys.exit(0)
+if action == "check":
+    print(state); sys.exit(0)
+if state == "missing":
+    new = old.rstrip("\n") + ("\n\n" if old.strip() else "") + block + "\n"
+else:
+    new = old[:old.index(BEGIN)] + block + old[old.index(END)+len(END):]
+try:
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    mode = os.stat(target).st_mode & 0o777 if os.path.exists(target) else 0o644
+    tmp = target + ".conduck-tmp-%d" % os.getpid()
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(new); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, target)
+except Exception:
+    try: os.unlink(tmp)
+    except Exception: pass
+    print("failed"); sys.exit(0)
+print("applied")
+PY
+}
+
+install_conduck_hermes_block() { # install_conduck_hermes_block <workspace>
+  local ws="$1" target state
+  [ -n "$ws" ] || { warn "Hermes shared folder is unknown — cannot install or prove its file guidance."; return 1; }
+  if ! target=$(hermes_guidance_target "$ws"); then
+    warn "This folder already has AGENTS.md, CLAUDE.md, or .cursorrules but no Hermes-specific context file."
+    warn "Creating HERMES.md would override that context in Hermes, so I will not guess; leaving the file lane out."
+    return 1
+  fi
+  state=$(hermes_guidance_edit "$target" check)
+  case "$state" in
+    ready)
+      ok "Hermes's Conduck file guidance is present in $target."
+      return 0 ;;
+    missing|stale) ;;
+    symlink|malformed|unreadable)
+      warn "$target is $state — refusing to edit or replace it; leaving the file lane out."
+      return 1 ;;
+    *)
+      warn "Could not inspect Hermes file guidance safely — leaving the file lane out."
+      return 1 ;;
+  esac
+  say ""
+  say "  Hermes loads project instructions from ${BOLD}${target##*/}${RESET}. I can install a"
+  say "  marker-delimited Conduck block: open the exact uploaded path with read_file;"
+  say "  finish output writes before replying; name returned files in plain reply text."
+  if $DRY_RUN; then
+    plan_add "INSTALL/refresh the Conduck agent-guidance block in $target (marker-delimited)"
+    note "(dry-run: a real run asks before editing the guidance file)"
+    return 0
+  fi
+  if $REUSE_ONLY; then
+    warn "(reuse-only: guidance is absent/stale and cannot be changed; leaving the file lane out)"
+    return 1
+  fi
+  if ! confirm "  Install/refresh that Hermes guidance block?"; then
+    note "Leaving the file lane out — chat is unaffected."
+    return 1
+  fi
+  mutate_guard "install the marker-delimited Conduck block in $target" || return 1
+  state=$(hermes_guidance_edit "$target" apply)
+  if [ "$state" = "applied" ]; then
+    HERMES_GUIDANCE_CHANGED_THIS_RUN=true
+    HERMES_GUIDANCE_TARGET_THIS_RUN="$target"
+  fi
+  if [ "$state" != "applied" ] || [ "$(hermes_guidance_edit "$target" check)" != "ready" ]; then
+    warn "Could not install and re-check Hermes's guidance — leaving the file lane out."
+    return 1
+  fi
+  ok "Conduck agent-guidance block installed in $target."
+  return 0
+}
+
+AGENT_FILE_PROBE_REASON=""
+AGENT_PROBE_ACTIVE=false
+AGENT_PROBE_TAG=""
+AGENT_PROBE_DIRKEY=""
+AGENT_PROBE_INPUTKEY=""
+AGENT_PROBE_OUTPUTKEY=""
+AGENT_PROBE_TMP=""
+AGENT_PROBE_OUTTMP=""
+AGENT_PROBE_FS_URL=""
+AGENT_PROBE_FS_CRED=""
+AGENT_PROBE_FS_FOLDER=""
+AGENT_PROBE_TRANSPORT=""
+AGENT_PROBE_GW_CERT_FP=""
+AGENT_PROBE_FS_CERT_FP=""
+AGENT_PROBE_DIR_ARMED=false
+AGENT_PROBE_INPUT_ARMED=false
+AGENT_PROBE_OUTPUT_ARMED=false
+AGENT_PROBE_DIR_VERIFY_METHOD=""
+AGENT_PROBE_LATE_RISK=false
+
+agent_probe_now_ms() {
+  python3 -c 'import time; print(int(time.monotonic() * 1000))' 2>/dev/null
+}
+
+agent_probe_ms_seconds() { # agent_probe_ms_seconds <milliseconds>
+  case "$1" in 0|[1-9][0-9]*) ;; *) return 1 ;; esac
+  printf '%d.%03d' "$(($1 / 1000))" "$(($1 % 1000))"
+}
+
+agent_file_chat_eval() { # dedicated five-minute sentinel turn
+  local max_time="${CONDUCK_AGENT_CHAT_TIMEOUT_SECONDS:-300}"
+  case "$max_time" in 0|[1-9][0-9]*) ;; *) max_time=300 ;; esac
+  [ "$max_time" -ge 31 ] 2>/dev/null && [ "$max_time" -le 1800 ] 2>/dev/null \
+    || max_time=300
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  if ! doctor_chat_request "$1" "$max_time"; then
+    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
+  fi
+  app_chat_loaded_eval "-"
+}
+
+# Mirror FileTransferOutputDetector.extractCandidates: safe filename token,
+# extension allowlist, first-occurrence dedupe, inbound-name exclusion, then
+# the app's five-candidate cap. The sentinel output must be one exact candidate;
+# merely containing its bytes inside a longer token is not discoverable.
+agent_reply_names_output() { # agent_reply_names_output <reply> <outputkey> <inputkey>
+  printf '%s' "$1" | python3 -c '
+import re, sys
+target, inbound_key = sys.argv[1:3]
+reply = sys.stdin.read()
+allow = {"pdf","csv","tsv","json","xml","yaml","yml","txt","md","log","zip","tar","gz",
+         "png","jpg","jpeg","gif","svg","xlsx","xls","docx","doc","pptx","html",
+         "py","js","ts","sh","sql","parquet"}
+seen, ordered = set(), []
+for token in re.findall(r"[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8}", reply):
+    ext = token.rsplit(".", 1)[1].lower()
+    if ext in allow and token not in seen:
+        seen.add(token)
+        ordered.append(token)
+inbound = {inbound_key, inbound_key.rsplit("/", 1)[-1]}
+candidates = [token for token in ordered if token not in inbound][:5]
+sys.exit(0 if target in candidates else 1)' "$2" "$3" >/dev/null 2>&1
+}
+
+agent_output_local_snapshot() { # <known-root> <exact-output-key> <expected-file>
+  python3 - "$1" "$2" "$3" <<'PY' >/dev/null 2>&1
+import os, re, stat, sys
+root, key, expected = sys.argv[1:4]
+if not os.path.isabs(root) or not re.fullmatch(r"output-[0-9a-f]{16}\.txt", key):
+    sys.exit(1)
+root = os.path.realpath(root)
+if not os.path.isdir(root):
+    sys.exit(1)
+path = os.path.join(root, key)
+if os.path.dirname(os.path.realpath(path)) != root:
+    sys.exit(1)
+try:
+    with open(expected, "rb") as fh:
+        want = fh.read()
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        sys.exit(1)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            sys.exit(1)
+        # The expected sentinel is connector-owned and tiny. Reject a
+        # wrong-sized agent file before reading it, then perform one bounded
+        # read so an exact-name giant file cannot consume connector memory.
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size != len(want):
+            sys.exit(1)
+        got = os.read(fd, len(want) + 1)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    final_path = os.lstat(path)
+except Exception:
+    sys.exit(1)
+stable = (
+    (after.st_dev, after.st_ino) == (opened.st_dev, opened.st_ino) ==
+    (final_path.st_dev, final_path.st_ino) and
+    stat.S_ISREG(final_path.st_mode) and not stat.S_ISLNK(final_path.st_mode) and
+    after.st_size == final_path.st_size == len(want)
+)
+sys.exit(0 if stable and got == want else 1)
+PY
+}
+
+agent_probe_registered_names_safe() {
+  local nested="conduck-connect-agent-$AGENT_PROBE_TAG/input-$AGENT_PROBE_TAG.txt"
+  local flat="conduck-connect-agent-$AGENT_PROBE_TAG-input.txt"
+  case "$AGENT_PROBE_TAG" in ''|*[!a-f0-9]*) return 1 ;; esac
+  [ "${#AGENT_PROBE_TAG}" -eq 16 ] || return 1
+  [ "$AGENT_PROBE_OUTPUTKEY" = "output-$AGENT_PROBE_TAG.txt" ] || return 1
+  [ "$AGENT_PROBE_DIRKEY" = "conduck-connect-agent-$AGENT_PROBE_TAG" ] || return 1
+  case "$AGENT_PROBE_DIR_VERIFY_METHOD" in ""|propfind|get) ;; *) return 1 ;; esac
+  [ "$AGENT_PROBE_INPUTKEY" = "$nested" ] || [ "$AGENT_PROBE_INPUTKEY" = "$flat" ]
+}
+
+agent_probe_cleanup_file() { # agent_probe_cleanup_file <exact-key>
+  local key="$1" code verify
+  code=$(curl_fs_with_timeout 1 -X DELETE -o /dev/null -w '%{http_code}' \
+    "$FS_URL/$key" 2>/dev/null || true)
+  case "$code" in 2??|404) ;; *) return 1 ;; esac
+  verify=$(curl_fs_with_timeout 1 -o /dev/null -w '%{http_code}' \
+    "$FS_URL/$key" 2>/dev/null || true)
+  [ "$verify" = "404" ]
+}
+
+agent_probe_directory_absent() {
+  local code
+  case "$AGENT_PROBE_DIR_VERIFY_METHOD" in
+    propfind)
+      code=$(curl_fs_with_timeout 1 -X PROPFIND -H 'Depth: 0' \
+        -o /dev/null -w '%{http_code}' "$FS_URL/$AGENT_PROBE_DIRKEY/" \
+        2>/dev/null || true)
+      ;;
+    get)
+      code=$(curl_fs_with_timeout 1 -o /dev/null -w '%{http_code}' \
+        "$FS_URL/$AGENT_PROBE_DIRKEY/" 2>/dev/null || true)
+      ;;
+    *)
+      # An interrupt can arrive between MKCOL and capability discovery. Try the
+      # WebDAV authority first, then the exact directory GET fallback; only an
+      # explicit 404 is absence.
+      code=$(curl_fs_with_timeout 1 -X PROPFIND -H 'Depth: 0' \
+        -o /dev/null -w '%{http_code}' "$FS_URL/$AGENT_PROBE_DIRKEY/" \
+        2>/dev/null || true)
+      [ "$code" = "404" ] || {
+        code=$(curl_fs_with_timeout 1 -o /dev/null -w '%{http_code}' \
+          "$FS_URL/$AGENT_PROBE_DIRKEY/" 2>/dev/null || true)
+      }
+      ;;
+  esac
+  [ "$code" = "404" ]
+}
+
+# Exact-name cleanup for normal completion and EXIT/signal interruption. It
+# snapshots the lane credential/transport at registration time, so a later
+# fail-closed drop cannot turn cleanup into an unauthenticated no-op.
+agent_file_probe_cleanup_backstop() { # [final:true]
+  $AGENT_PROBE_ACTIVE || return 0
+  local final="${1:-false}"
+  local FS_URL="$AGENT_PROBE_FS_URL" FS_CRED="$AGENT_PROBE_FS_CRED"
+  local TRANSPORT="$AGENT_PROBE_TRANSPORT" GW_CERT_FP="$AGENT_PROBE_GW_CERT_FP"
+  local FS_CERT_FP="$AGENT_PROBE_FS_CERT_FP"
+  local clean=true code
+  rm -f "$AGENT_PROBE_TMP" "$AGENT_PROBE_OUTTMP" 2>/dev/null || true
+  if ! agent_probe_registered_names_safe; then
+    warn "Agent sentinel cleanup registry was invalid; refusing any delete."
+    return 1
+  fi
+  if $AGENT_PROBE_INPUT_ARMED; then
+    agent_probe_cleanup_file "$AGENT_PROBE_INPUTKEY" || clean=false
+  fi
+  if $AGENT_PROBE_OUTPUT_ARMED; then
+    agent_probe_cleanup_file "$AGENT_PROBE_OUTPUTKEY" || clean=false
+  fi
+  if $AGENT_PROBE_DIR_ARMED; then
+    code=$(curl_fs_with_timeout 1 -X DELETE -o /dev/null -w '%{http_code}' \
+      "$FS_URL/$AGENT_PROBE_DIRKEY/" 2>/dev/null || true)
+    case "$code" in 2??|404) ;; *) clean=false ;; esac
+    agent_probe_directory_absent || clean=false
+  fi
+  if $clean; then
+    # A failed/timed-out chat can still have work running behind its returned
+    # response. Normal cleanup proves the exact key absent now, but retains the
+    # output-only registry so EXIT checks it once more. The final trap call
+    # clears the registry after its last exact DELETE + 404 proof.
+    if $AGENT_PROBE_LATE_RISK && [ "$final" != "true" ]; then
+      AGENT_PROBE_DIR_ARMED=false
+      AGENT_PROBE_INPUT_ARMED=false
+      AGENT_PROBE_DIR_VERIFY_METHOD=""
+      AGENT_PROBE_TMP=""; AGENT_PROBE_OUTTMP=""
+      return 0
+    fi
+    if $AGENT_PROBE_LATE_RISK; then
+      warn "Sentinel cleanup proves absence only at this moment; the failed, timed-out, cancelled, or reply-first agent turn may still have background work."
+      warn "Recheck and remove this exact file later if it appears: ${AGENT_PROBE_FS_FOLDER:-<shared-root>}/$AGENT_PROBE_OUTPUTKEY"
+    fi
+    AGENT_PROBE_ACTIVE=false
+    AGENT_PROBE_TAG=""; AGENT_PROBE_DIRKEY=""; AGENT_PROBE_INPUTKEY=""
+    AGENT_PROBE_OUTPUTKEY=""; AGENT_PROBE_TMP=""; AGENT_PROBE_OUTTMP=""
+    AGENT_PROBE_FS_URL=""; AGENT_PROBE_FS_CRED=""; AGENT_PROBE_FS_FOLDER=""
+    AGENT_PROBE_TRANSPORT=""
+    AGENT_PROBE_GW_CERT_FP=""; AGENT_PROBE_FS_CERT_FP=""
+    AGENT_PROBE_DIR_ARMED=false; AGENT_PROBE_INPUT_ARMED=false
+    AGENT_PROBE_OUTPUT_ARMED=false
+    AGENT_PROBE_DIR_VERIFY_METHOD=""; AGENT_PROBE_LATE_RISK=false
+    return 0
+  fi
+  warn "Sentinel cleanup was not proven; remove only these exact paths if present:"
+  warn "$AGENT_PROBE_INPUTKEY and $AGENT_PROBE_OUTPUTKEY"
+  $AGENT_PROBE_DIR_ARMED && warn "$AGENT_PROBE_DIRKEY/ (only after confirming it contains no unrelated files)"
+  return 1
+}
+
+agent_probe_abandon_registry() { # no registered remote target was created
+  rm -f "$AGENT_PROBE_TMP" "$AGENT_PROBE_OUTTMP" 2>/dev/null || true
+  AGENT_PROBE_ACTIVE=false
+  AGENT_PROBE_TAG=""; AGENT_PROBE_DIRKEY=""; AGENT_PROBE_INPUTKEY=""
+  AGENT_PROBE_OUTPUTKEY=""; AGENT_PROBE_TMP=""; AGENT_PROBE_OUTTMP=""
+  AGENT_PROBE_FS_URL=""; AGENT_PROBE_FS_CRED=""; AGENT_PROBE_FS_FOLDER=""
+  AGENT_PROBE_TRANSPORT=""
+  AGENT_PROBE_GW_CERT_FP=""; AGENT_PROBE_FS_CERT_FP=""
+  AGENT_PROBE_DIR_ARMED=false; AGENT_PROBE_INPUT_ARMED=false
+  AGENT_PROBE_OUTPUT_ARMED=false
+  AGENT_PROBE_DIR_VERIFY_METHOD=""; AGENT_PROBE_LATE_RISK=false
+}
+
+agent_file_wait_for_output() { # agent_file_wait_for_output <expected> <download>
+  local expected="$1" download="$2"
+  local window="${CONDUCK_AGENT_OUTPUT_DEADLINE_MS:-5000}"
+  local request_ms="${CONDUCK_AGENT_OUTPUT_REQUEST_TIMEOUT_MS:-750}"
+  local start deadline now remaining call_ms max_time code sleep_ms
+  case "$window" in 0|[1-9][0-9]*) ;; *) window=5000 ;; esac
+  case "$request_ms" in 0|[1-9][0-9]*) ;; *) request_ms=750 ;; esac
+  [ "$window" -ge 1 ] 2>/dev/null && [ "$window" -le 30000 ] 2>/dev/null || window=5000
+  [ "$request_ms" -ge 50 ] 2>/dev/null && [ "$request_ms" -le 2000 ] 2>/dev/null || request_ms=750
+  start=$(agent_probe_now_ms) || return 1
+  deadline=$((start + window))
+  while :; do
+    now=$(agent_probe_now_ms) || return 1
+    remaining=$((deadline - now))
+    [ "$remaining" -gt 0 ] || return 1
+    call_ms="$request_ms"; [ "$remaining" -lt "$call_ms" ] && call_ms="$remaining"
+    max_time=$(agent_probe_ms_seconds "$call_ms")
+    : > "$download"
+    code=$(curl_fs_with_timeout "$max_time" -o "$download" -w '%{http_code}' \
+      "$FS_URL/$AGENT_PROBE_OUTPUTKEY" 2>/dev/null || true)
+    if [[ "$code" == 2?? ]] && cmp -s "$expected" "$download"; then
+      return 0
+    fi
+    now=$(agent_probe_now_ms) || return 1
+    remaining=$((deadline - now))
+    [ "$remaining" -gt 0 ] || return 1
+    sleep_ms=250; [ "$remaining" -lt "$sleep_ms" ] && sleep_ms="$remaining"
+    sleep "$(agent_probe_ms_seconds "$sleep_ms")"
+  done
+}
+
+agent_file_probe() {
+  AGENT_FILE_PROBE_REASON=""
+  if $AGENT_PROBE_ACTIVE && ! agent_file_probe_cleanup_backstop true; then
+    AGENT_FILE_PROBE_REASON="a prior sentinel's exact cleanup is still unproven"
+    return 1
+  fi
+  local tag secret dirkey inputkey outputkey tmp outtmp code content payload model reply
+  local bytes_ok=false request_ms request_timeout
+  local agent_name read_tool write_tool
+  case "$GW_KIND" in
+    openclaw)
+      agent_name="OpenClaw"; read_tool="read"; write_tool="write" ;;
+    hermes)
+      agent_name="Hermes"; read_tool="read_file"; write_tool="write_file" ;;
+    *)
+      AGENT_FILE_PROBE_REASON="this gateway has no verified agent file-tool probe"
+      return 1 ;;
+  esac
+  tag=$(python3 -c 'import secrets; print(secrets.token_hex(8))' 2>/dev/null) || {
+    AGENT_FILE_PROBE_REASON="could not generate a sentinel nonce"; return 1; }
+  secret=$(python3 -c 'import secrets; print(secrets.token_hex(24))' 2>/dev/null) || {
+    AGENT_FILE_PROBE_REASON="could not generate sentinel content"; return 1; }
+  dirkey="conduck-connect-agent-$tag"
+  inputkey="$dirkey/input-$tag.txt"
+  outputkey="output-$tag.txt"
+  # The content nonce is independent of every name carried in the prompt. A
+  # tool-less model can see the randomized path, but cannot derive these bytes
+  # from it and synthesize a passing output without reading the input file.
+  content="CONDUCK-AGENT-FILE-SENTINEL-$secret"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-agent-probe.XXXXXX" 2>/dev/null) || {
+    AGENT_FILE_PROBE_REASON="could not stage the sentinel"; return 1; }
+  outtmp=$(mktemp "${TMPDIR:-/tmp}/conduck-agent-output.XXXXXX" 2>/dev/null) || {
+    rm -f "$tmp"
+    AGENT_FILE_PROBE_REASON="could not stage the sentinel download"; return 1; }
+  printf '%s\n' "$content" > "$tmp"
+
+  # Register every exact remote/local target before the first request can
+  # create it. The EXIT trap uses this snapshot even if later code drops the
+  # optional file lane from the pairing state.
+  AGENT_PROBE_TAG="$tag"
+  AGENT_PROBE_DIRKEY="$dirkey"
+  AGENT_PROBE_INPUTKEY="$inputkey"
+  AGENT_PROBE_OUTPUTKEY="$outputkey"
+  AGENT_PROBE_TMP="$tmp"
+  AGENT_PROBE_OUTTMP="$outtmp"
+  AGENT_PROBE_FS_URL="$FS_URL"
+  AGENT_PROBE_FS_CRED="$FS_CRED"
+  AGENT_PROBE_FS_FOLDER="$FS_FOLDER"
+  AGENT_PROBE_TRANSPORT="$TRANSPORT"
+  AGENT_PROBE_GW_CERT_FP="$GW_CERT_FP"
+  AGENT_PROBE_FS_CERT_FP="$FS_CERT_FP"
+  AGENT_PROBE_DIR_ARMED=false
+  AGENT_PROBE_INPUT_ARMED=false
+  AGENT_PROBE_OUTPUT_ARMED=false
+  AGENT_PROBE_DIR_VERIFY_METHOD=""
+  AGENT_PROBE_LATE_RISK=false
+  AGENT_PROBE_ACTIVE=true
+
+  # Prove the randomized output name is free before the agent turn. A stale
+  # output must never let a tool-less model earn a pass.
+  request_ms="${CONDUCK_AGENT_OUTPUT_REQUEST_TIMEOUT_MS:-750}"
+  case "$request_ms" in 0|[1-9][0-9]*) ;; *) request_ms=750 ;; esac
+  [ "$request_ms" -ge 50 ] 2>/dev/null && [ "$request_ms" -le 2000 ] 2>/dev/null \
+    || request_ms=750
+  request_timeout=$(agent_probe_ms_seconds "$request_ms")
+  code=$(curl_fs_with_timeout "$request_timeout" -o /dev/null -w '%{http_code}' \
+    "$FS_URL/$outputkey" 2>/dev/null || true)
+  case "$code" in 404) ;; *)
+    AGENT_FILE_PROBE_REASON="the randomized output name was not provably free (HTTP ${code:-000})"
+    agent_probe_abandon_registry
+    return 1 ;;
+  esac
+  AGENT_PROBE_OUTPUT_ARMED=true
+
+  # Match the app's nested-folder shape when MKCOL is available; rclone supports
+  # it. A flat fallback preserves compatibility with manually supplied WebDAV.
+  code=$(curl_fs -X MKCOL -o /dev/null -w '%{http_code}' "$FS_URL/$dirkey/" 2>/dev/null || true)
+  case "$code" in 2??)
+    AGENT_PROBE_DIR_ARMED=true
+    code=$(curl_fs_with_timeout 1 -X PROPFIND -H 'Depth: 0' \
+      -o /dev/null -w '%{http_code}' "$FS_URL/$dirkey/" 2>/dev/null || true)
+    case "$code" in
+      2??) AGENT_PROBE_DIR_VERIFY_METHOD="propfind" ;;
+      *)
+        code=$(curl_fs_with_timeout 1 -o /dev/null -w '%{http_code}' \
+          "$FS_URL/$dirkey/" 2>/dev/null || true)
+        case "$code" in
+          2??) AGENT_PROBE_DIR_VERIFY_METHOD="get" ;;
+          *)
+            AGENT_FILE_PROBE_REASON="the temporary WebDAV directory could not be observed for cleanup proof"
+            agent_file_probe_cleanup_backstop || true
+            return 1 ;;
+        esac ;;
+    esac
+    ;;
+    *)
+      inputkey="conduck-connect-agent-$tag-input.txt"
+      AGENT_PROBE_INPUTKEY="$inputkey"
+      dirkey="" ;;
+  esac
+  AGENT_PROBE_INPUT_ARMED=true
+  code=$(curl_fs -T "$tmp" -o /dev/null -w '%{http_code}' "$FS_URL/$inputkey" 2>/dev/null || true)
+  case "$code" in 2??) ;;
+    *)
+      AGENT_FILE_PROBE_REASON="could not place the agent sentinel through WebDAV (HTTP ${code:-000})"
+      agent_file_probe_cleanup_backstop || true
+      return 1 ;;
+  esac
+
+  # Match the app/setup request exactly: Hermes normally chooses its configured
+  # default when no custom model was entered. Do not substitute the first
+  # advertised model here; it could be a non-agent/tool-less model and would
+  # manufacture a file-lane failure the app itself would never encounter.
+  model="${GW_MODEL:-}"
+  payload=$(AF_MODEL="$model" AF_INPUT="$inputkey" AF_OUTPUT="$outputkey" \
+    AF_READ="$read_tool" AF_WRITE="$write_tool" python3 - <<'PY' 2>/dev/null
+import json, os
+e = os.environ
+task = (
+    "Use %s to read the exact uploaded file path listed below. Use %s "
+    "to copy its bytes unchanged into a new file named %s at the ROOT of your working "
+    "directory. Finish the write before replying. Do not reconstruct or guess the "
+    "file contents. Then reply with one short sentence containing the exact output "
+    "filename." % (e["AF_READ"], e["AF_WRITE"], e["AF_OUTPUT"]))
+ref = (
+    "The following file(s) are in your working directory — use them for this request. "
+    "Each input lives under its conversation folder at the path shown:\n"
+    "- input.txt (saved as %s)" % e["AF_INPUT"])
+instr = (
+    "[Conduck file transfer] To return a file, write it to the root of your working "
+    "directory and state its exact filename in plain text in your reply. Attachment "
+    "directives (MEDIA: lines or similar) do not reach this user — only files named "
+    "in plain reply text are delivered.")
+p = {"messages": [{"role": "user", "content": task + "\n\n" + ref + "\n\n" + instr}],
+     "stream": False}
+if e["AF_MODEL"]:
+    p["model"] = e["AF_MODEL"]
+print(json.dumps(p))
+PY
+  )
+  if [ -z "$payload" ]; then
+    AGENT_FILE_PROBE_REASON="could not build the agent sentinel request"
+  else
+    AGENT_PROBE_LATE_RISK=true
+    if ! agent_file_chat_eval "$payload"; then
+      AGENT_FILE_PROBE_REASON="the $agent_name file turn failed: $CCE_REASON"
+    elif ! agent_output_local_snapshot "$FS_FOLDER" "$outputkey" "$tmp"; then
+      AGENT_FILE_PROBE_REASON="$agent_name replied before a byte-identical regular output file existed in the guarded shared root"
+      # This is cleanup-only. A later file can never turn the result green, but
+      # watching the exact key for the existing five-second window lets us remove
+      # common reply-first/background writes before returning.
+      agent_file_wait_for_output "$tmp" "$outtmp" || true
+    else
+      AGENT_PROBE_LATE_RISK=false
+      reply=$(printf '%s' "$DCC_BODY" | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin)["choices"][0]["message"]["content"])
+except Exception: pass' 2>/dev/null)
+      # rclone's 1-second directory cache may still hold the deliberate pre-turn
+      # 404 when the agent writes directly to disk. Creation is already proven
+      # at the reply boundary above; these retries can prove visibility only.
+      agent_file_wait_for_output "$tmp" "$outtmp" && bytes_ok=true
+      if ! $bytes_ok; then
+        AGENT_FILE_PROBE_REASON="$agent_name created the output before replying, but it did not become byte-identically visible through WebDAV within five seconds"
+      elif ! agent_reply_names_output "$reply" "$outputkey" "$inputkey"; then
+        AGENT_FILE_PROBE_REASON="the output bytes were correct, but the reply did not name the randomized output file for Conduck to discover"
+      fi
+    fi
+  fi
+
+  # Exact nonce names only. A successful DELETE is not proof: follow each file
+  # delete with an authenticated GET that must answer 404.
+  if ! agent_file_probe_cleanup_backstop; then
+    [ -n "$AGENT_FILE_PROBE_REASON" ] || AGENT_FILE_PROBE_REASON="sentinel cleanup could not be proven"
+    return 1
+  fi
+  [ -z "$AGENT_FILE_PROBE_REASON" ]
+}

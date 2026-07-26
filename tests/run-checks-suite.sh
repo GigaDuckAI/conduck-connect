@@ -1615,6 +1615,16 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" shared-app-evaluator "*) true ;; *) fa
   run_shared_app_evaluator_wiring_case
 fi
 
+if [ -z "$ONLY" ] || case " $ONLY " in *" file-lane-readiness "*) true ;; *) false ;; esac; then
+  if bash "$HERE/run-file-lane-readiness-suite.sh"; then
+    PASS=$((PASS+1))
+    printf 'SUITE ✓ file-lane-readiness\n'
+  else
+    FAIL=$((FAIL+1))
+    printf 'SUITE ✗ file-lane-readiness — focused suite failed\n'
+  fi
+fi
+
 printf '\nSUITE RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ] || exit 1
 [ "$PASS" -gt 0 ] || { echo "no cases ran" >&2; exit 1; }

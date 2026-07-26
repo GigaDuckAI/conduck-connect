@@ -2,6 +2,50 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [Unreleased]
+
+- File-server loopback ports are now allocated per gateway from a bounded range,
+  excluding both live listeners and every connector-owned unit (including
+  stopped units). The selected port persists in that gateway's service/profile
+  and is reused on later runs; an unreadable existing unit is refused rather
+  than overwritten or exposed.
+- Setup now proves the exact local file-server service is active,
+  authenticated, rejects missing/wrong credentials, and carries byte-identical
+  writes before creating an HTTPS exposure.
+- OpenClaw and Hermes file readiness is now agent-side, not WebDAV/static-config
+  only: both run a real randomized
+  read→byte-identical-write→reply-discovery sentinel before the lane is
+  included. Hermes additionally checks the exact `terminal.cwd`, preserves an
+  explicit API-server toolset while adding only the missing `file` bundle, and
+  installs guidance in a verified Hermes context file. Non-local backends,
+  global tool disables, ambiguous YAML/context precedence, agent failures, and
+  failed cleanup stay fail-closed.
+- Added focused loopback regressions for port ownership/live collisions, stable
+  reuse, unsafe-unit refusal, Hermes config/guidance policy, local auth, and
+  agent sentinel false-green cases.
+- Hardened those readiness gates before release: the live agent turn has its
+  own five-minute budget; a guarded local-root snapshot must prove the regular
+  output file already existed with exact bytes when the reply returned, while
+  the one real five-second WebDAV deadline is cache-visibility-only. Reply
+  discovery mirrors the app's exact allowlisted-token logic; cleanup requires
+  post-delete 404 for files and GET/PROPFIND absence for the temporary
+  directory, and is chained through EXIT/signals by exact nonce names.
+  systemd/plist reuse now requires one structural
+  `ExecStart`/`--addr` authority plus an absolute served root, and
+  credentials/control characters plus systemd path expansion are refused
+  before use. Activity checks remain tied to the exact selected unit when
+  stale per-gateway definitions duplicate a loopback port.
+- Hermes's editable YAML subset now JSON-decodes double-quoted strings/arrays
+  (including commas, escapes, and `#` inside quotes) and fails closed on
+  single-quoted, null, non-string, complex, or comment-ambiguous values instead
+  of risking a lossy rewrite. Valid direct-child indentation is detected and
+  preserved (including four-space configs); inconsistent/nested ambiguity is
+  refused before mutation. Quoted/spaced authoritative section keys and
+  unsupported document-root forms (including flow mappings, tags, and explicit
+  mapping keys) are never mistaken for missing sections or duplicated with
+  plain block keys; anchors, aliases, and merge keys are globally refused
+  because they can change the effective target paths.
+
 ## [0.13.0] — one command surface, and checks that hand off to setup
 
 An intentional public CLI simplification, Apple-client parity,

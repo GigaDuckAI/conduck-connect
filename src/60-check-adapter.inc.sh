@@ -337,11 +337,11 @@ doctor_auth_checks() {
 # never printed — these probes may run against a live personal agent, and this
 # script never logs message content; graders emit verdict words and lengths).
 DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
-doctor_chat_request() { # doctor_chat_request <payload-json> -> 0 iff the transfer completed
-  local out tail_
+doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 iff transfer completed
+  local out tail_ max_time="${2:-300}"
   DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
-        --max-time 300 -H "Accept: application/json" \
+        --max-time "$max_time" -H "Accept: application/json" \
         -H "Content-Type: application/json" -d "$1" 2>/dev/null) || return 1
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"

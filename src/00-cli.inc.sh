@@ -34,12 +34,12 @@
 #   3. Helps you expose the gateway over HTTPS (works WITH what you have installed:
 #      Tailscale, Cloudflare Tunnel, your own reverse proxy, or a self-signed cert).
 #   4. Optionally sets up the agent file lane (rclone WebDAV) so Conduck can hand
-#      your agent real files and download its outputs. On OpenClaw it also checks
-#      the gateway's TOOL POLICY (a policy denying read/write breaks attachments
-#      agent-side even when every transport test is green) and installs a short
-#      agent-guidance block in the workspace TOOLS.md (how to open attachments,
-#      how to return files) — both shown first, both optional.
-#   5. Verifies everything end-to-end with real requests.
+#      your agent real files and download its outputs. OpenClaw gets a tool-policy
+#      check + TOOLS.md guidance. Hermes gets its API-server file toolset and
+#      terminal.cwd checked + verified Hermes context guidance. Every edit is
+#      narrow, shown first, and optional.
+#   5. Verifies everything with real requests. An OpenClaw/Hermes file lane must
+#      pass a real agent read -> byte-identical write sentinel before a code.
 #   6. Prints a QR code you scan with the Conduck app — URL, token, and file-lane
 #      credentials imported in one scan — nothing to retype on your phone
 #      (iPhone or iPad).
@@ -69,8 +69,9 @@
 #   bash conduck-connect.sh --show-code     # re-show a SAVED pairing code; no
 #                                           # configuration changes, but live
 #                                           # verification sends requests and a
-#                                           # configured file lane gets one small
-#                                           # PUT -> GET -> DELETE probe
+#                                           # configured file lane gets live
+#                                           # transport verification; OpenClaw/
+#                                           # Hermes get a real agent sentinel
 #
 # Modifiers:
 #   bash conduck-connect.sh --setup --dry-run

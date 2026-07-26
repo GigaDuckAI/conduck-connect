@@ -82,7 +82,10 @@ set, the shared folder the fixture-webdav server also serves):
                          background thread, $CONDUCK_FILES_LATE_DELAY s) — after
                          the doctor's immediate no-grace probe has already fired
     files-wrong-bytes    write the output but with different (non-identical) bytes
+    files-no-final-newline write the output without the input's final newline
     files-no-reference   write a correct output but reply naming no filename
+    files-reference-substring write a correct output but mention its name only
+                         as a substring of a longer, non-allowlisted token
     files-slow           like files-good, but sleep $CONDUCK_FILES_SLOW_DELAY s
                          BEFORE replying to the file turn (a window for the
                          signal-cleanup case to SIGINT the doctor mid-turn)
@@ -101,7 +104,8 @@ import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 FILE_MODES = {"files-good", "files-no-write", "files-late-write",
-              "files-wrong-bytes", "files-no-reference", "files-slow"}
+              "files-wrong-bytes", "files-no-final-newline",
+              "files-no-reference", "files-reference-substring", "files-slow"}
 LATE_DELAY = float(os.environ.get("CONDUCK_FILES_LATE_DELAY", "1.5"))
 SLOW_DELAY = float(os.environ.get("CONDUCK_FILES_SLOW_DELAY", "6.0"))
 
@@ -137,9 +141,15 @@ def handle_file_turn(mode, files_dir, text):
     if mode == "files-wrong-bytes":
         write(b"conduck-check-TAMPERED\n" + data)
         return named
+    if mode == "files-no-final-newline":
+        write(data[:-1] if data.endswith(b"\n") else data)
+        return named
     if mode == "files-no-reference":
         write(data)
         return "Done — the requested file has been written to the working directory root."
+    if mode == "files-reference-substring":
+        write(data)
+        return "Done — details are in prefix%s.bak." % okey
     if mode == "files-late-write":
         threading.Thread(target=lambda: (time.sleep(LATE_DELAY), write(data)),
                          daemon=True).start()

@@ -41,6 +41,8 @@ doctor_curl_fs() { # doctor_curl_fs <real|wrong|none> <curl args…>
   local kind="$1"; shift
   case "$kind" in
     real)
+      credential_value_safe "$DF_CRED" || return 2
+      credential_value_safe "$DF_USER" || return 2
       local cred="$DF_CRED" user="$DF_USER"
       cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"
       user="${user//\\/\\\\}"; user="${user//\"/\\\"}"
@@ -109,9 +111,11 @@ doctor_files_resolve() {
       d_say FILES_CONFIG "(mixing an overridden URL with a discovered folder could grade one lane and mutate another)"
       return 1
     fi
-    case "${CONDUCK_FILES_PASS}${CONDUCK_FILES_USER:-}" in *$'\n'*|*$'\r'*)
-      d_bad FILES_CONFIG "CONDUCK_FILES_PASS/CONDUCK_FILES_USER contain control characters — refusing"; return 1 ;;
-    esac
+    if ! credential_value_safe "$CONDUCK_FILES_PASS" \
+       || ! credential_value_safe "${CONDUCK_FILES_USER:-conduck}"; then
+      d_bad FILES_CONFIG "CONDUCK_FILES_PASS/CONDUCK_FILES_USER contain control characters — refusing"
+      return 1
+    fi
     if ! DF_URL=$(doctor_accept_url "$CONDUCK_FILES_URL"); then
       d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
       return 1
@@ -183,9 +187,10 @@ PY
     DF_URL="http://127.0.0.1:$FS_LOCAL_PORT"
     DF_DIR="$pfolder"; DF_CRED="$FS_CRED"; DF_USER="conduck"
   fi
-  case "$DF_CRED" in *$'\n'*|*$'\r'*)
-    d_bad FILES_CONFIG "the recovered credential contains control characters — refusing"; return 1 ;;
-  esac
+  if ! credential_value_safe "$DF_CRED"; then
+    d_bad FILES_CONFIG "the recovered credential contains control characters — refusing"
+    return 1
+  fi
   out=$(python3 - "$DF_DIR" <<'PY' 2>/dev/null
 import os, sys
 p = sys.argv[1]

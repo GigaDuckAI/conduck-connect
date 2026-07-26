@@ -324,12 +324,24 @@ rollback_fs_exposures() {
 }
 
 # Drop the file lane from the pairing AND undo any exposure we applied for it.
-drop_file_lane() { rollback_fs_exposures; FS_URL=""; FS_CRED=""; FS_REACH=""; }
+drop_file_lane() {
+  rollback_fs_exposures
+  if declare -F hermes_residual_state_note >/dev/null 2>&1; then
+    hermes_residual_state_note
+  fi
+  FS_URL=""; FS_CRED=""; FS_REACH=""
+}
 
 # Backstop: if the script exits (incl. a `die`) AFTER applying exposures but BEFORE
 # emitting a code, print exactly how to undo them. Non-interactive (safe in a trap).
 EMITTED=false
 on_exit() {
+  # The OpenClaw/Hermes setup sentinel registers exact nonce paths before any
+  # remote creation. Keep that cleanup chained ahead of exposure reporting,
+  # including exits where the optional lane state was already cleared.
+  if declare -F agent_file_probe_cleanup_backstop >/dev/null 2>&1; then
+    agent_file_probe_cleanup_backstop true || true
+  fi
   $DRY_RUN && return 0
   local all=(); all+=( ${APPLIED[@]+"${APPLIED[@]}"} ); all+=( ${FS_APPLIED[@]+"${FS_APPLIED[@]}"} )
   [ ${#all[@]} -gt 0 ] || return 0
@@ -346,6 +358,12 @@ on_exit() {
   print_undo_hints "${all[@]}"
 }
 trap on_exit EXIT
+# macOS Bash 3.2 does not reliably run EXIT for an unhandled signal. Route
+# setup signals through exit so exact-name sentinel cleanup and conventional
+# 128+signal statuses both survive.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # An EARLIER run (or a hand setup) may still expose the SAME local backend
 # publicly on a DIFFERENT port. A private choice must not leave that live

@@ -31,6 +31,15 @@ Modes ("good" behavior unless listed):
     no-range       ignores Range, always answers 200 with the full body
     no-delete      DELETE answers 405 (everything else good)
     no-mkcol       MKCOL answers 405 (everything else good)
+    no-final-newline GET removes one trailing newline from otherwise correct bytes
+    first-output-404 the first GET of each existing output-*.txt answers 404
+    hang-output-get GET of an existing output-*.txt stalls for
+                    $WEBDAV_HANG_SECONDS (default 10)
+    delete-lies    DELETE answers 204 but deliberately leaves the target behind
+    delete-swaps-symlink DELETE replaces a local-service probe with a symlink
+                    to unrelated-victim.txt, then answers 204
+    delete-dir-lies DELETE removes files normally but answers 204 without
+                    removing directories
 """
 import argparse
 import base64
@@ -52,6 +61,8 @@ def make_handler(cfg):
     stale_seconds = cfg["stale_seconds"]
     capture = cfg["capture"]
     known = cfg["known"]          # relpaths written via a PUT through this server
+    first_output_misses = cfg["first_output_misses"]
+    hang_seconds = cfg["hang_seconds"]
 
     def cap(line):
         if not capture:
@@ -142,10 +153,20 @@ def make_handler(cfg):
             if rel is None:
                 return self._send(403, "Forbidden")
             full = os.path.join(served, rel)
+            if os.path.isdir(full):
+                return self._send(200, "directory")
             if not os.path.isfile(full) or not self._visible(full, rel):
+                return self._send(404, "Not Found")
+            if mode == "hang-output-get" and rel.startswith("output-"):
+                time.sleep(hang_seconds)
+            if mode == "first-output-404" and rel.startswith("output-") \
+                    and rel not in first_output_misses:
+                first_output_misses.add(rel)
                 return self._send(404, "Not Found")
             with open(full, "rb") as fh:
                 data = fh.read()
+            if mode == "no-final-newline" and data.endswith(b"\n"):
+                data = data[:-1]
             rng = self.headers.get("Range")
             if rng and mode != "no-range":
                 spec = rng.split("=", 1)[-1].split(",")[0].strip()
@@ -166,6 +187,19 @@ def make_handler(cfg):
                                          ("Accept-Ranges", "bytes")])
             return self._send(200, b"" if head else data,
                               extra=[("Accept-Ranges", "bytes")])
+
+        def do_PROPFIND(self):
+            if not self._require_auth():
+                return
+            rel = self._relpath()
+            if rel is None:
+                return self._send(403, "Forbidden")
+            full = os.path.join(served, rel)
+            if not os.path.exists(full):
+                return self._send(404, "Not Found")
+            body = ('<?xml version="1.0" encoding="utf-8"?>'
+                    '<d:multistatus xmlns:d="DAV:"/>')
+            return self._send(207, body, extra=[("Content-Type", "application/xml")])
 
         def do_PUT(self):
             if not self._require_auth():
@@ -196,6 +230,8 @@ def make_handler(cfg):
                 return
             if mode == "no-delete":
                 return self._send(405, "Method Not Allowed")
+            if mode == "delete-lies":
+                return self._send(204, b"")
             if mode == "read-only":
                 return self._send(403, "Read-only")
             rel = self._relpath()
@@ -206,6 +242,17 @@ def make_handler(cfg):
                 st = os.lstat(full)
             except FileNotFoundError:
                 return self._send(404, "Not Found")
+            if mode == "delete-swaps-symlink" \
+                    and rel.startswith("conduck-connect-local-probe-"):
+                victim = os.path.join(served, "unrelated-victim.txt")
+                try:
+                    os.remove(full)
+                    os.symlink(victim, full)
+                except Exception:
+                    return self._send(500, "Symlink swap failed")
+                return self._send(204, b"")
+            if mode == "delete-dir-lies" and stat.S_ISDIR(st.st_mode):
+                return self._send(204, b"")
             try:
                 if stat.S_ISDIR(st.st_mode):
                     shutil.rmtree(full)
@@ -263,7 +310,8 @@ def main():
 
     cfg = {"dir": served, "mode": args.mode, "user": args.user,
            "password": password, "stale_seconds": args.stale_seconds,
-           "capture": args.capture, "known": set()}
+           "capture": args.capture, "known": set(), "first_output_misses": set(),
+           "hang_seconds": float(os.environ.get("WEBDAV_HANG_SECONDS", "10"))}
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(cfg))
     server.daemon_threads = True
     print("READY %d" % server.server_address[1], flush=True)

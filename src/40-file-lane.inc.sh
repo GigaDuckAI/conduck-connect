@@ -5,8 +5,12 @@ FS_LOCAL_PORT=""
 FS_REACH=""         # the file lane's OWN reach (public|private) — can differ from the gateway's
                     # SCOPE in a mixed-scope setup; recorded as fileServer.reach for --show-code
 FS_UNIT=""          # resolved unit/plist path actually in use (existing or new)
-FS_FOLDER=""        # served workspace path — for the non-secret profile only; "" when unknown
+FS_FOLDER=""        # absolute served root; load-bearing for config alignment + local snapshots
 FS_CRED_LEGACY_ARGV=false   # true when a reused unit keeps the password on argv (ps-visible)
+FS_EXISTING_UNSAFE=false    # matching unit exists but cannot be parsed/reused without guessing
+FS_PORT_ALLOCATION_REASON=""
+FS_PORT_START=5006
+FS_PORT_END=5105
 
 state_cred_file() { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$GW_ID"; }
 state_env_file()  { printf '%s/fileserver-%s.env'  "$STATE_DIR" "$GW_ID"; }
@@ -24,57 +28,288 @@ mac_unit_candidates() {
     "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"
 }
 
+fs_all_units() {
+  local f
+  if [ "$OS" = "Linux" ]; then
+    for f in "$HOME"/.config/systemd/user/conduck-files-*.service \
+             "$HOME/.config/systemd/user/conduck-files.service" \
+             "$HOME/.config/systemd/user/conduck-fileserver.service"; do
+      [ -f "$f" ] && printf '%s\n' "$f"
+    done
+  else
+    for f in "$HOME"/Library/LaunchAgents/ai.gigaduck.conduck-files-*.plist \
+             "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
+             "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"; do
+      [ -f "$f" ] && printf '%s\n' "$f"
+    done
+  fi
+}
+
+# Parse one connector-owned systemd unit / launchd plist structurally. The
+# service definition is authority for both the loopback port and served folder,
+# so comments, duplicate directives, or a second --addr must never win by grep
+# order. This intentionally supports only the simple argv shape this connector
+# writes (and earlier connector releases wrote); anything more expressive is
+# refused rather than guessed.
+fs_unit_field() { # fs_unit_field <unit-or-plist> <port|folder|argv_cred|env_cred|argv_exposed>
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import os, plistlib, re, shlex, sys
+
+path, field = sys.argv[1:3]
+
+def clean(value):
+    return isinstance(value, str) and value and all(ch.isprintable() for ch in value)
+
+def inspect_argv(argv, systemd=False):
+    if not isinstance(argv, list) or not all(clean(x) for x in argv):
+        raise ValueError("argv")
+    if len(argv) < 6 or argv[1:3] != ["serve", "webdav"]:
+        raise ValueError("shape")
+    if os.path.basename(argv[0]) != "rclone":
+        raise ValueError("executable")
+    # Connector-written units always use an absolute served root. A relative
+    # argv is resolved against the service manager's cwd, which is not a root
+    # this process can safely align Hermes to or guard a local snapshot under.
+    if not os.path.isabs(argv[3]):
+        raise ValueError("relative folder")
+    # $VAR and %specifier expansion make the literal folder unrecoverable from
+    # a systemd ExecStart line. launchd argv has no such expansion.
+    if systemd and any(ch in argv[3] for ch in ("$", "%")):
+        raise ValueError("expanded folder")
+    if systemd and any(x.startswith(("#", ";")) for x in argv[4:]):
+        raise ValueError("inline comment")
+    if argv.count("--addr") != 1 or any(x.startswith("--addr=") for x in argv):
+        raise ValueError("addr count")
+    ai = argv.index("--addr")
+    if ai + 1 >= len(argv):
+        raise ValueError("addr value")
+    m = re.fullmatch(r"127\.0\.0\.1:([0-9]+)", argv[ai + 1])
+    if not m or not 1 <= int(m.group(1)) <= 65535:
+        raise ValueError("addr")
+    if argv.count("--pass") > 1 or any(x.startswith("--pass=") for x in argv):
+        raise ValueError("pass count")
+    cred = ""
+    if "--pass" in argv:
+        pi = argv.index("--pass")
+        if pi + 1 >= len(argv) or not clean(argv[pi + 1]):
+            raise ValueError("pass value")
+        cred = argv[pi + 1]
+    return m.group(1), argv[3], cred
+
+try:
+    env_cred = ""
+    is_systemd = not path.endswith(".plist")
+    if not is_systemd:
+        data = plistlib.load(open(path, "rb"))
+        if not isinstance(data, dict):
+            raise ValueError("plist")
+        argv = data.get("ProgramArguments")
+        env = data.get("EnvironmentVariables", {})
+        if not isinstance(env, dict):
+            raise ValueError("environment")
+        if "RCLONE_PASS" in env:
+            env_cred = env["RCLONE_PASS"]
+            if not clean(env_cred):
+                raise ValueError("environment credential")
+    else:
+        raw = open(path, encoding="utf-8").read()
+        section = ""
+        starts = []
+        for physical in raw.splitlines():
+            if physical.endswith("\\"):
+                raise ValueError("continuation")
+            stripped = physical.strip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+            if stripped.startswith("[") and stripped.endswith("]"):
+                section = stripped[1:-1].strip()
+                continue
+            if section != "Service" or "=" not in physical:
+                continue
+            key, value = physical.split("=", 1)
+            if key.strip() == "ExecStart":
+                starts.append(value.strip())
+        if len(starts) != 1 or not starts[0]:
+            raise ValueError("ExecStart count")
+        argv = shlex.split(starts[0], posix=True, comments=False)
+    port, folder, argv_cred = inspect_argv(argv, systemd=is_systemd)
+    values = {
+        "port": port,
+        "folder": folder,
+        "argv_cred": argv_cred,
+        "env_cred": env_cred,
+        "argv_exposed": "yes" if argv_cred else "",
+    }
+    if field not in values:
+        raise ValueError("field")
+    sys.stdout.write(values[field])
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# Echo the loopback port encoded in one connector-created service definition.
+# Empty means "could not prove it"; callers must never silently treat that unit
+# as owning the default port.
+fs_unit_port() { fs_unit_field "$1" port; }
+
+# Credentials ride curl's stdin config and, on Linux, a systemd EnvironmentFile.
+# Reject every ASCII control (including CR/LF/DEL) before either parser sees it.
+credential_value_safe() { # credential_value_safe <value>
+  [ -n "$1" ] || return 1
+  printf '%s' "$1" | python3 -c '
+import sys
+s = sys.stdin.read()
+sys.exit(0 if s and all(c.isprintable() for c in s) else 1)' 2>/dev/null
+}
+
+fs_systemd_value_safe() { # fs_systemd_value_safe <literal path/argv value>
+  [ -n "$1" ] || return 1
+  case "$1" in *'$'*|*'%'*) return 1 ;; esac
+  printf '%s' "$1" | python3 -c '
+import sys
+s = sys.stdin.read()
+sys.exit(0 if s and all(c.isprintable() for c in s) else 1)' 2>/dev/null
+}
+
+fs_systemd_quote() { # fs_systemd_quote <literal>
+  fs_systemd_value_safe "$1" || return 1
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+# Binding is the only portable, race-minimising answer to "is this port free?"
+# Connector-owned units are ALSO reserved even while stopped: otherwise a second
+# gateway can steal 5006 today and collide when the first unit starts tomorrow.
+fs_port_bind_free() { # fs_port_bind_free <port>
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+
+fs_port_owned_by_unit() { # fs_port_owned_by_unit <port>
+  local want="$1" unit p
+  while IFS= read -r unit; do
+    p=$(fs_unit_port "$unit" 2>/dev/null || true)
+    [ "$p" = "$want" ] && return 0
+  done < <(fs_all_units)
+  return 1
+}
+
+fs_owned_unit_ports_safe() {
+  local unit p
+  while IFS= read -r unit; do
+    p=$(fs_unit_port "$unit" 2>/dev/null || true)
+    if [ -z "$p" ]; then
+      FS_PORT_ALLOCATION_REASON="Found connector-owned unit $unit, but its loopback port cannot be read safely. Repair or remove that unit before adding another file lane."
+      return 1
+    fi
+  done < <(fs_all_units)
+  return 0
+}
+
+fs_unit_is_legacy() {
+  case "$(basename "$1")" in
+    conduck-files.service|conduck-fileserver.service|\
+    ai.gigaduck.conduck-files.plist|ai.gigaduck.conduck-fileserver.plist) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# A pre-per-gateway unit may be adopted once, but after a saved profile ties its
+# port to another gateway it must not silently become this gateway's lane too.
+fs_legacy_claimed_by_other_gateway() { # <legacy-unit>
+  local port
+  port=$(fs_unit_port "$1" 2>/dev/null || true)
+  [ -n "$port" ] || return 0
+  python3 - "$STATE_DIR" "$GW_ID" "$port" <<'PY' >/dev/null 2>&1
+import glob, json, os, sys
+state, current, port = sys.argv[1:4]
+for p in glob.glob(os.path.join(state, "profile-*.json")):
+    try: d = json.load(open(p))
+    except Exception: continue
+    gw, fs = d.get("gateway") or {}, d.get("fileServer")
+    if not isinstance(fs, dict): continue
+    if str(fs.get("localPort") or "") == port and (gw.get("id") or "") != current:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+allocate_fs_local_port() {
+  local p="$FS_PORT_START"
+  FS_PORT_ALLOCATION_REASON=""
+  case "$FS_PORT_START:$FS_PORT_END" in
+    *[!0-9:]*|:*) die "Internal file-port range is invalid." ;;
+  esac
+  [ "$FS_PORT_START" -ge 1 ] 2>/dev/null && [ "$FS_PORT_END" -le 65535 ] 2>/dev/null \
+    && [ "$FS_PORT_START" -le "$FS_PORT_END" ] 2>/dev/null \
+    || die "Internal file-port range is invalid."
+  # A stopped malformed unit is still a future listener. If we cannot recover
+  # its port, allocating around only the parseable units could create a latent
+  # collision when that service starts later. Refuse the new lane instead.
+  fs_owned_unit_ports_safe || return 1
+  while [ "$p" -le "$FS_PORT_END" ]; do
+    if [ "$p" != "${GW_LOCAL_PORT:-}" ] \
+       && ! fs_port_owned_by_unit "$p" \
+       && fs_port_bind_free "$p"; then
+      FS_LOCAL_PORT="$p"
+      return 0
+    fi
+    p=$((p+1))
+  done
+  FS_PORT_ALLOCATION_REASON="No free loopback port in $FS_PORT_START-$FS_PORT_END for a new file lane."
+  return 1
+}
+
 # Find an existing file-server unit (script OR app generated) and recover its
 # config: local port + credential + served folder. Sets FS_LOCAL_PORT + FS_CRED +
-# FS_UNIT + FS_FOLDER (folder is best-effort — for the profile only, never gates).
+# FS_UNIT + FS_FOLDER. The folder parse is load-bearing: setup/show-code use that
+# structurally recovered live root to guard the agent's local output snapshot.
 existing_fs_config() {
   local unit="" f
+  FS_EXISTING_UNSAFE=false
   if [ "$OS" = "Linux" ]; then
     while IFS= read -r f; do [ -f "$f" ] && { unit="$f"; break; }; done < <(linux_unit_candidates)
   else
     while IFS= read -r f; do [ -f "$f" ] && { unit="$f"; break; }; done < <(mac_unit_candidates)
   fi
   [ -n "$unit" ] || return 1
+  if fs_unit_is_legacy "$unit" && fs_legacy_claimed_by_other_gateway "$unit"; then
+    note "The legacy file-server unit on port $(fs_unit_port "$unit") is already tied to another saved gateway; not reusing it for $GW_ID."
+    return 1
+  fi
   FS_UNIT="$unit"
 
   # addr port: systemd ExecStart carries `--addr 127.0.0.1:PORT` on one line, but
   # a plist splits it across two <string> elements — parse those STRUCTURALLY, or
   # a lane on a non-default port silently falls back to 5006 and probes nothing.
   local port=""
-  if [ "${unit##*.}" = "plist" ]; then
-    port=$(python3 - "$unit" <<'PY' 2>/dev/null
-import sys, plistlib
-try:
-    a = plistlib.load(open(sys.argv[1], 'rb')).get("ProgramArguments", [])
-    i = a.index("--addr")
-    print(a[i + 1].rsplit(":", 1)[-1])
-except Exception: pass
-PY
-)
-  else
-    port=$(grep -oE -- '--addr[" >]+127\.0\.0\.1:[0-9]+' "$unit" 2>/dev/null | grep -oE '[0-9]+$' | head -1)
+  port=$(fs_unit_port "$unit" 2>/dev/null || true)
+  if [ -z "$port" ]; then
+    warn "Found $unit, but its loopback port could not be read safely."
+    FS_EXISTING_UNSAFE=true
+    FS_UNIT=""
+    return 1
   fi
-  case "$port" in ''|*[!0-9]*) port="" ;; esac
-  FS_LOCAL_PORT="${port:-5006}"
+  FS_LOCAL_PORT="$port"
 
-  # served folder: the `rclone serve webdav <folder>` argument. Plist → the element
-  # right after "webdav" (STRUCTURAL, handles any path); systemd → the text between
-  # `serve webdav` and `--addr` (the existing grep style; strip its surrounding
-  # quotes). Best-effort: recorded in the profile only, omitted when unreadable.
-  FS_FOLDER=""
-  if [ "${unit##*.}" = "plist" ]; then
-    FS_FOLDER=$(python3 - "$unit" <<'PY' 2>/dev/null
-import sys, plistlib
-try:
-    a = plistlib.load(open(sys.argv[1], 'rb')).get("ProgramArguments", [])
-    i = a.index("webdav")
-    print(a[i + 1])
-except Exception: pass
-PY
-)
-  else
-    FS_FOLDER=$(sed -n 's/^ExecStart=.* serve webdav \(.*\) --addr .*/\1/p' "$unit" 2>/dev/null | head -1)
-    FS_FOLDER="${FS_FOLDER#\"}"; FS_FOLDER="${FS_FOLDER%\"}"
+  # The same structural parse yields the exact argv element after `webdav`.
+  FS_FOLDER=$(fs_unit_field "$unit" folder 2>/dev/null || true)
+  if [ -z "$FS_FOLDER" ]; then
+    warn "Found $unit, but its served folder could not be read safely."
+    FS_EXISTING_UNSAFE=true
+    FS_UNIT=""
+    return 1
   fi
 
   # credential: prefer our 0600 state cred file; else env file RCLONE_PASS; else
@@ -84,48 +319,45 @@ PY
   if [ -f "$(state_cred_file)" ]; then FS_CRED=$(cat "$(state_cred_file)")
   elif [ -f "$(state_env_file)" ]; then FS_CRED=$(env_get "$(state_env_file)" "RCLONE_PASS")
   elif [ "${unit##*.}" = "plist" ]; then
-    local line; line=$(python3 - "$unit" <<'PY' 2>/dev/null
-import sys,plistlib
-try:
-    d=plistlib.load(open(sys.argv[1],'rb')); a=d.get("ProgramArguments",[])
-    if "--pass" in a: print("ARGV\t"+a[a.index("--pass")+1])           # app plist: cred on argv
-    else:
-        c=(d.get("EnvironmentVariables",{}) or {}).get("RCLONE_PASS","")
-        if c: print("ENV\t"+c)
-except Exception: pass
-PY
-)
-    if [ -n "$line" ]; then FS_CRED="${line#*$'\t'}"; [ "${line%%$'\t'*}" = "ARGV" ] && FS_CRED_LEGACY_ARGV=true; fi
+    FS_CRED=$(fs_unit_field "$unit" argv_cred 2>/dev/null || true)
+    if [ -n "$FS_CRED" ]; then
+      FS_CRED_LEGACY_ARGV=true
+    else
+      FS_CRED=$(fs_unit_field "$unit" env_cred 2>/dev/null || true)
+    fi
   else
-    FS_CRED=$(grep -oE -- '--pass[" >]+[a-f0-9]{16,}' "$unit" 2>/dev/null | grep -oE '[a-f0-9]{16,}' | head -1)
+    FS_CRED=$(fs_unit_field "$unit" argv_cred 2>/dev/null || true)
     [ -n "$FS_CRED" ] && FS_CRED_LEGACY_ARGV=true
   fi
   # The `ps`-visible-credential warning keys off the UNIT, not off which source the
   # cred was read from: a leftover state-cred file must not mask an argv-exposed unit.
   if ! $FS_CRED_LEGACY_ARGV; then
     local argv_exposed=""
-    if [ "${unit##*.}" = "plist" ]; then
-      argv_exposed=$(python3 - "$unit" <<'PY' 2>/dev/null
-import sys,plistlib
-try:
-    a=plistlib.load(open(sys.argv[1],'rb')).get("ProgramArguments",[])
-    print("yes" if "--pass" in a else "")
-except Exception: pass
-PY
-)
-    elif grep -qE -- '--pass[" >]+[a-f0-9]{16,}' "$unit" 2>/dev/null; then
-      argv_exposed="yes"
-    fi
+    argv_exposed=$(fs_unit_field "$unit" argv_exposed 2>/dev/null || true)
     [ -n "$argv_exposed" ] && FS_CRED_LEGACY_ARGV=true
   fi
-  [ -n "$FS_CRED" ] || { FS_UNIT=""; return 1; }
+  if ! credential_value_safe "$FS_CRED"; then
+    warn "Found $unit, but its file-server credential could not be recovered safely."
+    FS_EXISTING_UNSAFE=true
+    FS_UNIT=""
+    return 1
+  fi
   return 0
 }
 
 # Write a per-gateway file-server unit that reads RCLONE_PASS from a 0600 env file
 # (credential never appears on the process command line / in `ps`).
 write_fs_unit_linux() { # write_fs_unit_linux <workspace>
-  local ws="$1" envf; envf=$(state_env_file)
+  local ws="$1" envf rclone_bin q_ws q_env q_rclone
+  envf=$(state_env_file)
+  rclone_bin=$(command -v rclone)
+  if ! credential_value_safe "$FS_CRED" \
+     || ! q_ws=$(fs_systemd_quote "$ws") \
+     || ! q_env=$(fs_systemd_quote "$envf") \
+     || ! q_rclone=$(fs_systemd_quote "$rclone_bin"); then
+    warn "The file credential or selected paths contain characters this systemd unit cannot encode safely."
+    return 1
+  fi
   FS_UNIT="$HOME/.config/systemd/user/conduck-files-$GW_ID.service"
   mkdir -p "$(dirname "$FS_UNIT")" "$STATE_DIR"
   umask 077
@@ -145,16 +377,20 @@ Description=Conduck agent file server ($GW_ID, rclone WebDAV)
 After=network.target
 
 [Service]
-EnvironmentFile=$envf
-ExecStart=$(command -v rclone) serve webdav "$ws" --addr 127.0.0.1:$FS_LOCAL_PORT --user conduck --dir-cache-time 1s
+EnvironmentFile=$q_env
+ExecStart=$q_rclone serve webdav $q_ws --addr 127.0.0.1:$FS_LOCAL_PORT --user conduck --dir-cache-time 1s
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 EOF
-  systemctl --user daemon-reload
-  systemctl --user enable --now "conduck-files-$GW_ID.service" && ok "File server running in the background (a systemd user service)." \
-    || warn "Could not start the service — check 'systemctl --user status conduck-files-$GW_ID'."
+  systemctl --user daemon-reload || return 1
+  if systemctl --user enable --now "conduck-files-$GW_ID.service"; then
+    ok "File server running in the background (a systemd user service)."
+  else
+    warn "Could not start the service — check 'systemctl --user status conduck-files-$GW_ID'."
+    return 1
+  fi
   local user_name="${USER:-$(id -un)}"   # $USER can be unset under set -u (su/cron shells)
   loginctl show-user "$user_name" 2>/dev/null | grep -q 'Linger=yes' || {
     warn "User services stop at logout unless 'linger' is on (needed for a 24/7 box)."
@@ -165,6 +401,10 @@ EOF
 }
 
 write_fs_unit_mac() { # write_fs_unit_mac <workspace>
+  credential_value_safe "$FS_CRED" || {
+    warn "The file credential contains control characters and cannot be stored safely."
+    return 1
+  }
   FS_UNIT="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
   mkdir -p "$(dirname "$FS_UNIT")" "$STATE_DIR"
   umask 077
@@ -185,13 +425,174 @@ with open(os.environ["PLIST"],"wb") as f: plistlib.dump(d,f)
 PY
   chmod 600 "$FS_UNIT"
   launchctl unload "$FS_UNIT" 2>/dev/null || true
-  launchctl load -w "$FS_UNIT" && ok "File server running in the background (a macOS LaunchAgent that restarts it automatically)." \
-    || warn "Could not load the LaunchAgent — check 'launchctl list | grep conduck'."
+  if launchctl load -w "$FS_UNIT"; then
+    ok "File server running in the background (a macOS LaunchAgent that restarts it automatically)."
+  else
+    warn "Could not load the LaunchAgent — check 'launchctl list | grep conduck'."
+    return 1
+  fi
   note "LaunchAgents run while this user is logged in — for a 24/7 Mac, keep automatic login on."
   if pmset -g 2>/dev/null | grep -qE '^[[:space:]]*sleep[[:space:]]+[1-9]'; then
     warn "This Mac is set to sleep — a sleeping host isn't reachable 24/7."
     note "For an always-on gateway: enable automatic login + 'sudo pmset -a sleep 0'."
   fi
+}
+
+# A unit file existing is not readiness: it may be disabled, crash-looping, or
+# shadowed by another process on the same port. Confirm the supervisor owns a
+# live process before any HTTPS exposure is created.
+fs_unit_active() {
+  [ -n "$FS_UNIT" ] || return 1
+  if [ "$OS" = "Linux" ]; then
+    have systemctl || return 1
+    systemctl --user is-active --quiet "$(basename "$FS_UNIT")"
+  else
+    have launchctl || return 1
+    local label
+    label=$(python3 - "$FS_UNIT" <<'PY' 2>/dev/null
+import plistlib, sys
+try:
+    print(plistlib.load(open(sys.argv[1], "rb")).get("Label", ""))
+except Exception:
+    pass
+PY
+)
+    [ -n "$label" ] && launchctl list "$label" >/dev/null 2>&1
+  fi
+}
+
+fs_local_curl() { # fs_local_curl <real|wrong|none> <curl args…>
+  local kind="$1"; shift
+  case "$kind" in
+    real)
+      credential_value_safe "$FS_CRED" || return 2
+      local cred="$FS_CRED"
+      cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"
+      printf 'user = "conduck:%s"\n' "$cred" \
+        | curl -q -sS --max-time 5 --noproxy '*' --config - "$@" ;;
+    wrong)
+      curl -q -sS --max-time 5 --noproxy '*' \
+        -u "conduck:conduck-connect-deliberately-wrong" "$@" ;;
+    none)
+      curl -q -sS --max-time 5 --noproxy '*' "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
+fs_local_code() { # fs_local_code <real|wrong|none> <curl args…>
+  local kind="$1" code
+  shift
+  code=$(fs_local_curl "$kind" -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || true
+  case "$code" in [0-9][0-9][0-9]) printf '%s' "$code" ;; *) printf '000' ;; esac
+}
+
+# Prove the exact service we will expose is active, accepts its recovered
+# credential, rejects missing/wrong credentials, and serves byte-identical
+# writes. This happens on loopback BEFORE creating a tunnel/Serve mapping.
+fs_local_service_ready() {
+  fs_unit_active || {
+    warn "The file-server service exists but is not active — refusing to expose it."
+    return 1
+  }
+  local base="http://127.0.0.1:$FS_LOCAL_PORT" i=0 code=""
+  while [ "$i" -lt 20 ]; do
+    code=$(fs_local_code real "$base/")
+    case "$code" in 2??|3??|404) break ;; esac
+    i=$((i+1)); sleep 0.25
+  done
+  case "$code" in 2??|3??|404) ;; *)
+    warn "The active file-server service did not answer with its saved credential on 127.0.0.1:$FS_LOCAL_PORT."
+    return 1 ;;
+  esac
+
+  local tag probe tmp outtmp missing wrong del gone get_code
+  local bytes_ok=false cleanup_ok=false removed_local=false
+  tag=$(python3 -c 'import secrets; print(secrets.token_hex(4))' 2>/dev/null) || return 1
+  probe="conduck-connect-local-probe-$tag.txt"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-local-probe.XXXXXX" 2>/dev/null) || return 1
+  outtmp=$(mktemp "${TMPDIR:-/tmp}/conduck-local-output.XXXXXX" 2>/dev/null) || {
+    rm -f "$tmp"
+    return 1
+  }
+  printf 'conduck-connect local service probe %s\n' "$tag" > "$tmp"
+  code=$(fs_local_code real -T "$tmp" "$base/$probe")
+  get_code="000"
+  case "$code" in
+    2??)
+      get_code=$(fs_local_curl real -o "$outtmp" -w '%{http_code}' "$base/$probe" 2>/dev/null || true)
+      case "$get_code" in 2??) cmp -s "$tmp" "$outtmp" && bytes_ok=true ;; esac
+      ;;
+  esac
+  missing=$(fs_local_code none "$base/$probe")
+  wrong=$(fs_local_code wrong "$base/$probe")
+  del=$(fs_local_code real -X DELETE "$base/$probe")
+  gone=$(fs_local_code real "$base/$probe")
+  rm -f "$tmp" "$outtmp"
+
+  # A 2xx DELETE alone is not proof; some broken WebDAV front ends acknowledge
+  # it while leaving the object behind. Require an authenticated follow-up GET
+  # to return exactly 404. If DELETE is unavailable and this exact recovered
+  # root is known, remove only the randomized regular file locally and prove
+  # the same 404 through WebDAV.
+  case "$del:$gone" in 2??:404|404:404) cleanup_ok=true ;; esac
+  if ! $cleanup_ok && [ -n "$FS_FOLDER" ] && python3 - "$FS_FOLDER" "$probe" <<'PY' >/dev/null 2>&1
+import os, re, stat, sys
+root, name = os.path.realpath(sys.argv[1]), sys.argv[2]
+if not re.fullmatch(r"conduck-connect-local-probe-[0-9a-f]{8}\.txt", name):
+    sys.exit(1)
+if not os.path.isdir(root):
+    sys.exit(1)
+root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+root_fd = os.open(root, root_flags)
+try:
+    try:
+        before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        sys.exit(0)
+    # Never resolve or unlink through a replacement symlink. Open and re-stat
+    # the exact directory entry so a swap also fails before unlinkat.
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        sys.exit(1)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    file_fd = os.open(name, file_flags, dir_fd=root_fd)
+    try:
+        opened = os.fstat(file_fd)
+        current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        if not stat.S_ISREG(opened.st_mode) or not stat.S_ISREG(current.st_mode):
+            sys.exit(1)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino) \
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            sys.exit(1)
+    finally:
+        os.close(file_fd)
+    os.unlink(name, dir_fd=root_fd)
+finally:
+    os.close(root_fd)
+PY
+  then
+    removed_local=true
+    gone=$(fs_local_code real "$base/$probe")
+    [ "$gone" = "404" ] && cleanup_ok=true
+  fi
+  if ! $cleanup_ok; then
+    warn "Cleanup was not proven for the exact local probe $probe (DELETE HTTP $del; follow-up GET HTTP $gone)."
+  elif $removed_local; then
+    warn "WebDAV DELETE was not reliable (HTTP $del); removed the exact local probe directly and proved HTTP 404."
+  fi
+
+  if ! $bytes_ok; then
+    warn "The local file server did not return the bytes just written — leaving the lane out."
+    return 1
+  fi
+  case "$missing:$wrong" in
+    401:401|401:403|403:401|403:403) ;;
+    *)
+      warn "The local file server did not reject both missing and wrong credentials — leaving the lane out."
+      return 1 ;;
+  esac
+  $cleanup_ok || return 1
+  ok "Local file server re-checked: active, authenticated, and byte-faithful on port $FS_LOCAL_PORT."
+  return 0
 }
 
 # --- file-lane scope alignment ------------------------------------------------
@@ -764,17 +1165,24 @@ setup_file_lane() {
     return 0
   fi
 
-  # Reuse an existing file server's folder + port + credential (the unit). Whether
-  # it ends up in the QR is decided by the exposure/scope step below — so this only
-  # reports the unit, never "done."
+  # Reuse an existing file server's folder + port + credential (the unit). A new
+  # gateway gets its own free, stable loopback port: connector-owned units for
+  # every OTHER gateway reserve their ports even while stopped, and a live bind
+  # by any process also reserves a port.
+  local workspace="" new_fs=false
   if existing_fs_config; then
     ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered."
+    workspace="$FS_FOLDER"
     if $FS_CRED_LEGACY_ARGV; then
       warn "Heads-up: that older unit keeps the file password on its command line (visible via 'ps')."
       note "It still works and the QR is correct. To hide it, recreate the unit so rclone reads the"
       note "password from a 0600 env file ('RCLONE_PASS' / '--htpasswd'); newly-created units already do."
     fi
   else
+    if $FS_EXISTING_UNSAFE; then
+      warn "I will not overwrite or expose that existing unit. Repair/remove it explicitly, then re-run setup."
+      FS_CRED=""; FS_URL=""; return 0
+    fi
     if $REUSE_ONLY; then
       note "(reuse-only: no existing file server found; skipping the file lane — re-run without --reuse-only to create one)"
       FS_CRED=""; return 0
@@ -786,11 +1194,14 @@ setup_file_lane() {
       warn "No systemd user session here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
       warn "I can't keep a file server running in the background. Skipping the file lane; chat still works."
       note "If this box does run systemd, log in directly as this user (ssh, not 'su -') and re-run."
-      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:5006 --user conduck --dir-cache-time 1s' with the app-generated password exported as RCLONE_PASS, under your own supervisor."
+      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:<free-port> --user conduck --dir-cache-time 1s' with the app-generated password exported as RCLONE_PASS, under your own supervisor."
       FS_CRED=""; return 0
     fi
-    FS_LOCAL_PORT=5006
-    local workspace
+    if ! allocate_fs_local_port; then
+      warn "${FS_PORT_ALLOCATION_REASON:-Could not allocate a safe loopback port for a new file lane.}"
+      FS_CRED=""; return 0
+    fi
+    ok "Reserved loopback port $FS_LOCAL_PORT for this gateway's file lane."
     case "$GW_KIND" in
       openclaw) workspace="$HOME/.openclaw/workspace" ;;
       hermes)   workspace="$HOME/.hermes/files" ;;
@@ -803,18 +1214,69 @@ setup_file_lane() {
         workspace="$w"; break
       done
     fi
-    [ "$GW_KIND" = "hermes" ] && note "Hermes: also point terminal.cwd at this folder in ~/.hermes/config.yaml so its tools land here."
     FS_FOLDER="$workspace"   # new lane knows its own folder — recorded in the profile
+    new_fs=true
+  fi
 
+  # Linux's systemd ExecStart language expands `$` environment references and
+  # `%` specifiers even though a filesystem can store those characters. Refuse
+  # such a newly selected workspace before any Hermes config/guidance edit or
+  # file-server write; spaces, quotes, and backslashes are encoded safely.
+  if $new_fs && [ "$OS" = "Linux" ] && ! fs_systemd_value_safe "$workspace"; then
+    warn "That workspace path contains control characters, '$', or '%' and cannot be represented safely in a systemd service."
+    warn "Choose a different folder and re-run; leaving the optional file lane out."
+    FS_CRED=""; FS_URL=""; FS_FOLDER=""
+    return 0
+  fi
+
+  # Hermes has two independent silent-failure gates: the API-server agent needs
+  # its file toolset and exact working root, and it needs the Conduck return-file
+  # convention in the context file Hermes actually loads. Both are explicit,
+  # narrowly scoped, and consented. Anything ambiguous omits the optional lane.
+  if [ "$GW_KIND" = "hermes" ]; then
+    if [ -z "$workspace" ]; then
+      warn "The existing Hermes file-server unit does not reveal its served folder — leaving the lane out."
+      FS_CRED=""; FS_URL=""; return 0
+    fi
+    if ! hermes_file_readiness_step "$workspace"; then
+      hermes_residual_state_note
+      FS_CRED=""; FS_URL=""; return 0
+    fi
+    if ! install_conduck_hermes_block "$workspace"; then
+      hermes_residual_state_note
+      FS_CRED=""; FS_URL=""; return 0
+    fi
+  fi
+
+  if $new_fs; then
     if $DRY_RUN; then
       plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
       note "(dry-run: would mint a credential and write the file-server unit)"
     else
-      mutate_guard "write file-server unit + credential" || { FS_CRED=""; return 0; }
-      mkdir -p "$workspace" || { warn "Could not create $workspace — skipping file lane."; FS_CRED=""; return 0; }
+      mutate_guard "write file-server unit + credential" || {
+        hermes_residual_state_note
+        FS_CRED=""; return 0
+      }
+      mkdir -p "$workspace" || {
+        warn "Could not create $workspace — skipping file lane."
+        hermes_residual_state_note
+        FS_CRED=""; return 0
+      }
       FS_CRED=$(openssl rand -hex 16)
       ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
-      if [ "$OS" = "Linux" ]; then write_fs_unit_linux "$workspace"; else write_fs_unit_mac "$workspace"; fi
+      if [ "$OS" = "Linux" ]; then
+        write_fs_unit_linux "$workspace" || {
+          warn "File-server unit did not start — leaving the lane out."
+          hermes_residual_state_note
+          FS_CRED=""; return 0
+        }
+      else
+        write_fs_unit_mac "$workspace" || {
+          warn "File-server unit did not start — leaving the lane out."
+          hermes_residual_state_note
+          FS_CRED=""; return 0
+        }
+      fi
     fi
   fi
 
@@ -827,6 +1289,18 @@ setup_file_lane() {
   # still show the TOOLS.md line (every earlier bail-out already returned).
   if [ "$GW_KIND" = "openclaw" ] && { [ -n "$FS_CRED" ] || $DRY_RUN; }; then
     install_conduck_tools_block "$FS_FOLDER"
+  fi
+
+  # Never expose a path merely because a unit file exists. In a dry run we
+  # promise zero network requests, so record the future gate; real setup and
+  # reuse-only both prove active service ownership + authentication on loopback.
+  if $DRY_RUN; then
+    plan_add "VERIFY file-server unit active + authenticated PUT/GET on 127.0.0.1:$FS_LOCAL_PORT before exposure"
+  elif [ -n "$FS_CRED" ] && ! fs_local_service_ready; then
+    warn "The file server is not safe to expose yet — leaving it out of the QR."
+    hermes_residual_state_note
+    FS_CRED=""; FS_URL=""
+    return 0
   fi
 
   # Expose the file lane. Prefer the file lane's OWN existing mapping over re-deriving
