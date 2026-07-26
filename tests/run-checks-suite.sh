@@ -114,6 +114,42 @@ bad-json|bad-json|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE,IMAGE_INPUT,MODEL_SELECTI
 
 ADAPTER_FILES_DIR=""   # when set, the chat adapter learns the shared folder to
                        # write --files outputs into (the file cases set it)
+# How long a fixture may take to bind and print READY, in tenths of a second.
+# A fixture that DIES leaves the loop immediately (the `kill -0` check), so this
+# bound only ever applies to one that is alive but slow to start — raising it
+# costs a healthy run nothing and spares a cold CI runner a false failure.
+FIXTURE_READY_TICKS=300
+
+# Explain why a fixture never reached READY.
+#
+# `fail_case` dumps `doctor.out`, which for a startup failure is the PREVIOUS
+# case's output — actively misleading. The real cause is in the fixture's own
+# stderr, and leaving that unread is how a single environment problem reads as a
+# hundred independent test failures. Detail is printed once per run; every later
+# fixture failure in the same run has the same cause, so it gets one line.
+FIXTURE_DIAG_SHOWN=false
+fixture_start_failed() { # fixture_start_failed <label> <outfile> <errfile>
+  local label="$1" outf="$2" errf="$3" py
+  if [ "$FIXTURE_DIAG_SHOWN" = true ]; then
+    printf '  ! %s never printed READY (see the first fixture failure above)\n' "$label"
+    return
+  fi
+  FIXTURE_DIAG_SHOWN=true
+  py=$(command -v python3 2>/dev/null) || py=""
+  printf '  ! %s never printed READY within %ss\n' "$label" "$((FIXTURE_READY_TICKS / 10))"
+  printf '  ! python3: %s (%s)\n' "${py:-NOT FOUND}" "$(python3 -V 2>&1 || echo 'no version')"
+  if [ -s "$errf" ]; then
+    printf '  ! its stderr:\n'
+    sed 's/^/  !   /' "$errf" | tail -n 20
+  else
+    printf '  ! its stderr was empty — the process produced no diagnostic at all\n'
+  fi
+  if [ -s "$outf" ]; then
+    printf '  ! its stdout:\n'
+    sed 's/^/  !   /' "$outf" | tail -n 5
+  fi
+}
+
 start_fixture() { # start_fixture <mode> -> sets FIXTURE_PID + PORT
   local mode="$1" i line
   : > "$TMP/fixture.out"
@@ -123,12 +159,14 @@ start_fixture() { # start_fixture <mode> -> sets FIXTURE_PID + PORT
   FIXTURE_PID=$!
   PORT=""
   i=0
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt "$FIXTURE_READY_TICKS" ]; do
     line=$(head -n 1 "$TMP/fixture.out" 2>/dev/null)
     case "$line" in READY\ *) PORT="${line#READY }"; break ;; esac
     kill -0 "$FIXTURE_PID" 2>/dev/null || break
     i=$((i+1)); sleep 0.1
   done
+  [ -n "$PORT" ] || fixture_start_failed \
+    "chat-adapter fixture (mode $mode)" "$TMP/fixture.out" "$TMP/fixture.err"
   [ -n "$PORT" ]
 }
 
@@ -146,12 +184,14 @@ start_webdav() { # start_webdav <mode> <served-dir> <cred> [capture-file] -> set
   WEBDAV_PID=$!
   WPORT=""
   i=0
-  while [ "$i" -lt 100 ]; do
+  while [ "$i" -lt "$FIXTURE_READY_TICKS" ]; do
     line=$(head -n 1 "$TMP/webdav.out" 2>/dev/null)
     case "$line" in READY\ *) WPORT="${line#READY }"; break ;; esac
     kill -0 "$WEBDAV_PID" 2>/dev/null || break
     i=$((i+1)); sleep 0.1
   done
+  [ -n "$WPORT" ] || fixture_start_failed \
+    "WebDAV fixture (mode $mode)" "$TMP/webdav.out" "$TMP/webdav.err"
   [ -n "$WPORT" ]
 }
 
