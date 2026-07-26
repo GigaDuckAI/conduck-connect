@@ -64,7 +64,12 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   statusline="${out##*$'\n'}"; body="${out%$'\n'*}"
   MODELS_HTTP_CODE="${statusline%% *}"; statusline="${statusline#* }"
   MODELS_TIME="${statusline%% *}"
-  MODELS_CONTENT_TYPE=""; [ "$statusline" != "${statusline#* }" ] && MODELS_CONTENT_TYPE="${statusline#* }"
+  # safe_display here, at the parser's exit: the header is whatever the server
+  # chose, it is echoed verbatim in the MODELS_ENVELOPE verdict, and curl does
+  # not strip control bytes from a header value. A real Content-Type is far
+  # inside the 200-char bound, so the grading in ct_is_json is unaffected.
+  MODELS_CONTENT_TYPE=""
+  [ "$statusline" != "${statusline#* }" ] && MODELS_CONTENT_TYPE=$(safe_display "${statusline#* }" 200)
   # HTML first: the endpoint-off page often comes back 200, and it deserves its
   # own diagnosis either way.
   case "$body" in *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;; esac
@@ -93,6 +98,12 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   # than the app it green-lights for.
   # On the envelope-OK paths the classifier also prints "<id-count>\t<first-id>"
   # for the doctor's model-selection probe; the wizard captures and ignores it.
+  # The id is stripped of C0 controls and DEL before it leaves the classifier —
+  # TAB/CR/LF because they would break this tab-delimited line, the rest because
+  # the id is printed in verdict lines a hostile gateway must not be able to
+  # repaint (ANSI) or forge extra transcript lines into. It is NOT truncated
+  # here: the same value becomes the chat payload's model and the paired
+  # profile's model, where a long-but-legitimate id must survive intact.
   local pyout prc
   pyout=$(printf '%s' "$body" | python3 -c '
 import json, sys
@@ -105,7 +116,7 @@ if not (isinstance(d, dict) and isinstance(d.get("data"), list)):
     sys.exit(3)
 data = d["data"]
 ids = [x["id"] for x in data if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
-first = (ids[0] if ids else "").replace("\t", " ").replace("\n", " ").replace("\r", " ")
+first = "".join(" " if (ord(c) < 0x20 or ord(c) == 0x7f) else c for c in (ids[0] if ids else ""))
 print("%d\t%s" % (len(ids), first))
 if not data:
     sys.exit(4)
@@ -139,9 +150,14 @@ curl_fs_with_timeout() { # curl_fs_with_timeout <max-seconds> <curl args…>
 }
 curl_fs() { curl_fs_with_timeout 30 "$@"; }
 
+# Loopback-only health probe — every caller passes http://127.0.0.1:… .
+# `--noproxy '*'` for the same reason curl_gw's diagnostics carry it: curl has no
+# loopback exemption, so with $http_proxy/$ALL_PROXY set this request goes to
+# that host instead, and a proxy answering 200 forges precisely the "your gateway
+# is up" verdict this function exists to establish.
 local_health_ok() { # local_health_ok <url> -> 0 when the server answered with < 500
   local code
-  code=$(curl -q -sS --max-time 10 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
+  code=$(curl -q -sS --max-time 10 --noproxy '*' -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
   case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
 }
 

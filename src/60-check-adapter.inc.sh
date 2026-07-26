@@ -145,6 +145,12 @@ doctor_accept_url() { # doctor_accept_url <candidate>
   # Pure Bash on purpose: validate_cli calls this before runtime preflight, so
   # a missing python3/curl (or any other executable) can never turn a runtime
   # dependency failure into exit-2 command misuse.
+  # Userinfo is refused on BOTH schemes. The loopback arm below has to (see its
+  # comment: http://127.0.0.1@evil.com is a REMOTE host); https needs it for the
+  # reason --show-code's profile validator already rejects it — this URL is
+  # echoed to the terminal, saved to the profile, and paired into the app, and a
+  # credential must never ride a routing field.
+  url_has_userinfo "$reply" && return 1
   case "$reply" in
     [Hh][Tt][Tt][Pp][Ss]://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
     [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-loopback
@@ -177,6 +183,9 @@ doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stder
     if url=$(doctor_accept_url "$reply"); then
       printf '  %s→ testing %s%s\n' "$DIM" "$url" "$RESET" >&2
       printf '%s' "$url"; return 0
+    fi
+    if url_has_userinfo "$reply"; then
+      warn "$URL_USERINFO_HINT" >&2; continue
     fi
     case "$reply" in
       [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." >&2 ;;

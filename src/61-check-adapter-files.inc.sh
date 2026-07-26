@@ -117,7 +117,12 @@ doctor_files_resolve() {
       return 1
     fi
     if ! DF_URL=$(doctor_accept_url "$CONDUCK_FILES_URL"); then
-      d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
+      if url_has_userinfo "$CONDUCK_FILES_URL"; then
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" credential in the address — give the plain URL"
+        d_say FILES_CONFIG "(the file-lane password goes in CONDUCK_FILES_PASS, the user in CONDUCK_FILES_USER)"
+      else
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
+      fi
       return 1
     fi
     DF_DIR="$CONDUCK_FILES_DIR"; DF_CRED="$CONDUCK_FILES_PASS"; DF_USER="${CONDUCK_FILES_USER:-conduck}"
@@ -220,7 +225,7 @@ PY
 
 # Tier 1 — transport. Sets DOCTOR_FILE_TRANSPORT.
 doctor_files_transport() {
-  local tfail=0 terr=0 disk_ok=true code out body tmp
+  local tfail=0 terr=0 disk_ok=true code out body tmpd tmp uprobe hdrs
   local wkey="conduck-check-$DF_RUN-wt.txt"
   local fkey="conduck-check-$DF_RUN-fresh.txt"
   local ukey1="conduck-check-$DF_RUN-unauth-none.txt"
@@ -228,11 +233,18 @@ doctor_files_transport() {
   local nkey="conduck-check-$DF_RUN-dir"
   local wt_nonce
   wt_nonce=$(python3 -c 'import secrets; print("conduck-check write-through " + secrets.token_hex(16))' 2>/dev/null)
-  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmp=""
-  if [ -z "$wt_nonce" ] || [ -z "$tmp" ]; then
+  # ONE 0700 directory, three files inside it — not one mktemp file plus sibling
+  # names built by string concatenation. mktemp publishes its random suffix the
+  # moment it creates the file, and /tmp's sticky bit stops DELETION, not the
+  # CREATION of "<that name>.u"; a local user who wins that race turns the plain
+  # redirect below into a write through their symlink, at this script's
+  # privileges — and `-D` lets the file server choose the bytes written.
+  tmpd=$(mktemp -d "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmpd=""
+  if [ -z "$wt_nonce" ] || [ -z "$tmpd" ]; then
     d_bad FILES_CONFIG "could not stage transport probes (python3/mktemp failed)"
     DOCTOR_FILE_TRANSPORT="ERROR"; return 0
   fi
+  tmp="$tmpd/probe"; uprobe="$tmpd/unauth"; hdrs="$tmpd/headers"
 
   # write-through: PUT over WebDAV must land byte-identical in the folder.
   df_register T file "$wkey"
@@ -279,21 +291,21 @@ doctor_files_transport() {
     note "  [FILES_AUTH_READ_MISSING] [FILES_AUTH_READ_WRONG] skipped — need the write-through file to probe against."
   fi
   df_register T file "$ukey1"
-  printf 'conduck-check unauth probe\n' > "$tmp.u"
-  code=$(doctor_fs_code none -T "$tmp.u" "$DF_URL/$ukey1")
+  printf 'conduck-check unauth probe\n' > "$uprobe"
+  code=$(doctor_fs_code none -T "$uprobe" "$DF_URL/$ukey1")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without credentials is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO credentials was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   df_register T file "$ukey2"
-  code=$(doctor_fs_code wrong -T "$tmp.u" "$DF_URL/$ukey2")
+  code=$(doctor_fs_code wrong -T "$uprobe" "$DF_URL/$ukey2")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_AUTH_WRITE_WRONG "PUT with a wrong credential answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
-  rm -f "$tmp.u" 2>/dev/null
+  rm -f "$uprobe" 2>/dev/null
 
   # freshness: a file written DIRECTLY to disk (exactly how agents deliver
   # output) must become visible over WebDAV fast. Prime the directory cache
@@ -360,10 +372,10 @@ PY
 
   # ranged-probe compatibility: the app's existence probe is Range: bytes=0-0.
   if $wt_ok; then
-    code=$(doctor_fs_code real -D "$tmp.h" -r 0-0 "$DF_URL/$wkey")
+    code=$(doctor_fs_code real -D "$hdrs" -r 0-0 "$DF_URL/$wkey")
     case "$code" in
       206)
-        if grep -qi '^content-range:' "$tmp.h" 2>/dev/null; then
+        if grep -qi '^content-range:' "$hdrs" 2>/dev/null; then
           d_ok FILES_PROBE_COMPAT "ranged probe honored (206 + Content-Range) — exactly what the app sends"
         else
           d_bad FILES_PROBE_COMPAT "206 without a Content-Range header"; tfail=$((tfail+1))
@@ -374,7 +386,7 @@ PY
       416) d_bad FILES_PROBE_COMPAT "Range: bytes=0-0 on a non-empty file answered 416 — the app's probe would see this as missing"; tfail=$((tfail+1)) ;;
       *)   d_bad FILES_PROBE_COMPAT "ranged probe answered HTTP $code"; tfail=$((tfail+1)) ;;
     esac
-    rm -f "$tmp.h" 2>/dev/null
+    rm -f "$hdrs" 2>/dev/null
   else
     note "  [FILES_PROBE_COMPAT] skipped — need the write-through file to probe against."
   fi
@@ -399,7 +411,7 @@ PY
     000) d_bad FILES_NESTED "no answer to MKCOL — transport trouble, not a capability verdict"; tfail=$((tfail+1)) ;;
     *)   d_bad FILES_NESTED "MKCOL answered HTTP $code — neither support nor a clean rejection"; tfail=$((tfail+1)) ;;
   esac
-  rm -f "$tmp" 2>/dev/null
+  rm -rf "$tmpd" 2>/dev/null
 
   if   [ "$terr" -gt 0 ];  then DOCTOR_FILE_TRANSPORT="ERROR"
   elif [ "$tfail" -gt 0 ]; then DOCTOR_FILE_TRANSPORT="FAIL"
@@ -518,7 +530,7 @@ PY
   fi
 
   say ""
-  say "  The file sentinel — one real turn against model '$MODELS_FIRST_ID': the agent must copy a"
+  say "  The file sentinel — one real turn against model '$(safe_display "$MODELS_FIRST_ID" 60)': the agent must copy a"
   say "  small input file to the folder root and name the output in its reply. Agents can be slow;"
   say "  I wait up to 5 minutes…"
   DF_AGENT_RAN=true
@@ -541,7 +553,7 @@ PY
   fi
 
   if $turn_ok && $copy_ok; then
-    d_ok FILE_COPY_BYTES "model '$MODELS_FIRST_ID' copied the sentinel byte-for-byte to the folder root (${DCC_TIME:-?}s)"
+    d_ok FILE_COPY_BYTES "model '$(safe_display "$MODELS_FIRST_ID" 60)' copied the sentinel byte-for-byte to the folder root (${DCC_TIME:-?}s)"
   elif $turn_ok; then
     case "$out" in
       MISSING)
@@ -618,7 +630,7 @@ print("YES" if os.environ["DF_OKEY"] in outputs else "NO")' 2>/dev/null)
 
   if $turn_ok && $copy_ok && $ref_ok; then DOCTOR_FILE_ACCESS="PASS"; else DOCTOR_FILE_ACCESS="FAIL"; fi
   [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null \
-    && note "  (file_access grades model '$MODELS_FIRST_ID' only — other advertised models may differ.)"
+    && note "  (file_access grades model '$(safe_display "$MODELS_FIRST_ID" 60)' only — other advertised models may differ.)"
   rm -f "$tmp" 2>/dev/null
   return 0
 }

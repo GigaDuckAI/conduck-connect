@@ -131,6 +131,39 @@ warn() { printf '%s! %s%s\n' "$YELLOW" "$*" "$RESET"; }
 die()  { printf '%sError:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 usage_die() { printf '%sUsage error:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 2; }
 
+# The ONE sanitiser for gateway-supplied text on its way to the terminal — model
+# ids, Content-Type values, wire error codes. A gateway is not trusted to be
+# friendly: an embedded newline forges an extra "[CHECK_ID] …" line in the check
+# transcript (a hostile server printing its own green PASS), and an ANSI escape
+# repaints or erases what the operator already read. Strips every C0 control and
+# DEL, then bounds the length so one reply cannot flood the run. Applied where a
+# value LEAVES its parser, so every later print site inherits it.
+# `tr`, not python3: this runs on failure paths, and a display helper must not be
+# able to fail. C1 (0x80-0x9F) is deliberately left alone — in a UTF-8 terminal
+# those bytes only occur inside multi-byte characters, and deleting them would
+# mangle a legitimate non-ASCII model id.
+safe_display() { # safe_display <value> [max-chars, default 120] -> printable, bounded
+  local max="${2:-120}" s
+  s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' 2>/dev/null)
+  [ "${#s}" -le "$max" ] || s="${s:0:$max}…"
+  printf '%s' "$s"
+}
+
+# https://user:pass@host is a legal URL that NO endpoint here may carry. It is a
+# credential the app would have to store inside a routing field, and this script
+# echoes the URL back on screen, writes it to the pairing profile that
+# WHAT-IT-TOUCHES.md calls credential-free, and puts it in the QR. The Conduck app
+# refuses userinfo on every persisted endpoint URL, on write and on read alike;
+# the connector has to agree, or the wizard happily emits a code the app rejects.
+# Pure Bash — doctor_accept_url calls this before the runtime preflight, so it may
+# not depend on python3/curl existing. The authority ends at the first / ? or #.
+url_has_userinfo() { # url_has_userinfo <url> -> 0 when the authority carries user[:pass]@
+  case "$1" in *://*) ;; *) return 1 ;; esac   # no scheme, no authority — let the scheme check answer
+  local a="${1#*://}"; a="${a%%[/?#]*}"
+  case "$a" in *@*) return 0 ;; *) return 1 ;; esac
+}
+URL_USERINFO_HINT="Credentials don't belong in the address. Drop the \"user:pass@\" part and give the plain URL — the token goes in the token prompt, not the URL."
+
 DRY_RUN=false
 REUSE_ONLY=false
 SHOW_QR=false
@@ -275,6 +308,9 @@ validate_cli() {
     check-server)
       COMPAT=true
       if [ -n "$CHECK_URL" ] && ! doctor_accept_url "$CHECK_URL" >/dev/null; then
+        # The userinfo case gets its own message, and deliberately does NOT echo
+        # the URL back: the rejected value contains the password.
+        url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
         usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
       fi
       $DRY_RUN && usage_die "--check-server sends live requests, so it doesn't combine with --dry-run."
@@ -287,6 +323,9 @@ validate_cli() {
     check-adapter)
       DOCTOR=true
       if [ -n "$CHECK_URL" ] && ! doctor_accept_url "$CHECK_URL" >/dev/null; then
+        # The userinfo case gets its own message, and deliberately does NOT echo
+        # the URL back: the rejected value contains the password.
+        url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
         usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
       fi
       $DRY_RUN && usage_die "--check-adapter sends live requests, so it doesn't combine with --dry-run."
@@ -387,6 +426,9 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] -> echoes the URL (or ""
       warn "Please enter an https:// URL, for example $example." >&2; continue
     fi
     case "$reply" in [Hh][Tt][Tt][Pp][Ss]://*) reply="https://${reply#*://}" ;; esac
+    if url_has_userinfo "$reply"; then
+      warn "$URL_USERINFO_HINT" >&2; continue
+    fi
     case "$reply" in
       https://?*) printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2; printf '%s' "$reply"; return 0 ;;
       http://*)   warn "That's http:// — Conduck requires https:// (encrypted). Try again." >&2 ;;
@@ -675,15 +717,22 @@ detect_gateway() {
 # Resolve OpenClaw's loopback port. Precedence: a live --port override (unknowable from
 # outside the process, so unread) > OPENCLAW_GATEWAY_PORT in the compose .env > gateway.port
 # in openclaw.json > 18789. Shared by setup AND --show-code so the two never disagree.
-# A config gateway.port is validated as a real 1-65535 port (like the interactive prompt);
+# BOTH sources are validated as a real 1-65535 port (like the interactive prompt);
 # garbage is noted (stderr — this runs under $()) and skipped so it can't interpolate into
-# a probe URL or the exposure commands.
+# a probe URL or the exposure commands. env_get returns the rest of the line, so the
+# ordinary dotenv trailing-comment form `OPENCLAW_GATEWAY_PORT=18789 # gateway` yields
+# "18789 # gateway" — which word-splits inside the unquoted `tailscale …` command and
+# defeats every `[ "$GW_LOCAL_PORT" = "…" ]` comparison downstream.
 openclaw_local_port() {
   local cfg="$HOME/.openclaw/openclaw.json"
   local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
   local praw port
   praw=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_PORT")
   port="${praw##*:}"
+  if [ -n "$port" ] && ! show_qr_is_port "$port"; then
+    note "Ignoring OPENCLAW_GATEWAY_PORT='$port' in $compose_dir/.env — not a whole number in 1-65535; falling back." >&2
+    port=""
+  fi
   if [ -z "$port" ]; then
     port=$(json_get "$cfg" "gateway.port")
     if [ -n "$port" ] && ! show_qr_is_port "$port"; then
@@ -692,6 +741,23 @@ openclaw_local_port() {
     fi
   fi
   printf '%s' "${port:-18789}"
+}
+
+# Hermes's loopback port, from API_SERVER_PORT in ~/.hermes/.env, validated the
+# same way openclaw_local_port validates its own sources and for the same reason:
+# `API_SERVER_PORT=8642 # full-agent server` is ordinary dotenv, and env_get hands
+# back the whole remainder of the line. Unvalidated, that string word-splits
+# inside the unquoted `tailscale serve/funnel …` command and silently defeats the
+# `= "8645"` guard that warns about the tool-less proxy port.
+# Shared by setup AND --show-code so the two can never disagree.
+hermes_api_server_port() {
+  local port
+  port=$(env_get "$HOME/.hermes/.env" "API_SERVER_PORT")
+  if [ -n "$port" ] && ! show_qr_is_port "$port"; then
+    note "Ignoring API_SERVER_PORT='$port' in ~/.hermes/.env — not a whole number in 1-65535; using the default." >&2
+    port=""
+  fi
+  printf '%s' "${port:-8642}"
 }
 
 # Prompt for the OpenClaw bearer credential (hidden), or die with <die-msg> on empty input.
@@ -836,7 +902,7 @@ configure_hermes() {
   [ -d "$HOME/.hermes" ] || die "Cannot find ~/.hermes — is Hermes installed for this user? (This script doesn't install gateways.)"
 
   local enabled; enabled=$(env_get "$envf" "API_SERVER_ENABLED")
-  GW_LOCAL_PORT=$(env_get "$envf" "API_SERVER_PORT"); GW_LOCAL_PORT="${GW_LOCAL_PORT:-8642}"
+  GW_LOCAL_PORT=$(hermes_api_server_port)
   GW_HEALTH_PATH="/v1/health"
 
   # 8645 is Hermes's OTHER OpenAI door: the tool-less `hermes proxy`. It chats
@@ -884,6 +950,20 @@ configure_hermes() {
         if [ -n "$keyline" ]; then echo "$keyline"; fi; } >> "$envf" \
         || die "Could not write to $envf. Fix its permissions (or add the API_SERVER_* lines yourself), then re-run me."
       ok "Written."
+      # The `umask 077` above only covers a file we CREATE. A ~/.hermes/.env that
+      # Hermes already wrote under umask 022 is 0644, and the API server key we
+      # just appended (or re-read) is a live gateway credential sitting in it.
+      # Tighten it, and say so either way — silently leaving a readable key, or
+      # silently changing a file the user owns, are both wrong.
+      if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
+           "$envf" 2>/dev/null; then
+        if chmod 600 "$envf" 2>/dev/null; then
+          note "Tightened $envf to 0600 — it holds the API server key and was readable by other accounts."
+        else
+          warn "$envf holds the API server key and is readable by other accounts on this machine, and I could not chmod it."
+          warn "Run 'chmod 600 $envf' yourself."
+        fi
+      fi
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "restart Hermes so the API server starts" \
           systemctl --user restart hermes-gateway.service || true
@@ -910,6 +990,10 @@ configure_hermes() {
 # is returned, echo it (used to pre-fill the model default — saves a prompt).
 # Sends the just-collected bearer when there is one — a compliant server 401s an
 # unauthenticated probe, which used to silently kill the pre-fill.
+# `--noproxy '*'` is mandatory here, not cosmetic: the target is unconditionally
+# 127.0.0.1, and curl has NO loopback exemption. `-q` suppresses ~/.curlrc but
+# not $http_proxy/$ALL_PROXY, so without it the bearer the user just pasted would
+# leave the machine in cleartext to whatever host those variables name.
 probe_single_model() { # probe_single_model <local_port>
   [ -n "$1" ] || return 0
   local body=""
@@ -917,15 +1001,21 @@ probe_single_model() { # probe_single_model <local_port>
     # Same stdin-config idiom as curl_gw: the token never rides argv (`ps`).
     local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
     body=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
-      | curl -q -sS --max-time 5 --config - "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+      | curl -q -sS --max-time 5 --noproxy '*' --config - "http://127.0.0.1:$1/v1/models" 2>/dev/null)
   else
-    body=$(curl -q -sS --max-time 5 "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+    body=$(curl -q -sS --max-time 5 --noproxy '*' "http://127.0.0.1:$1/v1/models" 2>/dev/null)
   fi
+  # Same C0/DEL strip as models_is_json's classifier, for the same reason: this id
+  # is echoed straight into the "Press Enter to use: …" prompt, where an ANSI
+  # escape could show the operator something other than what they are accepting.
+  # Not truncated — it becomes GW_MODEL and rides the pairing payload, so a long
+  # legitimate id must survive whole.
   printf '%s' "$body" | python3 -c '
 import json,sys
 try:
     ids=[m.get("id") for m in (json.load(sys.stdin).get("data") or []) if m.get("id")]
-    if len(ids)==1: print(ids[0])
+    if len(ids)==1:
+        print("".join(c for c in ids[0] if ord(c) >= 0x20 and ord(c) != 0x7f))
 except Exception: pass' 2>/dev/null
 }
 
@@ -2344,7 +2434,13 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
     return 1
   fi
   FS_UNIT="$HOME/.config/systemd/user/conduck-files-$GW_ID.service"
-  mkdir -p "$(dirname "$FS_UNIT")" "$STATE_DIR"
+  # Two mkdirs, deliberately: the systemd unit directory is shared with the rest
+  # of the user's units and keeps the ambient mode, while $STATE_DIR gets 0700 —
+  # it holds fileserver-*.cred/.env and profile-*.json, so at the ambient 0755
+  # any other account on the box could list which gateways this user has paired.
+  # Matches write_profile, which has always created it under `umask 077`.
+  mkdir -p "$(dirname "$FS_UNIT")"
+  ( umask 077; mkdir -p "$STATE_DIR" )
   umask 077
   printf 'RCLONE_PASS=%s\n' "$FS_CRED" > "$envf"; chmod 600 "$envf"
   printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
@@ -2391,7 +2487,11 @@ write_fs_unit_mac() { # write_fs_unit_mac <workspace>
     return 1
   }
   FS_UNIT="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
-  mkdir -p "$(dirname "$FS_UNIT")" "$STATE_DIR"
+  # Split for the same reason as the Linux twin: LaunchAgents is shared with the
+  # user's other agents and keeps the ambient mode; $STATE_DIR holds credentials
+  # and profile-*.json, so it is created 0700.
+  mkdir -p "$(dirname "$FS_UNIT")"
+  ( umask 077; mkdir -p "$STATE_DIR" )
   umask 077
   printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
   # Build the plist structurally with plistlib (correct escaping for any path).
@@ -3247,11 +3347,21 @@ setup_file_lane() {
         hermes_residual_state_note
         FS_CRED=""; return 0
       }
-      mkdir -p "$workspace" || {
+      # Every attachment the app uploads and every file the agent writes back
+      # lands in this folder. Created under `umask 077` so a shared host does not
+      # get the ambient 0755 — an agent workspace that ALREADY exists keeps its
+      # own mode (mkdir -p is a no-op on it), which is why the advisory below
+      # reports rather than silently re-chmods somebody else's directory.
+      ( umask 077; mkdir -p "$workspace" ) || {
         warn "Could not create $workspace — skipping file lane."
         hermes_residual_state_note
         FS_CRED=""; return 0
       }
+      if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
+           "$workspace" 2>/dev/null; then
+        note "$workspace is readable by other accounts on this machine (it already existed with that mode)."
+        note "On a shared host, 'chmod 700 $workspace' keeps your attachments and the agent's output files private."
+      fi
       FS_CRED=$(openssl rand -hex 16)
       ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
       if [ "$OS" = "Linux" ]; then
@@ -4723,7 +4833,12 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   statusline="${out##*$'\n'}"; body="${out%$'\n'*}"
   MODELS_HTTP_CODE="${statusline%% *}"; statusline="${statusline#* }"
   MODELS_TIME="${statusline%% *}"
-  MODELS_CONTENT_TYPE=""; [ "$statusline" != "${statusline#* }" ] && MODELS_CONTENT_TYPE="${statusline#* }"
+  # safe_display here, at the parser's exit: the header is whatever the server
+  # chose, it is echoed verbatim in the MODELS_ENVELOPE verdict, and curl does
+  # not strip control bytes from a header value. A real Content-Type is far
+  # inside the 200-char bound, so the grading in ct_is_json is unaffected.
+  MODELS_CONTENT_TYPE=""
+  [ "$statusline" != "${statusline#* }" ] && MODELS_CONTENT_TYPE=$(safe_display "${statusline#* }" 200)
   # HTML first: the endpoint-off page often comes back 200, and it deserves its
   # own diagnosis either way.
   case "$body" in *\<html*|*\<HTML*|*\<!DOCTYPE*) return 2 ;; esac
@@ -4752,6 +4867,12 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   # than the app it green-lights for.
   # On the envelope-OK paths the classifier also prints "<id-count>\t<first-id>"
   # for the doctor's model-selection probe; the wizard captures and ignores it.
+  # The id is stripped of C0 controls and DEL before it leaves the classifier —
+  # TAB/CR/LF because they would break this tab-delimited line, the rest because
+  # the id is printed in verdict lines a hostile gateway must not be able to
+  # repaint (ANSI) or forge extra transcript lines into. It is NOT truncated
+  # here: the same value becomes the chat payload's model and the paired
+  # profile's model, where a long-but-legitimate id must survive intact.
   local pyout prc
   pyout=$(printf '%s' "$body" | python3 -c '
 import json, sys
@@ -4764,7 +4885,7 @@ if not (isinstance(d, dict) and isinstance(d.get("data"), list)):
     sys.exit(3)
 data = d["data"]
 ids = [x["id"] for x in data if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
-first = (ids[0] if ids else "").replace("\t", " ").replace("\n", " ").replace("\r", " ")
+first = "".join(" " if (ord(c) < 0x20 or ord(c) == 0x7f) else c for c in (ids[0] if ids else ""))
 print("%d\t%s" % (len(ids), first))
 if not data:
     sys.exit(4)
@@ -4798,9 +4919,14 @@ curl_fs_with_timeout() { # curl_fs_with_timeout <max-seconds> <curl args…>
 }
 curl_fs() { curl_fs_with_timeout 30 "$@"; }
 
+# Loopback-only health probe — every caller passes http://127.0.0.1:… .
+# `--noproxy '*'` for the same reason curl_gw's diagnostics carry it: curl has no
+# loopback exemption, so with $http_proxy/$ALL_PROXY set this request goes to
+# that host instead, and a proxy answering 200 forges precisely the "your gateway
+# is up" verdict this function exists to establish.
 local_health_ok() { # local_health_ok <url> -> 0 when the server answered with < 500
   local code
-  code=$(curl -q -sS --max-time 10 -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
+  code=$(curl -q -sS --max-time 10 --noproxy '*' -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || return 1
   case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
 }
 
@@ -5127,6 +5253,12 @@ doctor_accept_url() { # doctor_accept_url <candidate>
   # Pure Bash on purpose: validate_cli calls this before runtime preflight, so
   # a missing python3/curl (or any other executable) can never turn a runtime
   # dependency failure into exit-2 command misuse.
+  # Userinfo is refused on BOTH schemes. The loopback arm below has to (see its
+  # comment: http://127.0.0.1@evil.com is a REMOTE host); https needs it for the
+  # reason --show-code's profile validator already rejects it — this URL is
+  # echoed to the terminal, saved to the profile, and paired into the app, and a
+  # credential must never ride a routing field.
+  url_has_userinfo "$reply" && return 1
   case "$reply" in
     [Hh][Tt][Tt][Pp][Ss]://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
     [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-loopback
@@ -5159,6 +5291,9 @@ doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stder
     if url=$(doctor_accept_url "$reply"); then
       printf '  %s→ testing %s%s\n' "$DIM" "$url" "$RESET" >&2
       printf '%s' "$url"; return 0
+    fi
+    if url_has_userinfo "$reply"; then
+      warn "$URL_USERINFO_HINT" >&2; continue
     fi
     case "$reply" in
       [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." >&2 ;;
@@ -5723,7 +5858,12 @@ doctor_files_resolve() {
       return 1
     fi
     if ! DF_URL=$(doctor_accept_url "$CONDUCK_FILES_URL"); then
-      d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
+      if url_has_userinfo "$CONDUCK_FILES_URL"; then
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" credential in the address — give the plain URL"
+        d_say FILES_CONFIG "(the file-lane password goes in CONDUCK_FILES_PASS, the user in CONDUCK_FILES_USER)"
+      else
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
+      fi
       return 1
     fi
     DF_DIR="$CONDUCK_FILES_DIR"; DF_CRED="$CONDUCK_FILES_PASS"; DF_USER="${CONDUCK_FILES_USER:-conduck}"
@@ -5826,7 +5966,7 @@ PY
 
 # Tier 1 — transport. Sets DOCTOR_FILE_TRANSPORT.
 doctor_files_transport() {
-  local tfail=0 terr=0 disk_ok=true code out body tmp
+  local tfail=0 terr=0 disk_ok=true code out body tmpd tmp uprobe hdrs
   local wkey="conduck-check-$DF_RUN-wt.txt"
   local fkey="conduck-check-$DF_RUN-fresh.txt"
   local ukey1="conduck-check-$DF_RUN-unauth-none.txt"
@@ -5834,11 +5974,18 @@ doctor_files_transport() {
   local nkey="conduck-check-$DF_RUN-dir"
   local wt_nonce
   wt_nonce=$(python3 -c 'import secrets; print("conduck-check write-through " + secrets.token_hex(16))' 2>/dev/null)
-  tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmp=""
-  if [ -z "$wt_nonce" ] || [ -z "$tmp" ]; then
+  # ONE 0700 directory, three files inside it — not one mktemp file plus sibling
+  # names built by string concatenation. mktemp publishes its random suffix the
+  # moment it creates the file, and /tmp's sticky bit stops DELETION, not the
+  # CREATION of "<that name>.u"; a local user who wins that race turns the plain
+  # redirect below into a write through their symlink, at this script's
+  # privileges — and `-D` lets the file server choose the bytes written.
+  tmpd=$(mktemp -d "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmpd=""
+  if [ -z "$wt_nonce" ] || [ -z "$tmpd" ]; then
     d_bad FILES_CONFIG "could not stage transport probes (python3/mktemp failed)"
     DOCTOR_FILE_TRANSPORT="ERROR"; return 0
   fi
+  tmp="$tmpd/probe"; uprobe="$tmpd/unauth"; hdrs="$tmpd/headers"
 
   # write-through: PUT over WebDAV must land byte-identical in the folder.
   df_register T file "$wkey"
@@ -5885,21 +6032,21 @@ doctor_files_transport() {
     note "  [FILES_AUTH_READ_MISSING] [FILES_AUTH_READ_WRONG] skipped — need the write-through file to probe against."
   fi
   df_register T file "$ukey1"
-  printf 'conduck-check unauth probe\n' > "$tmp.u"
-  code=$(doctor_fs_code none -T "$tmp.u" "$DF_URL/$ukey1")
+  printf 'conduck-check unauth probe\n' > "$uprobe"
+  code=$(doctor_fs_code none -T "$uprobe" "$DF_URL/$ukey1")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without credentials is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO credentials was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   df_register T file "$ukey2"
-  code=$(doctor_fs_code wrong -T "$tmp.u" "$DF_URL/$ukey2")
+  code=$(doctor_fs_code wrong -T "$uprobe" "$DF_URL/$ukey2")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_AUTH_WRITE_WRONG "PUT with a wrong credential answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
-  rm -f "$tmp.u" 2>/dev/null
+  rm -f "$uprobe" 2>/dev/null
 
   # freshness: a file written DIRECTLY to disk (exactly how agents deliver
   # output) must become visible over WebDAV fast. Prime the directory cache
@@ -5966,10 +6113,10 @@ PY
 
   # ranged-probe compatibility: the app's existence probe is Range: bytes=0-0.
   if $wt_ok; then
-    code=$(doctor_fs_code real -D "$tmp.h" -r 0-0 "$DF_URL/$wkey")
+    code=$(doctor_fs_code real -D "$hdrs" -r 0-0 "$DF_URL/$wkey")
     case "$code" in
       206)
-        if grep -qi '^content-range:' "$tmp.h" 2>/dev/null; then
+        if grep -qi '^content-range:' "$hdrs" 2>/dev/null; then
           d_ok FILES_PROBE_COMPAT "ranged probe honored (206 + Content-Range) — exactly what the app sends"
         else
           d_bad FILES_PROBE_COMPAT "206 without a Content-Range header"; tfail=$((tfail+1))
@@ -5980,7 +6127,7 @@ PY
       416) d_bad FILES_PROBE_COMPAT "Range: bytes=0-0 on a non-empty file answered 416 — the app's probe would see this as missing"; tfail=$((tfail+1)) ;;
       *)   d_bad FILES_PROBE_COMPAT "ranged probe answered HTTP $code"; tfail=$((tfail+1)) ;;
     esac
-    rm -f "$tmp.h" 2>/dev/null
+    rm -f "$hdrs" 2>/dev/null
   else
     note "  [FILES_PROBE_COMPAT] skipped — need the write-through file to probe against."
   fi
@@ -6005,7 +6152,7 @@ PY
     000) d_bad FILES_NESTED "no answer to MKCOL — transport trouble, not a capability verdict"; tfail=$((tfail+1)) ;;
     *)   d_bad FILES_NESTED "MKCOL answered HTTP $code — neither support nor a clean rejection"; tfail=$((tfail+1)) ;;
   esac
-  rm -f "$tmp" 2>/dev/null
+  rm -rf "$tmpd" 2>/dev/null
 
   if   [ "$terr" -gt 0 ];  then DOCTOR_FILE_TRANSPORT="ERROR"
   elif [ "$tfail" -gt 0 ]; then DOCTOR_FILE_TRANSPORT="FAIL"
@@ -6124,7 +6271,7 @@ PY
   fi
 
   say ""
-  say "  The file sentinel — one real turn against model '$MODELS_FIRST_ID': the agent must copy a"
+  say "  The file sentinel — one real turn against model '$(safe_display "$MODELS_FIRST_ID" 60)': the agent must copy a"
   say "  small input file to the folder root and name the output in its reply. Agents can be slow;"
   say "  I wait up to 5 minutes…"
   DF_AGENT_RAN=true
@@ -6147,7 +6294,7 @@ PY
   fi
 
   if $turn_ok && $copy_ok; then
-    d_ok FILE_COPY_BYTES "model '$MODELS_FIRST_ID' copied the sentinel byte-for-byte to the folder root (${DCC_TIME:-?}s)"
+    d_ok FILE_COPY_BYTES "model '$(safe_display "$MODELS_FIRST_ID" 60)' copied the sentinel byte-for-byte to the folder root (${DCC_TIME:-?}s)"
   elif $turn_ok; then
     case "$out" in
       MISSING)
@@ -6224,7 +6371,7 @@ print("YES" if os.environ["DF_OKEY"] in outputs else "NO")' 2>/dev/null)
 
   if $turn_ok && $copy_ok && $ref_ok; then DOCTOR_FILE_ACCESS="PASS"; else DOCTOR_FILE_ACCESS="FAIL"; fi
   [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null \
-    && note "  (file_access grades model '$MODELS_FIRST_ID' only — other advertised models may differ.)"
+    && note "  (file_access grades model '$(safe_display "$MODELS_FIRST_ID" 60)' only — other advertised models may differ.)"
   rm -f "$tmp" 2>/dev/null
   return 0
 }
@@ -6650,6 +6797,12 @@ app_chat_loaded_eval() { # app_chat_loaded_eval [expected-digit-code] — grades
       return 1
       ;;
     *)
+      # error.code is a JSON string the server fully controls, and it is quoted
+      # straight into CCE_REASON, which every failure verdict prints. A literal
+      # newline in it forges a second "[CHECK_ID] …" line — a hostile gateway
+      # writing its own green PASS into the transcript — and an ANSI escape
+      # rewrites what the operator sees. C0/DEL out here at the parser; the
+      # 64-char cap it already had stays.
       CCE_WIRE_CODE=$(printf '%s' "$DCC_BODY" | python3 -c '
 import json, sys
 try:
@@ -6659,7 +6812,7 @@ except Exception:
 e = d.get("error") if isinstance(d, dict) else None
 c = e.get("code") if isinstance(e, dict) else None
 if isinstance(c, str) and c:
-    print(c[:64])' 2>/dev/null)
+    print("".join(ch for ch in c if ord(ch) >= 0x20 and ord(ch) != 0x7f)[:64])' 2>/dev/null)
       CCE_REASON="HTTP ${DCC_CODE:-?}${CCE_WIRE_CODE:+ (wire code \"$CCE_WIRE_CODE\")}"
       return 1
       ;;
@@ -8497,7 +8650,7 @@ show_qr_load_profile() {
         GW_LOCAL_PORT=$(openclaw_local_port)
         ;;
       hermes)
-        GW_LOCAL_PORT=$(env_get "$HOME/.hermes/.env" "API_SERVER_PORT"); GW_LOCAL_PORT="${GW_LOCAL_PORT:-8642}"
+        GW_LOCAL_PORT=$(hermes_api_server_port)
         ;;
     esac
   fi

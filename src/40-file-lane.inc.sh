@@ -553,7 +553,13 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
     return 1
   fi
   FS_UNIT="$HOME/.config/systemd/user/conduck-files-$GW_ID.service"
-  mkdir -p "$(dirname "$FS_UNIT")" "$STATE_DIR"
+  # Two mkdirs, deliberately: the systemd unit directory is shared with the rest
+  # of the user's units and keeps the ambient mode, while $STATE_DIR gets 0700 —
+  # it holds fileserver-*.cred/.env and profile-*.json, so at the ambient 0755
+  # any other account on the box could list which gateways this user has paired.
+  # Matches write_profile, which has always created it under `umask 077`.
+  mkdir -p "$(dirname "$FS_UNIT")"
+  ( umask 077; mkdir -p "$STATE_DIR" )
   umask 077
   printf 'RCLONE_PASS=%s\n' "$FS_CRED" > "$envf"; chmod 600 "$envf"
   printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
@@ -600,7 +606,11 @@ write_fs_unit_mac() { # write_fs_unit_mac <workspace>
     return 1
   }
   FS_UNIT="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
-  mkdir -p "$(dirname "$FS_UNIT")" "$STATE_DIR"
+  # Split for the same reason as the Linux twin: LaunchAgents is shared with the
+  # user's other agents and keeps the ambient mode; $STATE_DIR holds credentials
+  # and profile-*.json, so it is created 0700.
+  mkdir -p "$(dirname "$FS_UNIT")"
+  ( umask 077; mkdir -p "$STATE_DIR" )
   umask 077
   printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
   # Build the plist structurally with plistlib (correct escaping for any path).
@@ -1456,11 +1466,21 @@ setup_file_lane() {
         hermes_residual_state_note
         FS_CRED=""; return 0
       }
-      mkdir -p "$workspace" || {
+      # Every attachment the app uploads and every file the agent writes back
+      # lands in this folder. Created under `umask 077` so a shared host does not
+      # get the ambient 0755 — an agent workspace that ALREADY exists keeps its
+      # own mode (mkdir -p is a no-op on it), which is why the advisory below
+      # reports rather than silently re-chmods somebody else's directory.
+      ( umask 077; mkdir -p "$workspace" ) || {
         warn "Could not create $workspace — skipping file lane."
         hermes_residual_state_note
         FS_CRED=""; return 0
       }
+      if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
+           "$workspace" 2>/dev/null; then
+        note "$workspace is readable by other accounts on this machine (it already existed with that mode)."
+        note "On a shared host, 'chmod 700 $workspace' keeps your attachments and the agent's output files private."
+      fi
       FS_CRED=$(openssl rand -hex 16)
       ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
       if [ "$OS" = "Linux" ]; then

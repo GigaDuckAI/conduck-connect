@@ -52,15 +52,22 @@ detect_gateway() {
 # Resolve OpenClaw's loopback port. Precedence: a live --port override (unknowable from
 # outside the process, so unread) > OPENCLAW_GATEWAY_PORT in the compose .env > gateway.port
 # in openclaw.json > 18789. Shared by setup AND --show-code so the two never disagree.
-# A config gateway.port is validated as a real 1-65535 port (like the interactive prompt);
+# BOTH sources are validated as a real 1-65535 port (like the interactive prompt);
 # garbage is noted (stderr — this runs under $()) and skipped so it can't interpolate into
-# a probe URL or the exposure commands.
+# a probe URL or the exposure commands. env_get returns the rest of the line, so the
+# ordinary dotenv trailing-comment form `OPENCLAW_GATEWAY_PORT=18789 # gateway` yields
+# "18789 # gateway" — which word-splits inside the unquoted `tailscale …` command and
+# defeats every `[ "$GW_LOCAL_PORT" = "…" ]` comparison downstream.
 openclaw_local_port() {
   local cfg="$HOME/.openclaw/openclaw.json"
   local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
   local praw port
   praw=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_PORT")
   port="${praw##*:}"
+  if [ -n "$port" ] && ! show_qr_is_port "$port"; then
+    note "Ignoring OPENCLAW_GATEWAY_PORT='$port' in $compose_dir/.env — not a whole number in 1-65535; falling back." >&2
+    port=""
+  fi
   if [ -z "$port" ]; then
     port=$(json_get "$cfg" "gateway.port")
     if [ -n "$port" ] && ! show_qr_is_port "$port"; then
@@ -69,6 +76,23 @@ openclaw_local_port() {
     fi
   fi
   printf '%s' "${port:-18789}"
+}
+
+# Hermes's loopback port, from API_SERVER_PORT in ~/.hermes/.env, validated the
+# same way openclaw_local_port validates its own sources and for the same reason:
+# `API_SERVER_PORT=8642 # full-agent server` is ordinary dotenv, and env_get hands
+# back the whole remainder of the line. Unvalidated, that string word-splits
+# inside the unquoted `tailscale serve/funnel …` command and silently defeats the
+# `= "8645"` guard that warns about the tool-less proxy port.
+# Shared by setup AND --show-code so the two can never disagree.
+hermes_api_server_port() {
+  local port
+  port=$(env_get "$HOME/.hermes/.env" "API_SERVER_PORT")
+  if [ -n "$port" ] && ! show_qr_is_port "$port"; then
+    note "Ignoring API_SERVER_PORT='$port' in ~/.hermes/.env — not a whole number in 1-65535; using the default." >&2
+    port=""
+  fi
+  printf '%s' "${port:-8642}"
 }
 
 # Prompt for the OpenClaw bearer credential (hidden), or die with <die-msg> on empty input.
@@ -213,7 +237,7 @@ configure_hermes() {
   [ -d "$HOME/.hermes" ] || die "Cannot find ~/.hermes — is Hermes installed for this user? (This script doesn't install gateways.)"
 
   local enabled; enabled=$(env_get "$envf" "API_SERVER_ENABLED")
-  GW_LOCAL_PORT=$(env_get "$envf" "API_SERVER_PORT"); GW_LOCAL_PORT="${GW_LOCAL_PORT:-8642}"
+  GW_LOCAL_PORT=$(hermes_api_server_port)
   GW_HEALTH_PATH="/v1/health"
 
   # 8645 is Hermes's OTHER OpenAI door: the tool-less `hermes proxy`. It chats
@@ -261,6 +285,20 @@ configure_hermes() {
         if [ -n "$keyline" ]; then echo "$keyline"; fi; } >> "$envf" \
         || die "Could not write to $envf. Fix its permissions (or add the API_SERVER_* lines yourself), then re-run me."
       ok "Written."
+      # The `umask 077` above only covers a file we CREATE. A ~/.hermes/.env that
+      # Hermes already wrote under umask 022 is 0644, and the API server key we
+      # just appended (or re-read) is a live gateway credential sitting in it.
+      # Tighten it, and say so either way — silently leaving a readable key, or
+      # silently changing a file the user owns, are both wrong.
+      if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
+           "$envf" 2>/dev/null; then
+        if chmod 600 "$envf" 2>/dev/null; then
+          note "Tightened $envf to 0600 — it holds the API server key and was readable by other accounts."
+        else
+          warn "$envf holds the API server key and is readable by other accounts on this machine, and I could not chmod it."
+          warn "Run 'chmod 600 $envf' yourself."
+        fi
+      fi
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "restart Hermes so the API server starts" \
           systemctl --user restart hermes-gateway.service || true
@@ -287,6 +325,10 @@ configure_hermes() {
 # is returned, echo it (used to pre-fill the model default — saves a prompt).
 # Sends the just-collected bearer when there is one — a compliant server 401s an
 # unauthenticated probe, which used to silently kill the pre-fill.
+# `--noproxy '*'` is mandatory here, not cosmetic: the target is unconditionally
+# 127.0.0.1, and curl has NO loopback exemption. `-q` suppresses ~/.curlrc but
+# not $http_proxy/$ALL_PROXY, so without it the bearer the user just pasted would
+# leave the machine in cleartext to whatever host those variables name.
 probe_single_model() { # probe_single_model <local_port>
   [ -n "$1" ] || return 0
   local body=""
@@ -294,15 +336,21 @@ probe_single_model() { # probe_single_model <local_port>
     # Same stdin-config idiom as curl_gw: the token never rides argv (`ps`).
     local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"
     body=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
-      | curl -q -sS --max-time 5 --config - "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+      | curl -q -sS --max-time 5 --noproxy '*' --config - "http://127.0.0.1:$1/v1/models" 2>/dev/null)
   else
-    body=$(curl -q -sS --max-time 5 "http://127.0.0.1:$1/v1/models" 2>/dev/null)
+    body=$(curl -q -sS --max-time 5 --noproxy '*' "http://127.0.0.1:$1/v1/models" 2>/dev/null)
   fi
+  # Same C0/DEL strip as models_is_json's classifier, for the same reason: this id
+  # is echoed straight into the "Press Enter to use: …" prompt, where an ANSI
+  # escape could show the operator something other than what they are accepting.
+  # Not truncated — it becomes GW_MODEL and rides the pairing payload, so a long
+  # legitimate id must survive whole.
   printf '%s' "$body" | python3 -c '
 import json,sys
 try:
     ids=[m.get("id") for m in (json.load(sys.stdin).get("data") or []) if m.get("id")]
-    if len(ids)==1: print(ids[0])
+    if len(ids)==1:
+        print("".join(c for c in ids[0] if ord(c) >= 0x20 and ord(c) != 0x7f))
 except Exception: pass' 2>/dev/null
 }
 

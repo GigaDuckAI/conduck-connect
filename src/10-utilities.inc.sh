@@ -19,6 +19,39 @@ warn() { printf '%s! %s%s\n' "$YELLOW" "$*" "$RESET"; }
 die()  { printf '%sError:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 usage_die() { printf '%sUsage error:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 2; }
 
+# The ONE sanitiser for gateway-supplied text on its way to the terminal — model
+# ids, Content-Type values, wire error codes. A gateway is not trusted to be
+# friendly: an embedded newline forges an extra "[CHECK_ID] …" line in the check
+# transcript (a hostile server printing its own green PASS), and an ANSI escape
+# repaints or erases what the operator already read. Strips every C0 control and
+# DEL, then bounds the length so one reply cannot flood the run. Applied where a
+# value LEAVES its parser, so every later print site inherits it.
+# `tr`, not python3: this runs on failure paths, and a display helper must not be
+# able to fail. C1 (0x80-0x9F) is deliberately left alone — in a UTF-8 terminal
+# those bytes only occur inside multi-byte characters, and deleting them would
+# mangle a legitimate non-ASCII model id.
+safe_display() { # safe_display <value> [max-chars, default 120] -> printable, bounded
+  local max="${2:-120}" s
+  s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' 2>/dev/null)
+  [ "${#s}" -le "$max" ] || s="${s:0:$max}…"
+  printf '%s' "$s"
+}
+
+# https://user:pass@host is a legal URL that NO endpoint here may carry. It is a
+# credential the app would have to store inside a routing field, and this script
+# echoes the URL back on screen, writes it to the pairing profile that
+# WHAT-IT-TOUCHES.md calls credential-free, and puts it in the QR. The Conduck app
+# refuses userinfo on every persisted endpoint URL, on write and on read alike;
+# the connector has to agree, or the wizard happily emits a code the app rejects.
+# Pure Bash — doctor_accept_url calls this before the runtime preflight, so it may
+# not depend on python3/curl existing. The authority ends at the first / ? or #.
+url_has_userinfo() { # url_has_userinfo <url> -> 0 when the authority carries user[:pass]@
+  case "$1" in *://*) ;; *) return 1 ;; esac   # no scheme, no authority — let the scheme check answer
+  local a="${1#*://}"; a="${a%%[/?#]*}"
+  case "$a" in *@*) return 0 ;; *) return 1 ;; esac
+}
+URL_USERINFO_HINT="Credentials don't belong in the address. Drop the \"user:pass@\" part and give the plain URL — the token goes in the token prompt, not the URL."
+
 DRY_RUN=false
 REUSE_ONLY=false
 SHOW_QR=false
@@ -163,6 +196,9 @@ validate_cli() {
     check-server)
       COMPAT=true
       if [ -n "$CHECK_URL" ] && ! doctor_accept_url "$CHECK_URL" >/dev/null; then
+        # The userinfo case gets its own message, and deliberately does NOT echo
+        # the URL back: the rejected value contains the password.
+        url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
         usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
       fi
       $DRY_RUN && usage_die "--check-server sends live requests, so it doesn't combine with --dry-run."
@@ -175,6 +211,9 @@ validate_cli() {
     check-adapter)
       DOCTOR=true
       if [ -n "$CHECK_URL" ] && ! doctor_accept_url "$CHECK_URL" >/dev/null; then
+        # The userinfo case gets its own message, and deliberately does NOT echo
+        # the URL back: the rejected value contains the password.
+        url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
         usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
       fi
       $DRY_RUN && usage_die "--check-adapter sends live requests, so it doesn't combine with --dry-run."
@@ -275,6 +314,9 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] -> echoes the URL (or ""
       warn "Please enter an https:// URL, for example $example." >&2; continue
     fi
     case "$reply" in [Hh][Tt][Tt][Pp][Ss]://*) reply="https://${reply#*://}" ;; esac
+    if url_has_userinfo "$reply"; then
+      warn "$URL_USERINFO_HINT" >&2; continue
+    fi
     case "$reply" in
       https://?*) printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2; printf '%s' "$reply"; return 0 ;;
       http://*)   warn "That's http:// — Conduck requires https:// (encrypted). Try again." >&2 ;;

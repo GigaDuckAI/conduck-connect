@@ -320,7 +320,7 @@ show_qr_load_profile() {
         GW_LOCAL_PORT=$(openclaw_local_port)
         ;;
       hermes)
-        GW_LOCAL_PORT=$(env_get "$HOME/.hermes/.env" "API_SERVER_PORT"); GW_LOCAL_PORT="${GW_LOCAL_PORT:-8642}"
+        GW_LOCAL_PORT=$(hermes_api_server_port)
         ;;
     esac
   fi

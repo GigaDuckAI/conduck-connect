@@ -84,6 +84,12 @@ app_chat_loaded_eval() { # app_chat_loaded_eval [expected-digit-code] — grades
       return 1
       ;;
     *)
+      # error.code is a JSON string the server fully controls, and it is quoted
+      # straight into CCE_REASON, which every failure verdict prints. A literal
+      # newline in it forges a second "[CHECK_ID] …" line — a hostile gateway
+      # writing its own green PASS into the transcript — and an ANSI escape
+      # rewrites what the operator sees. C0/DEL out here at the parser; the
+      # 64-char cap it already had stays.
       CCE_WIRE_CODE=$(printf '%s' "$DCC_BODY" | python3 -c '
 import json, sys
 try:
@@ -93,7 +99,7 @@ except Exception:
 e = d.get("error") if isinstance(d, dict) else None
 c = e.get("code") if isinstance(e, dict) else None
 if isinstance(c, str) and c:
-    print(c[:64])' 2>/dev/null)
+    print("".join(ch for ch in c if ord(ch) >= 0x20 and ord(ch) != 0x7f)[:64])' 2>/dev/null)
       CCE_REASON="HTTP ${DCC_CODE:-?}${CCE_WIRE_CODE:+ (wire code \"$CCE_WIRE_CODE\")}"
       return 1
       ;;

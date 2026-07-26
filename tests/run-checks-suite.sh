@@ -166,6 +166,15 @@ check_artifacts() { # check_artifacts <served-dir>
   find "$1" -mindepth 1 \( -name 'conduck-check-*' -o -name 'output-*' \) 2>/dev/null
 }
 
+# Lift named top-level functions out of the release artifact so a case can unit-
+# test the SHIPPED code with stubs around it. One sed run per name on purpose:
+# `sed -n '/^a()/,/^}/p;/^b()/,/^}/p'` looks equivalent but overlapping ranges
+# print their shared lines TWICE, and the duplicated fragment no longer parses.
+extract_funcs() { # extract_funcs <fn-name>… -> function source on stdout
+  local n
+  for n in "$@"; do sed -n "/^$n()/,/^}/p" "$SCRIPT"; done
+}
+
 PASS=0
 FAIL=0
 fail_case() { # fail_case <name> <why>
@@ -1019,6 +1028,143 @@ run_profile_legacy_file_reach_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# Drive the PRODUCTION write_profile in isolation, with both live secrets in
+# scope exactly as the real emit path has them.
+# Args: <function-source> <state-dir> <gateway-token> <file-lane-credential>.
+run_write_profile_isolated() {
+  FUNCS="$1" STATE="$2" GW_SECRET="$3" FS_SECRET="$4" bash -c '
+eval "$FUNCS"
+warn() { :; }
+note() { :; }
+SHOW_QR=false
+DRY_RUN=false
+STATE_DIR="$STATE"
+GW_ID="custom-secret-probe"
+GW_KIND="custom"
+GW_NAME="Secret probe"
+GW_AUTH="bearer"
+GW_TOKEN="$GW_SECRET"
+GW_URL="https://gw.example.test"
+GW_LOCAL_PORT="8080"
+GW_MODEL=""
+GW_CERT_FP=""
+TRANSPORT="tailscale"
+SCOPE="private"
+FS_URL="https://files.example.test:8443"
+FS_CRED="$FS_SECRET"
+FS_LOCAL_PORT="5006"
+FS_CERT_FP=""
+FS_FOLDER="/home/probe/conduck-files"
+FS_REACH="private"
+write_profile
+'
+}
+
+# 0 when either sentinel secret appears anywhere under <state-dir>.
+profile_state_leaks() { # profile_state_leaks <state-dir> <secret> <secret>
+  grep -rqF -e "$2" -e "$3" "$1" 2>/dev/null
+}
+
+# The pairing profile is the one file the connector leaves on disk that must
+# hold no secret at all — WHAT-IT-TOUCHES.md promises "routing facts only …
+# never a token or credential", and --show-code re-reads it indefinitely.
+# write_profile builds it in a python block that already holds GW_TOKEN's and
+# FS_CRED's values one e("…") away, so a single added line would silently
+# persist the live file-lane password to a file users are told is non-secret.
+# Prove the promise behaviourally against the shipped function — then prove the
+# assertion itself bites, by re-running it on a deliberately leaking copy.
+run_profile_secret_exclusion_case() {
+  local name="profile-never-carries-secrets"
+  local writer broken secrets gw_secret fs_secret
+  local state="$TMP/profile-secret-state" broken_state="$TMP/profile-secret-control"
+  local prof="$state/profile-custom-secret-probe.json" mode
+
+  secrets=$(python3 -c 'import secrets; print(secrets.token_hex(10)); print(secrets.token_hex(10))') \
+    || { fail_case "$name" "could not mint sentinel secrets"; return; }
+  gw_secret="conduck-sentinel-gw-$(printf '%s\n' "$secrets" | sed -n 1p)"
+  fs_secret="conduck-sentinel-fs-$(printf '%s\n' "$secrets" | sed -n 2p)"
+
+  # fail_case tails doctor.out; this case has no live run, so give it the
+  # sentinels and the produced profile as the failure context.
+  printf 'pairing-profile secret-exclusion guard\n  gateway-token sentinel: %s\n  file-lane sentinel:     %s\n' \
+    "$gw_secret" "$fs_secret" > "$TMP/doctor.out"
+
+  writer=$(sed -n '/^write_profile()/,/^}/p' "$SCRIPT")
+  if [ -z "$writer" ] || ! printf '%s\n' "$writer" | grep -qF 'write_profile()'; then
+    fail_case "$name" "could not extract write_profile from the release artifact"; return
+  fi
+
+  mkdir -p "$state" "$broken_state"
+  if ! run_write_profile_isolated "$writer" "$state" "$gw_secret" "$fs_secret"; then
+    fail_case "$name" "write_profile failed to run in isolation"; return
+  fi
+  printf -- '--- profile written by the shipped write_profile ---\n' >> "$TMP/doctor.out"
+  cat "$prof" >> "$TMP/doctor.out" 2>/dev/null || true
+
+  # Non-vacuous: a profile that silently wrote nothing (or dropped the file
+  # lane) would pass a leak scan trivially. Require the real, complete record.
+  if [ ! -f "$prof" ]; then
+    fail_case "$name" "write_profile wrote no profile at $prof"; return
+  fi
+  if ! PROF="$prof" python3 -c '
+import json, os, sys
+p = json.load(open(os.environ["PROF"]))
+fs = p.get("fileServer")
+if p.get("schemaVersion") != 1 or not p.get("gateway"): sys.exit(1)
+if not fs or fs.get("url") != "https://files.example.test:8443": sys.exit(1)
+if fs.get("folder") != "/home/probe/conduck-files": sys.exit(1)
+'; then
+    fail_case "$name" "the profile is not the complete gateway+file-lane record this guard must scan"; return
+  fi
+
+  # The invariant itself: neither live secret reached the profile — nor any
+  # other file the run dropped in the state directory.
+  if profile_state_leaks "$state" "$gw_secret" "$fs_secret"; then
+    fail_case "$name" "the saved pairing profile leaked a live token or file-lane credential"; return
+  fi
+
+  # Structural companion: no key that would ever be a place to put one.
+  if ! PROF="$prof" python3 -c '
+import json, os, re, sys
+bad = re.compile(r"token|credential|password|secret|passphrase", re.I)
+def walk(node):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if bad.search(k): sys.exit(1)
+            walk(v)
+    elif isinstance(node, list):
+        for v in node: walk(v)
+walk(json.load(open(os.environ["PROF"])))
+'; then
+    fail_case "$name" "the pairing profile grew a token/credential-shaped key"; return
+  fi
+
+  # WHAT-IT-TOUCHES.md states this file is 0600. Nothing else asserts it.
+  mode=$(ls -l "$prof" | cut -c1-10)
+  if [ "$mode" != "-rw-------" ]; then
+    fail_case "$name" "the pairing profile is $mode, not 0600"; return
+  fi
+
+  # Control: the exact regression this guard exists for — one added line that
+  # writes FS_CRED into the file-lane object. If the scan above cannot catch
+  # it, the guard is decoration and the case must fail here, not in the field.
+  broken=$(printf '%s\n' "$writer" | awk '
+    { print }
+    /fs = \{"url": e\("FS_URL"\)\}/ { print "    fs[\"credential\"] = e(\"FS_CRED\")" }')
+  if [ "$broken" = "$writer" ]; then
+    fail_case "$name" "could not inject the control leak — write_profile's file-lane block changed shape; re-anchor this guard"; return
+  fi
+  if ! run_write_profile_isolated "$broken" "$broken_state" "$gw_secret" "$fs_secret"; then
+    fail_case "$name" "the control copy of write_profile failed to run"; return
+  fi
+  if ! profile_state_leaks "$broken_state" "$gw_secret" "$fs_secret"; then
+    fail_case "$name" "the leak scan did not catch a profile that deliberately writes the credential — this guard proves nothing"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_help_surface_case() {
   local name="help-lists-public-meta-flags" rc=0
   TERM=dumb bash "$SCRIPT" --help </dev/null > "$TMP/doctor.out" 2>&1 || rc=$?
@@ -1151,6 +1297,23 @@ run_curl_config_isolation_case() {
     fail_case "$name" "a direct curl call does not put -q first"; return
   fi
 
+  # Structural guard, second half: `-q` suppresses ~/.curlrc but NOT $http_proxy
+  # / $ALL_PROXY, and curl has no loopback exemption. Any curl whose URL literal
+  # is http://127.0.0.1 would therefore hand a proxy host the request — with the
+  # bearer token, on the model-probe path — so every one of them must also carry
+  # --noproxy. This is written as a rule about the artifact, not about one
+  # function, because the missed call site was found by reading, not by a test.
+  if printf '%s\n' "$curl_lines" | grep -F 'http://127.0.0.1' \
+     | grep -vF -- '--noproxy' >/dev/null; then
+    fail_case "$name" "a curl call to a literal http://127.0.0.1 URL is missing --noproxy"; return
+  fi
+  # local_health_ok is the one loopback curl whose URL arrives as a variable, so
+  # the literal-URL rule above cannot see it. A proxy answering 200 here forges
+  # exactly the "your gateway is up" verdict the function exists to establish.
+  if ! sed -n '/^local_health_ok()/,/^}/p' "$SCRIPT" | grep -qF -- '--noproxy'; then
+    fail_case "$name" "local_health_ok probes loopback without --noproxy"; return
+  fi
+
   # Dynamic guard for the normal setup/show-code wrapper (the diagnostics
   # already run every server case with a hostile curlrc). A curlrc `output=`
   # directive would create this file if setup still honored user config.
@@ -1176,6 +1339,237 @@ curl_gw -o /dev/null "$URL/v1/models"
     fail_case "$name" "normal setup curl honored a hostile curl config"; return
   fi
 
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A gateway is not trusted to be friendly. Model ids, Content-Type values and
+# error.code all come off the wire and all reach the terminal, where the check
+# transcript is a sequence of "[CHECK_ID] …" lines that CI and humans read as
+# verdicts. An embedded newline forges a whole extra line — a hostile server
+# printing its own green PASS — and an ANSI escape repaints what was already
+# shown. Drive the three real parsers with a hostile reply and assert nothing
+# with a control byte in it survives to the transcript.
+run_gateway_text_sanitised_case() {
+  local name="gateway-text-cannot-forge-transcript" funcs out
+  local esc; esc=$(printf '\033')
+
+  # The hostile payloads are built as real JSON, so the control bytes ride as
+  # JSON string ESCAPES — which is how they actually arrive. A raw newline inside a JSON
+  # string is invalid JSON and never reaches the decoder in the first place.
+  local hostile_models hostile_error
+  hostile_models=$(python3 -c '
+import json
+bad = "gpt\x1b[2Kfake\n  ✓ [MODELS_ENVELOPE] forged pass\ttab"
+print(json.dumps({"data": [{"id": bad}]}))') \
+    || { fail_case "$name" "could not build the hostile models payload"; return; }
+  hostile_error=$(python3 -c '
+import json
+bad = "bad\n  ✓ [CHAT_BASIC] forged pass\x1b[0m"
+print(json.dumps({"error": {"code": bad}}))') \
+    || { fail_case "$name" "could not build the hostile error payload"; return; }
+
+  # 1) The /v1/models classifier: model id + Content-Type. curl_gw is stubbed so
+  #    the case stays a pure unit test of the parser (no fixture, no network).
+  funcs=$(extract_funcs safe_display models_is_json)
+  if ! printf '%s\n' "$funcs" | grep -qF 'models_is_json()' \
+     || ! printf '%s\n' "$funcs" | grep -qF 'safe_display()'; then
+    fail_case "$name" "could not extract safe_display/models_is_json from the release artifact"; return
+  fi
+  out=$(FUNCS="$funcs" BODY="$hostile_models" bash -c '
+eval "$FUNCS"
+DOCTOR=false
+# The -w trailer curl_gw appends is "<code> <seconds> <content-type>"; the
+# Content-Type carries an ESC, which curl would pass through verbatim.
+curl_gw() { printf "%s\n200 0.010 application/json\033[31m" "$BODY"; }
+models_is_json "http://127.0.0.1:1" >/dev/null 2>&1
+printf "ID<%s>\nCT<%s>\n" "$MODELS_FIRST_ID" "$MODELS_CONTENT_TYPE"
+' 2>/dev/null) || { fail_case "$name" "models_is_json failed to run in isolation"; return; }
+  printf '%s\n' "$out" > "$TMP/doctor.out"
+  if [ "$(printf '%s\n' "$out" | grep -c .)" != "2" ]; then
+    fail_case "$name" "a control byte from the models reply produced extra output lines"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -q '^ID<gpt'; then
+    fail_case "$name" "the model id did not survive sanitising as usable text"; return
+  fi
+  case "$out" in *"$esc"*) fail_case "$name" "an ANSI escape from the models reply survived the classifier"; return ;; esac
+
+  # 2) safe_display's own contract: strips C0/DEL, bounds the length, and keeps
+  #    ordinary text (including non-ASCII) byte-for-byte. Removing the ESC is the
+  #    whole job — the "[31m" left behind is inert text once it has no ESC.
+  funcs=$(extract_funcs safe_display)
+  out=$(FUNCS="$funcs" bash -c '
+eval "$FUNCS"
+printf "A<%s>\n" "$(safe_display "$(printf "a\033[31mb\tc\177d")")"
+printf "B<%s>\n" "$(safe_display "aaaaaaaaaa" 4)"
+printf "C<%s>\n" "$(safe_display "mistral-7b-instruct-v0.3-ü")"
+') || { fail_case "$name" "safe_display failed to run in isolation"; return; }
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  if ! printf '%s\n' "$out" | grep -qxF 'A<a[31mbcd>' \
+     || ! printf '%s\n' "$out" | grep -qxF 'B<aaaa…>' \
+     || ! printf '%s\n' "$out" | grep -qxF 'C<mistral-7b-instruct-v0.3-ü>'; then
+    fail_case "$name" "safe_display did not strip, bound, and otherwise preserve as specified"; return
+  fi
+
+  # 3) error.code: quoted verbatim into CCE_REASON, which every failure verdict
+  #    prints. This is the one that can forge a "[CHECK_ID] … ✓" line outright.
+  funcs=$(extract_funcs app_chat_loaded_eval)
+  if [ -z "$funcs" ]; then
+    fail_case "$name" "could not extract app_chat_loaded_eval from the release artifact"; return
+  fi
+  out=$(FUNCS="$funcs" BODY="$hostile_error" bash -c '
+eval "$FUNCS"
+app_chat_body_eval() { return 1; }
+DCC_CODE="400"
+DCC_BODY="$BODY"
+CCE_REASON=""; CCE_WIRE_CODE=""
+app_chat_loaded_eval >/dev/null 2>&1
+printf "REASON<%s>\n" "$CCE_REASON"
+' 2>/dev/null) || { fail_case "$name" "app_chat_loaded_eval failed to run in isolation"; return; }
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$(printf '%s\n' "$out" | grep -c .)" != "1" ]; then
+    fail_case "$name" "a newline in error.code forged an extra transcript line"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'wire code "bad'; then
+    fail_case "$name" "the wire code stopped reaching the verdict text at all"; return
+  fi
+  case "$out" in *"$esc"*) fail_case "$name" "an ANSI escape in error.code reached the verdict text"; return ;; esac
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# https://user:pass@host is a credential smuggled into a routing field: it is
+# echoed to the terminal, written to the pairing profile that WHAT-IT-TOUCHES.md
+# calls credential-free, and paired into the app — which refuses userinfo on
+# every persisted endpoint URL. Both URL entry points must refuse it too, and
+# the refusal must name the real fix rather than say "use https://".
+run_url_userinfo_refused_case() {
+  local name="urls-refuse-embedded-credentials" funcs out
+  local cred='https://spy:hunter2@gateway.example.test'
+
+  funcs=$(extract_funcs url_has_userinfo doctor_accept_url)
+  if ! printf '%s\n' "$funcs" | grep -qF 'doctor_accept_url()'; then
+    fail_case "$name" "could not extract the URL acceptors from the release artifact"; return
+  fi
+  out=$(FUNCS="$funcs" CRED="$cred" bash -c '
+eval "$FUNCS"
+# Refused on the https arm, on the loopback arm, and with a path/query after the
+# authority (the authority ends at the first / ? or #, not at the first slash).
+for u in "$CRED" "http://127.0.0.1@evil.example.test:8080" \
+         "https://spy:hunter2@gateway.example.test/v1" \
+         "https://spy@gateway.example.test?x=1"; do
+  doctor_accept_url "$u" >/dev/null 2>&1 && printf "ACCEPTED<%s>\n" "$u"
+done
+# An ordinary URL with an @ only in the PATH is still fine — the guard parses the
+# authority, it does not grep the whole string.
+doctor_accept_url "https://gateway.example.test/user@host/v1" || printf "REGRESSED<path-@>\n"
+doctor_accept_url "http://127.0.0.1:8080" >/dev/null || printf "REGRESSED<loopback>\n"
+printf "DONE\n"
+') || { fail_case "$name" "doctor_accept_url failed to run in isolation"; return; }
+  printf '%s\n' "$out" > "$TMP/doctor.out"
+  if printf '%s\n' "$out" | grep -q '^ACCEPTED<'; then
+    fail_case "$name" "doctor_accept_url accepted a URL carrying userinfo"; return
+  fi
+  if printf '%s\n' "$out" | grep -q '^REGRESSED<'; then
+    fail_case "$name" "the userinfo guard rejected a legitimate URL"; return
+  fi
+
+  # The interactive prompt: it must re-ask rather than abort, and the warning has
+  # to point at the token field instead of repeating "use https://".
+  funcs=$(extract_funcs url_has_userinfo ask_url; sed -n '/^URL_USERINFO_HINT=/p' "$SCRIPT")
+  if ! printf '%s\n' "$funcs" | grep -qF 'ask_url()' \
+     || ! printf '%s\n' "$funcs" | grep -qF 'URL_USERINFO_HINT='; then
+    fail_case "$name" "could not extract ask_url from the release artifact"; return
+  fi
+  out=$(FUNCS="$funcs" CRED="$cred" bash -c '
+eval "$FUNCS"
+DIM=""; RESET=""; YELLOW=""
+say() { printf "%s\n" "$*"; }
+warn() { printf "! %s\n" "$*"; }
+printf "%s\nhttps://gateway.example.test\n" "$CRED" | ask_url "Address" "https://ai.example.com"
+' 2>&1) || { fail_case "$name" "ask_url failed to run in isolation"; return; }
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  if ! printf '%s\n' "$out" | grep -qF 'the token goes in the token prompt'; then
+    fail_case "$name" "ask_url did not explain where the credential actually belongs"; return
+  fi
+  if printf '%s\n' "$out" | grep -qF 'hunter2@gateway'; then
+    fail_case "$name" "ask_url accepted or echoed back the credential-bearing URL"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'using https://gateway.example.test'; then
+    fail_case "$name" "ask_url did not go on to accept the corrected URL"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A dotenv value is the rest of the line. `API_SERVER_PORT=8642 # full-agent`
+# is an ordinary way to write that file, and unvalidated it becomes a
+# GW_LOCAL_PORT that word-splits inside the unquoted `tailscale serve …` command
+# and silently defeats the `= "8645"` comparison that warns about the tool-less
+# proxy port. Both gateway kinds resolve their port from a dotenv file; both
+# must reduce a non-port to the documented default.
+run_env_port_validation_case() {
+  local name="env-ports-are-validated" funcs out home="$TMP/env-port-home"
+
+  funcs=$(extract_funcs json_query json_get env_get show_qr_is_port openclaw_local_port hermes_api_server_port)
+  if ! printf '%s\n' "$funcs" | grep -qF 'hermes_api_server_port()' \
+     || ! printf '%s\n' "$funcs" | grep -qF 'openclaw_local_port()'; then
+    fail_case "$name" "could not extract the port resolvers from the release artifact"; return
+  fi
+
+  rm -rf "$home"; mkdir -p "$home/.hermes" "$home/openclaw"
+  printf 'API_SERVER_PORT=8642 # the full-agent API server\n' > "$home/.hermes/.env"
+  printf 'OPENCLAW_GATEWAY_PORT=18789 # gateway\n' > "$home/openclaw/.env"
+  out=$(HOME="$home" FUNCS="$funcs" bash -c '
+eval "$FUNCS"
+note() { :; }
+printf "H<%s>\nO<%s>\n" "$(hermes_api_server_port)" "$(openclaw_local_port)"
+' 2>/dev/null) || { fail_case "$name" "the port resolvers failed to run in isolation"; return; }
+  printf '%s\n' "$out" > "$TMP/doctor.out"
+  if ! printf '%s\n' "$out" | grep -qxF 'H<8642>' || ! printf '%s\n' "$out" | grep -qxF 'O<18789>'; then
+    fail_case "$name" "a trailing dotenv comment leaked into the resolved port"; return
+  fi
+
+  # A real port still reads through unchanged, and an out-of-range one falls back.
+  printf 'API_SERVER_PORT=8645\n' > "$home/.hermes/.env"
+  printf 'OPENCLAW_GATEWAY_PORT=70000\n' > "$home/openclaw/.env"
+  out=$(HOME="$home" FUNCS="$funcs" bash -c '
+eval "$FUNCS"
+note() { :; }
+printf "H<%s>\nO<%s>\n" "$(hermes_api_server_port)" "$(openclaw_local_port)"
+' 2>/dev/null) || { fail_case "$name" "the port resolvers failed on the second pass"; return; }
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  if ! printf '%s\n' "$out" | grep -qxF 'H<8645>'; then
+    fail_case "$name" "a valid API_SERVER_PORT was not read through verbatim"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qxF 'O<18789>'; then
+    fail_case "$name" "an out-of-range OPENCLAW_GATEWAY_PORT was not replaced by the default"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The transport tier stages three probe files. They must live inside ONE 0700
+# mktemp directory, not as sibling names built by string concatenation off a
+# single mktemp file: mktemp publishes its random suffix the moment it creates
+# the file, /tmp's sticky bit stops deletion but not the creation of
+# "<that name>.u", and the writes are plain redirects and curl -D.
+run_check_tempfile_isolation_case() {
+  local name="check-probe-files-are-not-siblings" body
+  body=$(extract_funcs doctor_files_transport)
+  if [ -z "$body" ]; then
+    fail_case "$name" "could not extract doctor_files_transport from the release artifact"; return
+  fi
+  printf '%s\n' "$body" > "$TMP/doctor.out"
+  if printf '%s\n' "$body" | grep -qE '\$\{?tmp\}?\.[a-z]'; then
+    fail_case "$name" "a probe path is still built by concatenating onto the mktemp name"; return
+  fi
+  if ! printf '%s\n' "$body" | grep -qF 'mktemp -d'; then
+    fail_case "$name" "the transport tier no longer stages its probes in a mktemp -d directory"; return
+  fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
 }
@@ -1547,6 +1941,10 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" profile-legacy-file-reach-fallback "*)
   run_profile_legacy_file_reach_case
 fi
 
+if [ -z "$ONLY" ] || case " $ONLY " in *" profile-never-carries-secrets "*) true ;; *) false ;; esac; then
+  run_profile_secret_exclusion_case
+fi
+
 if [ -z "$ONLY" ] || case " $ONLY " in *" help-lists-public-meta-flags "*) true ;; *) false ;; esac; then
   run_help_surface_case
 fi
@@ -1601,6 +1999,22 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" all-curl-calls-ignore-config "*) true ;; *) false ;; esac; then
   run_curl_config_isolation_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" gateway-text-cannot-forge-transcript "*) true ;; *) false ;; esac; then
+  run_gateway_text_sanitised_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" urls-refuse-embedded-credentials "*) true ;; *) false ;; esac; then
+  run_url_userinfo_refused_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" env-ports-are-validated "*) true ;; *) false ;; esac; then
+  run_env_port_validation_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" check-probe-files-are-not-siblings "*) true ;; *) false ;; esac; then
+  run_check_tempfile_isolation_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" check-pass-continuation-eof "*) true ;; *) false ;; esac; then
