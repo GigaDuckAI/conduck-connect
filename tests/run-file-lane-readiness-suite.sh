@@ -294,6 +294,49 @@ PY
   expect_false "systemd workspace rejects dollar expansion" fs_systemd_value_safe "$HOME/\$unsafe"
   expect_false "systemd workspace rejects percent specifier" fs_systemd_value_safe "$HOME/%h"
 
+  local env_path="$HOME/state directory/fileserver-hermes.env" env_directive
+  env_directive=$(fs_systemd_envfile_path "$env_path")
+  expect_eq "systemd EnvironmentFile keeps an absolute path unquoted" \
+    "$env_directive" "$env_path"
+  case "$env_directive" in
+    \"*|*\") fail "systemd EnvironmentFile never adds shell quotes" "path was quoted" ;;
+    *) pass "systemd EnvironmentFile never adds shell quotes" ;;
+  esac
+  expect_false "systemd EnvironmentFile rejects a relative path" \
+    fs_systemd_envfile_path "relative/fileserver.env"
+  expect_false "systemd EnvironmentFile rejects percent specifiers" \
+    fs_systemd_envfile_path "$HOME/%h/fileserver.env"
+  expect_false "systemd EnvironmentFile rejects glob metacharacters" \
+    fs_systemd_envfile_path "$HOME/fileserver-*.env"
+  expect_false "systemd EnvironmentFile rejects raw backslashes" \
+    fs_systemd_envfile_path "$HOME/state\\directory/fileserver.env"
+
+  local legacy_env
+  legacy_env=$(fs_systemd_quote "$env_path")
+  printf '%s\n' \
+    '[Unit]' \
+    'Description=preserve this line exactly' \
+    '[Service]' \
+    "EnvironmentFile=$legacy_env" \
+    "ExecStart=\"/usr/bin/rclone\" serve webdav $quoted --addr 127.0.0.1:5095 --user conduck" \
+    > "$unit"
+  expect_eq "legacy quoted EnvironmentFile is detected narrowly" \
+    "$(fs_systemd_envfile_status "$unit" "$env_path")" "legacy-quoted"
+  expect_true "legacy quoted EnvironmentFile repairs atomically" \
+    fs_repair_systemd_envfile_exact "$unit" "$env_path"
+  expect_eq "repaired EnvironmentFile re-checks ready" \
+    "$(fs_systemd_envfile_status "$unit" "$env_path")" "ready"
+  if grep -Fxq "EnvironmentFile=$env_path" "$unit" \
+     && grep -Fxq 'Description=preserve this line exactly' "$unit" \
+     && grep -Fq "ExecStart=\"/usr/bin/rclone\" serve webdav $quoted" "$unit"; then
+    pass "EnvironmentFile repair preserves the rest of the unit"
+  else
+    fail "EnvironmentFile repair preserves the rest of the unit" "unrelated unit content changed"
+  fi
+  printf '%s\n' "EnvironmentFile=$env_path" >> "$unit"
+  expect_eq "duplicate EnvironmentFile refuses migration" \
+    "$(fs_systemd_envfile_status "$unit" "$env_path")" "manual"
+
   printf '%s\n' "safe"$'\r'"injected" > "$STATE_DIR/fileserver-hermes.cred"
   if existing_fs_config; then
     fail "control-character file credential is refused" "unsafe credential was reused"
@@ -301,6 +344,36 @@ PY
     pass "control-character file credential is refused"
   else
     fail "control-character file credential is refused" "unsafe state was not reported"
+  fi
+}
+
+test_systemd_unit_writer() {
+  if (
+    reset_fake_home "writer"
+    STATE_DIR="$HOME/state directory"
+    GW_ID="openclaw"
+    FS_CRED="writer-fixture-secret"
+    FS_LOCAL_PORT="5096"
+    local fake_bin="$TMP/fake-bin" ws="$HOME/workspace with spaces"
+    mkdir -p "$fake_bin" "$ws"
+    printf '%s\n' '#!/usr/bin/env sh' 'exit 0' > "$fake_bin/rclone"
+    chmod 755 "$fake_bin/rclone"
+    PATH="$fake_bin:$PATH"
+    systemctl() { return 0; }
+    loginctl() { printf '%s\n' 'Linger=yes'; }
+    write_fs_unit_linux "$ws" >/dev/null 2>&1 || exit 1
+    local unit="$HOME/.config/systemd/user/conduck-files-openclaw.service"
+    grep -Fxq "EnvironmentFile=$STATE_DIR/fileserver-openclaw.env" "$unit" \
+      && ! grep -Fq 'EnvironmentFile="' "$unit" \
+      && [ "$(fs_systemd_envfile_status "$unit" "$STATE_DIR/fileserver-openclaw.env")" = "ready" ] \
+      && ensure_existing_fs_envfile_linux >/dev/null 2>&1 \
+      && printf '%s\n' 'RCLONE_PASS=drifted-fixture-secret' \
+           > "$STATE_DIR/fileserver-openclaw.env" \
+      && ! ensure_existing_fs_envfile_linux >/dev/null 2>&1
+  ); then
+    pass "Linux unit writer emits and revalidates its EnvironmentFile"
+  else
+    fail "Linux unit writer emits and revalidates its EnvironmentFile" "writer output was invalid or credential drift was accepted"
   fi
 }
 
@@ -1358,6 +1431,7 @@ test_prebound_port
 test_unsafe_existing_unit
 test_unsafe_cross_gateway_unit
 test_structural_unit_parsing
+test_systemd_unit_writer
 test_hermes_config
 test_hermes_guidance
 test_local_service_gate

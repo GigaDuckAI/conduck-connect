@@ -1971,6 +1971,200 @@ fs_systemd_quote() { # fs_systemd_quote <literal>
   printf '"%s"' "$value"
 }
 
+fs_systemd_envfile_path() { # fs_systemd_envfile_path <absolute literal path>
+  # EnvironmentFile= is not ExecStart=: systemd passes the entire right-hand
+  # side to its path/specifier parser and does NOT unquote it. Adding shell-like
+  # quotes therefore makes the leading character `"` instead of `/`, so systemd
+  # rejects the path as non-absolute and silently starts rclone without its
+  # password. Spaces are valid here without quoting. Keep the controlled path
+  # literal and fail closed on specifiers/control characters.
+  fs_systemd_value_safe "$1" || return 1
+  case "$1" in /*) ;; *) return 1 ;; esac
+  # config_parse_unit_env_file() later expands this directive with safe_glob().
+  # A connector-controlled state path must resolve to exactly one file, never a
+  # pattern. Backslashes are also refused because this RHS is emitted raw.
+  case "$1" in *'\'*|*'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
+  printf '%s' "$1"
+}
+
+fs_systemd_envfile_status() { # <unit> <expected-path> -> ready|legacy-quoted|absent|manual
+  local expected
+  expected=$(fs_systemd_envfile_path "$2") || { printf 'manual'; return 0; }
+  python3 - "$1" "$expected" <<'PY' 2>/dev/null
+import os, sys
+
+path, expected = sys.argv[1:3]
+try:
+    if os.path.islink(path):
+        raise ValueError("symlink")
+    raw = open(path, encoding="utf-8").read()
+except Exception:
+    print("manual"); sys.exit(0)
+
+section = ""
+values = []
+for physical in raw.splitlines():
+    if physical.endswith("\\"):
+        print("manual"); sys.exit(0)
+    stripped = physical.strip()
+    if not stripped or stripped.startswith(("#", ";")):
+        continue
+    if stripped.startswith("[") and stripped.endswith("]"):
+        section = stripped[1:-1].strip()
+        continue
+    if section != "Service" or "=" not in physical:
+        continue
+    key, value = physical.split("=", 1)
+    if key.strip() == "EnvironmentFile":
+        values.append(value.strip())
+
+if not values:
+    print("absent"); sys.exit(0)
+if len(values) != 1:
+    print("manual"); sys.exit(0)
+legacy = '"' + expected.replace("\\", "\\\\").replace('"', '\\"') + '"'
+if values[0] == expected:
+    print("ready")
+elif values[0] == legacy:
+    print("legacy-quoted")
+else:
+    print("manual")
+PY
+}
+
+fs_repair_systemd_envfile_exact() { # <unit> <expected-path>
+  local expected
+  expected=$(fs_systemd_envfile_path "$2") || return 1
+  python3 - "$1" "$expected" <<'PY' 2>/dev/null
+import os, stat, sys
+
+path, expected = sys.argv[1:3]
+if os.path.islink(path):
+    sys.exit(1)
+st = os.stat(path, follow_symlinks=False)
+if not stat.S_ISREG(st.st_mode):
+    sys.exit(1)
+raw = open(path, encoding="utf-8").readlines()
+legacy = '"' + expected.replace("\\", "\\\\").replace('"', '\\"') + '"'
+section = ""
+hits = []
+for i, physical in enumerate(raw):
+    body = physical.rstrip("\r\n")
+    if body.endswith("\\"):
+        sys.exit(1)
+    stripped = body.strip()
+    if not stripped or stripped.startswith(("#", ";")):
+        continue
+    if stripped.startswith("[") and stripped.endswith("]"):
+        section = stripped[1:-1].strip()
+        continue
+    if section != "Service" or "=" not in body:
+        continue
+    key, value = body.split("=", 1)
+    if key.strip() == "EnvironmentFile":
+        hits.append((i, value.strip()))
+if len(hits) != 1 or hits[0][1] != legacy:
+    sys.exit(1)
+i = hits[0][0]
+ending = "\r\n" if raw[i].endswith("\r\n") else "\n"
+raw[i] = "EnvironmentFile=" + expected + ending
+parent = os.path.dirname(path)
+tmp = os.path.join(parent, ".%s.conduck-tmp-%d" %
+                   (os.path.basename(path), os.getpid()))
+fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, st.st_mode & 0o777)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as out:
+        out.writelines(raw)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(tmp, path)
+    directory = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+except Exception:
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+    raise
+PY
+}
+
+fs_envfile_exposure_warning() {
+  warn "I did not change any pre-existing HTTPS exposure for this file port."
+  warn "If you mapped it yourself, turn that exact mapping off until local authentication passes."
+}
+
+ensure_existing_fs_envfile_linux() {
+  local expected status env_cred unit_name
+  expected=$(state_env_file)
+  status=$(fs_systemd_envfile_status "$FS_UNIT" "$expected")
+  case "$status" in
+    ready|legacy-quoted) ;;
+    absent)
+      # Older units with --pass on argv predate EnvironmentFile and remain
+      # readable (with the existing ps-visible warning). A credential recovered
+      # only from state cannot authenticate a unit that has no password source.
+      $FS_CRED_LEGACY_ARGV && return 0
+      warn "The existing file-server unit has no usable EnvironmentFile directive."
+      warn "I will not expose it because its saved credential is not wired into rclone."
+      fs_envfile_exposure_warning
+      return 1 ;;
+    *)
+      warn "The existing file-server unit has an EnvironmentFile form this connector will not rewrite."
+      warn "Repair or remove that exact connector-owned unit, then re-run setup."
+      fs_envfile_exposure_warning
+      return 1 ;;
+  esac
+
+  env_cred=$(env_get "$expected" "RCLONE_PASS" 2>/dev/null || true)
+  if ! credential_value_safe "$env_cred" || [ "$env_cred" != "$FS_CRED" ]; then
+    warn "The unit's environment file is missing or does not match its saved credential."
+    warn "Refusing to rewrite or expose it; repair/remove the exact unit and re-run."
+    fs_envfile_exposure_warning
+    return 1
+  fi
+  [ "$status" = "ready" ] && return 0
+
+  warn "This connector-owned unit uses the old quoted EnvironmentFile form."
+  note "systemd treats those quotes as part of the path, ignores the password file,"
+  note "and starts rclone unauthenticated. I can replace only that one directive"
+  note "with the same absolute path unquoted, then reload and restart this unit."
+  if $DRY_RUN; then
+    plan_add "REPAIR legacy quoted EnvironmentFile in $FS_UNIT; daemon-reload + restart"
+    note "(dry-run: a real run asks before repairing that connector-owned unit)"
+    return 0
+  fi
+  if $REUSE_ONLY; then
+    warn "(reuse-only: not repairing the legacy unit; leaving the file lane out)"
+    return 1
+  fi
+  if ! confirm "  Repair this connector-owned unit now?"; then
+    note "Leaving the file lane out; chat is unaffected."
+    fs_envfile_exposure_warning
+    return 1
+  fi
+  mutate_guard "repair the legacy connector-owned EnvironmentFile directive" || return 1
+  fs_repair_systemd_envfile_exact "$FS_UNIT" "$expected" || {
+    warn "The exact legacy directive changed or could not be repaired safely."
+    fs_envfile_exposure_warning
+    return 1
+  }
+  unit_name=$(basename "$FS_UNIT")
+  systemctl --user daemon-reload \
+    && systemctl --user restart "$unit_name" \
+    && [ "$(fs_systemd_envfile_status "$FS_UNIT" "$expected")" = "ready" ] \
+    && systemctl --user is-active --quiet "$unit_name" || {
+      warn "The repaired unit did not reload and re-check active; leaving the lane out."
+      fs_envfile_exposure_warning
+      return 1
+    }
+  ok "Legacy EnvironmentFile repaired and the exact file-server unit restarted."
+  return 0
+}
+
 # Binding is the only portable, race-minimising answer to "is this port free?"
 # Connector-owned units are ALSO reserved even while stopped: otherwise a second
 # gateway can steal 5006 today and collide when the first unit starts tomorrow.
@@ -2139,12 +2333,12 @@ existing_fs_config() {
 # Write a per-gateway file-server unit that reads RCLONE_PASS from a 0600 env file
 # (credential never appears on the process command line / in `ps`).
 write_fs_unit_linux() { # write_fs_unit_linux <workspace>
-  local ws="$1" envf rclone_bin q_ws q_env q_rclone
+  local ws="$1" envf rclone_bin q_ws env_directive q_rclone
   envf=$(state_env_file)
   rclone_bin=$(command -v rclone)
   if ! credential_value_safe "$FS_CRED" \
      || ! q_ws=$(fs_systemd_quote "$ws") \
-     || ! q_env=$(fs_systemd_quote "$envf") \
+     || ! env_directive=$(fs_systemd_envfile_path "$envf") \
      || ! q_rclone=$(fs_systemd_quote "$rclone_bin"); then
     warn "The file credential or selected paths contain characters this systemd unit cannot encode safely."
     return 1
@@ -2168,7 +2362,7 @@ Description=Conduck agent file server ($GW_ID, rclone WebDAV)
 After=network.target
 
 [Service]
-EnvironmentFile=$q_env
+EnvironmentFile=$env_directive
 ExecStart=$q_rclone serve webdav $q_ws --addr 127.0.0.1:$FS_LOCAL_PORT --user conduck --dir-cache-time 1s
 Restart=on-failure
 
@@ -2964,6 +3158,11 @@ setup_file_lane() {
   if existing_fs_config; then
     ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered."
     workspace="$FS_FOLDER"
+    if [ "$OS" = "Linux" ] \
+       && ! ensure_existing_fs_envfile_linux; then
+      FS_CRED=""; FS_URL=""
+      return 0
+    fi
     if $FS_CRED_LEGACY_ARGV; then
       warn "Heads-up: that older unit keeps the file password on its command line (visible via 'ps')."
       note "It still works and the QR is correct. To hide it, recreate the unit so rclone reads the"
