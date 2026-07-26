@@ -62,9 +62,11 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   holds the file-lane credential files and the saved profiles. A shared agent
   folder the connector creates is `0700`; one that already exists keeps its own
   mode and is reported rather than silently re-permissioned. An existing
-  `~/.hermes/.env` that other accounts can read is tightened to `0600` after the
-  append you approved — your gateway key is inside it — and the change is stated
-  on screen. `--check-adapter --files` stages its transport probes inside one
+  `~/.hermes/.env` that other accounts can read is reported — your gateway key is
+  inside it — and `chmod 600` is offered as its own confirmed step; a file the
+  connector did not create is never re-permissioned without a yes, so permissions
+  hold to the same promise as contents. `--check-adapter --files` stages its
+  transport probes inside one
   `0700` `mktemp -d` rather than a `mktemp` file plus sibling names built by
   string concatenation.
 - Documentation corrected against the code rather than the intent.
