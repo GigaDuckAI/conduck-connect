@@ -287,21 +287,10 @@ configure_hermes() {
       ok "Written."
       # The `umask 077` above only covers a file we CREATE. A ~/.hermes/.env that
       # Hermes already wrote under umask 022 is 0644, and the API server key just
-      # appended (or re-read) is a live gateway credential sitting in it.
-      # This is a file the USER owns, so the mode change goes through run_step
-      # like every other change to something we did not create: the exact command
-      # is printed and nothing runs without a yes. The promise is "never changes a
-      # config it didn't create without showing you the exact change first" — a
-      # permission is part of that config, so a silent chmod would break it even
-      # though it touches no content. Declining is a real answer, and a redirected
-      # run declines by default (confirm returns 1 on EOF).
-      if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
-           "$envf" 2>/dev/null; then
-        warn "$envf can be read by other accounts on this machine — your API server key is inside it."
-        run_step "tighten $envf to 0600 so only you can read the API server key" \
-          chmod 600 "$envf" \
-          || note "Left as it was. Run 'chmod 600 $envf' yourself when you can."
-      fi
+      # appended (or re-read) is a live gateway credential sitting in it. The
+      # announce-then-confirm gate, and what it says when the answer is no or the
+      # chmod fails, both live in secure_owned_file_mode.
+      secure_owned_file_mode "$envf" "your API server key" || true
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "restart Hermes so the API server starts" \
           systemctl --user restart hermes-gateway.service || true

@@ -453,6 +453,41 @@ run_step() {  # run_step "description" cmd args...
   fi
 }
 
+file_mode_is_open() { # file_mode_is_open <file> -> 0 when group or other have ANY access
+  # python3 is a hard preflight requirement on every path that calls this; a
+  # missing one answers "not open" and stays quiet rather than warning blindly.
+  python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
+    "$1" 2>/dev/null
+}
+
+# Rung 1b: a file the USER owns whose MODE is too open for a secret we just helped
+# put in it. A file's permissions are part of its configuration, so this goes
+# through run_step like any other change to something we did not create — the
+# exact command is printed and nothing happens without a yes. A silent chmod
+# would break "never changes a config it didn't create without showing you the
+# exact change first" even though it touches no content.
+# The two NON-success arms carry as much weight as the success one: a declined or
+# failed chmod leaves a live credential readable by every account on the box, and
+# going quiet there would be a worse outcome than the silent chmod this gate
+# replaced. So the final state is RE-READ from the file rather than inferred from
+# run_step's exit code — "still exposed" is then a fact about the file, not a
+# guess about why, and it is correct whether the user declined, the chmod failed,
+# or something else moved the mode underneath us.
+secure_owned_file_mode() { # secure_owned_file_mode <file> <what-is-inside> -> 1 if still open
+  local f="$1" what="$2"
+  file_mode_is_open "$f" || return 0
+  warn "$f can be read by other accounts on this machine — $what is inside it."
+  run_step "tighten $f to 0600 so only you can read $what" chmod 600 "$f" || true
+  if $DRY_RUN; then return 0; fi     # run_step only recorded the plan; nothing changed yet
+  if file_mode_is_open "$f"; then
+    warn "$what is STILL readable by other accounts on this machine."
+    warn "Fix it when you can:  chmod 600 $f"
+    return 1
+  fi
+  ok "Tightened — only you can read $f now."
+  return 0
+}
+
 # Rung 2: a change to something YOU own — we print the exact command, you run it.
 print_and_wait() {  # print_and_wait "why" "command shown to user"
   if $DRY_RUN; then plan_add "YOU RUN  $2  ($1)"; note "(dry-run: you would run the above)"; return 0; fi
@@ -954,21 +989,10 @@ configure_hermes() {
       ok "Written."
       # The `umask 077` above only covers a file we CREATE. A ~/.hermes/.env that
       # Hermes already wrote under umask 022 is 0644, and the API server key just
-      # appended (or re-read) is a live gateway credential sitting in it.
-      # This is a file the USER owns, so the mode change goes through run_step
-      # like every other change to something we did not create: the exact command
-      # is printed and nothing runs without a yes. The promise is "never changes a
-      # config it didn't create without showing you the exact change first" — a
-      # permission is part of that config, so a silent chmod would break it even
-      # though it touches no content. Declining is a real answer, and a redirected
-      # run declines by default (confirm returns 1 on EOF).
-      if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
-           "$envf" 2>/dev/null; then
-        warn "$envf can be read by other accounts on this machine — your API server key is inside it."
-        run_step "tighten $envf to 0600 so only you can read the API server key" \
-          chmod 600 "$envf" \
-          || note "Left as it was. Run 'chmod 600 $envf' yourself when you can."
-      fi
+      # appended (or re-read) is a live gateway credential sitting in it. The
+      # announce-then-confirm gate, and what it says when the answer is no or the
+      # chmod fails, both live in secure_owned_file_mode.
+      secure_owned_file_mode "$envf" "your API server key" || true
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "restart Hermes so the API server starts" \
           systemctl --user restart hermes-gateway.service || true
