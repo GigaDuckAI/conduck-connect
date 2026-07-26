@@ -431,6 +431,7 @@ test_hermes_config() {
     '  - file' \
     '  cli:' \
     '  - hermes-cli' \
+    '# Root-level comments after the final section remain outside its map.' \
     > "$cfg"
   expect_eq "Hermes standard PyYAML config is accepted" \
     "$(analysis_status "$cfg" "$ws")" "ready"
@@ -458,6 +459,7 @@ test_hermes_config() {
     '  - memory' \
     '  cli:' \
     '  - hermes-cli' \
+    '# Root-level comments after the final section remain outside its map.' \
     > "$cfg"
   expect_eq "Hermes standard PyYAML config detects narrow changes" \
     "$(analysis_status "$cfg" "$ws")" "fix"

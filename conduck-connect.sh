@@ -3421,15 +3421,19 @@ def child(section, name, src=None):
         s = content(src[i])
         if not s:
             continue
+        # Root-level comments can follow the final section all the way to EOF.
+        # Skip ordinary comments before demanding child indentation. A comment
+        # inside a proved multiline quote remains scalar content and is scanned
+        # below; one inside a plain continuation is handled by that state.
+        if quote_kind is None and plain_indent is None \
+           and s.lstrip().startswith("#"):
+            continue
         prefix = s[:len(s) - len(s.lstrip(" \t"))]
         if "\t" in prefix:
             return ("AMBIG", None, None, None, None)
         lead = len(prefix)
         if lead <= 0:
             return ("AMBIG", None, None, None, None)
-        if quote_kind is None and plain_indent is None \
-           and s.lstrip().startswith("#"):
-            continue
         if plain_indent is not None:
             if lead > plain_indent:
                 if s.lstrip().startswith("#"):
