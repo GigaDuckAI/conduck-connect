@@ -77,10 +77,12 @@
 #   bash conduck-connect.sh --setup --dry-run
 #                                           # show setup state + plan; change nothing
 #   bash conduck-connect.sh --setup --reuse-only
-#                                           # advanced: walk setup but refuse host
-#                                           # configuration changes; verification
-#                                           # still sends requests and may run a
-#                                           # small file probe
+#                                           # advanced: walk setup using only what
+#                                           # already exists. The first step that
+#                                           # would change host configuration STOPS
+#                                           # the run and names it — it is not
+#                                           # skipped. Verification still sends
+#                                           # requests and may run a small file probe
 #   bash conduck-connect.sh --check-adapter --deep [url]
 #                                           # add a semantic image-input check
 #   bash conduck-connect.sh --check-adapter --files [url]

@@ -77,10 +77,12 @@
 #   bash conduck-connect.sh --setup --dry-run
 #                                           # show setup state + plan; change nothing
 #   bash conduck-connect.sh --setup --reuse-only
-#                                           # advanced: walk setup but refuse host
-#                                           # configuration changes; verification
-#                                           # still sends requests and may run a
-#                                           # small file probe
+#                                           # advanced: walk setup using only what
+#                                           # already exists. The first step that
+#                                           # would change host configuration STOPS
+#                                           # the run and names it — it is not
+#                                           # skipped. Verification still sends
+#                                           # requests and may run a small file probe
 #   bash conduck-connect.sh --check-adapter --deep [url]
 #                                           # add a semantic image-input check
 #   bash conduck-connect.sh --check-adapter --files [url]
@@ -951,18 +953,21 @@ configure_hermes() {
         || die "Could not write to $envf. Fix its permissions (or add the API_SERVER_* lines yourself), then re-run me."
       ok "Written."
       # The `umask 077` above only covers a file we CREATE. A ~/.hermes/.env that
-      # Hermes already wrote under umask 022 is 0644, and the API server key we
-      # just appended (or re-read) is a live gateway credential sitting in it.
-      # Tighten it, and say so either way — silently leaving a readable key, or
-      # silently changing a file the user owns, are both wrong.
+      # Hermes already wrote under umask 022 is 0644, and the API server key just
+      # appended (or re-read) is a live gateway credential sitting in it.
+      # This is a file the USER owns, so the mode change goes through run_step
+      # like every other change to something we did not create: the exact command
+      # is printed and nothing runs without a yes. The promise is "never changes a
+      # config it didn't create without showing you the exact change first" — a
+      # permission is part of that config, so a silent chmod would break it even
+      # though it touches no content. Declining is a real answer, and a redirected
+      # run declines by default (confirm returns 1 on EOF).
       if python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
            "$envf" 2>/dev/null; then
-        if chmod 600 "$envf" 2>/dev/null; then
-          note "Tightened $envf to 0600 — it holds the API server key and was readable by other accounts."
-        else
-          warn "$envf holds the API server key and is readable by other accounts on this machine, and I could not chmod it."
-          warn "Run 'chmod 600 $envf' yourself."
-        fi
+        warn "$envf can be read by other accounts on this machine — your API server key is inside it."
+        run_step "tighten $envf to 0600 so only you can read the API server key" \
+          chmod 600 "$envf" \
+          || note "Left as it was. Run 'chmod 600 $envf' yourself when you can."
       fi
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "restart Hermes so the API server starts" \
@@ -3340,7 +3345,16 @@ setup_file_lane() {
 
   if $new_fs; then
     if $DRY_RUN; then
-      plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
+      # The shared folder is a real host change, and the plan is promised to
+      # enumerate every one of them. Named only when it would actually be created:
+      # an existing agent workspace is reused untouched (mkdir -p is a no-op and
+      # its mode is left alone), so listing it as a change would be a lie the real
+      # run never tells.
+      if [ -d "$workspace" ]; then
+        plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve the EXISTING folder $workspace (permissions untouched) on 127.0.0.1:$FS_LOCAL_PORT"
+      else
+        plan_add "CREATE the shared agent folder $workspace (0700); MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
+      fi
       note "(dry-run: would mint a credential and write the file-server unit)"
     else
       mutate_guard "write file-server unit + credential" || {

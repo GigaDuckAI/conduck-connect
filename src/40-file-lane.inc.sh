@@ -1459,7 +1459,16 @@ setup_file_lane() {
 
   if $new_fs; then
     if $DRY_RUN; then
-      plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
+      # The shared folder is a real host change, and the plan is promised to
+      # enumerate every one of them. Named only when it would actually be created:
+      # an existing agent workspace is reused untouched (mkdir -p is a no-op and
+      # its mode is left alone), so listing it as a change would be a lie the real
+      # run never tells.
+      if [ -d "$workspace" ]; then
+        plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve the EXISTING folder $workspace (permissions untouched) on 127.0.0.1:$FS_LOCAL_PORT"
+      else
+        plan_add "CREATE the shared agent folder $workspace (0700); MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
+      fi
       note "(dry-run: would mint a credential and write the file-server unit)"
     else
       mutate_guard "write file-server unit + credential" || {

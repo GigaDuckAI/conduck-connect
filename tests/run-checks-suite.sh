@@ -1504,6 +1504,93 @@ printf "%s\nhttps://gateway.example.test\n" "$CRED" | ask_url "Address" "https:/
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# SECURITY.md's load-bearing promise: the connector "never changes a config it
+# didn't create without showing you the exact change first". A file's PERMISSIONS
+# are part of its configuration, so tightening a pre-existing ~/.hermes/.env to
+# 0600 has to go through the same announce-then-confirm gate as any other change
+# to something the user owns — a silent chmod would break the promise even though
+# it touches no content. Two halves: the wiring stays on run_step, and run_step
+# really does refuse to act without a yes.
+run_owned_config_mode_change_case() {
+  local name="owned-config-mode-change-is-announced" funcs body out
+  local envf="$TMP/announce-hermes.env" mode
+
+  # Wiring: inside configure_hermes, `chmod` on the user's .env may appear ONLY as
+  # a run_step argument. A bare `chmod 600 "$envf"` would pass every behavioural
+  # test below while bypassing the gate entirely.
+  body=$(extract_funcs configure_hermes)
+  if [ -z "$body" ]; then
+    fail_case "$name" "could not extract configure_hermes from the release artifact"; return
+  fi
+  printf '%s\n' "$body" > "$TMP/doctor.out"
+  # Line continuations are joined first: `run_step "…" \` / `  chmod 600 "$envf"`
+  # is ONE statement, and a per-physical-line grep reads its second half as a bare
+  # chmod. Rule on the joined text: every logical line that chmods $envf must also
+  # name run_step, and there must be at least one such line.
+  local chmod_lines ungated
+  chmod_lines=$(printf '%s\n' "$body" | awk '
+    {
+      line = $0
+      while (line ~ /\\$/) {
+        sub(/\\$/, "", line)
+        if ((getline nxt) <= 0) break
+        sub(/^[[:space:]]+/, "", nxt)
+        line = line " " nxt
+      }
+      print line
+    }' | grep -F 'chmod' | grep -F 'envf')
+  if [ -z "$chmod_lines" ]; then
+    fail_case "$name" "configure_hermes no longer tightens the .env at all"; return
+  fi
+  ungated=$(printf '%s\n' "$chmod_lines" | grep -vF 'run_step')
+  if [ -n "$ungated" ]; then
+    printf 'ungated chmod:\n%s\n' "$ungated" >> "$TMP/doctor.out"
+    fail_case "$name" "configure_hermes chmods the user's .env outside run_step, bypassing the announce gate"; return
+  fi
+
+  # Behaviour: run_step must print the exact command, and must NOT run it unless
+  # the answer is yes. EOF counts as no — a redirected run has nobody to ask.
+  funcs=$(extract_funcs run_step mutate_guard confirm plan_add say warn note)
+  if ! printf '%s\n' "$funcs" | grep -qF 'run_step()'; then
+    fail_case "$name" "could not extract run_step from the release artifact"; return
+  fi
+  printf 'API_SERVER_KEY=sentinel\n' > "$envf"
+  chmod 644 "$envf"
+  out=$(FUNCS="$funcs" ENVF="$envf" bash -c '
+eval "$FUNCS"
+DRY_RUN=false; REUSE_ONLY=false; PLAN=(); BOLD=""; RESET=""; DIM=""; YELLOW=""
+: | run_step "tighten it" chmod 600 "$ENVF"   # EOF on stdin = no answer
+printf "declined-rc=%d\n" "$?"
+' 2>&1) || true
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  mode=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$envf")
+  if [ "$mode" != "0o644" ]; then
+    fail_case "$name" "run_step changed the file mode without a yes (mode now $mode)"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF "chmod 600 $envf"; then
+    fail_case "$name" "run_step did not print the exact command before asking"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'declined-rc=1'; then
+    fail_case "$name" "a declined run_step did not report failure to its caller"; return
+  fi
+
+  # And a yes really does apply it — the gate must not be a no-op in both directions.
+  out=$(FUNCS="$funcs" ENVF="$envf" bash -c '
+eval "$FUNCS"
+DRY_RUN=false; REUSE_ONLY=false; PLAN=(); BOLD=""; RESET=""; DIM=""; YELLOW=""
+printf "y\n" | run_step "tighten it" chmod 600 "$ENVF"
+printf "accepted-rc=%d\n" "$?"
+' 2>&1) || true
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  mode=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$envf")
+  if [ "$mode" != "0o600" ]; then
+    fail_case "$name" "an approved run_step did not apply the chmod (mode $mode)"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 # A dotenv value is the rest of the line. `API_SERVER_PORT=8642 # full-agent`
 # is an ordinary way to write that file, and unvalidated it becomes a
 # GW_LOCAL_PORT that word-splits inside the unquoted `tailscale serve …` command
@@ -2007,6 +2094,10 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" urls-refuse-embedded-credentials "*) true ;; *) false ;; esac; then
   run_url_userinfo_refused_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" owned-config-mode-change-is-announced "*) true ;; *) false ;; esac; then
+  run_owned_config_mode_change_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" env-ports-are-validated "*) true ;; *) false ;; esac; then
