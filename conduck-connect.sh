@@ -3360,12 +3360,13 @@ def child(section, name, src=None):
     # The FIRST content line establishes that direct-map indentation. Validate
     # the section as a conservative map/list tree, with two narrow additions
     # for normal PyYAML output: scalar sequence items may be indentless beneath
-    # an immediately preceding empty map key, and an unrelated double-quoted
-    # scalar may continue on deeper lines until its proved closing quote.
+    # an immediately preceding empty map key, and an unrelated quoted or
+    # prose-like scalar may continue on deeper lines within narrow boundaries.
     entries = []
-    quote_open = False
+    quote_kind = None
     quote_indent = None
     quote_escaped = False
+    plain_indent = None
 
     def scan_double_quote(text, opened=False, escaped=False):
         i = 0
@@ -3387,9 +3388,38 @@ def child(section, name, src=None):
             i += 1
         return ("open", escaped)
 
+    def scan_single_quote(text, opened=False):
+        i = 0
+        if not opened:
+            if not text.startswith("'"):
+                return "none"
+            i = 1
+        while i < len(text):
+            if text[i] == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                tail = text[i + 1:]
+                if tail.strip() and not tail.lstrip().startswith("#"):
+                    return "invalid"
+                return "closed"
+            i += 1
+        return "open"
+
+    def plain_string_can_continue(value):
+        # PyYAML wraps long plain strings onto more-indented continuation
+        # lines. Limit this accommodation to an obvious prose-like scalar;
+        # typed/symbolic values and all authoritative target values remain
+        # structurally checked rather than treated as opaque prose.
+        return (
+            bool(value)
+            and value[0].isalnum()
+            and any(ch.isspace() for ch in value)
+        )
+
     for i in range(start + 1, end):
         s = content(src[i])
-        if not s or s.lstrip().startswith("#"):
+        if not s:
             continue
         prefix = s[:len(s) - len(s.lstrip(" \t"))]
         if "\t" in prefix:
@@ -3397,29 +3427,55 @@ def child(section, name, src=None):
         lead = len(prefix)
         if lead <= 0:
             return ("AMBIG", None, None, None, None)
-        if quote_open:
+        if quote_kind is None and plain_indent is None \
+           and s.lstrip().startswith("#"):
+            continue
+        if plain_indent is not None:
+            if lead > plain_indent:
+                if s.lstrip().startswith("#"):
+                    continue
+                # A colon followed by separation whitespace cannot continue a
+                # YAML plain scalar. Treat it as structure instead of hiding a
+                # target-looking mapping inside the prose accommodation.
+                if re.search(r":(?:[ \t]|$)", s.lstrip(" ")):
+                    return ("AMBIG", None, None, None, None)
+                continue
+            plain_indent = None
+            if s.lstrip().startswith("#"):
+                continue
+        if quote_kind is not None:
             if lead <= quote_indent:
                 return ("AMBIG", None, None, None, None)
-            qst, quote_escaped = scan_double_quote(
-                s.lstrip(" "), opened=True, escaped=quote_escaped)
+            if quote_kind == "double":
+                qst, quote_escaped = scan_double_quote(
+                    s.lstrip(" "), opened=True, escaped=quote_escaped)
+            else:
+                qst = scan_single_quote(s.lstrip(" "), opened=True)
             if qst == "invalid":
                 return ("AMBIG", None, None, None, None)
             if qst == "closed":
-                quote_open = False
+                quote_kind = None
                 quote_indent = None
                 quote_escaped = False
             continue
         m = CHILD.match(s)
         if m:
-            qst, quote_escaped = scan_double_quote(
-                (m.group(3) or "").strip())
+            value = (m.group(3) or "").strip()
+            if value.startswith('"'):
+                qst, quote_escaped = scan_double_quote(value)
+            elif value.startswith("'"):
+                qst = scan_single_quote(value)
+            else:
+                qst = "none"
             if qst == "invalid":
                 return ("AMBIG", None, None, None, None)
             if qst == "open":
-                quote_open = True
+                quote_kind = "double" if value.startswith('"') else "single"
                 quote_indent = lead
+            elif m.group(2) != name and plain_string_can_continue(value):
+                plain_indent = lead
         entries.append((i, lead, s))
-    if quote_open:
+    if quote_kind is not None:
         return ("AMBIG", None, None, None, None)
 
     direct_indent = entries[0][1] if entries else None

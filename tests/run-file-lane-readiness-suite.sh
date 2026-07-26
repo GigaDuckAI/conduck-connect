@@ -413,9 +413,13 @@ test_hermes_config() {
     '  disabled_toolsets: []' \
     '  disabled_tools: null' \
     '  personalities:' \
-    '    creative: "A normal PyYAML-wrapped personality line that continues' \
-    '      cwd: this target-looking text remains scalar content' \
-    '      on a deeper line without becoming another mapping entry."' \
+    '    creative: A normal PyYAML-wrapped plain personality line that continues' \
+    '      as ordinary prose on a deeper continuation line' \
+    '      on a deeper line without becoming another mapping entry.' \
+    "    pirate: 'A normal PyYAML-wrapped single-quoted personality that continues" \
+    "      disabled_tools: this target-looking text remains scalar content'" \
+    '    kawaii: "A normal PyYAML-wrapped double-quoted personality that continues' \
+    '      disabled_toolsets: this target-looking text remains scalar content"' \
     'terminal:' \
     '  backend: local' \
     "  cwd: \"$real_ws\"" \
@@ -438,9 +442,13 @@ test_hermes_config() {
     '  disabled_toolsets: []' \
     '  disabled_tools: null' \
     '  personalities:' \
-    '    creative: "A normal PyYAML-wrapped personality line that continues' \
-    '      cwd: this target-looking text remains scalar content' \
-    '      on a deeper line without becoming another mapping entry."' \
+    '    creative: A normal PyYAML-wrapped plain personality line that continues' \
+    '      as ordinary prose on a deeper continuation line' \
+    '      on a deeper line without becoming another mapping entry.' \
+    "    pirate: 'A normal PyYAML-wrapped single-quoted personality that continues" \
+    "      disabled_tools: this target-looking text remains scalar content'" \
+    '    kawaii: "A normal PyYAML-wrapped double-quoted personality that continues' \
+    '      disabled_toolsets: this target-looking text remains scalar content"' \
     'terminal:' \
     '  backend: local' \
     "  cwd: \"$TMP/wrong-pyyaml-root\"" \
@@ -464,6 +472,26 @@ test_hermes_config() {
     pass "Hermes PyYAML edit preserves root/list/scalar layout"
   else
     fail "Hermes PyYAML edit preserves root/list/scalar layout" "standard layout changed or target edit missing"
+  fi
+
+  printf '%s\n' \
+    'agent:' \
+    '  disabled_tools: []' \
+    '  personalities:' \
+    '    creative: A plain scalar begins here and then becomes ambiguous' \
+    '      disabled_tools: this colon cannot be plain continuation syntax' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  cp "$cfg" "$cfg.before"
+  expect_eq "Hermes target-like plain continuation fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+  expect_eq "Hermes target-like plain continuation refuses direct apply" \
+    "$(analysis_status "$cfg" "$ws" apply)" "manual"
+  if cmp -s "$cfg" "$cfg.before"; then
+    pass "Hermes target-like plain continuation is not mutated"
+  else
+    fail "Hermes target-like plain continuation is not mutated" "config changed"
   fi
 
   printf '%s\n' \
@@ -628,6 +656,17 @@ test_hermes_config() {
     "  cwd: \"$ws\"" \
     > "$cfg"
   expect_eq "Hermes unclosed multiline scalar fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
+    'agent:' \
+    '  personalities:' \
+    "    creative: 'an unclosed generated scalar" \
+    '      still has no closing quote' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes unclosed multiline single-quoted scalar fails closed" \
     "$(analysis_status "$cfg" "$ws")" "manual"
 
   printf '%s\n' \
