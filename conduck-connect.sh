@@ -3237,6 +3237,8 @@ lines = raw.splitlines(True)
 KEY = re.compile(r"^([A-Za-z0-9_-]+):(?:[ \t]*(.*?))?[ \t]*(?:\n)?$")
 CHILD = re.compile(r"^([ ]+)([A-Za-z0-9_-]+):(?:[ \t]*(.*?))?[ \t]*(?:\n)?$")
 SPACED_KEY = re.compile(r"^([A-Za-z0-9_-]+)[ \t]+:")
+PLAIN_STRING_ITEM = re.compile(
+    r"^-[ ]+[A-Za-z0-9_][A-Za-z0-9_./-]*(?:[ \t]+#[^\r\n]*)?$")
 
 def content(line):
     # Config keys/lists in the paths we edit must not rely on YAML comments,
@@ -3295,6 +3297,11 @@ def top_section(name, src=None):
         if not s or s.lstrip().startswith("#"):
             continue
         if not s[:1].isspace():
+            # PyYAML emits a top-level scalar sequence without indenting its
+            # items (for example `toolsets:\n- hermes-cli`). Such an item still
+            # belongs to the preceding root key; it is not a new root section.
+            if PLAIN_STRING_ITEM.match(s):
+                continue
             end = j
             break
     return ("OK", hit, end)
@@ -3304,9 +3311,20 @@ def unsupported_root_form(src=None):
     src = lines if src is None else src
     saw_document_start = False
     saw_root_entry = False
+    root_sequence_open = False
+    root_has_indented_content = False
+    after_root_scalar_item = False
     for line in src:
         s = content(line)
-        if not s or s.lstrip().startswith("#") or s[:1].isspace():
+        if not s or s.lstrip().startswith("#"):
+            continue
+        if s[:1].isspace():
+            # A simple root scalar item cannot subsequently open an indented
+            # mapping/continuation. Supporting that would turn this into a
+            # general YAML parser, so fail closed.
+            if after_root_scalar_item:
+                return True
+            root_has_indented_content = True
             continue
         # One plain document-start marker before the mapping is harmless. Tags,
         # directives, explicit keys, document-end markers, quoted/spaced keys,
@@ -3314,9 +3332,23 @@ def unsupported_root_form(src=None):
         if s == "---" and not saw_document_start and not saw_root_entry:
             saw_document_start = True
             continue
+        # PyYAML's default dumper uses indentless sequences at the document
+        # root. Accept only a simple scalar item attached to a preceding empty
+        # plain root key. List-of-map, tagged, flow, and standalone root
+        # sequences remain outside the editable subset.
+        if PLAIN_STRING_ITEM.match(s):
+            if not saw_root_entry or not root_sequence_open \
+               or root_has_indented_content:
+                return True
+            after_root_scalar_item = True
+            continue
         saw_root_entry = True
-        if not KEY.match(s):
+        after_root_scalar_item = False
+        m = KEY.match(s)
+        if not m:
             return True
+        root_sequence_open = not (m.group(2) or "").strip()
+        root_has_indented_content = False
     return False
 
 def child(section, name, src=None):
@@ -3325,13 +3357,36 @@ def child(section, name, src=None):
     if st != "OK":
         return (st, None, None, None, None)
     # YAML permits any positive direct-child indentation, not just two spaces.
-    # The FIRST content line establishes that direct-map indentation: a valid
-    # mapping cannot begin with a deeper child and later outdent to its actual
-    # first key. Validate subsequent indentation as a conservative map/list
-    # tree so unrelated malformed/deeper keys cannot be ignored while a target
-    # key at another indentation is edited. Tabs, quoted child keys, complex
-    # list-of-map forms, and inconsistent levels fail closed.
+    # The FIRST content line establishes that direct-map indentation. Validate
+    # the section as a conservative map/list tree, with two narrow additions
+    # for normal PyYAML output: scalar sequence items may be indentless beneath
+    # an immediately preceding empty map key, and an unrelated double-quoted
+    # scalar may continue on deeper lines until its proved closing quote.
     entries = []
+    quote_open = False
+    quote_indent = None
+    quote_escaped = False
+
+    def scan_double_quote(text, opened=False, escaped=False):
+        i = 0
+        if not opened:
+            if not text.startswith('"'):
+                return ("none", False)
+            i = 1
+        while i < len(text):
+            ch = text[i]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                tail = text[i + 1:]
+                if tail.strip() and not tail.lstrip().startswith("#"):
+                    return ("invalid", False)
+                return ("closed", False)
+            i += 1
+        return ("open", escaped)
+
     for i in range(start + 1, end):
         s = content(src[i])
         if not s or s.lstrip().startswith("#"):
@@ -3342,9 +3397,34 @@ def child(section, name, src=None):
         lead = len(prefix)
         if lead <= 0:
             return ("AMBIG", None, None, None, None)
+        if quote_open:
+            if lead <= quote_indent:
+                return ("AMBIG", None, None, None, None)
+            qst, quote_escaped = scan_double_quote(
+                s.lstrip(" "), opened=True, escaped=quote_escaped)
+            if qst == "invalid":
+                return ("AMBIG", None, None, None, None)
+            if qst == "closed":
+                quote_open = False
+                quote_indent = None
+                quote_escaped = False
+            continue
+        m = CHILD.match(s)
+        if m:
+            qst, quote_escaped = scan_double_quote(
+                (m.group(3) or "").strip())
+            if qst == "invalid":
+                return ("AMBIG", None, None, None, None)
+            if qst == "open":
+                quote_open = True
+                quote_indent = lead
         entries.append((i, lead, s))
+    if quote_open:
+        return ("AMBIG", None, None, None, None)
+
     direct_indent = entries[0][1] if entries else None
     levels, level_kinds = [], {}
+    indentless_open = {}
     previous_indent, previous_opens = None, False
     for _, lead, s in entries:
         m = CHILD.match(s)
@@ -3354,31 +3434,44 @@ def child(section, name, src=None):
             node_opens = not (m.group(3) or "").strip()
         elif stripped == "-" or stripped.startswith("- "):
             item = stripped[1:].strip()
-            # Scalar block-sequence items are supported. A list item that opens
-            # another mapping/list is outside this editor's safe subset.
             node_kind = "list"
             node_opens = not item
         else:
             return ("AMBIG", None, None, None, None)
+
+        indentless_item = False
         if previous_indent is None:
             levels = [lead]
         elif lead > previous_indent:
             if not previous_opens:
                 return ("AMBIG", None, None, None, None)
+            # This opening key chose an ordinarily indented child, so it cannot
+            # later also own an indentless sequence.
+            indentless_open[previous_indent] = False
             levels.append(lead)
         elif lead < previous_indent:
             while levels and levels[-1] > lead:
                 levels.pop()
             if not levels or levels[-1] != lead:
                 return ("AMBIG", None, None, None, None)
+
         expected_kind = level_kinds.get(lead)
         if expected_kind is None:
             level_kinds[lead] = node_kind
         elif expected_kind != node_kind:
+            if expected_kind == "map" and node_kind == "list" \
+               and indentless_open.get(lead, False) \
+               and PLAIN_STRING_ITEM.match(stripped):
+                indentless_item = True
+            else:
+                return ("AMBIG", None, None, None, None)
+
+        if lead == direct_indent and node_kind != "map" and not indentless_item:
             return ("AMBIG", None, None, None, None)
-        if lead == direct_indent and node_kind != "map":
-            return ("AMBIG", None, None, None, None)
+        if node_kind == "map":
+            indentless_open[lead] = node_opens
         previous_indent, previous_opens = lead, node_opens
+
     found = None
     for i, indent, s in entries:
         m = CHILD.match(s)
@@ -3491,7 +3584,7 @@ def scalar(section, name):
         return st, None
     return string_value(value)
 
-def sequence(section, name):
+def sequence(section, name, allow_null=False):
     st, i, value, indent, end = child(section, name)
     if st != "OK":
         return st, None, None
@@ -3500,6 +3593,8 @@ def sequence(section, name):
             v = split_comment(value)
         except ValueError:
             return "AMBIG", None, None
+        if allow_null and v == "null":
+            return "OK", [], ("inline-null", i, indent, end)
         if v.startswith("[") and v.endswith("]"):
             try:
                 vals = json.loads(v)
@@ -3521,9 +3616,15 @@ def sequence(section, name):
         if not s or s.lstrip().startswith("#"):
             j += 1; continue
         lead = len(s) - len(s.lstrip(" "))
-        if lead <= indent:
+        if lead < indent:
             break
         t = s.strip()
+        # PyYAML emits a sequence value at the same indentation as its key:
+        #   api_server:
+        #   - web
+        # A different mapping key at that level closes the sequence.
+        if lead == indent and not t.startswith("- "):
+            break
         if not t.startswith("- "):
             return "AMBIG", None, None
         if item_indent is None:
@@ -3576,7 +3677,7 @@ elif pst in ("AMBIG", "FLOW"):
 
 for key, blocked in (("disabled_toolsets", {"file", "hermes-api-server"}),
                      ("disabled_tools", {"read_file", "write_file"})):
-    st, vals, meta = sequence("agent", key)
+    st, vals, meta = sequence("agent", key, allow_null=True)
     if st == "OK" and blocked.intersection(vals):
         manual.append("agent.%s globally disables %s; removing it would broaden other Hermes platforms" %
                       (key, ", ".join(sorted(blocked.intersection(vals)))))

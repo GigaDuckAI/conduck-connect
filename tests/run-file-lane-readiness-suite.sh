@@ -407,6 +407,230 @@ test_hermes_config() {
     "$(analysis_status "$cfg" "$ws")" "fix"
 
   printf '%s\n' \
+    'toolsets:' \
+    '- hermes-cli' \
+    'agent:' \
+    '  disabled_toolsets: []' \
+    '  disabled_tools: null' \
+    '  personalities:' \
+    '    creative: "A normal PyYAML-wrapped personality line that continues' \
+    '      cwd: this target-looking text remains scalar content' \
+    '      on a deeper line without becoming another mapping entry."' \
+    'terminal:' \
+    '  backend: local' \
+    "  cwd: \"$real_ws\"" \
+    '  env_passthrough: []' \
+    'platform_toolsets:' \
+    '  api_server:' \
+    '  - web' \
+    '  - memory' \
+    '  - file' \
+    '  cli:' \
+    '  - hermes-cli' \
+    > "$cfg"
+  expect_eq "Hermes standard PyYAML config is accepted" \
+    "$(analysis_status "$cfg" "$ws")" "ready"
+
+  printf '%s\n' \
+    'toolsets:' \
+    '- hermes-cli' \
+    'agent:' \
+    '  disabled_toolsets: []' \
+    '  disabled_tools: null' \
+    '  personalities:' \
+    '    creative: "A normal PyYAML-wrapped personality line that continues' \
+    '      cwd: this target-looking text remains scalar content' \
+    '      on a deeper line without becoming another mapping entry."' \
+    'terminal:' \
+    '  backend: local' \
+    "  cwd: \"$TMP/wrong-pyyaml-root\"" \
+    'platform_toolsets:' \
+    '  api_server:' \
+    '  - web' \
+    '  - memory' \
+    '  cli:' \
+    '  - hermes-cli' \
+    > "$cfg"
+  expect_eq "Hermes standard PyYAML config detects narrow changes" \
+    "$(analysis_status "$cfg" "$ws")" "fix"
+  expect_eq "Hermes standard PyYAML config applies narrow changes" \
+    "$(analysis_status "$cfg" "$ws" apply)" "applied"
+  expect_eq "Hermes edited PyYAML config re-checks ready" \
+    "$(analysis_status "$cfg" "$ws")" "ready"
+  if grep -q '^- hermes-cli$' "$cfg" \
+     && grep -q '^  - file$' "$cfg" \
+     && grep -qF "  cwd: \"$real_ws\"" "$cfg" \
+     && grep -q 'continues$' "$cfg"; then
+    pass "Hermes PyYAML edit preserves root/list/scalar layout"
+  else
+    fail "Hermes PyYAML edit preserves root/list/scalar layout" "standard layout changed or target edit missing"
+  fi
+
+  printf '%s\n' \
+    'terminal:' \
+    '  backend: local' \
+    '    dangling continuation' \
+    "  cwd: \"$TMP/wrong-dangling-root\"" \
+    > "$cfg"
+  cp "$cfg" "$cfg.before"
+  expect_eq "Hermes unproved continuation fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+  expect_eq "Hermes unproved continuation refuses direct apply" \
+    "$(analysis_status "$cfg" "$ws" apply)" "manual"
+  if cmp -s "$cfg" "$cfg.before"; then
+    pass "Hermes unproved continuation is not mutated"
+  else
+    fail "Hermes unproved continuation is not mutated" "config changed"
+  fi
+
+  printf '%s\n' \
+    'terminal:' \
+    '  backend: local' \
+    '  - stray' \
+    "  cwd: \"$TMP/wrong-stray-root\"" \
+    > "$cfg"
+  expect_eq "Hermes unattached indentless list fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
+    '- hermes-cli' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes standalone root list fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
+    'toolsets:' \
+    '- name: hermes-cli' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes root list-of-map fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
+    'toolsets:' \
+    '- *' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  cp "$cfg" "$cfg.before"
+  expect_eq "Hermes lone root alias marker fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+  expect_eq "Hermes lone root alias marker refuses apply" \
+    "$(analysis_status "$cfg" "$ws" apply)" "manual"
+  if cmp -s "$cfg" "$cfg.before"; then
+    pass "Hermes lone root alias marker is not mutated"
+  else
+    fail "Hermes lone root alias marker is not mutated" "config changed"
+  fi
+
+  printf '%s\n' \
+    'toolsets:' \
+    '- -' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes nested root sequence marker fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
+    'toolsets:' \
+    '- hermes-cli' \
+    '  nested: value' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes root scalar list continuation fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
+    'toolsets:' \
+    '  nested: invalid-mixed-node' \
+    '- hermes-cli' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  cp "$cfg" "$cfg.before"
+  expect_eq "Hermes mixed indented and root list value fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+  expect_eq "Hermes mixed root value refuses apply" \
+    "$(analysis_status "$cfg" "$ws" apply)" "manual"
+  if cmp -s "$cfg" "$cfg.before"; then
+    pass "Hermes mixed root value is not mutated"
+  else
+    fail "Hermes mixed root value is not mutated" "config changed"
+  fi
+
+  printf '%s\n' \
+    'terminal:' \
+    '  "cwd": "/quoted-target"' \
+    > "$cfg"
+  cp "$cfg" "$cfg.before"
+  expect_eq "Hermes quoted direct target fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+  expect_eq "Hermes quoted direct target refuses apply" \
+    "$(analysis_status "$cfg" "$ws" apply)" "manual"
+  if cmp -s "$cfg" "$cfg.before"; then
+    pass "Hermes quoted direct target is not mutated"
+  else
+    fail "Hermes quoted direct target is not mutated" "config changed"
+  fi
+
+  printf '%s\n' \
+    'terminal:' \
+    '  cwd : "/spaced-target"' \
+    > "$cfg"
+  cp "$cfg" "$cfg.before"
+  expect_eq "Hermes spaced direct target fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+  expect_eq "Hermes spaced direct target refuses apply" \
+    "$(analysis_status "$cfg" "$ws" apply)" "manual"
+  if cmp -s "$cfg" "$cfg.before"; then
+    pass "Hermes spaced direct target is not mutated"
+  else
+    fail "Hermes spaced direct target is not mutated" "config changed"
+  fi
+
+  printf '%s\n' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    "  cwd: \"$TMP/duplicate-target\"" \
+    > "$cfg"
+  cp "$cfg" "$cfg.before"
+  expect_eq "Hermes duplicate direct target fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+  expect_eq "Hermes duplicate direct target refuses apply" \
+    "$(analysis_status "$cfg" "$ws" apply)" "manual"
+  if cmp -s "$cfg" "$cfg.before"; then
+    pass "Hermes duplicate direct target is not mutated"
+  else
+    fail "Hermes duplicate direct target is not mutated" "config changed"
+  fi
+
+  printf '%s\n' \
+    'agent:' \
+    '  disabled_tools:' \
+    '  - read_file' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes indentless global file disable fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
+    'agent:' \
+    '  personalities:' \
+    '    creative: "an unclosed generated scalar' \
+    '      still has no closing quote' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes unclosed multiline scalar fails closed" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  printf '%s\n' \
     "{\"terminal\":{\"cwd\":\"$ws\"},\"platform_toolsets\":{\"api_server\":[\"web\"]}}" \
     > "$cfg"
   cp "$cfg" "$cfg.before"
