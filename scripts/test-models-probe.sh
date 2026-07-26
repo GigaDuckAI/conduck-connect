@@ -81,10 +81,15 @@ s.close()') || break
 done
 [ -n "$CLOSED" ] || { printf 'FAIL could not find a closed port for the refused-connection case\n'; exit 2; }
 
-# Pull in the functions under test + the vars curl_gw expects.
-fn_curl=$(sed -n '/^curl_gw()/,/^}/p' "$SCRIPT")
-fn_probe=$(sed -n '/^models_is_json()/,/^}/p' "$SCRIPT")
-eval "$fn_curl"; eval "$fn_probe"
+# Pull in the functions under test, the helpers they call, and the vars curl_gw
+# expects. Each extraction is asserted non-empty: a renamed or relocated helper
+# fails the suite here, rather than surfacing as a "command not found" mid-probe
+# that leaves a diagnostic global silently empty while the assertions still pass.
+for fn in curl_gw models_is_json safe_display; do
+  fn_body=$(sed -n "/^$fn()/,/^}/p" "$SCRIPT")
+  [ -n "$fn_body" ] || { printf 'FAIL could not extract %s() from the built artifact\n' "$fn"; exit 2; }
+  eval "$fn_body"
+done
 MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false
 MODELS_NO_VALID_ID=false
 # MODELS_TIME/DOCTOR/COMPAT are read only inside the eval'd functions — export keeps
