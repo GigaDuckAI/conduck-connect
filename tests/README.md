@@ -16,6 +16,17 @@ No network, no real gateway, nothing installed — except where a file says othe
 | `fixture-canary.py` | Contract-conformant adapter that can hold a response silently for a per-turn delay, then reply deterministically — for measuring whether an exposure rail (reverse proxy / tunnel) kills long silent HTTP responses, the shape of a real agent turn. |
 | `pty-run.py` | Runs one command inside a real PTY and feeds it a fixed input sequence: `pty-run.py <timeout-seconds> <input> <command> [args...]`. **A hard dependency of `run-checks-suite.sh`**, not an optional helper — the script offers the PASS→setup handoff only to a genuine interactive terminal, so those cases cannot be driven by a pipe. A timeout kills the child and appends `PTY TIMEOUT` to the captured output rather than hanging the suite. |
 
+**Every HTTP fixture binds without reverse-resolving.** `http.server`'s
+`server_bind()` calls `socket.getfqdn()` on the bind address, and each fixture
+prints its `READY <port>` line only after that returns. On a host with no
+reverse zone for `127.0.0.1` the lookup blocks until the resolver gives up —
+around 20 seconds on GitHub's macOS runners — so the suite stops waiting for
+READY while the fixture is still alive and silent, and every case that needs one
+fails for a reason nothing prints. Each fixture therefore subclasses its server
+and overrides `server_bind` to skip the lookup; `server_name` is read only by
+the CGI handlers, which none of these use. The
+`fixtures-do-not-reverse-resolve-their-bind` case enforces this across the tree.
+
 Run the suite from the repo root:
 
 ```bash

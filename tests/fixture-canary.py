@@ -40,9 +40,29 @@ import json
 import os
 import re
 import socket
+import socketserver
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class LoopbackThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that does not reverse-resolve its own bind address.
+
+    http.server's server_bind() calls socket.getfqdn(host) — a REVERSE DNS
+    lookup — and this fixture prints READY only after it returns. On a CI runner
+    with no reverse zone for 127.0.0.1 that blocks until the resolver gives up
+    (~20s observed on GitHub's macOS images), so the runner stops waiting for
+    READY while the process is still alive and silent.
+
+    server_name is read only by the CGI handlers, which this fixture does not
+    use, so setting it to the bind host loses nothing.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
 
 CANARY_VERSION = "1.0.0"
 MAX_DELAY = 600            # canary ceiling; the campaign itself stays <= 240
@@ -281,7 +301,7 @@ def main():
         print("CONDUCK_TOKEN is required", file=sys.stderr)
         sys.exit(2)
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(token))
+    server = LoopbackThreadingHTTPServer(("127.0.0.1", args.port), make_handler(token))
     server.daemon_threads = True
     print("READY %d" % server.server_address[1], flush=True)
     try:

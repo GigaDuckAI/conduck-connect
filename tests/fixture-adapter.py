@@ -98,10 +98,30 @@ import os
 import re
 import struct
 import sys
+import socketserver
 import threading
 import time
 import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class LoopbackHTTPServer(HTTPServer):
+    """HTTPServer that does not reverse-resolve its own bind address.
+
+    http.server's server_bind() calls socket.getfqdn(host) — a REVERSE DNS
+    lookup — and this fixture prints READY only after that returns. On a CI
+    runner with no reverse zone for 127.0.0.1 the lookup blocks until the
+    resolver gives up (~20s observed on GitHub's macOS images), the runner stops
+    waiting for READY, and every case needing a fixture fails while the process
+    is still alive and produces no diagnostic at all.
+
+    server_name is read only by the CGI handlers, which this fixture does not
+    use, so setting it to the bind host loses nothing.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 FILE_MODES = {"files-good", "files-no-write", "files-late-write",
               "files-wrong-bytes", "files-no-final-newline",
@@ -511,8 +531,8 @@ def main():
         models = ["org/route-" + ("opaque-model-segment-" * 8) + "final"]
     else:
         models = ["fixture-echo", "fixture-echo-2"]
-    server = HTTPServer(("127.0.0.1", args.port),
-                        make_handler(args.mode, token, models))
+    server = LoopbackHTTPServer(("127.0.0.1", args.port),
+                                make_handler(args.mode, token, models))
     print("READY %d" % server.server_address[1], flush=True)
     try:
         server.serve_forever()

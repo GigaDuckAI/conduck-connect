@@ -1325,6 +1325,31 @@ raise SystemExit(0 if p["gateway"].get("model") == os.environ["EXPECTED_MODEL"] 
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+run_fixture_bind_case() {
+  local name="fixtures-do-not-reverse-resolve-their-bind" offenders
+
+  # Structural guard: no fixture may instantiate a STOCK HTTPServer or
+  # ThreadingHTTPServer. http.server's server_bind() calls socket.getfqdn() on
+  # the bind address — a REVERSE DNS lookup — and every fixture prints READY
+  # only after it returns. On a runner with no reverse zone for 127.0.0.1 that
+  # blocks until the resolver gives up (~20s measured on GitHub's macOS images),
+  # the runner stops waiting for READY, and every case needing a fixture fails
+  # while the process is still alive and producing no diagnostic at all.
+  #
+  # Written as a rule about the tree rather than about one fixture: the same
+  # line existed in four places, and three of them were found only by grepping
+  # for the first. Subclasses that override server_bind do not match, which is
+  # the point — the fix is to bind without resolving, not to avoid the class.
+  offenders=$(grep -rnE '=[[:space:]]*(http\.server\.)?(Threading)?HTTPServer\(' \
+    "$HERE"/*.py "$HERE/../scripts"/*.sh 2>/dev/null || true)
+  if [ -n "$offenders" ]; then
+    fail_case "$name" "binds a stock HTTPServer, whose server_bind reverse-resolves before READY: $(printf '%s' "$offenders" | head -n 1)"
+    return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_curl_config_isolation_case() {
   local name="all-curl-calls-ignore-config" rc=0 hard_home="$TMP/curl-home"
   local curl_lines funcs
@@ -2165,6 +2190,10 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" all-curl-calls-ignore-config "*) true ;; *) false ;; esac; then
   run_curl_config_isolation_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" fixtures-do-not-reverse-resolve-their-bind "*) true ;; *) false ;; esac; then
+  run_fixture_bind_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" gateway-text-cannot-forge-transcript "*) true ;; *) false ;; esac; then

@@ -88,6 +88,14 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   anywhere under the state directory. It runs a control against a deliberately
   leaking copy of the same function, so a guard that stopped biting fails the
   suite rather than passing quietly.
+- Test fixtures no longer reverse-resolve their own bind address.
+  `http.server`'s `server_bind()` calls `socket.getfqdn()` before a fixture can
+  print `READY`, which blocks until the resolver gives up on a host with no
+  reverse zone for `127.0.0.1` — every case needing a fixture then failed with
+  nothing printed to say why. A structural guard
+  (`fixtures-do-not-reverse-resolve-their-bind`) now keeps a stock
+  `HTTPServer`/`ThreadingHTTPServer` out of the tree, and a fixture that fails
+  to start reports its own stderr instead of the previous case's output.
 
 ## [0.13.0] — one command surface, and checks that hand off to setup
 

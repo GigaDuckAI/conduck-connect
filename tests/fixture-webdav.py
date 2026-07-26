@@ -46,11 +46,31 @@ import base64
 import hmac
 import os
 import shutil
+import socketserver
 import stat
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
+
+
+class LoopbackThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that does not reverse-resolve its own bind address.
+
+    http.server's server_bind() calls socket.getfqdn(host) — a REVERSE DNS
+    lookup — and this fixture prints READY only after that returns. On a CI
+    runner with no reverse zone for 127.0.0.1 the lookup blocks until the
+    resolver gives up (~20s observed on GitHub's macOS images), the runner stops
+    waiting for READY, and every case needing a fixture fails while the process
+    is still alive and produces no diagnostic at all.
+
+    server_name is read only by the CGI handlers, which this fixture does not
+    use, so setting it to the bind host loses nothing.
+    """
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def make_handler(cfg):
@@ -312,7 +332,7 @@ def main():
            "password": password, "stale_seconds": args.stale_seconds,
            "capture": args.capture, "known": set(), "first_output_misses": set(),
            "hang_seconds": float(os.environ.get("WEBDAV_HANG_SECONDS", "10"))}
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(cfg))
+    server = LoopbackThreadingHTTPServer(("127.0.0.1", args.port), make_handler(cfg))
     server.daemon_threads = True
     print("READY %d" % server.server_address[1], flush=True)
     try:

@@ -9,7 +9,7 @@ SCRIPT="${1:-conduck-connect.sh}"   # default: run from the repo root
 # runs and an unrelated listener on the host can never collide with this fixture.
 PORT_FILE=$(mktemp "${TMPDIR:-/tmp}/conduck-models-probe.XXXXXX") || exit 2
 CONDUCK_PORT_FILE="$PORT_FILE" python3 - <<'PY' &
-import http.server, json, os
+import http.server, json, os, socketserver
 
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -37,7 +37,16 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+class S(http.server.HTTPServer):
+    # server_bind() reverse-resolves the bind address (socket.getfqdn), which
+    # blocks until the resolver gives up on a CI runner with no reverse zone for
+    # 127.0.0.1 — ~20s, before the port file is ever written. server_name is
+    # CGI-only and this fixture never reads it.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+srv = S(("127.0.0.1", 0), H)
 with open(os.environ["CONDUCK_PORT_FILE"], "w") as fh:
     fh.write("%d\n" % srv.server_address[1])
 srv.serve_forever()
