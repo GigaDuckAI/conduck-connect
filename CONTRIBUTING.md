@@ -29,6 +29,17 @@ last commit;
 `git rebase --signoff <base>` fixes a whole branch. Push the corrected history
 and the check re-runs.
 
+Rather than rely on remembering the flag, enable the tracked hook once per clone:
+
+```
+git config core.hooksPath .githooks
+```
+
+`.githooks/prepare-commit-msg` then adds the trailer for you. It is keyed on the
+commit **author** (the person who can certify the change, and not always the
+committer), skipped for merge and squash messages, and idempotent — so
+`git commit -s` keeps working and never produces a duplicate line.
+
 ## Development baseline
 
 The script runs on **Linux and macOS** and must stay **Bash 3.2-compatible** —
