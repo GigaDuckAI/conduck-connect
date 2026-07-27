@@ -15,7 +15,7 @@ write_profile() {
   $DRY_RUN && return 0                       # emit_payload never runs in dry-run, but stay explicit
   [ -n "$GW_ID" ] || return 0                # no stable id → nowhere to key the profile; skip quietly
   local pf; pf="$STATE_DIR/profile-$GW_ID.json"
-  ( umask 077; mkdir -p "$STATE_DIR" ) 2>/dev/null \
+  ensure_state_dir \
     || { warn "Couldn't create $STATE_DIR to save the pairing profile — pairing is still complete."; return 0; }
   local out
   out=$(GW_ID="$GW_ID" GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_AUTH="$GW_AUTH" \

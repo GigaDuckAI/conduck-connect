@@ -1078,6 +1078,7 @@ warn() { :; }
 note() { :; }
 SHOW_QR=false
 DRY_RUN=false
+STATE_DIR_EXPOSURE_REPORTED=false
 STATE_DIR="$STATE"
 GW_ID="custom-secret-probe"
 GW_KIND="custom"
@@ -1129,7 +1130,10 @@ run_profile_secret_exclusion_case() {
   printf 'pairing-profile secret-exclusion guard\n  gateway-token sentinel: %s\n  file-lane sentinel:     %s\n' \
     "$gw_secret" "$fs_secret" > "$TMP/doctor.out"
 
-  writer=$(extract_funcs write_profile)
+  # ensure_state_dir + file_mode_is_open ride along because write_profile creates
+  # $STATE_DIR through them; the REAL helpers, not stubs, so this case still
+  # proves the profile lands in a directory the shipped code made.
+  writer=$(extract_funcs write_profile ensure_state_dir file_mode_is_open)
   if [ -z "$writer" ] || ! printf '%s\n' "$writer" | grep -qF 'write_profile()'; then
     fail_case "$name" "could not extract write_profile from the release artifact"; return
   fi
@@ -1765,6 +1769,106 @@ run_check_tempfile_isolation_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# $STATE_DIR holds fileserver-*.cred/.env and profile-*.json, so the artifact
+# creates it 0700 — otherwise any other account on the box can list which
+# gateways this user has paired. `mkdir -p` is a no-op on an EXISTING directory,
+# mode included, so `umask 077` around it only ever secures a first run: a
+# $STATE_DIR left at 0755 by an earlier version, a different umask, or the
+# user's own mkdir keeps that mode for good. The rule is therefore about the
+# artifact, not about one writer — every creation goes through ensure_state_dir,
+# and that helper is graded on both arms, because "silently correct on a fresh
+# box, silently exposed on an upgraded one" is exactly the shape this misses.
+run_state_dir_mode_case() {
+  local name="state-dir-is-0700-or-reported" funcs out mode dir
+  local artifact_mkdirs
+
+  # Wiring: no writer may mkdir $STATE_DIR on its own. A bare
+  # `( umask 077; mkdir -p "$STATE_DIR" )` at a call site satisfies every
+  # behavioural assertion below while skipping the exposure report entirely.
+  artifact_mkdirs=$(grep -n 'mkdir -p "\$STATE_DIR"' "$SCRIPT")
+  printf '%s\n' "$artifact_mkdirs" > "$TMP/doctor.out"
+  if [ "$(printf '%s\n' "$artifact_mkdirs" | grep -c .)" != "1" ]; then
+    fail_case "$name" "\$STATE_DIR is created outside ensure_state_dir"; return
+  fi
+  funcs=$(extract_funcs ensure_state_dir file_mode_is_open warn)
+  if ! printf '%s\n' "$funcs" | grep -qF 'ensure_state_dir()'; then
+    fail_case "$name" "could not extract ensure_state_dir from the release artifact"; return
+  fi
+  # …and the sole mkdir must be the one inside ensure_state_dir.
+  if ! printf '%s\n' "$funcs" | grep -qF 'mkdir -p "$STATE_DIR"'; then
+    fail_case "$name" "the one \$STATE_DIR mkdir is not the one inside ensure_state_dir"; return
+  fi
+
+  # Arm 1 — a FRESH state dir is created 0700, and says nothing.
+  dir="$TMP/state-fresh/conduck"
+  rm -rf "$TMP/state-fresh"
+  out=$(FUNCS="$funcs" SD="$dir" bash -c '
+eval "$FUNCS"
+STATE_DIR="$SD"; STATE_DIR_EXPOSURE_REPORTED=false; YELLOW=""; RESET=""
+ensure_state_dir
+printf "fresh-rc=%d\n" "$?"
+' 2>&1) || true
+  printf -- '--- fresh ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  mode=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$dir" 2>/dev/null)
+  if [ "$mode" != "0o700" ]; then
+    fail_case "$name" "a freshly created \$STATE_DIR is $mode, not 0o700"; return
+  fi
+  if [ "$(printf '%s\n' "$out" | grep -c .)" != "1" ]; then
+    fail_case "$name" "creating a fresh \$STATE_DIR produced output instead of staying silent"; return
+  fi
+
+  # Arm 2 — a PRE-EXISTING 0755 dir keeps its mode (no silent chmod of something
+  # we may not have created) and the run names both the exposure and the fix.
+  dir="$TMP/state-open/conduck"
+  rm -rf "$TMP/state-open"; mkdir -p "$dir"; chmod 755 "$dir"
+  out=$(FUNCS="$funcs" SD="$dir" bash -c '
+eval "$FUNCS"
+STATE_DIR="$SD"; STATE_DIR_EXPOSURE_REPORTED=false; YELLOW=""; RESET=""
+ensure_state_dir
+printf "open-rc=%d\n" "$?"
+ensure_state_dir
+printf "second-rc=%d\n" "$?"
+' 2>&1) || true
+  printf -- '--- pre-existing 0755 ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  mode=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$dir")
+  if [ "$mode" != "0o755" ]; then
+    fail_case "$name" "an existing \$STATE_DIR was silently re-chmodded to $mode"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF "chmod 700 $dir"; then
+    fail_case "$name" "an exposed \$STATE_DIR did not print the exact fix"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'can be listed by other accounts'; then
+    fail_case "$name" "an exposed \$STATE_DIR went quiet about who can read the listing"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'open-rc=0' || ! printf '%s\n' "$out" | grep -qF 'second-rc=0'; then
+    fail_case "$name" "reporting the exposure turned into a failure for the caller"; return
+  fi
+  # Said ONCE per run: three writers reach this helper in a single setup, and a
+  # warning repeated at each of them is noise the user learns to skip.
+  if [ "$(printf '%s\n' "$out" | grep -cF "chmod 700 $dir")" != "1" ]; then
+    fail_case "$name" "the exposure warning repeats on every call instead of once per run"; return
+  fi
+
+  # Arm 3 — an uncreatable state dir is a clean 1, so write_profile can warn
+  # about the profile rather than looking like it succeeded.
+  dir="$TMP/state-blocked/conduck"
+  rm -rf "$TMP/state-blocked"; : > "$TMP/state-blocked"
+  out=$(FUNCS="$funcs" SD="$dir" bash -c '
+eval "$FUNCS"
+STATE_DIR="$SD"; STATE_DIR_EXPOSURE_REPORTED=false; YELLOW=""; RESET=""
+ensure_state_dir
+printf "blocked-rc=%d\n" "$?"
+' 2>&1) || true
+  printf -- '--- uncreatable ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  rm -f "$TMP/state-blocked"
+  if ! printf '%s\n' "$out" | grep -qF 'blocked-rc=1'; then
+    fail_case "$name" "a \$STATE_DIR that could not be created did not report failure"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_check_continue_eof_case() {
   local name="check-pass-continuation-eof" rc=0
   start_fixture good || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
@@ -2214,6 +2318,10 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" check-probe-files-are-not-siblings "*) true ;; *) false ;; esac; then
   run_check_tempfile_isolation_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" state-dir-is-0700-or-reported "*) true ;; *) false ;; esac; then
+  run_state_dir_mode_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" check-pass-continuation-eof "*) true ;; *) false ;; esac; then

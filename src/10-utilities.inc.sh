@@ -374,6 +374,30 @@ secure_owned_file_mode() { # secure_owned_file_mode <file> <what-is-inside> -> 1
   return 0
 }
 
+# The ONE way $STATE_DIR is created. It holds fileserver-*.cred/.env and
+# profile-*.json, so it is created 0700: at the ambient 0755 any other account
+# on the box can list which gateways this user has paired, and the file names
+# alone carry that.
+#
+# `mkdir -p` is a no-op on a directory that ALREADY exists, mode included, so
+# creating it under `umask 077` only ever secures a first run. A $STATE_DIR that
+# an earlier version, a different umask, or the user's own `mkdir` left at 0755
+# keeps that mode for good — the files inside stay 0600, but the listing is
+# world-readable forever and nothing ever says so. A directory we may not have
+# created is not re-chmodded silently (same rule as the agent workspace), so the
+# exposure is REPORTED, once per run, with the exact fix.
+STATE_DIR_EXPOSURE_REPORTED=false
+ensure_state_dir() {  # -> 1 when the directory does not exist and could not be created
+  ( umask 077; mkdir -p "$STATE_DIR" ) 2>/dev/null || return 1
+  $STATE_DIR_EXPOSURE_REPORTED && return 0
+  file_mode_is_open "$STATE_DIR" || return 0
+  STATE_DIR_EXPOSURE_REPORTED=true
+  warn "$STATE_DIR can be listed by other accounts on this machine (it already existed with that mode)."
+  warn "The credential files inside are 0600, but the folder itself names every gateway you have paired."
+  warn "Fix it when you can:  chmod 700 $STATE_DIR"
+  return 0
+}
+
 # Rung 2: a change to something YOU own — we print the exact command, you run it.
 print_and_wait() {  # print_and_wait "why" "command shown to user"
   if $DRY_RUN; then plan_add "YOU RUN  $2  ($1)"; note "(dry-run: you would run the above)"; return 0; fi

@@ -43,6 +43,7 @@ GW_CERT_FP=""
 FS_CERT_FP=""
 OS="Linux"
 STATE_DIR="$TMP/state"
+STATE_DIR_EXPOSURE_REPORTED=false
 GW_ID="test"
 GW_LOCAL_PORT=""
 
@@ -56,6 +57,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 env_get() {
   awk -F= -v key="$2" '$1 == key { sub(/^[^=]*=/, ""); value=$0 } END { print value }' "$1"
 }
+
+# The file-lane unit writers create $STATE_DIR through ensure_state_dir. That is
+# implementation, not runtime plumbing — stubbing it would stop this suite from
+# proving the writers make a 0700 state directory — so the REAL pair is lifted
+# out of the utilities module rather than sourcing all of it (which would drag
+# in the CLI/global state this deliberately minimal runtime replaces).
+eval "$(sed -n '/^file_mode_is_open()/,/^}/p;/^ensure_state_dir()/,/^}/p' "$ROOT/src/10-utilities.inc.sh")"
+declare -F ensure_state_dir >/dev/null || { echo "could not lift ensure_state_dir out of src/10-utilities.inc.sh" >&2; exit 2; }
 
 # shellcheck source=src/40-file-lane.inc.sh
 source "$ROOT/src/40-file-lane.inc.sh"

@@ -554,12 +554,11 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
   fi
   FS_UNIT="$HOME/.config/systemd/user/conduck-files-$GW_ID.service"
   # Two mkdirs, deliberately: the systemd unit directory is shared with the rest
-  # of the user's units and keeps the ambient mode, while $STATE_DIR gets 0700 —
-  # it holds fileserver-*.cred/.env and profile-*.json, so at the ambient 0755
-  # any other account on the box could list which gateways this user has paired.
-  # Matches write_profile, which has always created it under `umask 077`.
+  # of the user's units and keeps the ambient mode, while $STATE_DIR goes through
+  # ensure_state_dir — it holds fileserver-*.cred/.env and profile-*.json, so it
+  # is created 0700 and an already-open one is reported rather than left silent.
   mkdir -p "$(dirname "$FS_UNIT")"
-  ( umask 077; mkdir -p "$STATE_DIR" )
+  ensure_state_dir
   umask 077
   printf 'RCLONE_PASS=%s\n' "$FS_CRED" > "$envf"; chmod 600 "$envf"
   printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
@@ -608,9 +607,9 @@ write_fs_unit_mac() { # write_fs_unit_mac <workspace>
   FS_UNIT="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
   # Split for the same reason as the Linux twin: LaunchAgents is shared with the
   # user's other agents and keeps the ambient mode; $STATE_DIR holds credentials
-  # and profile-*.json, so it is created 0700.
+  # and profile-*.json, so it goes through ensure_state_dir.
   mkdir -p "$(dirname "$FS_UNIT")"
-  ( umask 077; mkdir -p "$STATE_DIR" )
+  ensure_state_dir
   umask 077
   printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
   # Build the plist structurally with plistlib (correct escaping for any path).

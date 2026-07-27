@@ -55,7 +55,18 @@ trap 'exit 143' TERM
 SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1\.3 harness=[0-9][0-9.]* profile=(basic|deep) core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_access=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_e2e=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
 
 PASS=0; FAIL=0
-fail_case() { FAIL=$((FAIL+1)); printf 'INTEG ✗ %s — %s\n' "$1" "$2"; sed 's/^/    | /' "$TMP/doctor.out" | tail -n 22; }
+# The dumped file is an argument, not always doctor.out: a case that dies before
+# the connector ever runs has no doctor.out, and `sed` on a missing path printed
+# its own error instead of the log that would explain the failure.
+fail_case() { # fail_case <label> <why> [log-file…]
+  FAIL=$((FAIL+1)); printf 'INTEG ✗ %s — %s\n' "$1" "$2"; shift 2
+  local f
+  for f in "${@:-$TMP/doctor.out}"; do
+    [ -s "$f" ] || continue
+    printf '    | --- %s ---\n' "$(basename "$f")"
+    tail -n 22 "$f" | sed 's/^/    | /'
+  done
+}
 
 start_adapter() { # start_adapter <served> -> ADAPTER_PID + APORT
   : > "$TMP/adapter.out"
@@ -81,8 +92,12 @@ start_rclone() { # start_rclone <served> <cred> [extra rclone args…] -> RCLONE
     > "$TMP/rclone.out" 2>"$TMP/rclone.err" &
   RCLONE_PID=$!
   RPORT=""; local i=0
+  # rclone changed this line's shape: 1.60 prints `…started on http://127.0.0.1:PORT/`,
+  # later versions bracket the URL (`…started on [http://127.0.0.1:PORT/]`). Matching
+  # only the bracketed form leaves the port empty on a distro rclone, and the case
+  # then reports "rclone serve failed to start" about a server that started fine.
   while [ "$i" -lt 100 ]; do
-    RPORT=$(grep -hoE 'Server started on \[http://127\.0\.0\.1:[0-9]+' "$TMP/rclone.err" 2>/dev/null \
+    RPORT=$(grep -hoE 'Server started on \[?http://127\.0\.0\.1:[0-9]+' "$TMP/rclone.err" 2>/dev/null \
             | grep -oE '[0-9]+$' | head -n 1)
     [ -n "$RPORT" ] && break
     kill -0 "$RCLONE_PID" 2>/dev/null || break
@@ -120,9 +135,11 @@ run_rclone_case() { # run_rclone_case <label> <expexit> <expfails> <frags-space-
   home=$(mktemp -d "$TMP/home.XXXXXX") || { fail_case "$label" "mktemp home"; return; }
   cred=$(python3 -c 'import secrets; print("rc-" + secrets.token_hex(8))') || { fail_case "$label" "cred gen"; return; }
 
-  start_adapter "$served" || { fail_case "$label" "adapter failed to start"; stop_adapter; return; }
+  start_adapter "$served" \
+    || { fail_case "$label" "adapter never printed READY" "$TMP/adapter.err" "$TMP/adapter.out"; stop_adapter; return; }
   RCLONE_PASS="$cred" start_rclone "$served" "$cred" "$@" \
-    || { fail_case "$label" "rclone serve failed to start"; stop_adapter; stop_rclone; return; }
+    || { fail_case "$label" "no listening port parsed out of rclone's startup log" "$TMP/rclone.err"
+         stop_adapter; stop_rclone; return; }
 
   local rc=0
   env -u XDG_CONFIG_HOME HOME="$home" TERM=dumb CONDUCK_TOKEN="$TOKEN" \

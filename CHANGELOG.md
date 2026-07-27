@@ -4,6 +4,21 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- The state directory's `0700` is now enforced on every run, not just the one
+  that created it. `( umask 077; mkdir -p )` is a no-op on an existing
+  directory, mode included, so a `~/.config/conduck` left world-listable by an
+  earlier version or a different umask kept that mode forever and setup said
+  nothing. Credential files inside stay `0600`, but the filenames name every
+  gateway paired. A single `ensure_state_dir` is now the only creator: fresh →
+  `0700` silently; already-open → reported once per run with the exact
+  `chmod 700`, and never silently re-chmodded, since the connector may not have
+  created it (same rule as the agent workspace).
+- The real-rclone integration harness now parses rclone's startup port whether
+  or not the URL is bracketed. rclone 1.60 prints it unbracketed, so on those
+  builds the port came back empty and both cases failed as "rclone serve failed
+  to start" — a false red about a server that had started correctly. Its
+  failure path also dumps the log it actually has rather than a `doctor.out`
+  that does not exist yet.
 - File-server loopback ports are now allocated per gateway from a bounded range,
   excluding both live listeners and every connector-owned unit (including
   stopped units). The selected port persists in that gateway's service/profile
