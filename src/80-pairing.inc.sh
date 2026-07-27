@@ -113,8 +113,20 @@ emit_payload() {
   local pairing="conduck-setup:v${PAYLOAD_VERSION}:$encoded"
 
   say ""
-  warn "The setup code below CONTAINS YOUR TOKEN — both the QR and the plain-text string."
-  warn "Treat it like a password: anyone who scans or copies it can use your agent."
+  # The file-lane clause must ride the SAME condition build_pairing_payload_json uses to
+  # attach fileServer — warning about a shared folder that isn't in this code is a lie the
+  # user cannot check, and omitting it when it IS in the code understates what they hold.
+  warn "The setup code below CONTAINS YOUR GATEWAY TOKEN — both the QR and the plain-text string."
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+    warn "It also carries the FILE-SERVER CREDENTIAL for your shared folder."
+    warn "Treat it like a password: whoever holds it can do anything your gateway allows and can"
+    warn "read or change files in that folder, and it keeps working until you rotate those secrets."
+  else
+    warn "Treat it like a password: whoever holds it can do anything your gateway allows, and it"
+    warn "keeps working until you rotate that secret."
+  fi
+  warn "Handing the code to another person hands them that same access. Devices sharing one token"
+  warn "cannot be cut off one at a time — rotating it cuts off every device using that token."
   warn "Show it to your own phone only. Note: over SSH, Ctrl-L only clears the visible screen —"
   warn "the code stays in your scroll-back, so close the terminal (or clear scroll-back) when"
   warn "you're done, and never paste it into chat or a bug report."

@@ -252,6 +252,8 @@ Nothing fails, so no message prints — but the result quietly isn't what you wa
 
 `conduck-setup:v1:<base64(JSON)>` — same content in the QR and the paste string. Full contract in **[PAYLOAD.md](PAYLOAD.md)**.
 
+It is a reusable credential, not a one-time invite: it carries your gateway token (and the file-server credential when a file lane is set up), so whoever holds it keeps that access until you rotate those secrets — see **[SECURITY.md](SECURITY.md#the-pairing-code-is-a-secret)**.
+
 ## Reporting a problem
 
 Security issues: see **[SECURITY.md](SECURITY.md)** (private vulnerability reporting — please don't open a public issue). Bugs and questions: open an issue.
