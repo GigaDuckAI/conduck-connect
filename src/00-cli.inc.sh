@@ -104,7 +104,8 @@
 #
 # Re-running is safe: every step detects existing state and reuses what's done.
 # Use --show-code to re-show a saved gateway's code, skipping setup questions
-# (handy for pairing a second device).
+# (handy for pairing your own second device — the code is the same reusable secret,
+# so treat every copy of it like the token it carries).
 
 set -u -o pipefail
 

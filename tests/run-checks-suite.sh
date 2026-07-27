@@ -1209,6 +1209,151 @@ walk(json.load(open(os.environ["PROF"])))
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# Drive the PRODUCTION emit_payload in isolation so the warning it prints can be
+# graded in both shapes it has. The file-lane pair is the ONLY input that varies:
+# an empty pair is a run with no file lane, exactly as build_pairing_payload_json
+# reads it. Output helpers are stubbed to plain text (no colour), with warn()
+# tagged so the assertions can isolate the warning block from the rest of Step 6.
+# Args: <function-source> <file-server-url> <file-server-credential>.
+run_emit_payload_isolated() {
+  FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" bash -c '
+eval "$FUNCS"
+say()   { printf "%s\n" "$*"; }
+warn()  { printf "WARNLINE %s\n" "$*"; }
+note()  { printf "%s\n" "$*"; }
+head_() { printf "%s\n" "$*"; }
+die()   { printf "Error: %s\n" "$*" >&2; exit 1; }
+render_qr()        { return 1; }   # no QR here; the paste string still prints
+write_profile()    { :; }          # this case grades emitted text, not saved state
+cleanup_exposures() { :; }
+BOLD=""; RESET=""
+VERIFY_FAILED=false
+FS_ROLLBACK_INCOMPLETE=false
+EMITTED=false
+PAYLOAD_VERSION=1
+GW_KIND="custom"
+GW_NAME="Warning probe"
+GW_URL="https://gw.example.test"
+GW_AUTH="bearer"
+GW_TOKEN="probe-token"
+GW_MODEL=""
+GW_CERT_FP=""
+GW_LOCAL_PORT=""
+TRANSPORT="public"
+FS_URL="$FS_URL_IN"
+FS_CRED="$FS_CRED_IN"
+FS_CERT_FP=""
+emit_payload
+'
+}
+
+# 0 when the warning block states the fact <regex> describes.
+warning_states() { # warning_states <flattened-warning-block> <extended-regex>
+  printf '%s\n' "$1" | grep -qiE "$2"
+}
+
+# The emitted warning is the only place a user is told what the code they are
+# about to show around actually IS — a reusable bearer credential. SECURITY.md
+# makes specific promises about that text, and nothing but this case keeps the
+# two from drifting (they already did once: the doc promised a file-lane and
+# rotation clause the script never printed).
+#
+# Grade STABLE FACTS, never the paragraph — a verbatim assertion rots on the
+# first reword and gets deleted rather than fixed. Each check below is an
+# alternation of phrasings for ONE fact. Reword the warning freely and EXTEND
+# the alternation; do not remove a fact.
+run_pairing_warning_case() {
+  local name="pairing-warning-states-what-the-code-is"
+  local emit out_files out_bare block_files block_bare
+
+  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
+    fail_case "$name" "could not extract emit_payload from the release artifact"; return
+  fi
+
+  out_files=$(run_emit_payload_isolated "$emit" \
+    "https://files.example.test:8443" "probe-file-credential") \
+    || { printf '%s\n' "$out_files" > "$TMP/doctor.out"
+         fail_case "$name" "emit_payload failed to run with a file lane"; return; }
+  out_bare=$(run_emit_payload_isolated "$emit" "" "") \
+    || { printf '%s\n' "$out_bare" > "$TMP/doctor.out"
+         fail_case "$name" "emit_payload failed to run without a file lane"; return; }
+
+  printf -- '--- emit_payload WITH a file lane ---\n%s\n--- emit_payload WITHOUT a file lane ---\n%s\n' \
+    "$out_files" "$out_bare" > "$TMP/doctor.out"
+
+  # Non-vacuous: both runs really reached the emit, not an early return.
+  if ! printf '%s\n' "$out_files" | grep -qF 'conduck-setup:v1:' ||
+     ! printf '%s\n' "$out_bare"  | grep -qF 'conduck-setup:v1:'; then
+    fail_case "$name" "emit_payload printed no pairing code — the warning below proves nothing"; return
+  fi
+
+  # Grade the warning block only. Flattened to one line so a fact stated across
+  # two wrapped warn() lines still matches.
+  block_files=$(printf '%s\n' "$out_files" | grep '^WARNLINE ' | tr '\n' ' ')
+  block_bare=$(printf '%s\n' "$out_bare" | grep '^WARNLINE ' | tr '\n' ' ')
+  if [ -z "$block_files" ] || [ -z "$block_bare" ]; then
+    fail_case "$name" "the pairing emit printed no warning at all"; return
+  fi
+
+  local b
+  for b in "$block_files" "$block_bare"; do
+    # FACT 1 — the code carries the gateway token, and that token is a secret.
+    if ! warning_states "$b" 'token' ||
+       ! warning_states "$b" 'like a password|is a secret|keep (it|them|these) secret'; then
+      fail_case "$name" "the warning no longer names the gateway token as a secret"; return
+    fi
+    # FACT 2 — whoever holds the code gets whatever the gateway permits.
+    if ! warning_states "$b" 'whoever holds|anyone who (holds|scans|copies|has)|the holder' ||
+       ! warning_states "$b" 'your gateway (allows|permits|lets)|anything the gateway (allows|permits)'; then
+      fail_case "$name" "the warning no longer states that the holder gets the gateway's capabilities"; return
+    fi
+    # FACT 3 — it stays valid until the secrets are rotated. No expiry.
+    if ! warning_states "$b" 'until you rotate|until (that secret|those secrets|the token) (is|are) rotated'; then
+      fail_case "$name" "the warning no longer states the code works until the secrets are rotated"; return
+    fi
+    # FACT 4 — handing it to a person hands them the same access.
+    if ! warning_states "$b" 'another person|someone else|hand(ing)? (it|the code) to' ||
+       ! warning_states "$b" 'same access'; then
+      fail_case "$name" "the warning no longer states that giving the code away grants the same access"; return
+    fi
+    # FACT 5 — a shared credential has no per-device revoke; rotation hits every
+    # device on THAT token (a custom gateway may issue several, so not "every device").
+    if ! warning_states "$b" '(cannot|can ?not|can.t) be (cut off|revoked|removed)( one at a time| individually| separately)?' ||
+       ! warning_states "$b" 'every device (using|on|that uses) that token|all devices (using|on) that token'; then
+      fail_case "$name" "the warning no longer states the shared-credential revocation consequence"; return
+    fi
+  done
+
+  # FACT 6 — the file-lane clause is CONDITIONAL. Present when the code really
+  # carries the file-server credential; absent when it does not, so the wizard
+  # never claims a shared folder this run has no lane for.
+  if ! warning_states "$block_files" 'credential' ||
+     ! warning_states "$block_files" 'folder'; then
+    fail_case "$name" "a run WITH a file lane did not warn that the code carries the file-server credential"; return
+  fi
+  if warning_states "$block_bare" 'credential|shared folder|file server|file-server'; then
+    fail_case "$name" "a run WITHOUT a file lane still claimed a file-server credential or shared folder"; return
+  fi
+
+  # Control: the exact regression FACT 6 exists for — an emit whose file-lane
+  # guard is gone, so it promises a shared folder on a run that has no lane. If
+  # the check above cannot catch that, it is decoration and this case must fail
+  # here rather than in the field.
+  local unguarded control
+  unguarded=$(printf '%s\n' "$emit" | sed 's/if \[ -n "\$FS_URL" \] && \[ -n "\$FS_CRED" \]; then/if true; then/')
+  if [ "$unguarded" = "$emit" ]; then
+    fail_case "$name" "could not inject the control — emit_payload's file-lane guard changed shape; re-anchor this case"; return
+  fi
+  control=$(run_emit_payload_isolated "$unguarded" "" "" | grep '^WARNLINE ' | tr '\n' ' ')
+  if ! warning_states "$control" 'credential|shared folder|file server|file-server'; then
+    fail_case "$name" "the file-lane check did not see an unconditional file-server clause — it proves nothing"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_help_surface_case() {
   local name="help-lists-public-meta-flags" rc=0
   TERM=dumb bash "$SCRIPT" --help </dev/null > "$TMP/doctor.out" 2>&1 || rc=$?
@@ -2238,6 +2383,10 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" profile-never-carries-secrets "*) true ;; *) false ;; esac; then
   run_profile_secret_exclusion_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-warning-states-what-the-code-is "*) true ;; *) false ;; esac; then
+  run_pairing_warning_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" help-lists-public-meta-flags "*) true ;; *) false ;; esac; then
