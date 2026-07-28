@@ -135,7 +135,7 @@ The diagnostic deliberately does not follow HTTP redirects or forward your crede
 
 Four wire checks cover core text-chat compatibility: models envelope + 15-second limit, chat decode, advertised-model selection, and history-image tolerance. The image-capability result (`VERIFIED` / `DECLINED` / `IGNORED` / `OPAQUE`) is separate and informational; it never changes the core PASS/FAIL verdict. Servers that require a `model` field pass with a `model=required` note—in the app, pick a model in gateway settings. Android is still a work-in-progress client and is not the compatibility authority yet.
 
-The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_SERVER schema=2 … wire=PASS|FAIL …`); exit `0` means core text-chat compatibility is green. It does **not** certify image understanding, public reachability, HTTPS certificate trust/pinning, or make the server a Conduck adapter (that is `--check-adapter`). Statefulness is also invisible on the wire: Conduck resends the full conversation every turn, so a server that keeps its own history will silently double-count context.
+The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_SERVER schema=2 … wire=PASS|FAIL …`); exit `0` means core text-chat compatibility is green. It does **not** certify image understanding, public reachability, HTTPS certificate trust, or make the server a Conduck adapter (that is `--check-adapter`). Statefulness is also invisible on the wire: Conduck resends the full conversation every turn, so a server that keeps its own history will silently double-count context.
 
 ## Trust posture
 
@@ -161,7 +161,13 @@ Conduck needs the gateway at an `https://` URL. The wizard walks four paths and 
 - **Tailscale** — private, tailnet-only. *Note: a standalone Apple Watch cannot reach a tailnet-only gateway.*
 - **Tailscale Funnel** — public, end-to-end encrypted.
 - **Cloudflare Tunnel** — public; needs a domain and `cloudflared`.
-- **I already run my own HTTPS** — give the address; the script trusts a publicly-valid cert (e.g. Let's Encrypt) or pins a self-signed one for you. A broken cert (expired / wrong host) stops the run rather than getting silently pinned.
+- **I already run my own HTTPS** — give the address; its certificate has to be one your devices already trust (e.g. Let's Encrypt). Anything else — self-signed, a private CA, expired, wrong hostname — stops the run, and the script names the three free ways to get a real certificate.
+
+Whatever you pick, the certificate is not negotiable: Apple's App Transport Security rejects a chain the device doesn't trust before Conduck is ever consulted, and a fingerprint pin can only *narrow* trust a device already has — it cannot grant it. So a self-signed certificate has no working outcome on a phone, and the wizard refuses to mint a code that would fail there. The three free routes it points you at:
+
+- **Tailscale Serve** — issues a real certificate automatically and exposes nothing publicly (that's option 1 above).
+- **Let's Encrypt** — free, and since January 2026 it also issues certificates for a bare IP address, so no domain is required.
+- **A domain in front of it** — Caddy or another reverse proxy obtains and renews the certificate for you.
 
 Whichever path you pick, every address you type — gateway or file lane — has to be a plain URL. One carrying `user:pass@` credentials is refused, by the wizard and by both check commands: that password would otherwise be echoed on screen, saved into the profile, and ride inside the pairing code. Credentials belong in the token prompt, not the address.
 
@@ -173,7 +179,7 @@ Conduck doesn't care *how* the endpoint is built, only that it satisfies the con
 
 **The contract**
 
-- **HTTPS, not HTTP.** The app rejects an `http://` file URL outright. Terminate TLS with a real or self-signed certificate (see security notes).
+- **HTTPS, not HTTP.** The app rejects an `http://` file URL outright. Terminate TLS with a certificate the device already trusts — the same bar as the gateway (see security notes).
 - **HTTP Basic auth, username `conduck`.** The password is generated *in the app* — **Settings → your gateway → File transfer → Generate credential** — and pasted into your server's config. Conduck never accepts a password you invent; the app is the source of truth for that credential.
 - **Serve the folder the agent actually reads and writes.** The WebDAV root must be the agent's working directory — for OpenClaw its workspace (`~/.openclaw/workspace` by default), for Hermes the folder `terminal.cwd` points at in `~/.hermes/config.yaml`. The wizard aligns the Hermes root and live-proves both OpenClaw and Hermes lanes before including them. For a custom/manual adapter, `--check-adapter --files` runs the same decisive kind of agent-side copy test; the in-app WebDAV test alone cannot prove the agent's working root.
 - **The agent must be ALLOWED to use its file tools.** Byte transport is only half the lane: the gateway's tool policy decides whether the agent may open uploads and write output files. On OpenClaw, `tools.deny` containing `group:fs` (a common hardening move) breaks every attachment turn while transport stays green — `read` and `write` must be allowed (keep `edit`/`apply_patch`/`exec` denied if you like), and native PDF analysis additionally needs `tools.alsoAllow: ["pdf"]` (the `pdf` tool is not in the `coding` profile). The wizard checks this and offers the exact fix. On Hermes, an explicit `platform_toolsets.api_server` must retain the file toolset; the wizard offers only that narrow addition and refuses global-disable or non-local-backend cases it cannot safely map. `--check-adapter --files` is the end-to-end proof for hand-built adapters.
@@ -184,7 +190,7 @@ Then, in the app: paste the file-lane URL and run **Test Connection**. The stage
 **Security**
 
 - **Never put the password on a command line** — `argv` is visible to `ps`. Pass it through an environment variable or a config file with `0600` permissions.
-- **HTTPS with a real or self-signed cert.** Self-signed is fine — paste its SPKI fingerprint in the app (your gateway → **File transfer** → Advanced → *Pinned cert fingerprint*) so Conduck trusts exactly that key.
+- **HTTPS with a certificate the device already trusts.** Self-signed is not an option here either, for the same reason it isn't for the gateway — see the three free routes to a real certificate under [Reaching your gateway](#reaching-your-gateway) above. The app's *Pinned cert fingerprint* field (your gateway → **File transfer** → Advanced) isn't that fix: it's an optional *tightening* for a certificate the device already trusts, narrowing an already-trusted connection to one exact key — it can't grant trust an untrusted certificate doesn't have.
 - **Isolate lanes.** If you run more than one file lane on a host, give each its own credential, port, and service name — no shared state between them.
 
 **Exposure**
@@ -214,7 +220,7 @@ The wizard's Step 5 verifies with real requests and names what failed. What each
 | `…failed: connection refused` | Nothing is listening at that host and port. | Is the server running? Right port? Firewall open? Many local servers (Ollama, LM Studio) bind to `127.0.0.1` only — front them with the wizard's exposure step. |
 | `…failed: timed out` | No answer at all. | Host offline, unreachable address, or a firewall silently dropping traffic. |
 | `…failed: TLS/certificate problem` | Either the server's certificate is bad (expired, wrong hostname) or this machine's own trust store rejected it. | Renew or fix the certificate — expired and wrong-hostname certs both stop the run, deliberately. A wrong system clock on either end produces the same failure. |
-| `…failed: pinned key mismatch` | The server's certificate is not the one this run pinned. | Re-run the wizard so it pins the current cert (it never re-pins silently). |
+| `The certificate at … is signed by an issuer this machine doesn't trust` | A self-signed certificate, or one from a private CA. Your phone would reject it too, before Conduck ever sees it, and no fingerprint you paste into the app changes that. | Get a certificate the device trusts: Tailscale Serve (option 1 — automatic, nothing public), Let's Encrypt (free, and it issues IP-address certificates since January 2026, so no domain needed), or a reverse proxy like Caddy that mints and renews one for you. Then re-run the wizard. |
 | `…failed: HTTP 401 — token rejected` | Wrong or stale bearer token — or an access layer in front wants its own login. (A 403 prints the same shape.) | Re-read the token from the gateway's config (OpenClaw: `gateway.auth.token` · Hermes: `API_SERVER_KEY`); check any proxy access policy. |
 | `…failed: HTTP 404 — nothing at that path` | No `/v1/models` at that base address. | Give the server's *base* address — the script and the app append `/v1/…` themselves. (A pasted `…/v1` is normalized away automatically.) |
 | `…failed: HTTP 3xx redirect — enter the final gateway base URL directly` | The address you gave redirects elsewhere. The wizard stops rather than forwarding your token to the `Location` target. | Use the address the redirect lands on as the gateway URL. |

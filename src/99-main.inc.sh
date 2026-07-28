@@ -5,7 +5,6 @@ prepare_setup_from_check() {
   SETUP_FROM_CHECK=true
   GW_KIND="custom"
   GW_HEALTH_PATH=""
-  GW_CERT_FP=""
   TRANSPORT=""
   SCOPE=""
 
@@ -90,7 +89,7 @@ run_setup() {
     # selects a gateway: the user always makes an explicit 1/2/3 choice.
     while true; do
       GW_KIND=""; GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
-      GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""; GW_CERT_FP=""
+      GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""
       detect_gateway
       case "$GW_KIND" in
         openclaw) configure_openclaw ;;
@@ -149,8 +148,8 @@ finish_successful_check() { # finish_successful_check <server|adapter>
   REUSE_ONLY=false
   CHECK_URL=""
 
-  # The standalone checks do not need openssl; setup might need it for
-  # certificate trust/pinning, so run the setup preflight after transitioning.
+  # The standalone checks do not need openssl; setup does (it mints the gateway
+  # and file-lane credentials), so run the setup preflight after transitioning.
   preflight
   run_setup
 }

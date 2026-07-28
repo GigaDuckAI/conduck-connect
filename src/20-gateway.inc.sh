@@ -9,7 +9,6 @@ GW_AUTH="bearer"   # bearer | none
 GW_TOKEN=""
 GW_MODEL=""        # optional explicit model (generic servers like vLLM/Ollama)
 GW_URL=""          # final https URL
-GW_CERT_FP=""      # SPKI SHA-256 hex, self-signed path only
 
 detect_gateway() {
   head_ "Step 1 — find your gateway"

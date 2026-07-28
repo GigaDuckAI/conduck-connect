@@ -32,7 +32,9 @@
 #   1. Finds your gateway (OpenClaw, Hermes, or any OpenAI-compatible server).
 #   2. Enables the OpenAI-compatible chat endpoint if it is off (the #1 setup trap).
 #   3. Helps you expose the gateway over HTTPS (works WITH what you have installed:
-#      Tailscale, Cloudflare Tunnel, your own reverse proxy, or a self-signed cert).
+#      Tailscale, Cloudflare Tunnel, or your own reverse proxy). Whatever the path,
+#      the certificate has to be one your devices already trust; a self-signed one
+#      stops the run, and the script names the free ways to get a real certificate.
 #   4. Optionally sets up the agent file lane (rclone WebDAV) so Conduck can hand
 #      your agent real files and download its outputs. OpenClaw gets a tool-policy
 #      check + TOOLS.md guidance. Hermes gets its API-server file toolset and
@@ -547,9 +549,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Collect ALL missing required tools and report together, with install hints.
 preflight() {
   local missing=()
-  # openssl is only used by the wizard's self-signed cert path (SPKI compute /
-  # pin); the two standalone checks never reach it, so don't gate a
-  # live diagnostic on a tool it doesn't use.
+  # openssl is only used by the wizard, to mint credentials and to read a
+  # failing certificate's own diagnosis; the two standalone checks never reach
+  # it, so don't gate a live diagnostic on a tool it doesn't use.
   local tools="curl python3"; { $DOCTOR || $COMPAT; } || tools="$tools openssl"
   for t in $tools; do need "$t" || missing+=("$t"); done
   if [ ${#missing[@]} -gt 0 ]; then
@@ -560,10 +562,6 @@ preflight() {
     esac
     die "Install the tool(s) above, then re-run me."
   fi
-}
-
-sha256_hex() { # stdin -> lowercase hex digest
-  if have sha256sum; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi
 }
 
 b64_nowrap() { # stdin -> single-line base64
@@ -736,7 +734,6 @@ GW_AUTH="bearer"   # bearer | none
 GW_TOKEN=""
 GW_MODEL=""        # optional explicit model (generic servers like vLLM/Ollama)
 GW_URL=""          # final https URL
-GW_CERT_FP=""      # SPKI SHA-256 hex, self-signed path only
 
 detect_gateway() {
   head_ "Step 1 — find your gateway"
@@ -1116,7 +1113,7 @@ configure_generic() {
 }
 # ------------------------------------------------------------ exposure phase --
 
-TRANSPORT=""       # tailscale | funnel | cloudflare | public | selfsigned
+TRANSPORT=""       # tailscale | funnel | cloudflare | public
 SCOPE="unknown"    # private | public | unknown  (actual reachability, NOT the label)
 TS_STATE_KNOWN=true
 declare -a TS_PORTS=()        # "port<TAB>verb<TAB>proxy" lines from ts_targets
@@ -1563,10 +1560,11 @@ explain_exposure_paths() {
   say "     Apple Watch:       works on its own, anywhere."
   say ""
   say "  4) Your own HTTPS — reach is whatever you built"
-  say "     For a gateway that already has an https:// address — a reverse proxy, a"
-  say "     rented server (VPS), or a self-signed certificate you made yourself. You"
-  say "     paste the address; I check the certificate and set up the app's trust —"
-  say "     you don't need to know which kind you have."
+  say "     For a gateway that already has an https:// address — a reverse proxy or a"
+  say "     rented server (VPS). Its certificate has to be one your phone already"
+  say "     trusts by itself; a certificate you signed yourself does not qualify, and"
+  say "     there is no way for the app to make an exception (I explain the free ways"
+  say "     to get a real one if yours doesn't pass)."
   say "     Apple Watch:       works on its own IF that address works without a VPN."
   say ""
   say "  You can re-run this script any time and pick a different path."
@@ -1574,8 +1572,8 @@ explain_exposure_paths() {
 }
 
 choose_exposure() {
-  # Generic with a ready URL skips the transport menu — but still classifies the
-  # certificate (trust-or-pin), exactly like menu option 4.
+  # Generic with a ready URL skips the transport menu — but still puts the
+  # certificate through the same trust gate as menu option 4.
   if [ -n "$GW_URL" ] && [ -z "$GW_LOCAL_PORT" ]; then
     head_ "Step 3 — HTTPS reachability"
     ok "Using your existing URL: $GW_URL"
@@ -1605,7 +1603,7 @@ choose_exposure() {
   say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
   say ""
   say "  4) ${BOLD}I already run my own HTTPS for it${RESET}"
-  say "     You give the https:// address; I check its certificate and set up the app's trust."
+  say "     You give the https:// address; its certificate has to be one your devices already trust."
   say ""
   if $SETUP_FROM_CHECK; then
     say "  ${DIM}b) stop this setup (the completed check remains unchanged)${RESET}"
@@ -1702,13 +1700,14 @@ choose_exposure() {
       apply_gateway_url_normalization
       ;;
     4)
-      # One option for "I run my own HTTPS." The script figures out whether the
-      # certificate is publicly trusted (no pin) or self-managed (pin its SPKI).
+      # One option for "I run my own HTTPS." It is a GATE, not a fork: the
+      # certificate is either one this machine trusts (which is the bar the app
+      # applies too) or the run stops.
       GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com") || die "$NO_ANSWER"
       apply_gateway_url_normalization
       scope_choice
       keyless_public_guard
-      classify_own_https   # sets TRANSPORT=public|selfsigned (+ GW_CERT_FP); STOPs on a broken cert
+      classify_own_https   # sets TRANSPORT=public, or STOPs and names the free routes
       ;;
     *) die "Invalid choice." ;;
   esac
@@ -1785,39 +1784,6 @@ tls_connect_target() { # tls_connect_target <https-url> -> "connectarg\tserverna
   printf '%s\t%s' "$connectarg" "$sni"
 }
 
-# Self-signed SPKI: compute the lowercase hex digest (for the QR) AND validate the
-# key algorithm is one the app can actually pin. Echoes hex on success.
-compute_spki_hex() { # compute_spki_hex <https-url>
-  local url="$1" _tgt connectarg sni; _tgt=$(tls_connect_target "$url")
-  connectarg="${_tgt%%$'\t'*}"; sni="${_tgt#*$'\t'}"
-  local sni_args=(); [ -n "$sni" ] && sni_args=(-servername "$sni")   # omit SNI for an IP literal
-  local der; der=$(mktemp); local cert; cert=$(mktemp)
-  trap 'rm -f "$der" "$cert"' RETURN
-  openssl s_client -connect "$connectarg" ${sni_args[@]+"${sni_args[@]}"} </dev/null 2>/dev/null \
-    | openssl x509 -outform PEM > "$cert" 2>/dev/null
-  [ -s "$cert" ] || return 1
-  # Reject key types the app's pinner does not support (RSA 2048/3072/4096, EC P-256/P-384).
-  # Diagnostics go to stderr — stdout is reserved for the hex digest (captured by $()).
-  local algline; algline=$(openssl x509 -in "$cert" -noout -text 2>/dev/null)
-  if printf '%s' "$algline" | grep -qi 'ED25519\|ED448'; then
-    bad "That certificate uses an Ed25519/Ed448 key, which the Conduck app cannot pin." >&2; return 1
-  fi
-  if printf '%s' "$algline" | grep -qi 'Public Key Algorithm: id-ecPublicKey'; then
-    printf '%s' "$algline" | grep -qi 'prime256v1\|secp384r1' \
-      || { bad "That EC curve isn't supported (app pins only P-256 / P-384)." >&2; return 1; }
-  elif printf '%s' "$algline" | grep -qi 'Public Key Algorithm: rsaEncryption'; then
-    printf '%s' "$algline" | grep -qiE 'Public-Key: \((2048|3072|4096) bit\)' \
-      || { bad "That RSA key size isn't supported (app pins only 2048/3072/4096-bit)." >&2; return 1; }
-  else
-    # Fail CLOSED: anything not RSA/EC above (DSA, RSA-PSS, Ed25519/Ed448, unknown) is unpinnable.
-    bad "That certificate's key type isn't one the Conduck app can pin (needs RSA-2048/3072/4096 or EC P-256/P-384)." >&2; return 1
-  fi
-  openssl x509 -in "$cert" -pubkey -noout 2>/dev/null \
-    | openssl pkey -pubin -outform DER 2>/dev/null > "$der"
-  [ -s "$der" ] || return 1
-  sha256_hex < "$der"
-}
-
 # Read the leaf cert's openssl verify return code — the stable X509_V_ERR_*
 # numbers (same on OpenSSL and LibreSSL), so we classify WHY normal TLS trust
 # failed without fragile date math.
@@ -1830,9 +1796,10 @@ cert_verify_code() { # cert_verify_code <https-url> -> numeric code (or "")
 }
 
 # Leaf-cert date sanity, checked independently of the chain verify code (some
-# OpenSSL builds report the chain error first) so a self-signed cert that is
-# ALSO expired or not-yet-valid never gets pinned. Echoes "expired" / "notyet" /
-# nothing; an unreadable cert counts as expired (fail closed).
+# OpenSSL builds report the chain error first) so an untrusted certificate that
+# is ALSO expired or not-yet-valid still gets its dates named — a wrong clock is
+# the one cause the user can fix without changing certificate at all. Echoes
+# "expired" / "notyet" / nothing; an unreadable cert counts as expired.
 cert_leaf_date_problem() { # cert_leaf_date_problem <https-url>
   local url="$1" pem _tgt connectarg sni; _tgt=$(tls_connect_target "$url")
   connectarg="${_tgt%%$'\t'*}"; sni="${_tgt#*$'\t'}"
@@ -1855,17 +1822,17 @@ if nb > datetime.datetime.utcnow():
     print("notyet")' 2>/dev/null
 }
 
-# Resolve the merged "I run my own HTTPS" choice: probe the cert and decide
-# trust-vs-pin. Sets TRANSPORT to public (trusted, no pin) or selfsigned (pin),
-# and GW_CERT_FP when pinning. STOPS on a genuinely broken cert (expired / not
-# yet valid) rather than pinning it — pinning bypasses the app's chain checks
-# (RemoteAgentTrustEvaluator .useCredential), so a bad cert would be trusted
-# forever. An explicit advanced override can still force a pin.
+# The "I run my own HTTPS" gate. The certificate must be one THIS machine already
+# trusts, because that is the same bar the app applies on the phone: Apple's App
+# Transport Security refuses an untrusted chain before the app is consulted, and a
+# fingerprint pin cannot override it — a pin only NARROWS trust the device already
+# has, it never grants it. So there is no accept-anyway arm to offer; an untrusted
+# certificate ends the run, with the reason named and the free remedies listed.
 classify_own_https() {  # GW_URL + SCOPE already set
   if $DRY_RUN; then
-    TRANSPORT="public"   # provisional routing; a real run decides trust-vs-pin
-    plan_add "CHECK the certificate at $GW_URL, then trust it (no pin) or pin its fingerprint"
-    note "(dry-run: on a real run I check this certificate and either let the app trust it normally, or pin it)"
+    TRANSPORT="public"   # provisional routing; a real run runs the trust gate
+    plan_add "CHECK the certificate at $GW_URL — setup continues only if this machine trusts it"
+    note "(dry-run: on a real run I check this certificate; one this machine doesn't trust stops setup)"
     return 0
   fi
   say ""
@@ -1876,7 +1843,7 @@ classify_own_https() {  # GW_URL + SCOPE already set
   curl -q -sS --max-time 15 -o /dev/null "$GW_URL/v1/models" 2>/dev/null || rc=$?
   if [ "$rc" = "0" ]; then
     TRANSPORT="public"
-    ok "Its certificate is trusted normally — the app needs no pin."
+    ok "Its certificate is trusted normally — that's exactly what the app needs."
     return 0
   fi
   case "$rc" in
@@ -1884,58 +1851,43 @@ classify_own_https() {  # GW_URL + SCOPE already set
     7)  die "Couldn't connect to $GW_URL (connection refused). Is the gateway up? Re-run when it is." ;;
     28) die "Connecting to $GW_URL timed out. Check the address / firewall and re-run." ;;
   esac
-  # Reached the server but normal trust failed — classify why. FAIL CLOSED: pin
-  # ONLY for the self-signed / unknown-issuer codes; anything else (a CA-valid but
-  # WRONG-HOST cert = code 0, an expired/not-yet-valid cert, or an unclassifiable
-  # failure) STOPS — pinning bypasses the app's hostname + chain checks, so we must
-  # not pin a cert that failed for any reason other than "no trusted issuer".
-  local code reason="" pinnable=false
+  # Reached the server but trust failed. The outcome is the same either way —
+  # stop — but WHY decides which remedy is the user's: a wrong clock, a wrong
+  # hostname, and no trusted issuer at all are three different jobs.
+  local code reason
   code=$(cert_verify_code "$GW_URL")
   case "$code" in
-    18|19|20|21) pinnable=true ;;   # self-signed / unknown issuer — the legit pin case
+    18|19|20|21)
+      reason="is signed by an issuer this machine doesn't trust (self-signed, or a private CA)"
+      case "$(cert_leaf_date_problem "$GW_URL")" in
+        expired) reason="$reason, and it has expired" ;;
+        notyet)  reason="$reason, and it is not valid yet (check the gateway's clock)" ;;
+      esac ;;
     10) reason="has expired" ;;
     9)  reason="is not valid yet (check the gateway's clock)" ;;
     0)  reason="is valid but does not match this address (it's issued for a different hostname)" ;;
     *)  reason="couldn't be classified (TLS verify code '${code:-none}')" ;;
   esac
-  # Belt-and-suspenders: even a self-signed cert must not be pinned while its
-  # dates are wrong (expired OR not yet valid).
-  if $pinnable; then
-    local dateprob; dateprob=$(cert_leaf_date_problem "$GW_URL")
-    case "$dateprob" in
-      expired) pinnable=false; reason="has expired" ;;
-      notyet)  pinnable=false; reason="is not valid yet (check the gateway's clock)" ;;
-    esac
-  fi
-  if ! $pinnable; then
-    bad "The certificate at $GW_URL $reason."
-    say "  Pinning it would tell the app to accept this server's key from now on —"
-    say "  skipping the very checks that just caught this problem."
-    say "  Best fix: correct the certificate (or use a free Let's Encrypt one), then re-run me."
-    confirm "  Advanced: pin THIS certificate anyway?" \
-      || die "Stopped — the certificate $reason. Fix it and re-run."
-    warn "Pinning a certificate that $reason, at your request."
-  fi
-  GW_CERT_FP=$(compute_spki_hex "$GW_URL") \
-    || die "Couldn't read a usable certificate from $GW_URL (key must be RSA-2048/3072/4096 or EC P-256/P-384)."
-  TRANSPORT="selfsigned"
-  $pinnable && ok "Detected a self-managed certificate — I'll pin it so the app trusts it."
-  $pinnable && note "Pinning = the app trusts exactly this certificate from now on (and skips the normal public-trust check). Re-run this script if you ever replace the certificate."
-  ok "Fingerprint: $GW_CERT_FP (rides inside the QR — no transcription)."
-}
-
-# Convert a 64-hex SPKI digest to base64-of-raw-bytes for curl --pinnedpubkey.
-# We pin the SAME fingerprint that goes into the QR (computed once), NOT a freshly
-# re-fetched cert — otherwise a cert that rotated mid-run could verify green yet the
-# app would reject the QR's now-stale pin.
-hex_to_b64() { # hex_to_b64 <64-hex>
-  printf '%s' "$1" | python3 -c 'import sys,base64,binascii
-h=sys.stdin.read().strip()
-sys.stdout.write(base64.b64encode(binascii.unhexlify(h)).decode() if h else "")' 2>/dev/null
+  bad "The certificate at $GW_URL $reason."
+  say "  Conduck needs a certificate your phone, tablet, or Mac trusts on its own — the"
+  say "  same bar this machine just applied. Apple rejects an untrusted certificate"
+  say "  before the app can see it, and no fingerprint you paste into the app changes"
+  say "  that: pinning narrows trust a device already has, it never grants it. So there"
+  say "  is no \"accept it anyway\" here, and a setup code that pretended otherwise would"
+  say "  simply fail on your phone."
+  say ""
+  say "  ${BOLD}Three free ways to get a certificate that works${RESET} — each one automatic after setup:"
+  say "    • ${BOLD}Tailscale Serve${RESET} — issues a real certificate for you and exposes nothing"
+  say "      publicly. Re-run me and pick option 1."
+  say "    • ${BOLD}Let's Encrypt${RESET} — free, and since January 2026 it also issues certificates for"
+  say "      a bare IP address, so you don't need to own a domain."
+  say "    • ${BOLD}A domain in front of it${RESET} — Caddy (or another reverse proxy) obtains and renews"
+  say "      the certificate automatically."
+  die "Stopped — the certificate $reason. Fix that, then re-run me."
 }
 # ----------------------------------------------------------- file-lane phase --
 
-FS_URL=""; FS_CRED=""; FS_CERT_FP=""
+FS_URL=""; FS_CRED=""
 FS_LOCAL_PORT=""
 FS_REACH=""         # the file lane's OWN reach (public|private) — can differ from the gateway's
                     # SCOPE in a mixed-scope setup; recorded as fileServer.reach for --show-code
@@ -3522,36 +3474,15 @@ setup_file_lane() {
         [ -n "$h2" ] && FS_URL="$h2" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
       else FS_CRED=""; fi
       ;;
-    public|selfsigned)
+    public)
       say ""
       say "  Your gateway's web server needs a second route for the file lane → 127.0.0.1:$FS_LOCAL_PORT"
       say "  (a second server block, a subdomain, or another port)."
       note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
+      note "Its certificate must be trusted the same way the gateway's is; the app applies one rule to both."
       local h; h=$(ask_url "The https:// web address that reaches it (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
       if [ -n "$h" ]; then
         FS_URL="$h"
-        # If self-signed AND a different host than the gateway, pin the file host
-        # too — behind the same broken-cert date gate as the gateway pin.
-        if [ "$TRANSPORT" = "selfsigned" ]; then
-          local g_host="${GW_URL#https://}"; g_host="${g_host%%/*}"
-          local f_host="${FS_URL#https://}"; f_host="${f_host%%/*}"
-          if [ "$f_host" != "$g_host" ]; then
-            if $DRY_RUN; then note "(dry-run: would compute the file host's SPKI fingerprint from $FS_URL)"
-            else
-              local fs_datep; fs_datep=$(cert_leaf_date_problem "$FS_URL")
-              if [ "$fs_datep" = "notyet" ]; then
-                warn "The file host's certificate is not valid yet (check its clock) — leaving the file lane out. Fix it and re-run."
-                FS_CRED=""; FS_URL=""
-              elif [ -n "$fs_datep" ]; then
-                warn "The file host's certificate has expired (or could not be read) — leaving the file lane out. Fix it and re-run."
-                FS_CRED=""; FS_URL=""
-              else
-                FS_CERT_FP=$(compute_spki_hex "$FS_URL") || { warn "Could not pin the file host's cert — leaving file lane out."; FS_CRED=""; FS_URL=""; }
-                [ -n "$FS_CERT_FP" ] && ok "File-lane fingerprint computed (rides in the QR)."
-              fi
-            fi
-          fi
-        fi
       else note "Skipped the file lane (Conduck still works — inline-only attachments)."; FS_CRED=""; fi
       ;;
   esac
@@ -4399,9 +4330,6 @@ AGENT_PROBE_OUTTMP=""
 AGENT_PROBE_FS_URL=""
 AGENT_PROBE_FS_CRED=""
 AGENT_PROBE_FS_FOLDER=""
-AGENT_PROBE_TRANSPORT=""
-AGENT_PROBE_GW_CERT_FP=""
-AGENT_PROBE_FS_CERT_FP=""
 AGENT_PROBE_DIR_ARMED=false
 AGENT_PROBE_INPUT_ARMED=false
 AGENT_PROBE_OUTPUT_ARMED=false
@@ -4548,14 +4476,12 @@ agent_probe_directory_absent() {
 }
 
 # Exact-name cleanup for normal completion and EXIT/signal interruption. It
-# snapshots the lane credential/transport at registration time, so a later
+# snapshots the lane URL and credential at registration time, so a later
 # fail-closed drop cannot turn cleanup into an unauthenticated no-op.
 agent_file_probe_cleanup_backstop() { # [final:true]
   $AGENT_PROBE_ACTIVE || return 0
   local final="${1:-false}"
   local FS_URL="$AGENT_PROBE_FS_URL" FS_CRED="$AGENT_PROBE_FS_CRED"
-  local TRANSPORT="$AGENT_PROBE_TRANSPORT" GW_CERT_FP="$AGENT_PROBE_GW_CERT_FP"
-  local FS_CERT_FP="$AGENT_PROBE_FS_CERT_FP"
   local clean=true code
   rm -f "$AGENT_PROBE_TMP" "$AGENT_PROBE_OUTTMP" 2>/dev/null || true
   if ! agent_probe_registered_names_safe; then
@@ -4594,8 +4520,6 @@ agent_file_probe_cleanup_backstop() { # [final:true]
     AGENT_PROBE_TAG=""; AGENT_PROBE_DIRKEY=""; AGENT_PROBE_INPUTKEY=""
     AGENT_PROBE_OUTPUTKEY=""; AGENT_PROBE_TMP=""; AGENT_PROBE_OUTTMP=""
     AGENT_PROBE_FS_URL=""; AGENT_PROBE_FS_CRED=""; AGENT_PROBE_FS_FOLDER=""
-    AGENT_PROBE_TRANSPORT=""
-    AGENT_PROBE_GW_CERT_FP=""; AGENT_PROBE_FS_CERT_FP=""
     AGENT_PROBE_DIR_ARMED=false; AGENT_PROBE_INPUT_ARMED=false
     AGENT_PROBE_OUTPUT_ARMED=false
     AGENT_PROBE_DIR_VERIFY_METHOD=""; AGENT_PROBE_LATE_RISK=false
@@ -4613,8 +4537,6 @@ agent_probe_abandon_registry() { # no registered remote target was created
   AGENT_PROBE_TAG=""; AGENT_PROBE_DIRKEY=""; AGENT_PROBE_INPUTKEY=""
   AGENT_PROBE_OUTPUTKEY=""; AGENT_PROBE_TMP=""; AGENT_PROBE_OUTTMP=""
   AGENT_PROBE_FS_URL=""; AGENT_PROBE_FS_CRED=""; AGENT_PROBE_FS_FOLDER=""
-  AGENT_PROBE_TRANSPORT=""
-  AGENT_PROBE_GW_CERT_FP=""; AGENT_PROBE_FS_CERT_FP=""
   AGENT_PROBE_DIR_ARMED=false; AGENT_PROBE_INPUT_ARMED=false
   AGENT_PROBE_OUTPUT_ARMED=false
   AGENT_PROBE_DIR_VERIFY_METHOD=""; AGENT_PROBE_LATE_RISK=false
@@ -4699,9 +4621,6 @@ agent_file_probe() {
   AGENT_PROBE_FS_URL="$FS_URL"
   AGENT_PROBE_FS_CRED="$FS_CRED"
   AGENT_PROBE_FS_FOLDER="$FS_FOLDER"
-  AGENT_PROBE_TRANSPORT="$TRANSPORT"
-  AGENT_PROBE_GW_CERT_FP="$GW_CERT_FP"
-  AGENT_PROBE_FS_CERT_FP="$FS_CERT_FP"
   AGENT_PROBE_DIR_ARMED=false
   AGENT_PROBE_INPUT_ARMED=false
   AGENT_PROBE_OUTPUT_ARMED=false
@@ -4838,15 +4757,12 @@ check() { # check "label" <command...>  (command's exit code decides)
   if "$@" >/dev/null 2>&1; then ok "$label"; else bad "$label"; VERIFY_FAILED=true; return 1; fi
 }
 
-# curl wrapper: normal TLS validation, EXCEPT self-signed which is verified by
-# pinning the SPKI (matching what the app pins) instead of disabling checks.
+# curl wrapper: normal TLS validation, with no exceptions and no override — the
+# same trust every setup path already had to clear, so verification proves the
+# route the app will actually take.
 # The bearer token rides a stdin curl config, never argv (argv shows in `ps`).
 curl_gw() { # curl_gw <curl args…>
   local extra=()
-  if [ "$TRANSPORT" = "selfsigned" ] && [ -n "$GW_CERT_FP" ]; then
-    local b64; b64=$(hex_to_b64 "$GW_CERT_FP")     # pin the QR's fingerprint, not a re-fetch
-    [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64")
-  fi
   # `-q` MUST be curl's first arg. Every connector request ignores curl config,
   # so a stray `proxy`/`output`/redirect/include line there can neither reroute
   # a secret nor make curl read/write files absent from our effects manifest.
@@ -4965,19 +4881,14 @@ sys.exit(0 if ids else 5)' 2>/dev/null)
   esac
 }
 
-# A self-signed-aware curl for the FILE lane (its own pin if set, else gateway's).
+# The FILE lane's curl — normal TLS validation, same single rule as curl_gw.
 # The credential rides a stdin curl config, never argv (argv shows in `ps`).
 curl_fs_with_timeout() { # curl_fs_with_timeout <max-seconds> <curl args…>
   local max_time="$1"; shift
-  local extra=()
-  if [ "$TRANSPORT" = "selfsigned" ]; then
-    local fp="$GW_CERT_FP"; [ -n "$FS_CERT_FP" ] && fp="$FS_CERT_FP"   # file's own pin if it has one
-    if [ -n "$fp" ]; then local b64; b64=$(hex_to_b64 "$fp"); [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64"); fi
-  fi
   credential_value_safe "$FS_CRED" || return 2
   local cred="$FS_CRED"; cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"   # curl-config quoting
   printf 'user = "conduck:%s"\n' "$cred" \
-    | curl -q -sS --max-time "$max_time" --config - ${extra[@]+"${extra[@]}"} "$@"
+    | curl -q -sS --max-time "$max_time" --config - "$@"
 }
 curl_fs() { curl_fs_with_timeout 30 "$@"; }
 
@@ -5075,7 +4986,6 @@ verify_all() {
         28)    why="timed out — no answer from the host" ;;
         35)    why="TLS/certificate problem — the HTTPS front rejected the connection" ;;
         60)    why="TLS/certificate problem — this machine doesn't trust the server's certificate" ;;
-        90)    why="pinned key mismatch — the server's certificate is not the one this run pinned" ;;
         *)     why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
       esac
     else
@@ -6686,9 +6596,9 @@ run_doctor() {
       || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi
-  # Plain TLS validation; the doctor has no pairing profile to pin from. For a
-  # self-signed cert, run it on the server itself against http://127.0.0.1.
-  TRANSPORT=""; GW_CERT_FP=""
+  # Plain TLS validation, the same rule the app applies. For a certificate this
+  # machine doesn't trust, run it on the server itself against http://127.0.0.1.
+  TRANSPORT=""
 
   head_ "Adapter check — $GW_URL"
 
@@ -6989,7 +6899,7 @@ run_compat() {
       note "Keyless: mirroring the app's explicit no-auth scheme — sensible only on an isolated network."
     fi
   fi
-  TRANSPORT=""; GW_CERT_FP=""
+  TRANSPORT=""
 
   head_ "Server check — $GW_URL"
   COMPAT_RAN=true
@@ -7214,9 +7124,9 @@ write_profile() {
   local out
   out=$(GW_ID="$GW_ID" GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_AUTH="$GW_AUTH" \
         TRANSPORT="$TRANSPORT" SCOPE="$SCOPE" GW_URL="$GW_URL" GW_LOCAL_PORT="$GW_LOCAL_PORT" \
-        GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
+        GW_MODEL="$GW_MODEL" \
         FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_LOCAL_PORT="$FS_LOCAL_PORT" \
-        FS_CERT_FP="$FS_CERT_FP" FS_FOLDER="$FS_FOLDER" FS_REACH="$FS_REACH" \
+        FS_FOLDER="$FS_FOLDER" FS_REACH="$FS_REACH" \
         python3 - <<'PY'
 import json, os
 e = os.environ.get
@@ -7226,15 +7136,13 @@ gw = {"id": e("GW_ID"), "kind": e("GW_KIND"), "auth": e("GW_AUTH"),
 if e("GW_NAME"):       gw["name"] = e("GW_NAME")
 if e("GW_LOCAL_PORT"): gw["localPort"] = e("GW_LOCAL_PORT")
 if e("GW_MODEL"):      gw["model"] = e("GW_MODEL")
-if e("GW_CERT_FP"):    gw["certFP"] = e("GW_CERT_FP")
 p = {"schemaVersion": 1, "gateway": gw, "fileServer": None}
 # Record the file lane only when it actually shipped in the QR (URL + credential
-# both present) — and record its URL/port/cert/folder, NEVER the credential.
+# both present) — and record its URL/port/folder, NEVER the credential.
 if e("FS_URL") and e("FS_CRED"):
     fs = {"url": e("FS_URL")}
     if e("FS_LOCAL_PORT"): fs["localPort"] = e("FS_LOCAL_PORT")
     if e("FS_REACH"):      fs["reach"]     = e("FS_REACH")
-    if e("FS_CERT_FP"):    fs["certFP"]    = e("FS_CERT_FP")
     if e("FS_FOLDER"):     fs["folder"]    = e("FS_FOLDER")
     p["fileServer"] = fs
 print(json.dumps(p, indent=1))
@@ -7258,8 +7166,8 @@ PY
 # long model ids) survive setup byte-for-byte before QR/base64 encoding.
 build_pairing_payload_json() {
   GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_URL="$GW_URL" GW_AUTH="$GW_AUTH" \
-  GW_TOKEN="$GW_TOKEN" GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
-  FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_CERT_FP="$FS_CERT_FP" \
+  GW_TOKEN="$GW_TOKEN" GW_MODEL="$GW_MODEL" \
+  FS_URL="$FS_URL" FS_CRED="$FS_CRED" \
   TRANSPORT="$TRANSPORT" PV="$PAYLOAD_VERSION" \
   python3 - <<'PY'
 import json, os
@@ -7268,12 +7176,9 @@ gw = {"kind": e("GW_KIND"), "url": e("GW_URL"), "auth": e("GW_AUTH")}
 if e("GW_NAME"):    gw["name"] = e("GW_NAME")
 if e("GW_TOKEN"):   gw["token"] = e("GW_TOKEN")
 if e("GW_MODEL"):   gw["model"] = e("GW_MODEL")
-if e("GW_CERT_FP"): gw["certFP"] = e("GW_CERT_FP")
 p = {"v": int(e("PV")), "gateway": gw, "transport": e("TRANSPORT")}
 if e("FS_URL") and e("FS_CRED"):
-    fs = {"url": e("FS_URL"), "credential": e("FS_CRED")}
-    if e("FS_CERT_FP"): fs["certFP"] = e("FS_CERT_FP")
-    p["fileServer"] = fs
+    p["fileServer"] = {"url": e("FS_URL"), "credential": e("FS_CRED")}
 print(json.dumps(p, separators=(",", ":")))
 PY
 }
@@ -7338,7 +7243,6 @@ emit_payload() {
   say ""
   case "$TRANSPORT" in
     tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, or Mac) needs the Tailscale app, logged in to the same tailnet." ;;
-    selfsigned) note "Your gateway uses its own certificate; a secure fingerprint of it travels inside the code, so the app trusts it automatically — nothing for you to copy." ;;
   esac
   say "  Run this script again any time to check the connection or show the code again."
   # Custom targets only (see the matching gate in emit_payload's failure branch).
@@ -8382,7 +8286,7 @@ print_plan() {
   case "$TRANSPORT" in
     tailscale) tr_h="Tailscale (private)" ;; funnel) tr_h="Tailscale Funnel (public)" ;;
     cloudflare) tr_h="Cloudflare Tunnel (public)" ;; public) tr_h="your own HTTPS (trusted cert)" ;;
-    selfsigned) tr_h="your own HTTPS (pinned cert)" ;; *) tr_h="to be decided during exposure" ;;
+    *) tr_h="to be decided during exposure" ;;
   esac
   case "$SCOPE" in
     public) reach_h="public (anyone with the URL)" ;; private) reach_h="private (your devices only)" ;;
@@ -8390,7 +8294,6 @@ print_plan() {
   esac
   note "gateway = $gw_h${GW_NAME:+ ($GW_NAME)}   reach = $reach_h   how = $tr_h"
   note "gateway URL = ${GW_URL:-<set during exposure>}"
-  [ -n "$GW_CERT_FP" ] && note "self-signed pin = $GW_CERT_FP"
   say ""
   if [ ${#PLAN[@]} -eq 0 ]; then
     note "Nothing to change — everything needed already exists (a real run would just verify + emit the QR)."
@@ -8505,13 +8408,6 @@ show_qr_is_port() { # show_qr_is_port <str> -> 0 if a decimal in 1..65535
   [ "${#1}" -le 5 ] || return 1        # length-bound so bash 3.2's intmax can't overflow
   [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
-show_qr_is_certfp() { # show_qr_is_certfp <str> -> 0 if 64 lowercase SPKI-sha256 hex chars
-  case "$1" in *[!0-9a-f]*) return 1 ;; esac
-  [ "${#1}" -eq 64 ]
-}
-show_qr_authority_key() { # normalized https authority: lowercase host + effective port
-  printf '%s:%s' "$(url_host_lc "$1")" "$(url_https_port "$1")"
-}
 show_qr_resolve_file_reach() { # saved file reach (possibly empty), gateway reach
   if [ -n "$1" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
 }
@@ -8522,8 +8418,8 @@ show_qr_resolve_file_reach() { # saved file reach (possibly empty), gateway reac
 PROFILE_VALIDATION_ERROR=""
 show_qr_profile_invalid() { PROFILE_VALIDATION_ERROR="$1"; return 1; }
 show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
-  local pf="$1" sv kind id name auth transport reach url port certfp
-  local gateway_type file_type fsurl fsreach fsport fsfp
+  local pf="$1" sv kind id name auth transport reach url port
+  local gateway_type file_type fsurl fsreach fsport
   PROFILE_VALIDATION_ERROR=""
   [ -f "$pf" ] || {
     show_qr_profile_invalid "That saved profile is missing — run setup again (bash conduck-connect.sh --setup) to recreate it."
@@ -8556,7 +8452,6 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   reach=$(json_get "$pf" "gateway.reach")
   url=$(json_get "$pf" "gateway.url")
   port=$(json_get "$pf" "gateway.localPort")
-  certfp=$(json_get "$pf" "gateway.certFP")
 
   if [ -z "$kind" ] || [ -z "$id" ] || [ -z "$url" ] || [ -z "$transport" ] ||
      [ -z "$reach" ] || [ -z "$auth" ]; then
@@ -8595,7 +8490,7 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
     return 1
   }
   case "$transport" in
-    tailscale|funnel|cloudflare|public|selfsigned) ;;
+    tailscale|funnel|cloudflare|public) ;;
     *)
       show_qr_profile_invalid "That saved profile has an unrecognized transport '$transport' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
       return 1 ;;
@@ -8612,14 +8507,6 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
     show_qr_profile_invalid "That saved profile's gateway transport and reach don't agree — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
   fi
-  if [ "$transport" = "selfsigned" ] && [ -z "$certfp" ]; then
-    show_qr_profile_invalid "That saved profile uses a self-signed certificate but stores no fingerprint — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  if [ "$transport" != "selfsigned" ] && [ -n "$certfp" ]; then
-    show_qr_profile_invalid "That saved profile pins a certificate but doesn't use the self-signed path — the app would import a wrong pin. Re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
   if [ -n "$port" ] && ! show_qr_is_port "$port"; then
     show_qr_profile_invalid "That saved profile's gateway local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
@@ -8634,15 +8521,10 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
         return 1 ;;
     esac
   fi
-  if [ -n "$certfp" ] && ! show_qr_is_certfp "$certfp"; then
-    show_qr_profile_invalid "That saved profile's gateway certificate fingerprint isn't a 64-character lowercase hex value — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
 
   fsurl=$(json_get "$pf" "fileServer.url")
   fsreach=$(json_get "$pf" "fileServer.reach")
   fsport=$(json_get "$pf" "fileServer.localPort")
-  fsfp=$(json_get "$pf" "fileServer.certFP")
   if [ "$file_type" = "object" ] && [ -z "$fsurl" ]; then
     show_qr_profile_invalid "That saved profile's file-server object is missing its URL — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
@@ -8661,22 +8543,6 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   fi
   if [ -n "$fsport" ] && ! show_qr_is_port "$fsport"; then
     show_qr_profile_invalid "That saved profile's file-server local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  if [ -n "$fsfp" ] && ! show_qr_is_certfp "$fsfp"; then
-    show_qr_profile_invalid "That saved profile's file-server certificate fingerprint isn't a 64-character lowercase hex value — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  if [ "$transport" != "selfsigned" ] && [ -n "$fsfp" ]; then
-    show_qr_profile_invalid "That saved profile pins a file-server certificate but doesn't use the self-signed path — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  # The file lane may inherit the gateway pin only when both URLs reach the same
-  # authority. A different host or port presents an independent certificate and
-  # therefore needs the fileServer.certFP that the writer normally records.
-  if [ "$transport" = "selfsigned" ] && [ -n "$fsurl" ] && [ -z "$fsfp" ] &&
-     [ "$(show_qr_authority_key "$fsurl")" != "$(show_qr_authority_key "$url")" ]; then
-    show_qr_profile_invalid "That saved self-signed file server uses a different host or port but stores no certificate fingerprint — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
   fi
   return 0
@@ -8707,7 +8573,6 @@ show_qr_load_profile() {
   GW_URL=$(json_get "$PROFILE_FILE" "gateway.url")
   GW_LOCAL_PORT=$(json_get "$PROFILE_FILE" "gateway.localPort")
   GW_MODEL=$(json_get "$PROFILE_FILE" "gateway.model")
-  GW_CERT_FP=$(json_get "$PROFILE_FILE" "gateway.certFP")
 
   # Health path is derived from kind (not stored), exactly as the wizard sets it.
   case "$GW_KIND" in
@@ -8767,16 +8632,14 @@ show_qr_recover_gateway_secret() {
 show_qr_recover_file_lane() {
   local fsurl; fsurl=$(json_get "$PROFILE_FILE" "fileServer.url")
   [ -n "$fsurl" ] || { FS_URL=""; FS_CRED=""; return 0; }   # profile has no file lane
-  local saved_port saved_fp saved_folder
+  local saved_port saved_folder
   saved_port=$(json_get "$PROFILE_FILE" "fileServer.localPort")
-  saved_fp=$(json_get "$PROFILE_FILE" "fileServer.certFP")
   saved_folder=$(json_get "$PROFILE_FILE" "fileServer.folder")
   # existing_fs_config recovers the credential (state cred file / env file / unit) and
-  # sets FS_CRED + FS_LOCAL_PORT + FS_FOLDER; keep the profile's URL/port/cert authoritative.
+  # sets FS_CRED + FS_LOCAL_PORT + FS_FOLDER; keep the profile's URL/port authoritative.
   if existing_fs_config && [ -n "$FS_CRED" ]; then
     FS_URL="$fsurl"
     [ -n "$saved_port" ] && FS_LOCAL_PORT="$saved_port"
-    FS_CERT_FP="$saved_fp"
     if [ -n "$saved_folder" ] && [ "$saved_folder" != "$FS_FOLDER" ]; then
       note "The saved profile's informational folder differs from the live service definition; using the structurally parsed live folder."
     fi
@@ -8789,7 +8652,7 @@ show_qr_recover_file_lane() {
     warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
     if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?"; then
       note "Leaving the file lane out of this QR — re-run the wizard (bash conduck-connect.sh) to rebuild it."
-      FS_URL=""; FS_CRED=""; FS_CERT_FP=""; FS_FOLDER=""
+      FS_URL=""; FS_CRED=""; FS_FOLDER=""
     else
       die "Stopped — re-run the wizard (bash conduck-connect.sh) to rebuild the file lane and refresh the profile."
     fi
@@ -8872,27 +8735,6 @@ show_qr_check_live() {
         show_qr_assert_mapping "$fs_host" "$(url_https_port "$FS_URL")" "$FS_LOCAL_PORT" "$fs_verb" "file lane" || show_qr_stale
       fi
       ;;
-    selfsigned)
-      # Re-pin check: the cert the app would trust must be the one we saved.
-      local live; live=$(compute_spki_hex "$GW_URL" 2>/dev/null)
-      if [ -z "$live" ] || [ "$live" != "$GW_CERT_FP" ]; then
-        bad "The gateway's certificate changed since this profile was saved."
-        note "expected fingerprint: ${GW_CERT_FP:-<none>}"
-        note "live fingerprint:     ${live:-<unreadable>}"
-        die "The gateway's certificate changed; re-run the wizard (bash conduck-connect.sh) to re-pin — scanning an old pin would fail on the device."
-      fi
-      ok "Gateway certificate still matches the pinned fingerprint."
-      if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] && [ -n "$FS_CERT_FP" ]; then
-        local flive; flive=$(compute_spki_hex "$FS_URL" 2>/dev/null)
-        if [ -z "$flive" ] || [ "$flive" != "$FS_CERT_FP" ]; then
-          bad "The file lane's certificate changed since this profile was saved."
-          note "expected fingerprint: $FS_CERT_FP"
-          note "live fingerprint:     ${flive:-<unreadable>}"
-          die "The file lane's certificate changed; re-run the wizard (bash conduck-connect.sh) to re-pin it."
-        fi
-        ok "File-lane certificate still matches its pinned fingerprint."
-      fi
-      ;;
     cloudflare|public)
       note "This transport has no local exposure to introspect — reachability is proven by the real requests below."
       ;;
@@ -8923,7 +8765,6 @@ prepare_setup_from_check() {
   SETUP_FROM_CHECK=true
   GW_KIND="custom"
   GW_HEALTH_PATH=""
-  GW_CERT_FP=""
   TRANSPORT=""
   SCOPE=""
 
@@ -9008,7 +8849,7 @@ run_setup() {
     # selects a gateway: the user always makes an explicit 1/2/3 choice.
     while true; do
       GW_KIND=""; GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
-      GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""; GW_CERT_FP=""
+      GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""
       detect_gateway
       case "$GW_KIND" in
         openclaw) configure_openclaw ;;
@@ -9067,8 +8908,8 @@ finish_successful_check() { # finish_successful_check <server|adapter>
   REUSE_ONLY=false
   CHECK_URL=""
 
-  # The standalone checks do not need openssl; setup might need it for
-  # certificate trust/pinning, so run the setup preflight after transitioning.
+  # The standalone checks do not need openssl; setup does (it mints the gateway
+  # and file-lane credentials), so run the setup preflight after transitioning.
   preflight
   run_setup
 }

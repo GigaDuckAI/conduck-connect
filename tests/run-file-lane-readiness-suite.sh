@@ -39,8 +39,6 @@ TRANSPORT="public"
 GW_AUTH="bearer"
 GW_TOKEN=""
 GW_MODEL=""
-GW_CERT_FP=""
-FS_CERT_FP=""
 OS="Linux"
 STATE_DIR="$TMP/state"
 STATE_DIR_EXPOSURE_REPORTED=false
@@ -1323,9 +1321,6 @@ test_agent_deadlines_and_cleanup() {
   AGENT_PROBE_OUTPUTKEY="output-$tag.txt"
   AGENT_PROBE_FS_URL="$FS_URL"
   AGENT_PROBE_FS_CRED="$FS_CRED"
-  AGENT_PROBE_TRANSPORT="$TRANSPORT"
-  AGENT_PROBE_GW_CERT_FP="$GW_CERT_FP"
-  AGENT_PROBE_FS_CERT_FP="$FS_CERT_FP"
   AGENT_PROBE_DIR_ARMED=true
   AGENT_PROBE_INPUT_ARMED=true
   AGENT_PROBE_OUTPUT_ARMED=true
@@ -1360,9 +1355,6 @@ test_agent_deadlines_and_cleanup() {
   AGENT_PROBE_FS_URL="$FS_URL"
   AGENT_PROBE_FS_CRED="$FS_CRED"
   AGENT_PROBE_FS_FOLDER="$served"
-  AGENT_PROBE_TRANSPORT="$TRANSPORT"
-  AGENT_PROBE_GW_CERT_FP="$GW_CERT_FP"
-  AGENT_PROBE_FS_CERT_FP="$FS_CERT_FP"
   AGENT_PROBE_DIR_ARMED=false
   AGENT_PROBE_INPUT_ARMED=false
   AGENT_PROBE_OUTPUT_ARMED=true
@@ -1407,7 +1399,6 @@ test_show_code_live_folder() {
       case "$2" in
         fileServer.url)       printf '%s' "https://files.example.test" ;;
         fileServer.localPort) printf '%s' "7443" ;;
-        fileServer.certFP)    printf '%s' "fixture-cert-fingerprint" ;;
         fileServer.folder)    printf '%s' "$stale_folder" ;;
       esac
     }
@@ -1419,12 +1410,11 @@ test_show_code_live_folder() {
       return 0
     }
     PROFILE_FILE="$TMP/unused-profile.json"
-    FS_URL=""; FS_CRED=""; FS_LOCAL_PORT=""; FS_CERT_FP=""; FS_FOLDER=""
+    FS_URL=""; FS_CRED=""; FS_LOCAL_PORT=""; FS_FOLDER=""
     show_qr_recover_file_lane > "$output" 2>&1 \
       && [ "$FS_FOLDER" = "$live_folder" ] \
       && [ "$FS_URL" = "https://files.example.test" ] \
       && [ "$FS_LOCAL_PORT" = "7443" ] \
-      && [ "$FS_CERT_FP" = "fixture-cert-fingerprint" ] \
       && grep -qF "using the structurally parsed live folder" "$output"
   ); then
     pass "show-code keeps structurally parsed live folder"

@@ -1001,36 +1001,151 @@ run_profile_local_port_gate_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
-run_profile_selfsigned_file_pin_case() {
-  local name="profile-selfsigned-file-pin-gate" rc=0 state="$TMP/selfsigned-pin-state"
+# `selfsigned` is not a transport, and `certFP` is not a field. A saved profile
+# naming either describes a setup the app cannot use, so the menu must filter it
+# out rather than advertise it and fail after the user picks it. The control arm
+# proves the filter is the TRANSPORT and not the picker rejecting everything.
+run_profile_selfsigned_transport_refused_case() {
+  local name="profile-selfsigned-transport-refused" rc=0 state="$TMP/selfsigned-transport-state"
   local fp="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   mkdir -p "$state/conduck"
 
-  # A different file authority presents an independent certificate. Without
-  # fileServer.certFP the loader would incorrectly reuse the gateway's pin.
   printf '{"schemaVersion":1,"gateway":{"id":"custom-pin","kind":"custom","name":"Pinned","auth":"none","transport":"selfsigned","reach":"private","url":"https://gateway.example.test:8443","certFP":"%s"},"fileServer":{"url":"https://files.example.test:9443","reach":"private"}}\n' \
-    "$fp" > "$state/conduck/profile-missing-file-pin.json"
+    "$fp" > "$state/conduck/profile-custom-pin.json"
   PTY_ENV=(XDG_CONFIG_HOME="$state")
   pty_run 10 $'4\n' > "$TMP/doctor.out" 2>&1 || rc=$?
   if [ "$rc" = "0" ] ||
      grep -qF '4) Show a saved setup code' "$TMP/doctor.out" ||
      grep -qF 'Re-show your pairing code' "$TMP/doctor.out"; then
-    fail_case "$name" "a different self-signed file authority without its own pin was advertised"; return
+    fail_case "$name" "a profile pinning a self-signed certificate was still advertised"; return
   fi
 
-  # Shared authority is the intentional legacy/writer fallback: both routes
-  # present the same certificate, so omitting fileServer.certFP is valid.
-  state="$TMP/selfsigned-shared-state"
+  # Control: the same gateway on a trusted-certificate transport IS advertised.
+  state="$TMP/public-transport-state"
   mkdir -p "$state/conduck"
-  printf '{"schemaVersion":1,"gateway":{"id":"custom-shared-pin","kind":"custom","name":"Shared pin","auth":"none","transport":"selfsigned","reach":"private","url":"https://shared.example.test:8443/gateway","certFP":"%s"},"fileServer":{"url":"https://shared.example.test:8443/files","reach":"private"}}\n' \
-    "$fp" > "$state/conduck/profile-shared-pin.json"
+  printf '{"schemaVersion":1,"gateway":{"id":"custom-trusted","kind":"custom","name":"Trusted","auth":"none","transport":"public","reach":"private","url":"https://gateway.example.test:8443"},"fileServer":{"url":"https://files.example.test:9443","reach":"private"}}\n' \
+    > "$state/conduck/profile-custom-trusted.json"
   rc=0
   PTY_ENV=(XDG_CONFIG_HOME="$state")
   pty_run 10 $'q\n' > "$TMP/doctor.out" 2>&1 || rc=$?
   if [ "$rc" != "0" ] ||
      ! grep -qF '4) Show a saved setup code' "$TMP/doctor.out"; then
-    fail_case "$name" "a valid shared-authority self-signed profile was hidden"; return
+    fail_case "$name" "a valid trusted-certificate profile was hidden"; return
   fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Drive the PRODUCTION classify_own_https with curl's verdict and the two
+# certificate readers supplied, so every arm of the gate is reachable without a
+# real TLS server. Everything the branch decides — accept, or stop and explain —
+# is the shipped code's own.
+# Args: <function-source> <curl-exit-code> <openssl-verify-code> <date-problem>.
+run_classify_own_https_isolated() {
+  FUNCS="$1" CURL_RC="$2" VERIFY_CODE="$3" DATE_PROBLEM="$4" bash -c '
+eval "$FUNCS"
+say()  { printf "%s\n" "$*"; }
+ok()   { printf "OK %s\n" "$*"; }
+bad()  { printf "BAD %s\n" "$*"; }
+note() { printf "%s\n" "$*"; }
+warn() { printf "WARN %s\n" "$*"; }
+confirm() { printf "CONFIRM %s\n" "$*"; return 0; }
+die()  { printf "DIE %s\n" "$*"; exit 1; }
+plan_add() { :; }
+curl() { return "$CURL_RC"; }
+cert_verify_code()      { printf "%s" "$VERIFY_CODE"; }
+cert_leaf_date_problem() { printf "%s" "$DATE_PROBLEM"; }
+BOLD=""; RESET=""
+DRY_RUN=false
+TRANSPORT=""
+GW_URL="https://gw.example.test"
+classify_own_https
+printf "TRANSPORT=%s\n" "$TRANSPORT"
+'
+}
+
+# The exposure menu's option 4 is a GATE, not a fork. Apple's App Transport
+# Security refuses a chain the device does not trust before the app is consulted,
+# and a fingerprint pin can only NARROW trust a device already has — so "pin it
+# anyway" has no working outcome, and a setup code minted on that promise fails
+# on the phone. This creation path shipped with ZERO coverage, which is how the
+# pin-anyway fork survived; the assertions below are written as rules about the
+# released artifact so a future re-introduction fails here rather than shipping.
+run_own_https_trust_gate_case() {
+  local name="own-https-requires-trusted-cert" funcs out rc
+
+  funcs=$(extract_funcs classify_own_https)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'classify_own_https()'; then
+    fail_case "$name" "could not extract classify_own_https from the release artifact"; return
+  fi
+
+  # A certificate this machine trusts is the ONLY way through. curl exit 0.
+  rc=0
+  out=$(run_classify_own_https_isolated "$funcs" 0 0 "") || rc=$?
+  printf -- '--- trusted certificate ---\n%s\n' "$out" > "$TMP/doctor.out"
+  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'TRANSPORT=public'; then
+    fail_case "$name" "a trusted certificate did not continue setup on the public transport"; return
+  fi
+
+  # curl 60 = the peer certificate could not be authenticated. Verify code 18 is
+  # "self-signed certificate" — the exact case that used to be pinned.
+  rc=0
+  out=$(run_classify_own_https_isolated "$funcs" 60 18 "") || rc=$?
+  printf -- '--- untrusted (self-signed) certificate ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$rc" = "0" ] || ! printf '%s\n' "$out" | grep -qF 'DIE '; then
+    fail_case "$name" "an untrusted certificate did not stop the run"; return
+  fi
+  if printf '%s\n' "$out" | grep -qF 'CONFIRM '; then
+    fail_case "$name" "the gate still offers an accept-it-anyway override"; return
+  fi
+  if printf '%s\n' "$out" | grep -qF 'TRANSPORT='; then
+    fail_case "$name" "the gate fell through to a transport instead of stopping"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF "doesn't trust"; then
+    fail_case "$name" "the refusal did not name WHY the certificate failed"; return
+  fi
+  # Refusing without a remedy just moves the dead end. All three free routes,
+  # named — Tailscale Serve, Let's Encrypt (IP certificates included), a proxy.
+  local route
+  for route in 'Tailscale Serve' "Let's Encrypt" 'Caddy'; do
+    if ! printf '%s\n' "$out" | grep -qF "$route"; then
+      fail_case "$name" "the refusal did not name the free route: $route"; return
+    fi
+  done
+
+  # The reason is diagnostic, not decorative: a wrong clock and a wrong hostname
+  # are different jobs from "no trusted issuer", and both readers still run.
+  rc=0
+  out=$(run_classify_own_https_isolated "$funcs" 60 18 "expired") || rc=$?
+  printf -- '--- untrusted AND expired ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$rc" = "0" ] || ! printf '%s\n' "$out" | grep -qF 'has expired'; then
+    fail_case "$name" "an untrusted, expired certificate did not report its expiry"; return
+  fi
+  rc=0
+  out=$(run_classify_own_https_isolated "$funcs" 60 0 "") || rc=$?
+  printf -- '--- wrong hostname ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$rc" = "0" ] || ! printf '%s\n' "$out" | grep -qF 'different hostname'; then
+    fail_case "$name" "a wrong-host certificate was not diagnosed as such"; return
+  fi
+
+  # Artifact-wide: nothing may mint, carry, or honour a pin any more. `certFP`
+  # and `selfsigned` are wire/profile names — one occurrence anywhere means a
+  # code the app rejects, or a saved profile it cannot use.
+  local gone
+  for gone in compute_spki_hex hex_to_b64 --pinnedpubkey certFP selfsigned; do
+    if grep -qF -- "$gone" "$SCRIPT"; then
+      fail_case "$name" "the released artifact still carries '$gone'"; return
+    fi
+  done
+  # …but the two readers that explain the failure stay. Deleting them would turn
+  # every refusal into an unexplained one.
+  local kept
+  for kept in cert_verify_code cert_leaf_date_problem; do
+    if [ "$(grep -c "^$kept()" "$SCRIPT")" != "1" ]; then
+      fail_case "$name" "the certificate diagnosis helper '$kept' is gone"; return
+    fi
+  done
 
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -1088,13 +1203,11 @@ GW_TOKEN="$GW_SECRET"
 GW_URL="https://gw.example.test"
 GW_LOCAL_PORT="8080"
 GW_MODEL=""
-GW_CERT_FP=""
 TRANSPORT="tailscale"
 SCOPE="private"
 FS_URL="https://files.example.test:8443"
 FS_CRED="$FS_SECRET"
 FS_LOCAL_PORT="5006"
-FS_CERT_FP=""
 FS_FOLDER="/home/probe/conduck-files"
 FS_REACH="private"
 write_profile
@@ -1237,12 +1350,10 @@ GW_URL="https://gw.example.test"
 GW_AUTH="bearer"
 GW_TOKEN="probe-token"
 GW_MODEL=""
-GW_CERT_FP=""
 GW_LOCAL_PORT=""
 TRANSPORT="public"
 FS_URL="$FS_URL_IN"
 FS_CRED="$FS_CRED_IN"
-FS_CERT_FP=""
 emit_payload
 '
 }
@@ -1445,14 +1556,12 @@ GW_NAME=""
 GW_KIND=""
 GW_ID=""
 GW_MODEL=""
-GW_CERT_FP=""
 GW_LOCAL_PORT=""
 GW_HEALTH_PATH=""
 TRANSPORT=""
 SCOPE=""
 FS_URL=""
 FS_CRED=""
-FS_CERT_FP=""
 COMPAT_MODEL_FIELD="required"
 MODELS_FIRST_ID="$LONG_MODEL"
 PAYLOAD_VERSION=1
@@ -1541,7 +1650,6 @@ run_curl_config_isolation_case() {
     FUNCS="$funcs" URL="http://127.0.0.1:$PORT" bash -c '
 eval "$FUNCS"
 TRANSPORT="public"
-GW_CERT_FP=""
 GW_AUTH="none"
 GW_TOKEN=""
 DOCTOR=false
@@ -2373,8 +2481,12 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" profile-local-port-gate "*) true ;; *)
   run_profile_local_port_gate_case
 fi
 
-if [ -z "$ONLY" ] || case " $ONLY " in *" profile-selfsigned-file-pin-gate "*) true ;; *) false ;; esac; then
-  run_profile_selfsigned_file_pin_case
+if [ -z "$ONLY" ] || case " $ONLY " in *" profile-selfsigned-transport-refused "*) true ;; *) false ;; esac; then
+  run_profile_selfsigned_transport_refused_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" own-https-requires-trusted-cert "*) true ;; *) false ;; esac; then
+  run_own_https_trust_gate_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" profile-legacy-file-reach-fallback "*) true ;; *) false ;; esac; then

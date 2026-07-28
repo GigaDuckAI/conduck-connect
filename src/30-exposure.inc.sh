@@ -1,6 +1,6 @@
 # ------------------------------------------------------------ exposure phase --
 
-TRANSPORT=""       # tailscale | funnel | cloudflare | public | selfsigned
+TRANSPORT=""       # tailscale | funnel | cloudflare | public
 SCOPE="unknown"    # private | public | unknown  (actual reachability, NOT the label)
 TS_STATE_KNOWN=true
 declare -a TS_PORTS=()        # "port<TAB>verb<TAB>proxy" lines from ts_targets
@@ -447,10 +447,11 @@ explain_exposure_paths() {
   say "     Apple Watch:       works on its own, anywhere."
   say ""
   say "  4) Your own HTTPS — reach is whatever you built"
-  say "     For a gateway that already has an https:// address — a reverse proxy, a"
-  say "     rented server (VPS), or a self-signed certificate you made yourself. You"
-  say "     paste the address; I check the certificate and set up the app's trust —"
-  say "     you don't need to know which kind you have."
+  say "     For a gateway that already has an https:// address — a reverse proxy or a"
+  say "     rented server (VPS). Its certificate has to be one your phone already"
+  say "     trusts by itself; a certificate you signed yourself does not qualify, and"
+  say "     there is no way for the app to make an exception (I explain the free ways"
+  say "     to get a real one if yours doesn't pass)."
   say "     Apple Watch:       works on its own IF that address works without a VPN."
   say ""
   say "  You can re-run this script any time and pick a different path."
@@ -458,8 +459,8 @@ explain_exposure_paths() {
 }
 
 choose_exposure() {
-  # Generic with a ready URL skips the transport menu — but still classifies the
-  # certificate (trust-or-pin), exactly like menu option 4.
+  # Generic with a ready URL skips the transport menu — but still puts the
+  # certificate through the same trust gate as menu option 4.
   if [ -n "$GW_URL" ] && [ -z "$GW_LOCAL_PORT" ]; then
     head_ "Step 3 — HTTPS reachability"
     ok "Using your existing URL: $GW_URL"
@@ -489,7 +490,7 @@ choose_exposure() {
   say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
   say ""
   say "  4) ${BOLD}I already run my own HTTPS for it${RESET}"
-  say "     You give the https:// address; I check its certificate and set up the app's trust."
+  say "     You give the https:// address; its certificate has to be one your devices already trust."
   say ""
   if $SETUP_FROM_CHECK; then
     say "  ${DIM}b) stop this setup (the completed check remains unchanged)${RESET}"
@@ -586,13 +587,14 @@ choose_exposure() {
       apply_gateway_url_normalization
       ;;
     4)
-      # One option for "I run my own HTTPS." The script figures out whether the
-      # certificate is publicly trusted (no pin) or self-managed (pin its SPKI).
+      # One option for "I run my own HTTPS." It is a GATE, not a fork: the
+      # certificate is either one this machine trusts (which is the bar the app
+      # applies too) or the run stops.
       GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com") || die "$NO_ANSWER"
       apply_gateway_url_normalization
       scope_choice
       keyless_public_guard
-      classify_own_https   # sets TRANSPORT=public|selfsigned (+ GW_CERT_FP); STOPs on a broken cert
+      classify_own_https   # sets TRANSPORT=public, or STOPs and names the free routes
       ;;
     *) die "Invalid choice." ;;
   esac
@@ -669,39 +671,6 @@ tls_connect_target() { # tls_connect_target <https-url> -> "connectarg\tserverna
   printf '%s\t%s' "$connectarg" "$sni"
 }
 
-# Self-signed SPKI: compute the lowercase hex digest (for the QR) AND validate the
-# key algorithm is one the app can actually pin. Echoes hex on success.
-compute_spki_hex() { # compute_spki_hex <https-url>
-  local url="$1" _tgt connectarg sni; _tgt=$(tls_connect_target "$url")
-  connectarg="${_tgt%%$'\t'*}"; sni="${_tgt#*$'\t'}"
-  local sni_args=(); [ -n "$sni" ] && sni_args=(-servername "$sni")   # omit SNI for an IP literal
-  local der; der=$(mktemp); local cert; cert=$(mktemp)
-  trap 'rm -f "$der" "$cert"' RETURN
-  openssl s_client -connect "$connectarg" ${sni_args[@]+"${sni_args[@]}"} </dev/null 2>/dev/null \
-    | openssl x509 -outform PEM > "$cert" 2>/dev/null
-  [ -s "$cert" ] || return 1
-  # Reject key types the app's pinner does not support (RSA 2048/3072/4096, EC P-256/P-384).
-  # Diagnostics go to stderr — stdout is reserved for the hex digest (captured by $()).
-  local algline; algline=$(openssl x509 -in "$cert" -noout -text 2>/dev/null)
-  if printf '%s' "$algline" | grep -qi 'ED25519\|ED448'; then
-    bad "That certificate uses an Ed25519/Ed448 key, which the Conduck app cannot pin." >&2; return 1
-  fi
-  if printf '%s' "$algline" | grep -qi 'Public Key Algorithm: id-ecPublicKey'; then
-    printf '%s' "$algline" | grep -qi 'prime256v1\|secp384r1' \
-      || { bad "That EC curve isn't supported (app pins only P-256 / P-384)." >&2; return 1; }
-  elif printf '%s' "$algline" | grep -qi 'Public Key Algorithm: rsaEncryption'; then
-    printf '%s' "$algline" | grep -qiE 'Public-Key: \((2048|3072|4096) bit\)' \
-      || { bad "That RSA key size isn't supported (app pins only 2048/3072/4096-bit)." >&2; return 1; }
-  else
-    # Fail CLOSED: anything not RSA/EC above (DSA, RSA-PSS, Ed25519/Ed448, unknown) is unpinnable.
-    bad "That certificate's key type isn't one the Conduck app can pin (needs RSA-2048/3072/4096 or EC P-256/P-384)." >&2; return 1
-  fi
-  openssl x509 -in "$cert" -pubkey -noout 2>/dev/null \
-    | openssl pkey -pubin -outform DER 2>/dev/null > "$der"
-  [ -s "$der" ] || return 1
-  sha256_hex < "$der"
-}
-
 # Read the leaf cert's openssl verify return code — the stable X509_V_ERR_*
 # numbers (same on OpenSSL and LibreSSL), so we classify WHY normal TLS trust
 # failed without fragile date math.
@@ -714,9 +683,10 @@ cert_verify_code() { # cert_verify_code <https-url> -> numeric code (or "")
 }
 
 # Leaf-cert date sanity, checked independently of the chain verify code (some
-# OpenSSL builds report the chain error first) so a self-signed cert that is
-# ALSO expired or not-yet-valid never gets pinned. Echoes "expired" / "notyet" /
-# nothing; an unreadable cert counts as expired (fail closed).
+# OpenSSL builds report the chain error first) so an untrusted certificate that
+# is ALSO expired or not-yet-valid still gets its dates named — a wrong clock is
+# the one cause the user can fix without changing certificate at all. Echoes
+# "expired" / "notyet" / nothing; an unreadable cert counts as expired.
 cert_leaf_date_problem() { # cert_leaf_date_problem <https-url>
   local url="$1" pem _tgt connectarg sni; _tgt=$(tls_connect_target "$url")
   connectarg="${_tgt%%$'\t'*}"; sni="${_tgt#*$'\t'}"
@@ -739,17 +709,17 @@ if nb > datetime.datetime.utcnow():
     print("notyet")' 2>/dev/null
 }
 
-# Resolve the merged "I run my own HTTPS" choice: probe the cert and decide
-# trust-vs-pin. Sets TRANSPORT to public (trusted, no pin) or selfsigned (pin),
-# and GW_CERT_FP when pinning. STOPS on a genuinely broken cert (expired / not
-# yet valid) rather than pinning it — pinning bypasses the app's chain checks
-# (RemoteAgentTrustEvaluator .useCredential), so a bad cert would be trusted
-# forever. An explicit advanced override can still force a pin.
+# The "I run my own HTTPS" gate. The certificate must be one THIS machine already
+# trusts, because that is the same bar the app applies on the phone: Apple's App
+# Transport Security refuses an untrusted chain before the app is consulted, and a
+# fingerprint pin cannot override it — a pin only NARROWS trust the device already
+# has, it never grants it. So there is no accept-anyway arm to offer; an untrusted
+# certificate ends the run, with the reason named and the free remedies listed.
 classify_own_https() {  # GW_URL + SCOPE already set
   if $DRY_RUN; then
-    TRANSPORT="public"   # provisional routing; a real run decides trust-vs-pin
-    plan_add "CHECK the certificate at $GW_URL, then trust it (no pin) or pin its fingerprint"
-    note "(dry-run: on a real run I check this certificate and either let the app trust it normally, or pin it)"
+    TRANSPORT="public"   # provisional routing; a real run runs the trust gate
+    plan_add "CHECK the certificate at $GW_URL — setup continues only if this machine trusts it"
+    note "(dry-run: on a real run I check this certificate; one this machine doesn't trust stops setup)"
     return 0
   fi
   say ""
@@ -760,7 +730,7 @@ classify_own_https() {  # GW_URL + SCOPE already set
   curl -q -sS --max-time 15 -o /dev/null "$GW_URL/v1/models" 2>/dev/null || rc=$?
   if [ "$rc" = "0" ]; then
     TRANSPORT="public"
-    ok "Its certificate is trusted normally — the app needs no pin."
+    ok "Its certificate is trusted normally — that's exactly what the app needs."
     return 0
   fi
   case "$rc" in
@@ -768,52 +738,37 @@ classify_own_https() {  # GW_URL + SCOPE already set
     7)  die "Couldn't connect to $GW_URL (connection refused). Is the gateway up? Re-run when it is." ;;
     28) die "Connecting to $GW_URL timed out. Check the address / firewall and re-run." ;;
   esac
-  # Reached the server but normal trust failed — classify why. FAIL CLOSED: pin
-  # ONLY for the self-signed / unknown-issuer codes; anything else (a CA-valid but
-  # WRONG-HOST cert = code 0, an expired/not-yet-valid cert, or an unclassifiable
-  # failure) STOPS — pinning bypasses the app's hostname + chain checks, so we must
-  # not pin a cert that failed for any reason other than "no trusted issuer".
-  local code reason="" pinnable=false
+  # Reached the server but trust failed. The outcome is the same either way —
+  # stop — but WHY decides which remedy is the user's: a wrong clock, a wrong
+  # hostname, and no trusted issuer at all are three different jobs.
+  local code reason
   code=$(cert_verify_code "$GW_URL")
   case "$code" in
-    18|19|20|21) pinnable=true ;;   # self-signed / unknown issuer — the legit pin case
+    18|19|20|21)
+      reason="is signed by an issuer this machine doesn't trust (self-signed, or a private CA)"
+      case "$(cert_leaf_date_problem "$GW_URL")" in
+        expired) reason="$reason, and it has expired" ;;
+        notyet)  reason="$reason, and it is not valid yet (check the gateway's clock)" ;;
+      esac ;;
     10) reason="has expired" ;;
     9)  reason="is not valid yet (check the gateway's clock)" ;;
     0)  reason="is valid but does not match this address (it's issued for a different hostname)" ;;
     *)  reason="couldn't be classified (TLS verify code '${code:-none}')" ;;
   esac
-  # Belt-and-suspenders: even a self-signed cert must not be pinned while its
-  # dates are wrong (expired OR not yet valid).
-  if $pinnable; then
-    local dateprob; dateprob=$(cert_leaf_date_problem "$GW_URL")
-    case "$dateprob" in
-      expired) pinnable=false; reason="has expired" ;;
-      notyet)  pinnable=false; reason="is not valid yet (check the gateway's clock)" ;;
-    esac
-  fi
-  if ! $pinnable; then
-    bad "The certificate at $GW_URL $reason."
-    say "  Pinning it would tell the app to accept this server's key from now on —"
-    say "  skipping the very checks that just caught this problem."
-    say "  Best fix: correct the certificate (or use a free Let's Encrypt one), then re-run me."
-    confirm "  Advanced: pin THIS certificate anyway?" \
-      || die "Stopped — the certificate $reason. Fix it and re-run."
-    warn "Pinning a certificate that $reason, at your request."
-  fi
-  GW_CERT_FP=$(compute_spki_hex "$GW_URL") \
-    || die "Couldn't read a usable certificate from $GW_URL (key must be RSA-2048/3072/4096 or EC P-256/P-384)."
-  TRANSPORT="selfsigned"
-  $pinnable && ok "Detected a self-managed certificate — I'll pin it so the app trusts it."
-  $pinnable && note "Pinning = the app trusts exactly this certificate from now on (and skips the normal public-trust check). Re-run this script if you ever replace the certificate."
-  ok "Fingerprint: $GW_CERT_FP (rides inside the QR — no transcription)."
-}
-
-# Convert a 64-hex SPKI digest to base64-of-raw-bytes for curl --pinnedpubkey.
-# We pin the SAME fingerprint that goes into the QR (computed once), NOT a freshly
-# re-fetched cert — otherwise a cert that rotated mid-run could verify green yet the
-# app would reject the QR's now-stale pin.
-hex_to_b64() { # hex_to_b64 <64-hex>
-  printf '%s' "$1" | python3 -c 'import sys,base64,binascii
-h=sys.stdin.read().strip()
-sys.stdout.write(base64.b64encode(binascii.unhexlify(h)).decode() if h else "")' 2>/dev/null
+  bad "The certificate at $GW_URL $reason."
+  say "  Conduck needs a certificate your phone, tablet, or Mac trusts on its own — the"
+  say "  same bar this machine just applied. Apple rejects an untrusted certificate"
+  say "  before the app can see it, and no fingerprint you paste into the app changes"
+  say "  that: pinning narrows trust a device already has, it never grants it. So there"
+  say "  is no \"accept it anyway\" here, and a setup code that pretended otherwise would"
+  say "  simply fail on your phone."
+  say ""
+  say "  ${BOLD}Three free ways to get a certificate that works${RESET} — each one automatic after setup:"
+  say "    • ${BOLD}Tailscale Serve${RESET} — issues a real certificate for you and exposes nothing"
+  say "      publicly. Re-run me and pick option 1."
+  say "    • ${BOLD}Let's Encrypt${RESET} — free, and since January 2026 it also issues certificates for"
+  say "      a bare IP address, so you don't need to own a domain."
+  say "    • ${BOLD}A domain in front of it${RESET} — Caddy (or another reverse proxy) obtains and renews"
+  say "      the certificate automatically."
+  die "Stopped — the certificate $reason. Fix that, then re-run me."
 }

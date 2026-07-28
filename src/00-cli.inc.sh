@@ -32,7 +32,9 @@
 #   1. Finds your gateway (OpenClaw, Hermes, or any OpenAI-compatible server).
 #   2. Enables the OpenAI-compatible chat endpoint if it is off (the #1 setup trap).
 #   3. Helps you expose the gateway over HTTPS (works WITH what you have installed:
-#      Tailscale, Cloudflare Tunnel, your own reverse proxy, or a self-signed cert).
+#      Tailscale, Cloudflare Tunnel, or your own reverse proxy). Whatever the path,
+#      the certificate has to be one your devices already trust; a self-signed one
+#      stops the run, and the script names the free ways to get a real certificate.
 #   4. Optionally sets up the agent file lane (rclone WebDAV) so Conduck can hand
 #      your agent real files and download its outputs. OpenClaw gets a tool-policy
 #      check + TOOLS.md guidance. Hermes gets its API-server file toolset and

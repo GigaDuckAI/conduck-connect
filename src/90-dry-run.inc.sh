@@ -26,7 +26,7 @@ print_plan() {
   case "$TRANSPORT" in
     tailscale) tr_h="Tailscale (private)" ;; funnel) tr_h="Tailscale Funnel (public)" ;;
     cloudflare) tr_h="Cloudflare Tunnel (public)" ;; public) tr_h="your own HTTPS (trusted cert)" ;;
-    selfsigned) tr_h="your own HTTPS (pinned cert)" ;; *) tr_h="to be decided during exposure" ;;
+    *) tr_h="to be decided during exposure" ;;
   esac
   case "$SCOPE" in
     public) reach_h="public (anyone with the URL)" ;; private) reach_h="private (your devices only)" ;;
@@ -34,7 +34,6 @@ print_plan() {
   esac
   note "gateway = $gw_h${GW_NAME:+ ($GW_NAME)}   reach = $reach_h   how = $tr_h"
   note "gateway URL = ${GW_URL:-<set during exposure>}"
-  [ -n "$GW_CERT_FP" ] && note "self-signed pin = $GW_CERT_FP"
   say ""
   if [ ${#PLAN[@]} -eq 0 ]; then
     note "Nothing to change — everything needed already exists (a real run would just verify + emit the QR)."

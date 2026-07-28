@@ -4,6 +4,30 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The exposure menu's option 4 ("I already run my own HTTPS") is a gate, not a
+  fork.** It accepts a certificate this machine trusts, or it stops. Apple's App
+  Transport Security rejects an untrusted chain before the app is consulted, and
+  a fingerprint pin can only *narrow* trust a device already has — it can never
+  grant it, so a self-signed gateway never worked on a real device no matter
+  what the wizard put in the code. The refusal names why the certificate failed
+  and the three free routes to one that works: Tailscale Serve, Let's Encrypt
+  (including its IP-address certificates, GA since January 2026, so no domain is
+  needed), or a reverse proxy such as Caddy that mints and renews automatically.
+  Removed with it: `compute_spki_hex`, `hex_to_b64`, the `selfsigned` transport,
+  the "pin THIS certificate anyway" override, file-lane SPKI mirroring, curl
+  `--pinnedpubkey` plumbing, and `certFP` from both the emitted payload and the
+  on-disk profile schema. The certificate *diagnosis* stays: `cert_verify_code`
+  and `cert_leaf_date_problem` still explain expiry, a wrong clock, a wrong
+  hostname, or an untrusted issuer. `--check-server` / `--check-adapter` are
+  unchanged — they already required a certificate this machine would trust.
+- Added the regression coverage this path never had: the shipped
+  `classify_own_https` is driven through its accept arm and every refusal arm
+  (untrusted issuer, untrusted-and-expired, wrong hostname), asserting it stops,
+  offers no override, and names all three remedies; a saved profile on the
+  retired `selfsigned` transport is refused by the menu, with a
+  trusted-transport control proving the filter is the transport itself; and the
+  released artifact is asserted free of every pinning symbol while keeping both
+  diagnosis helpers.
 - The state directory's `0700` is now enforced on every run, not just the one
   that created it. `( umask 077; mkdir -p )` is a no-op on an existing
   directory, mode included, so a `~/.config/conduck` left world-listable by an

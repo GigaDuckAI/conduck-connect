@@ -101,13 +101,6 @@ show_qr_is_port() { # show_qr_is_port <str> -> 0 if a decimal in 1..65535
   [ "${#1}" -le 5 ] || return 1        # length-bound so bash 3.2's intmax can't overflow
   [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
-show_qr_is_certfp() { # show_qr_is_certfp <str> -> 0 if 64 lowercase SPKI-sha256 hex chars
-  case "$1" in *[!0-9a-f]*) return 1 ;; esac
-  [ "${#1}" -eq 64 ]
-}
-show_qr_authority_key() { # normalized https authority: lowercase host + effective port
-  printf '%s:%s' "$(url_host_lc "$1")" "$(url_https_port "$1")"
-}
 show_qr_resolve_file_reach() { # saved file reach (possibly empty), gateway reach
   if [ -n "$1" ]; then printf '%s' "$1"; else printf '%s' "$2"; fi
 }
@@ -118,8 +111,8 @@ show_qr_resolve_file_reach() { # saved file reach (possibly empty), gateway reac
 PROFILE_VALIDATION_ERROR=""
 show_qr_profile_invalid() { PROFILE_VALIDATION_ERROR="$1"; return 1; }
 show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
-  local pf="$1" sv kind id name auth transport reach url port certfp
-  local gateway_type file_type fsurl fsreach fsport fsfp
+  local pf="$1" sv kind id name auth transport reach url port
+  local gateway_type file_type fsurl fsreach fsport
   PROFILE_VALIDATION_ERROR=""
   [ -f "$pf" ] || {
     show_qr_profile_invalid "That saved profile is missing — run setup again (bash conduck-connect.sh --setup) to recreate it."
@@ -152,7 +145,6 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   reach=$(json_get "$pf" "gateway.reach")
   url=$(json_get "$pf" "gateway.url")
   port=$(json_get "$pf" "gateway.localPort")
-  certfp=$(json_get "$pf" "gateway.certFP")
 
   if [ -z "$kind" ] || [ -z "$id" ] || [ -z "$url" ] || [ -z "$transport" ] ||
      [ -z "$reach" ] || [ -z "$auth" ]; then
@@ -191,7 +183,7 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
     return 1
   }
   case "$transport" in
-    tailscale|funnel|cloudflare|public|selfsigned) ;;
+    tailscale|funnel|cloudflare|public) ;;
     *)
       show_qr_profile_invalid "That saved profile has an unrecognized transport '$transport' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
       return 1 ;;
@@ -208,14 +200,6 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
     show_qr_profile_invalid "That saved profile's gateway transport and reach don't agree — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
   fi
-  if [ "$transport" = "selfsigned" ] && [ -z "$certfp" ]; then
-    show_qr_profile_invalid "That saved profile uses a self-signed certificate but stores no fingerprint — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  if [ "$transport" != "selfsigned" ] && [ -n "$certfp" ]; then
-    show_qr_profile_invalid "That saved profile pins a certificate but doesn't use the self-signed path — the app would import a wrong pin. Re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
   if [ -n "$port" ] && ! show_qr_is_port "$port"; then
     show_qr_profile_invalid "That saved profile's gateway local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
@@ -230,15 +214,10 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
         return 1 ;;
     esac
   fi
-  if [ -n "$certfp" ] && ! show_qr_is_certfp "$certfp"; then
-    show_qr_profile_invalid "That saved profile's gateway certificate fingerprint isn't a 64-character lowercase hex value — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
 
   fsurl=$(json_get "$pf" "fileServer.url")
   fsreach=$(json_get "$pf" "fileServer.reach")
   fsport=$(json_get "$pf" "fileServer.localPort")
-  fsfp=$(json_get "$pf" "fileServer.certFP")
   if [ "$file_type" = "object" ] && [ -z "$fsurl" ]; then
     show_qr_profile_invalid "That saved profile's file-server object is missing its URL — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
@@ -257,22 +236,6 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   fi
   if [ -n "$fsport" ] && ! show_qr_is_port "$fsport"; then
     show_qr_profile_invalid "That saved profile's file-server local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  if [ -n "$fsfp" ] && ! show_qr_is_certfp "$fsfp"; then
-    show_qr_profile_invalid "That saved profile's file-server certificate fingerprint isn't a 64-character lowercase hex value — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  if [ "$transport" != "selfsigned" ] && [ -n "$fsfp" ]; then
-    show_qr_profile_invalid "That saved profile pins a file-server certificate but doesn't use the self-signed path — re-run setup (bash conduck-connect.sh --setup) to refresh it."
-    return 1
-  fi
-  # The file lane may inherit the gateway pin only when both URLs reach the same
-  # authority. A different host or port presents an independent certificate and
-  # therefore needs the fileServer.certFP that the writer normally records.
-  if [ "$transport" = "selfsigned" ] && [ -n "$fsurl" ] && [ -z "$fsfp" ] &&
-     [ "$(show_qr_authority_key "$fsurl")" != "$(show_qr_authority_key "$url")" ]; then
-    show_qr_profile_invalid "That saved self-signed file server uses a different host or port but stores no certificate fingerprint — re-run setup (bash conduck-connect.sh --setup) to refresh it."
     return 1
   fi
   return 0
@@ -303,7 +266,6 @@ show_qr_load_profile() {
   GW_URL=$(json_get "$PROFILE_FILE" "gateway.url")
   GW_LOCAL_PORT=$(json_get "$PROFILE_FILE" "gateway.localPort")
   GW_MODEL=$(json_get "$PROFILE_FILE" "gateway.model")
-  GW_CERT_FP=$(json_get "$PROFILE_FILE" "gateway.certFP")
 
   # Health path is derived from kind (not stored), exactly as the wizard sets it.
   case "$GW_KIND" in
@@ -363,16 +325,14 @@ show_qr_recover_gateway_secret() {
 show_qr_recover_file_lane() {
   local fsurl; fsurl=$(json_get "$PROFILE_FILE" "fileServer.url")
   [ -n "$fsurl" ] || { FS_URL=""; FS_CRED=""; return 0; }   # profile has no file lane
-  local saved_port saved_fp saved_folder
+  local saved_port saved_folder
   saved_port=$(json_get "$PROFILE_FILE" "fileServer.localPort")
-  saved_fp=$(json_get "$PROFILE_FILE" "fileServer.certFP")
   saved_folder=$(json_get "$PROFILE_FILE" "fileServer.folder")
   # existing_fs_config recovers the credential (state cred file / env file / unit) and
-  # sets FS_CRED + FS_LOCAL_PORT + FS_FOLDER; keep the profile's URL/port/cert authoritative.
+  # sets FS_CRED + FS_LOCAL_PORT + FS_FOLDER; keep the profile's URL/port authoritative.
   if existing_fs_config && [ -n "$FS_CRED" ]; then
     FS_URL="$fsurl"
     [ -n "$saved_port" ] && FS_LOCAL_PORT="$saved_port"
-    FS_CERT_FP="$saved_fp"
     if [ -n "$saved_folder" ] && [ "$saved_folder" != "$FS_FOLDER" ]; then
       note "The saved profile's informational folder differs from the live service definition; using the structurally parsed live folder."
     fi
@@ -385,7 +345,7 @@ show_qr_recover_file_lane() {
     warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
     if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?"; then
       note "Leaving the file lane out of this QR — re-run the wizard (bash conduck-connect.sh) to rebuild it."
-      FS_URL=""; FS_CRED=""; FS_CERT_FP=""; FS_FOLDER=""
+      FS_URL=""; FS_CRED=""; FS_FOLDER=""
     else
       die "Stopped — re-run the wizard (bash conduck-connect.sh) to rebuild the file lane and refresh the profile."
     fi
@@ -466,27 +426,6 @@ show_qr_check_live() {
           "$(json_get "$PROFILE_FILE" "fileServer.reach")" "$SCOPE")
         local fs_verb="serve"; [ "$fs_reach" = "public" ] && fs_verb="funnel"
         show_qr_assert_mapping "$fs_host" "$(url_https_port "$FS_URL")" "$FS_LOCAL_PORT" "$fs_verb" "file lane" || show_qr_stale
-      fi
-      ;;
-    selfsigned)
-      # Re-pin check: the cert the app would trust must be the one we saved.
-      local live; live=$(compute_spki_hex "$GW_URL" 2>/dev/null)
-      if [ -z "$live" ] || [ "$live" != "$GW_CERT_FP" ]; then
-        bad "The gateway's certificate changed since this profile was saved."
-        note "expected fingerprint: ${GW_CERT_FP:-<none>}"
-        note "live fingerprint:     ${live:-<unreadable>}"
-        die "The gateway's certificate changed; re-run the wizard (bash conduck-connect.sh) to re-pin — scanning an old pin would fail on the device."
-      fi
-      ok "Gateway certificate still matches the pinned fingerprint."
-      if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] && [ -n "$FS_CERT_FP" ]; then
-        local flive; flive=$(compute_spki_hex "$FS_URL" 2>/dev/null)
-        if [ -z "$flive" ] || [ "$flive" != "$FS_CERT_FP" ]; then
-          bad "The file lane's certificate changed since this profile was saved."
-          note "expected fingerprint: $FS_CERT_FP"
-          note "live fingerprint:     ${flive:-<unreadable>}"
-          die "The file lane's certificate changed; re-run the wizard (bash conduck-connect.sh) to re-pin it."
-        fi
-        ok "File-lane certificate still matches its pinned fingerprint."
       fi
       ;;
     cloudflare|public)

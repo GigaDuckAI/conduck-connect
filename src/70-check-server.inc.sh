@@ -214,7 +214,7 @@ run_compat() {
       note "Keyless: mirroring the app's explicit no-auth scheme — sensible only on an isolated network."
     fi
   fi
-  TRANSPORT=""; GW_CERT_FP=""
+  TRANSPORT=""
 
   head_ "Server check — $GW_URL"
   COMPAT_RAN=true

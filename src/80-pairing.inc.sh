@@ -20,9 +20,9 @@ write_profile() {
   local out
   out=$(GW_ID="$GW_ID" GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_AUTH="$GW_AUTH" \
         TRANSPORT="$TRANSPORT" SCOPE="$SCOPE" GW_URL="$GW_URL" GW_LOCAL_PORT="$GW_LOCAL_PORT" \
-        GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
+        GW_MODEL="$GW_MODEL" \
         FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_LOCAL_PORT="$FS_LOCAL_PORT" \
-        FS_CERT_FP="$FS_CERT_FP" FS_FOLDER="$FS_FOLDER" FS_REACH="$FS_REACH" \
+        FS_FOLDER="$FS_FOLDER" FS_REACH="$FS_REACH" \
         python3 - <<'PY'
 import json, os
 e = os.environ.get
@@ -32,15 +32,13 @@ gw = {"id": e("GW_ID"), "kind": e("GW_KIND"), "auth": e("GW_AUTH"),
 if e("GW_NAME"):       gw["name"] = e("GW_NAME")
 if e("GW_LOCAL_PORT"): gw["localPort"] = e("GW_LOCAL_PORT")
 if e("GW_MODEL"):      gw["model"] = e("GW_MODEL")
-if e("GW_CERT_FP"):    gw["certFP"] = e("GW_CERT_FP")
 p = {"schemaVersion": 1, "gateway": gw, "fileServer": None}
 # Record the file lane only when it actually shipped in the QR (URL + credential
-# both present) — and record its URL/port/cert/folder, NEVER the credential.
+# both present) — and record its URL/port/folder, NEVER the credential.
 if e("FS_URL") and e("FS_CRED"):
     fs = {"url": e("FS_URL")}
     if e("FS_LOCAL_PORT"): fs["localPort"] = e("FS_LOCAL_PORT")
     if e("FS_REACH"):      fs["reach"]     = e("FS_REACH")
-    if e("FS_CERT_FP"):    fs["certFP"]    = e("FS_CERT_FP")
     if e("FS_FOLDER"):     fs["folder"]    = e("FS_FOLDER")
     p["fileServer"] = fs
 print(json.dumps(p, indent=1))
@@ -64,8 +62,8 @@ PY
 # long model ids) survive setup byte-for-byte before QR/base64 encoding.
 build_pairing_payload_json() {
   GW_KIND="$GW_KIND" GW_NAME="$GW_NAME" GW_URL="$GW_URL" GW_AUTH="$GW_AUTH" \
-  GW_TOKEN="$GW_TOKEN" GW_MODEL="$GW_MODEL" GW_CERT_FP="$GW_CERT_FP" \
-  FS_URL="$FS_URL" FS_CRED="$FS_CRED" FS_CERT_FP="$FS_CERT_FP" \
+  GW_TOKEN="$GW_TOKEN" GW_MODEL="$GW_MODEL" \
+  FS_URL="$FS_URL" FS_CRED="$FS_CRED" \
   TRANSPORT="$TRANSPORT" PV="$PAYLOAD_VERSION" \
   python3 - <<'PY'
 import json, os
@@ -74,12 +72,9 @@ gw = {"kind": e("GW_KIND"), "url": e("GW_URL"), "auth": e("GW_AUTH")}
 if e("GW_NAME"):    gw["name"] = e("GW_NAME")
 if e("GW_TOKEN"):   gw["token"] = e("GW_TOKEN")
 if e("GW_MODEL"):   gw["model"] = e("GW_MODEL")
-if e("GW_CERT_FP"): gw["certFP"] = e("GW_CERT_FP")
 p = {"v": int(e("PV")), "gateway": gw, "transport": e("TRANSPORT")}
 if e("FS_URL") and e("FS_CRED"):
-    fs = {"url": e("FS_URL"), "credential": e("FS_CRED")}
-    if e("FS_CERT_FP"): fs["certFP"] = e("FS_CERT_FP")
-    p["fileServer"] = fs
+    p["fileServer"] = {"url": e("FS_URL"), "credential": e("FS_CRED")}
 print(json.dumps(p, separators=(",", ":")))
 PY
 }
@@ -144,7 +139,6 @@ emit_payload() {
   say ""
   case "$TRANSPORT" in
     tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, or Mac) needs the Tailscale app, logged in to the same tailnet." ;;
-    selfsigned) note "Your gateway uses its own certificate; a secure fingerprint of it travels inside the code, so the app trusts it automatically — nothing for you to copy." ;;
   esac
   say "  Run this script again any time to check the connection or show the code again."
   # Custom targets only (see the matching gate in emit_payload's failure branch).

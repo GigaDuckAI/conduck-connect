@@ -841,9 +841,6 @@ AGENT_PROBE_OUTTMP=""
 AGENT_PROBE_FS_URL=""
 AGENT_PROBE_FS_CRED=""
 AGENT_PROBE_FS_FOLDER=""
-AGENT_PROBE_TRANSPORT=""
-AGENT_PROBE_GW_CERT_FP=""
-AGENT_PROBE_FS_CERT_FP=""
 AGENT_PROBE_DIR_ARMED=false
 AGENT_PROBE_INPUT_ARMED=false
 AGENT_PROBE_OUTPUT_ARMED=false
@@ -990,14 +987,12 @@ agent_probe_directory_absent() {
 }
 
 # Exact-name cleanup for normal completion and EXIT/signal interruption. It
-# snapshots the lane credential/transport at registration time, so a later
+# snapshots the lane URL and credential at registration time, so a later
 # fail-closed drop cannot turn cleanup into an unauthenticated no-op.
 agent_file_probe_cleanup_backstop() { # [final:true]
   $AGENT_PROBE_ACTIVE || return 0
   local final="${1:-false}"
   local FS_URL="$AGENT_PROBE_FS_URL" FS_CRED="$AGENT_PROBE_FS_CRED"
-  local TRANSPORT="$AGENT_PROBE_TRANSPORT" GW_CERT_FP="$AGENT_PROBE_GW_CERT_FP"
-  local FS_CERT_FP="$AGENT_PROBE_FS_CERT_FP"
   local clean=true code
   rm -f "$AGENT_PROBE_TMP" "$AGENT_PROBE_OUTTMP" 2>/dev/null || true
   if ! agent_probe_registered_names_safe; then
@@ -1036,8 +1031,6 @@ agent_file_probe_cleanup_backstop() { # [final:true]
     AGENT_PROBE_TAG=""; AGENT_PROBE_DIRKEY=""; AGENT_PROBE_INPUTKEY=""
     AGENT_PROBE_OUTPUTKEY=""; AGENT_PROBE_TMP=""; AGENT_PROBE_OUTTMP=""
     AGENT_PROBE_FS_URL=""; AGENT_PROBE_FS_CRED=""; AGENT_PROBE_FS_FOLDER=""
-    AGENT_PROBE_TRANSPORT=""
-    AGENT_PROBE_GW_CERT_FP=""; AGENT_PROBE_FS_CERT_FP=""
     AGENT_PROBE_DIR_ARMED=false; AGENT_PROBE_INPUT_ARMED=false
     AGENT_PROBE_OUTPUT_ARMED=false
     AGENT_PROBE_DIR_VERIFY_METHOD=""; AGENT_PROBE_LATE_RISK=false
@@ -1055,8 +1048,6 @@ agent_probe_abandon_registry() { # no registered remote target was created
   AGENT_PROBE_TAG=""; AGENT_PROBE_DIRKEY=""; AGENT_PROBE_INPUTKEY=""
   AGENT_PROBE_OUTPUTKEY=""; AGENT_PROBE_TMP=""; AGENT_PROBE_OUTTMP=""
   AGENT_PROBE_FS_URL=""; AGENT_PROBE_FS_CRED=""; AGENT_PROBE_FS_FOLDER=""
-  AGENT_PROBE_TRANSPORT=""
-  AGENT_PROBE_GW_CERT_FP=""; AGENT_PROBE_FS_CERT_FP=""
   AGENT_PROBE_DIR_ARMED=false; AGENT_PROBE_INPUT_ARMED=false
   AGENT_PROBE_OUTPUT_ARMED=false
   AGENT_PROBE_DIR_VERIFY_METHOD=""; AGENT_PROBE_LATE_RISK=false
@@ -1141,9 +1132,6 @@ agent_file_probe() {
   AGENT_PROBE_FS_URL="$FS_URL"
   AGENT_PROBE_FS_CRED="$FS_CRED"
   AGENT_PROBE_FS_FOLDER="$FS_FOLDER"
-  AGENT_PROBE_TRANSPORT="$TRANSPORT"
-  AGENT_PROBE_GW_CERT_FP="$GW_CERT_FP"
-  AGENT_PROBE_FS_CERT_FP="$FS_CERT_FP"
   AGENT_PROBE_DIR_ARMED=false
   AGENT_PROBE_INPUT_ARMED=false
   AGENT_PROBE_OUTPUT_ARMED=false

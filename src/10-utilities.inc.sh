@@ -432,9 +432,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # Collect ALL missing required tools and report together, with install hints.
 preflight() {
   local missing=()
-  # openssl is only used by the wizard's self-signed cert path (SPKI compute /
-  # pin); the two standalone checks never reach it, so don't gate a
-  # live diagnostic on a tool it doesn't use.
+  # openssl is only used by the wizard, to mint credentials and to read a
+  # failing certificate's own diagnosis; the two standalone checks never reach
+  # it, so don't gate a live diagnostic on a tool it doesn't use.
   local tools="curl python3"; { $DOCTOR || $COMPAT; } || tools="$tools openssl"
   for t in $tools; do need "$t" || missing+=("$t"); done
   if [ ${#missing[@]} -gt 0 ]; then
@@ -445,10 +445,6 @@ preflight() {
     esac
     die "Install the tool(s) above, then re-run me."
   fi
-}
-
-sha256_hex() { # stdin -> lowercase hex digest
-  if have sha256sum; then sha256sum | awk '{print $1}'; else shasum -a 256 | awk '{print $1}'; fi
 }
 
 b64_nowrap() { # stdin -> single-line base64

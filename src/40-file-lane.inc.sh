@@ -1,6 +1,6 @@
 # ----------------------------------------------------------- file-lane phase --
 
-FS_URL=""; FS_CRED=""; FS_CERT_FP=""
+FS_URL=""; FS_CRED=""
 FS_LOCAL_PORT=""
 FS_REACH=""         # the file lane's OWN reach (public|private) — can differ from the gateway's
                     # SCOPE in a mixed-scope setup; recorded as fileServer.reach for --show-code
@@ -1587,36 +1587,15 @@ setup_file_lane() {
         [ -n "$h2" ] && FS_URL="$h2" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
       else FS_CRED=""; fi
       ;;
-    public|selfsigned)
+    public)
       say ""
       say "  Your gateway's web server needs a second route for the file lane → 127.0.0.1:$FS_LOCAL_PORT"
       say "  (a second server block, a subdomain, or another port)."
       note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
+      note "Its certificate must be trusted the same way the gateway's is; the app applies one rule to both."
       local h; h=$(ask_url "The https:// web address that reaches it (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
       if [ -n "$h" ]; then
         FS_URL="$h"
-        # If self-signed AND a different host than the gateway, pin the file host
-        # too — behind the same broken-cert date gate as the gateway pin.
-        if [ "$TRANSPORT" = "selfsigned" ]; then
-          local g_host="${GW_URL#https://}"; g_host="${g_host%%/*}"
-          local f_host="${FS_URL#https://}"; f_host="${f_host%%/*}"
-          if [ "$f_host" != "$g_host" ]; then
-            if $DRY_RUN; then note "(dry-run: would compute the file host's SPKI fingerprint from $FS_URL)"
-            else
-              local fs_datep; fs_datep=$(cert_leaf_date_problem "$FS_URL")
-              if [ "$fs_datep" = "notyet" ]; then
-                warn "The file host's certificate is not valid yet (check its clock) — leaving the file lane out. Fix it and re-run."
-                FS_CRED=""; FS_URL=""
-              elif [ -n "$fs_datep" ]; then
-                warn "The file host's certificate has expired (or could not be read) — leaving the file lane out. Fix it and re-run."
-                FS_CRED=""; FS_URL=""
-              else
-                FS_CERT_FP=$(compute_spki_hex "$FS_URL") || { warn "Could not pin the file host's cert — leaving file lane out."; FS_CRED=""; FS_URL=""; }
-                [ -n "$FS_CERT_FP" ] && ok "File-lane fingerprint computed (rides in the QR)."
-              fi
-            fi
-          fi
-        fi
       else note "Skipped the file lane (Conduck still works — inline-only attachments)."; FS_CRED=""; fi
       ;;
   esac

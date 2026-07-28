@@ -7,15 +7,12 @@ check() { # check "label" <command...>  (command's exit code decides)
   if "$@" >/dev/null 2>&1; then ok "$label"; else bad "$label"; VERIFY_FAILED=true; return 1; fi
 }
 
-# curl wrapper: normal TLS validation, EXCEPT self-signed which is verified by
-# pinning the SPKI (matching what the app pins) instead of disabling checks.
+# curl wrapper: normal TLS validation, with no exceptions and no override — the
+# same trust every setup path already had to clear, so verification proves the
+# route the app will actually take.
 # The bearer token rides a stdin curl config, never argv (argv shows in `ps`).
 curl_gw() { # curl_gw <curl args…>
   local extra=()
-  if [ "$TRANSPORT" = "selfsigned" ] && [ -n "$GW_CERT_FP" ]; then
-    local b64; b64=$(hex_to_b64 "$GW_CERT_FP")     # pin the QR's fingerprint, not a re-fetch
-    [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64")
-  fi
   # `-q` MUST be curl's first arg. Every connector request ignores curl config,
   # so a stray `proxy`/`output`/redirect/include line there can neither reroute
   # a secret nor make curl read/write files absent from our effects manifest.
@@ -134,19 +131,14 @@ sys.exit(0 if ids else 5)' 2>/dev/null)
   esac
 }
 
-# A self-signed-aware curl for the FILE lane (its own pin if set, else gateway's).
+# The FILE lane's curl — normal TLS validation, same single rule as curl_gw.
 # The credential rides a stdin curl config, never argv (argv shows in `ps`).
 curl_fs_with_timeout() { # curl_fs_with_timeout <max-seconds> <curl args…>
   local max_time="$1"; shift
-  local extra=()
-  if [ "$TRANSPORT" = "selfsigned" ]; then
-    local fp="$GW_CERT_FP"; [ -n "$FS_CERT_FP" ] && fp="$FS_CERT_FP"   # file's own pin if it has one
-    if [ -n "$fp" ]; then local b64; b64=$(hex_to_b64 "$fp"); [ -n "$b64" ] && extra+=(--insecure --pinnedpubkey "sha256//$b64"); fi
-  fi
   credential_value_safe "$FS_CRED" || return 2
   local cred="$FS_CRED"; cred="${cred//\\/\\\\}"; cred="${cred//\"/\\\"}"   # curl-config quoting
   printf 'user = "conduck:%s"\n' "$cred" \
-    | curl -q -sS --max-time "$max_time" --config - ${extra[@]+"${extra[@]}"} "$@"
+    | curl -q -sS --max-time "$max_time" --config - "$@"
 }
 curl_fs() { curl_fs_with_timeout 30 "$@"; }
 
@@ -244,7 +236,6 @@ verify_all() {
         28)    why="timed out — no answer from the host" ;;
         35)    why="TLS/certificate problem — the HTTPS front rejected the connection" ;;
         60)    why="TLS/certificate problem — this machine doesn't trust the server's certificate" ;;
-        90)    why="pinned key mismatch — the server's certificate is not the one this run pinned" ;;
         *)     why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
       esac
     else

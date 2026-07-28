@@ -883,9 +883,9 @@ run_doctor() {
       || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi
-  # Plain TLS validation; the doctor has no pairing profile to pin from. For a
-  # self-signed cert, run it on the server itself against http://127.0.0.1.
-  TRANSPORT=""; GW_CERT_FP=""
+  # Plain TLS validation, the same rule the app applies. For a certificate this
+  # machine doesn't trust, run it on the server itself against http://127.0.0.1.
+  TRANSPORT=""
 
   head_ "Adapter check — $GW_URL"
 
