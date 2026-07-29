@@ -4,6 +4,84 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **`--check-server` no longer grades an arbitrary model and calls the result a
+  verdict on the server.** It probed with whichever id `/v1/models` listed first,
+  so an aggregator fronting hundreds of models could report FAIL or PASS purely
+  on the order it listed them — the same server, nothing about it changed. New
+  `CONDUCK_CHECK_SERVER_MODEL` names the model to grade; it is snapshotted once
+  and drives the named-selection turn, the history-image probe and the image
+  probe alike, so a run cannot silently switch targets midway. Both verdicts now
+  say which model they graded and that the others are untested, and a mistyped
+  override is caught against the advertised roster before it produces failures
+  the server would be blamed for. The old wording — "the app would hit the same
+  walls" — was the actual falsehood: the observation was right, the
+  extrapolation was not. Deliberately NOT added: an automatic retry against a
+  second model, which would convert a false FAIL into a false PASS and hide a
+  genuinely broken first id.
+- **The setup handoff pairs the model that was actually checked.** It re-derived
+  the model from the first advertised id, so a run that graded one model could
+  pair another; and when a server required a model but advertised none, it
+  emitted a pairing with no model at all — which that server rejects. Both come
+  from `COMPAT_MODEL_ID` now. An empty value keeps its old meaning (the check
+  passed without a model field, so app-side selection stays open) rather than
+  standing in for "unknown".
+- **A rejection sent before the request body is read now has a name.** Three of
+  five independent adapter builds answered `401` while leaving the body unread
+  on a keep-alive connection, so the next request was parsed starting mid-body.
+  The check reported it as `WRONG token → HTTP 400`, which is true and causally
+  wrong — every builder then audited auth logic that was fine. A paired probe
+  down one connection now separates a proven desync from an unstable answer from
+  a genuine auth fault, and says which it saw rather than asserting a cause it
+  cannot prove through a proxy. The comment that taught the bug is corrected:
+  auth is checked before the body is *processed*, and the bytes must still be
+  consumed or the connection closed.
+- **"transfer failed (timed out or the connection dropped)" split into nine
+  specific causes**, including the one that reads as a network fault and is not:
+  an adapter started without a supervisor and reaped mid-turn.
+- **Hermes's API-server recall scope is reported before pairing, and offered for
+  removal.** `memory` and `session_search` give the gateway a memory of its own,
+  which double-counts context because Conduck resends the full history every
+  turn — and no wire check can see it: such a gateway passes every check with
+  `failed=0`. This is not an edge case. With no explicit `platform_toolsets.
+  api_server` list, Hermes falls back to a bundle that contains both, so a fresh
+  install is affected by default. Only plainly listed entries are removed, and
+  only with a separate yes bound to the exact list previewed; bundle names, an
+  unwritten key, unfamiliar names, commented lines and ambiguous YAML are
+  described for manual editing and never rewritten. Reported from the gateway
+  path and from `--show-code`, so it reaches chat-only users and configs that
+  drifted after pairing. It reports and offers — it never blocks pairing.
+- **Fixed: a bare `api_server:` key silently narrowed the whole API-server
+  scope.** YAML reads it as null, not an empty list; it parsed as `[]`, so the
+  wizard previewed `[] -> ["file"]` and on a yes wrote a file-only list,
+  discarding every tool the operator had. It is now treated as the wide default
+  it is, and no toolset change is proposed.
+- **Install advice matches the distribution.** Any Linux was told to run `apt`.
+  The package manager is detected (apt-get, dnf, yum, zypper, pacman, apk,
+  xbps, emerge) with per-manager package names, and falls back to naming the
+  tool honestly rather than printing a command that cannot work. `pacman` is
+  never told to `-Sy`: Arch forbids partial upgrades, and a pairing wizard has
+  no business prescribing a system upgrade.
+- **`sudo` is no longer assumed.** Root needs no prefix, `doas` systems have no
+  `sudo`, and a retry offered to a root shell would reprint the command that
+  just failed. Root is now told why no retry is offered instead.
+- **Lingering is checked against the right user.** It read `$USER`, which
+  survives `su` and `sudo -u`, so it could answer "durable" about an account
+  that was not the one `systemctl --user` was driving — and the reused-lane path
+  never checked at all, silently re-shipping a lane born in a session that will
+  not outlive logout. Both paths now ask `id -un`, distinguish "cannot tell"
+  from "off", and re-check after enabling.
+- Tracks adapter contract **revision 1.4**.
+- `--help` gained an `Environment` section documenting `CONDUCK_TOKEN` (already
+  in the README, never in `--help` — where someone looks before typing a token
+  into argv) and `CONDUCK_CHECK_SERVER_MODEL`.
+- Added `tests/run-host-environment-suite.sh` (125 assertions: package-manager
+  detection and naming per distribution, privilege prefixes, linger states) and
+  grew the file-lane readiness suite from 148 to 265 assertions covering recall
+  classification across inline, block, bundle, wildcard, comment, anchor, flow,
+  null and globally-disabled forms. The summary regex no longer pins a literal
+  contract revision — every other free-moving field in it was already
+  shape-matched, and the pinned literal broke the suite on a revision bump while
+  guarding nothing.
 - **The exposure menu's option 4 ("I already run my own HTTPS") is a gate, not a
   fork.** It accepts a certificate this machine trusts, or it stops. Apple's App
   Transport Security rejects an untrusted chain before the app is consulted, and

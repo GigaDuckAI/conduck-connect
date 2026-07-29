@@ -52,9 +52,62 @@ note() { printf '  %s\n' "$*"; }
 warn() { printf '  ! %s\n' "$*"; }
 die()  { printf 'error: %s\n' "$*" >&2; return 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+head_() { printf '\n== %s ==\n' "$*"; }
+plan_add() { printf 'PLAN %s\n' "$*"; }
+safe_display() { printf '%s' "$1"; }
 env_get() {
   awk -F= -v key="$2" '$1 == key { sub(/^[^=]*=/, ""); value=$0 } END { print value }' "$1"
 }
+
+# Scriptable operator answers. CONFIRM_SCRIPT is a ':'-separated queue consumed
+# left to right (a step that asks twice can be answered differently each time);
+# CONFIRM_ANSWER is what every prompt past the queue gets. The default is "n"
+# because an undefined `confirm` used to return 127 — declining by default keeps
+# every pre-existing case in this suite on the path it already took.
+CONFIRM_ANSWER="n"
+CONFIRM_SCRIPT=""
+confirm() {
+  local reply="$CONFIRM_ANSWER"
+  if [ -n "$CONFIRM_SCRIPT" ]; then
+    reply="${CONFIRM_SCRIPT%%:*}"
+    case "$CONFIRM_SCRIPT" in
+      *:*) CONFIRM_SCRIPT="${CONFIRM_SCRIPT#*:}" ;;
+      *)   CONFIRM_SCRIPT="" ;;
+    esac
+  fi
+  # The marker is what the flow assertions count: "was the operator asked twice?"
+  # is a question about prompts, and only a printed prompt can be counted from a
+  # captured transcript.
+  printf '[confirm] %s -> %s\n' "$1" "$reply"
+  [ "$reply" = "y" ]
+}
+# The real one `die`s under --reuse-only; `die` here returns 1, so the guard has
+# to return explicitly or the caller would read a refusal as permission.
+mutate_guard() {
+  if $REUSE_ONLY; then
+    die "--reuse-only mode is on, so I won't change anything (this step would: $1)"
+    return 1
+  fi
+  return 0
+}
+# Both mirror the real pair's dry-run/reuse-only arms — the restart of an approved
+# config change must stay refusable, or "reuse-only changed nothing" would pass on a
+# stub that quietly ran it. The operator y/N the real ones wrap is auto-accepted.
+run_step() {
+  local desc="$1"; shift
+  if $DRY_RUN; then plan_add "RUN  $*"; return 0; fi
+  mutate_guard "$desc" || return 1
+  printf '[run_step] %s\n' "$desc"
+  return 0
+}
+print_and_wait() {
+  if $DRY_RUN; then plan_add "YOU RUN  $2  ($1)"; return 0; fi
+  mutate_guard "$1" || return 1
+  printf '[by-hand] %s\n' "$1"
+  return 0
+}
+ask_secret() { printf '%s' "fixture-secret"; }
+secure_owned_file_mode() { return 0; }
 
 # The file-lane unit writers create $STATE_DIR through ensure_state_dir. That is
 # implementation, not runtime plumbing — stubbing it would stop this suite from
@@ -75,6 +128,16 @@ source "$ROOT/src/70-check-server.inc.sh"
 # shellcheck source=src/91-show-code.inc.sh
 source "$ROOT/src/91-show-code.inc.sh"
 FS_UNIT_ACTIVE_IMPL=$(declare -f fs_unit_active)
+
+# The chat-only reach of the recall step is a property of the REAL configure_hermes,
+# so the real one is lifted rather than re-stated here. Sourcing all of
+# src/20-gateway.inc.sh would re-initialise the GW_* globals this suite sets above
+# (GW_ID in particular), which is why only the two functions are taken. The declare
+# guard turns a rename into a loud build failure instead of a silently skipped test.
+# hermes_api_server_port comes along because configure_hermes calls it.
+eval "$(sed -n '/^hermes_api_server_port()/,/^}/p;/^configure_hermes()/,/^}/p' "$ROOT/src/20-gateway.inc.sh")"
+declare -F configure_hermes >/dev/null || { echo "could not lift configure_hermes out of src/20-gateway.inc.sh" >&2; exit 2; }
+declare -F hermes_api_server_port >/dev/null || { echo "could not lift hermes_api_server_port out of src/20-gateway.inc.sh" >&2; exit 2; }
 
 # The focused gate test only needs the observable omission behavior; exposure
 # rollback is covered by the assembled-script regression suite.
@@ -944,6 +1007,609 @@ test_hermes_guidance() {
     "$(hermes_guidance_edit "$ws/.hermes.md" check)" "malformed"
 }
 
+# --- Hermes API-server recall scope -------------------------------------------
+# One key, `platform_toolsets.api_server`, decides whether the gateway keeps a
+# conversation memory of its own: Hermes's default api_server bundle carries
+# `memory` and `session_search`, so a config nobody has narrowed is stateful. That
+# contradicts Conduck's client-owned history and bills the user for context it
+# already replayed — and NO request/response check can detect it, because a
+# remembering gateway answers every probe correctly. The classifier below is the
+# only thing standing between a user and that silent state, so its four states,
+# its refusal to guess, and the reach of the step that reports it are all pinned.
+recall_field() { # <config> <recall|recall_fix|recall_scope|recall_after>
+  hermes_config_analysis "$1" "" recall | awk -F '\t' -v k="$2" '$1 == k { print $2; exit }'
+}
+recall_items() { # <config> -> "memory,session_search," in file order
+  hermes_config_analysis "$1" "" recall | awk -F '\t' '$1 == "recall_item" { printf "%s,", $2 }'
+}
+apply_status() { # <config> <workspace> <action> [approved-scope]
+  hermes_config_analysis "$@" | awk -F '\t' '$1 == "status" { print $2; exit }'
+}
+
+# Every latch module 41 keeps is per-RUN, so each flow case has to start from a
+# fresh run or it would inherit the previous case's answer.
+reset_recall_run() {
+  HERMES_RECALL_REPORTED=false
+  HERMES_RECALL_DECLINED=false
+  HERMES_SCOPE_CHANGED_THIS_RUN=false
+  HERMES_CONFIG_CHANGED_THIS_RUN=false
+  HERMES_GUIDANCE_CHANGED_THIS_RUN=false
+  HERMES_RESIDUAL_REPORTED=false
+  CONFIRM_SCRIPT=""
+  CONFIRM_ANSWER="n"
+  DRY_RUN=false
+  REUSE_ONLY=false
+  GW_KIND="hermes"
+}
+
+recall_home() { # <tag> — a fresh $HOME whose ~/.hermes looks like a working install
+  HOME="$TMP/recall-home-$1"
+  rm -rf "$HOME"
+  mkdir -p "$HOME/.hermes"
+  printf '%s\n' \
+    'API_SERVER_ENABLED=true' \
+    'API_SERVER_PORT=8642' \
+    'API_SERVER_KEY=fixture-api-server-key' \
+    > "$HOME/.hermes/.env"
+}
+
+test_hermes_recall_classification() {
+  local cfg="$TMP/recall-config.yaml"
+
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$cfg"
+  expect_eq "recall: inline memory is in scope" \
+    "$(recall_field "$cfg" recall)" "in-scope"
+  expect_eq "recall: inline memory is literally fixable" \
+    "$(recall_field "$cfg" recall_fix)" "literal"
+  expect_eq "recall: inline memory names the entry" \
+    "$(recall_items "$cfg")" "memory,"
+  expect_eq "recall: inline removal shows the before" \
+    "$(recall_field "$cfg" recall_scope)" '["web", "memory"]'
+  expect_eq "recall: inline removal shows the after" \
+    "$(recall_field "$cfg" recall_after)" '["web"]'
+
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '  - web' '  - memory' '  - session_search' > "$cfg"
+  expect_eq "recall: block list is in scope" "$(recall_field "$cfg" recall)" "in-scope"
+  expect_eq "recall: block list names both recall tools" \
+    "$(recall_items "$cfg")" "memory,session_search,"
+
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "file"]' > "$cfg"
+  expect_eq "recall: a narrowed list reads clear" "$(recall_field "$cfg" recall)" "clear"
+
+  # The whole reason this exists: a fresh Hermes names no toolset and gets the
+  # wide default, memory included. Silence here would be the false all-clear.
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$cfg"
+  expect_eq "recall: an absent api_server key is default-wide" \
+    "$(recall_field "$cfg" recall)" "default-wide"
+  printf '%s\n' 'platform_toolsets:' '  cli: ["hermes-cli"]' > "$cfg"
+  expect_eq "recall: a sibling-only platform_toolsets is default-wide" \
+    "$(recall_field "$cfg" recall)" "default-wide"
+  # `api_server:` with nothing under it is YAML null, not an empty list — Hermes
+  # falls back to the wide default there, so reading it as "[]" would print an
+  # all-clear on a stateful gateway.
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '  cli: ["hermes-cli"]' > "$cfg"
+  expect_eq "recall: a bare api_server key is default-wide, not empty" \
+    "$(recall_field "$cfg" recall)" "default-wide"
+  expect_eq "recall: absent config is default-wide" \
+    "$(recall_field "$TMP/recall-absent.yaml" recall)" "default-wide"
+
+  # A bundle expands to a whole platform's tools, so it cannot be edited down to
+  # "everything except memory" — report it, never rewrite it.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$cfg"
+  expect_eq "recall: the default bundle is in scope" "$(recall_field "$cfg" recall)" "in-scope"
+  expect_eq "recall: a bundle is not literally fixable" "$(recall_field "$cfg" recall_fix)" "none"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["all"]' > "$cfg"
+  expect_eq "recall: a wildcard bundle is in scope" "$(recall_field "$cfg" recall)" "in-scope"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "hermes-discord", "memory"]' > "$cfg"
+  expect_eq "recall: a bundle beside memory stays manual" "$(recall_field "$cfg" recall_fix)" "none"
+
+  # Deleting named entries only proves the scope clean when every surviving name
+  # is one this connector knows; a plugin toolset may carry recall of its own.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory", "my_plugin_tools"]' > "$cfg"
+  expect_eq "recall: an unknown neighbour blocks the literal fix" \
+    "$(recall_field "$cfg" recall_fix)" "none"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "my_plugin_tools"]' > "$cfg"
+  expect_eq "recall: an unknown name alone is unknown" "$(recall_field "$cfg" recall)" "unknown"
+
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"] # keep this' > "$cfg"
+  expect_eq "recall: a commented line is reported, not rewritten" \
+    "$(recall_field "$cfg" recall_fix)" "none"
+  expect_eq "recall: a commented line still reads in-scope" \
+    "$(recall_field "$cfg" recall)" "in-scope"
+
+  printf '%s\n' 'agent:' '  disabled_toolsets: ["memory", "session_search"]' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$cfg"
+  expect_eq "recall: a global disable clears a listed entry" "$(recall_field "$cfg" recall)" "clear"
+  printf '%s\n' 'agent:' '  disabled_toolsets: ["memory", "session_search"]' > "$cfg"
+  expect_eq "recall: a global disable clears the wide default too" \
+    "$(recall_field "$cfg" recall)" "clear"
+  printf '%s\n' 'agent:' '  disabled_toolsets: ["memory"]' \
+    'platform_toolsets:' '  api_server: ["web", "session_search"]' > "$cfg"
+  expect_eq "recall: a partial global disable still reports" \
+    "$(recall_field "$cfg" recall)" "in-scope"
+  # Classification runs on the ACTIVE names. An unrecognised entry the user has
+  # already switched off globally cannot carry recall, so it must not veto the
+  # one edit this connector is willing to make — and it stays in the list.
+  printf '%s\n' 'agent:' '  disabled_toolsets: ["my_plugin_tools"]' \
+    'platform_toolsets:' '  api_server: ["web", "memory", "my_plugin_tools"]' > "$cfg"
+  expect_eq "recall: a globally disabled unknown name still allows the fix" \
+    "$(recall_field "$cfg" recall_fix)" "literal"
+  expect_eq "recall: a globally disabled unknown name survives the removal" \
+    "$(recall_field "$cfg" recall_after)" '["web", "my_plugin_tools"]'
+
+  # Everything the conservative parser will not guess at answers "I cannot tell".
+  printf '%s\n' '{"platform_toolsets": {"api_server": ["web"]}}' > "$cfg"
+  expect_eq "recall: a flow-style document is unknown" "$(recall_field "$cfg" recall)" "unknown"
+  printf '%s\n' 'platform_toolsets: &a' '  api_server: ["web"]' > "$cfg"
+  expect_eq "recall: anchors are unknown" "$(recall_field "$cfg" recall)" "unknown"
+  printf '%s\n' 'platform_toolsets:' '  api_server: null' > "$cfg"
+  expect_eq "recall: an inline null is unknown" "$(recall_field "$cfg" recall)" "unknown"
+
+  # A symlinked config is refused before classification, so it emits no recall
+  # fact at all. The bash reader must still leave the globals at "unknown" —
+  # keeping a previous answer here would carry an all-clear onto a config nobody
+  # read.
+  ln -sf "$TMP/recall-nowhere.yaml" "$TMP/recall-link.yaml"
+  expect_eq "recall: a symlinked config emits no recall fact" \
+    "$(recall_field "$TMP/recall-link.yaml" recall)" ""
+  HERMES_RECALL_STATE="clear"
+  hermes_recall_read "$TMP/recall-link.yaml"
+  expect_eq "recall: an unreadable config re-arms the globals to unknown" \
+    "$HERMES_RECALL_STATE" "unknown"
+}
+
+test_hermes_recall_edits() {
+  local ws="$TMP/recall-ws" cfg="$TMP/recall-edit.yaml" real_ws
+  mkdir -p "$ws"
+  real_ws=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ws")
+
+  # The file-readiness contract is unchanged by the recall work: an unapproved
+  # `memory` survives a plain file-lane apply.
+  printf '%s\n' 'terminal:' "  cwd: \"$real_ws\"" \
+    'platform_toolsets:' '  api_server: ["web", "memory", "file"]' > "$cfg"
+  expect_eq "recall: a stateful config is still file-lane ready" \
+    "$(apply_status "$cfg" "$ws")" "ready"
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$cfg"
+  expect_eq "recall: an unapproved apply still reports fix" "$(apply_status "$cfg" "$ws")" "fix"
+  expect_eq "recall: an unapproved apply succeeds" "$(apply_status "$cfg" "$ws" apply)" "applied"
+  expect_eq "recall: an unapproved apply preserves memory" \
+    "$(grep -c 'api_server: \["web", "memory", "file"\]' "$cfg")" "1"
+
+  # A bare key must never be narrowed to [file]: that would take the whole wide
+  # default away and hand the user a scope they never chose.
+  printf '%s\n' 'terminal:' "  cwd: \"$real_ws\"" 'platform_toolsets:' '  api_server:' > "$cfg"
+  expect_eq "recall: a bare key needs no toolset change" "$(apply_status "$cfg" "$ws")" "ready"
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' 'platform_toolsets:' '  api_server:' > "$cfg"
+  expect_eq "recall: a bare key applies only the cwd change" \
+    "$(apply_status "$cfg" "$ws" apply)" "applied"
+  if grep -q -- '- file' "$cfg"; then
+    fail "recall: a bare key is not silently narrowed to [file]" "$(cat "$cfg")"
+  else
+    pass "recall: a bare key is not silently narrowed to [file]"
+  fi
+
+  # An approved removal and the file toolset are ONE before→after, not two
+  # overlapping edits to the same line.
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$cfg"
+  expect_eq "recall: approval folds into one before/after" \
+    "$(hermes_config_analysis "$cfg" "$ws" analyze '["web", "memory"]' \
+       | awk -F '\t' '$1 == "change" && $2 ~ /api_server/ { print $2; exit }')" \
+    'platform_toolsets.api_server: ["web", "memory"] -> ["web", "file"]'
+  expect_eq "recall: the combined edit applies" \
+    "$(apply_status "$cfg" "$ws" apply '["web", "memory"]')" "applied"
+  expect_eq "recall: the combined edit lands as one list" \
+    "$(grep -c 'api_server: \["web", "file"\]' "$cfg")" "1"
+
+  # The approval is bound to the exact list shown, so a config edited between the
+  # preview and the yes refuses instead of overwriting someone else's change.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$cfg"
+  expect_eq "recall: a stale approval refuses" \
+    "$(apply_status "$cfg" "$ws" apply '["memory"]')" "manual"
+  expect_eq "recall: a stale approval changed nothing" "$(grep -c memory "$cfg")" "1"
+
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '  - web   # keep me' '  - memory' \
+    '  cli:' '  - hermes-cli' > "$cfg"
+  expect_eq "recall: block removal applies" \
+    "$(apply_status "$cfg" "" apply-recall '["web", "memory"]')" "applied"
+  if grep -q '^  - web   # keep me$' "$cfg" && ! grep -q 'memory' "$cfg" \
+     && grep -q '^  - hermes-cli$' "$cfg"; then
+    pass "recall: block removal deletes one line and keeps the rest verbatim"
+  else
+    fail "recall: block removal deletes one line and keeps the rest verbatim" "$(cat "$cfg")"
+  fi
+
+  # The comment restriction is an INLINE-form rule: a block item's own trailing
+  # comment travels with the line it annotates, and cannot be orphaned onto a
+  # neighbour it was never about.
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '  - web' '  - memory  # why is this here' > "$cfg"
+  expect_eq "recall: a commented block item is still fixable" \
+    "$(recall_field "$cfg" recall_fix)" "literal"
+  expect_eq "recall: a commented block item is removed" \
+    "$(apply_status "$cfg" "" apply-recall '["web", "memory"]')" "applied"
+  if ! grep -q 'why is this here' "$cfg" && grep -q '^  - web$' "$cfg"; then
+    pass "recall: a removed block item takes its own comment with it"
+  else
+    fail "recall: a removed block item takes its own comment with it" "$(cat "$cfg")"
+  fi
+
+  # Emptying a block key would leave YAML null, which hands the wide default —
+  # memory included — straight back. It has to become an explicit empty list.
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '  - memory' > "$cfg"
+  expect_eq "recall: removing the last entry applies" \
+    "$(apply_status "$cfg" "" apply-recall '["memory"]')" "applied"
+  expect_eq "recall: an emptied list is written explicit" \
+    "$(grep -c 'api_server: \[\]' "$cfg")" "1"
+  expect_eq "recall: an emptied list re-reads clear" "$(recall_field "$cfg" recall)" "clear"
+
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$cfg"
+  expect_eq "recall: a recall-only apply succeeds" \
+    "$(apply_status "$cfg" "" apply-recall '["web", "memory"]')" "applied"
+  if grep -q 'cwd: "/nope"' "$cfg" && grep -q 'api_server: \["web"\]' "$cfg"; then
+    pass "recall: a recall-only apply leaves cwd and the file toolset alone"
+  else
+    fail "recall: a recall-only apply leaves cwd and the file toolset alone" "$(cat "$cfg")"
+  fi
+}
+
+test_hermes_recall_operator_flow() {
+  local saved_home="$HOME" out rc cfg
+  cfg=".hermes/config.yaml"
+
+  reset_recall_run
+  recall_home "flow"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="n"
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: a declined removal returns nonzero" "$rc" "1"
+  case "$out" in *memory*) pass "recall step: a declined removal names the finding" ;;
+    *) fail "recall step: a declined removal names the finding" "$out" ;; esac
+  case "$out" in *config.yaml*) pass "recall step: a declined removal hands back the manual edit" ;;
+    *) fail "recall step: a declined removal hands back the manual edit" "$out" ;; esac
+  expect_eq "recall step: a declined removal changed nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: an accepted removal returns zero" "$rc" "0"
+  expect_eq "recall step: an accepted removal wrote the narrow list" \
+    "$(grep -c 'api_server: \["web"\]' "$HOME/$cfg")" "1"
+
+  reset_recall_run
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: a clean scope passes" "$rc" "0"
+  case "$out" in *"stays Conduck's"*) pass "recall step: a clean scope says so" ;;
+    *) fail "recall step: a clean scope says so" "$out" ;; esac
+
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$HOME/$cfg"
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: a bundle returns nonzero" "$rc" "1"
+  expect_eq "recall step: a bundle is never rewritten" \
+    "$(grep -c 'hermes-api-server' "$HOME/$cfg")" "1"
+  case "$out" in *"[confirm]"*) fail "recall step: a bundle is not offered as an edit" "asked anyway" ;;
+    *) pass "recall step: a bundle is not offered as an edit" ;; esac
+
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: the wide default returns nonzero" "$rc" "1"
+  case "$out" in *"default bundle"*) pass "recall step: the wide default is named as the default" ;;
+    *) fail "recall step: the wide default is named as the default" "$out" ;; esac
+  case "$out" in *"[confirm]"*) fail "recall step: the wide default is not offered as an edit" "asked anyway" ;;
+    *) pass "recall step: the wide default is not offered as an edit" ;; esac
+
+  # A run whose whole promise is that it changes nothing may report but never gate.
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  DRY_RUN=true
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: dry-run never blocks" "$rc" "0"
+  expect_eq "recall step: dry-run changed nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  REUSE_ONLY=true
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: reuse-only never blocks" "$rc" "0"
+  expect_eq "recall step: reuse-only changed nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+
+  # Two passes in ONE run, with no reset in between. This is not hypothetical: the
+  # wizard's exposure menu can send the operator back to the gateway choice, which
+  # re-runs configure_hermes and with it this step. A no is a no for the whole run
+  # — asking the same question again reads as nagging, not as consent.
+  reset_recall_run
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="n"
+  hermes_recall_scope_step >/dev/null 2>&1
+  CONFIRM_ANSWER="y"
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  case "$out" in *"[confirm]"*)
+      fail "recall step: a second pass does not re-ask" "prompted again in the same run" ;;
+    *) pass "recall step: a second pass does not re-ask" ;; esac
+  expect_eq "recall step: a second pass still returns nonzero" "$rc" "1"
+  expect_eq "recall step: a second pass changed nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+
+  reset_recall_run
+  GW_KIND="openclaw"
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: a non-Hermes gateway stays silent" "$out" ""
+  expect_eq "recall step: a non-Hermes gateway passes" "$rc" "0"
+
+  reset_recall_run
+  HOME="$saved_home"
+}
+
+test_hermes_recall_file_lane() {
+  local saved_home="$HOME" ws="$TMP/recall-lane-ws" real_ws out rc
+  mkdir -p "$ws"
+  real_ws=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ws")
+
+  reset_recall_run
+  recall_home "lane"
+  CONFIRM_ANSWER="y"
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/.hermes/config.yaml"
+  out=$(hermes_file_readiness_step "$ws" 2>&1); rc=$?
+  expect_eq "recall lane: an accepted lane succeeds" "$rc" "0"
+  expect_eq "recall lane: the combined list is written once" \
+    "$(grep -c 'api_server: \["web", "file"\]' "$HOME/.hermes/config.yaml")" "1"
+  case "$out" in *'["web", "memory"] -> ["web", "file"]'*)
+      pass "recall lane: one combined before/after is shown" ;;
+    *) fail "recall lane: one combined before/after is shown" "$out" ;; esac
+
+  # An already file-ready config is still stateful, and the memory question is
+  # asked on its own merits rather than skipped as "nothing to fix".
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  printf '%s\n' 'terminal:' "  cwd: \"$real_ws\"" \
+    'platform_toolsets:' '  api_server: ["web", "memory", "file"]' > "$HOME/.hermes/config.yaml"
+  out=$(hermes_file_readiness_step "$ws" 2>&1); rc=$?
+  expect_eq "recall lane: a ready-but-stateful config keeps its lane" "$rc" "0"
+  expect_eq "recall lane: a ready-but-stateful config still loses memory" \
+    "$(grep -c 'api_server: \["web", "file"\]' "$HOME/.hermes/config.yaml")" "1"
+
+  # File readiness being unprovable does not make the memory scope unfixable:
+  # it is a different question about the same line, and it decides how CHAT
+  # behaves whether or not files ever work.
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  printf '%s\n' 'terminal:' '  backend: remote' "  cwd: \"$real_ws\"" \
+    'platform_toolsets:' '  api_server: ["web", "memory", "file"]' > "$HOME/.hermes/config.yaml"
+  out=$(hermes_file_readiness_step "$ws" 2>&1); rc=$?
+  expect_eq "recall lane: an unusable lane is still dropped" "$rc" "1"
+  expect_eq "recall lane: an unusable lane still fixes the scope" \
+    "$(grep -c 'api_server: \["web", "file"\]' "$HOME/.hermes/config.yaml")" "1"
+  case "$out" in *"cannot prove a safe Hermes file configuration"*)
+      pass "recall lane: the manual reasons survive the scope edit" ;;
+    *) fail "recall lane: the manual reasons survive the scope edit" "$out" ;; esac
+
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$HOME/.hermes/config.yaml"
+  out=$(hermes_file_readiness_step "$ws" 2>&1); rc=$?
+  expect_eq "recall lane: a bundle config still gets its lane" "$rc" "0"
+  expect_eq "recall lane: a bundle config keeps its bundle" \
+    "$(grep -c 'hermes-api-server' "$HOME/.hermes/config.yaml")" "1"
+
+  # A no is a no for the whole run. Asking again at the next Hermes step would
+  # read as nagging, not as consent.
+  reset_recall_run
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/.hermes/config.yaml"
+  CONFIRM_ANSWER="n"
+  hermes_recall_scope_step >/dev/null 2>&1
+  CONFIRM_ANSWER="y"
+  out=$(hermes_file_readiness_step "$ws" 2>&1); rc=$?
+  case "$out" in *"Remove Hermes's recall tools"*)
+      fail "recall lane: a declined removal is not re-asked" "asked twice in one run" ;;
+    *) pass "recall lane: a declined removal is not re-asked" ;; esac
+  expect_eq "recall lane: a declined removal left memory in place" \
+    "$(grep -c memory "$HOME/.hermes/config.yaml")" "1"
+
+  reset_recall_run
+  HOME="$saved_home"
+}
+
+# The reach of the report — the point of wiring it beyond the OPTIONAL file lane.
+# A chat-only Hermes user never runs hermes_file_readiness_step, so without these
+# call sites the common case never learns its gateway is stateful.
+# configure_hermes sets GW_TOKEN/GW_AUTH/GW_LOCAL_PORT in the caller's shell, so it
+# must NOT be graded through a command substitution — a subshell would swallow
+# exactly the globals these cases check. Its transcript goes to a file instead and
+# comes back in $out.
+run_configure_hermes() {
+  configure_hermes > "$TMP/reach-configure.out" 2>&1
+  local rc=$?
+  out=$(cat "$TMP/reach-configure.out")
+  return $rc
+}
+
+test_hermes_recall_reach() {
+  # configure_hermes writes the GW_* globals this suite's other cases rely on, so
+  # they are saved and put back rather than left holding a fixture's values.
+  local saved_home="$HOME" saved_id="${GW_ID:-}" saved_auth="${GW_AUTH:-}"
+  local saved_token="${GW_TOKEN:-}" saved_port="${GW_LOCAL_PORT:-}"
+  local saved_health="${GW_HEALTH_PATH:-}" saved_fs="${FS_URL:-}"
+  local out rc body n_live n_recall n_verify cfg=".hermes/config.yaml"
+
+  # --- the pairing wizard's chat-only path ---
+  reset_recall_run
+  recall_home "wizard"
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
+  CONFIRM_ANSWER="n"
+  run_configure_hermes; rc=$?
+  expect_eq "reach: configure_hermes reports on a default-wide config" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
+  # The product call: report and offer, NEVER block. A gateway that chats fine is
+  # still pairable; a fresh Hermes is default-wide, so a blocking gate here would
+  # stop nearly every new user until they hand-edit YAML.
+  expect_eq "reach: configure_hermes never blocks on an unproven scope" "$rc" "0"
+  expect_eq "reach: configure_hermes still completes the gateway config" "$GW_AUTH" "bearer"
+  expect_eq "reach: configure_hermes still reads the API server key" \
+    "$GW_TOKEN" "fixture-api-server-key"
+  # The step runs LAST, after the API server and its key are settled: everything
+  # above it can die, and a config.yaml edit on a run about to abort would leave a
+  # change the user never got to use.
+  n_live=$(printf '%s\n' "$out" | grep -n 'API server already enabled' | head -1 | cut -d: -f1)
+  n_recall=$(printf '%s\n' "$out" | grep -n 'Hermes memory scope' | head -1 | cut -d: -f1)
+  if [ -n "$n_live" ] && [ -n "$n_recall" ] && [ "$n_recall" -gt "$n_live" ]; then
+    pass "reach: the memory report follows the API-server result"
+  else
+    fail "reach: the memory report follows the API-server result" "enabled=$n_live recall=$n_recall"
+  fi
+
+  reset_recall_run
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="y"
+  run_configure_hermes; rc=$?
+  expect_eq "reach: configure_hermes applies an accepted removal" \
+    "$(grep -c 'api_server: \["web"\]' "$HOME/$cfg")" "1"
+  expect_eq "reach: an accepted removal still returns zero" "$rc" "0"
+
+  reset_recall_run
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="n"
+  run_configure_hermes; rc=$?
+  expect_eq "reach: a declined removal does not fail the gateway step" "$rc" "0"
+  expect_eq "reach: a declined removal changes nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+
+  # The exposure menu's "b" returns to the gateway choice, so configure_hermes can
+  # run twice in one process. The second pass must not re-open a settled question.
+  reset_recall_run
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="n"
+  run_configure_hermes
+  CONFIRM_ANSWER="y"
+  run_configure_hermes; rc=$?
+  case "$out" in *"[confirm]"*)
+      fail "reach: back-navigation does not re-ask the memory question" "asked again" ;;
+    *) pass "reach: back-navigation does not re-ask the memory question" ;; esac
+  expect_eq "reach: back-navigation changes nothing after a no" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+  expect_eq "reach: back-navigation still completes the gateway step" "$rc" "0"
+
+  reset_recall_run
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "file"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="y"
+  run_configure_hermes; rc=$?
+  expect_eq "reach: a clean scope is reported as clean" \
+    "$(printf '%s' "$out" | grep -c "stays Conduck's")" "1"
+  case "$out" in *"[confirm]"*) fail "reach: a clean scope asks nothing" "prompted anyway" ;;
+    *) pass "reach: a clean scope asks nothing" ;; esac
+
+  reset_recall_run
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="y"
+  DRY_RUN=true
+  run_configure_hermes; rc=$?
+  expect_eq "reach: dry-run reports through configure_hermes" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
+  expect_eq "reach: dry-run changes no Hermes config" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+  expect_eq "reach: dry-run does not fail the gateway step" "$rc" "0"
+
+  reset_recall_run
+  CONFIRM_ANSWER="y"
+  REUSE_ONLY=true
+  run_configure_hermes; rc=$?
+  expect_eq "reach: reuse-only reports through configure_hermes" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
+  expect_eq "reach: reuse-only changes no Hermes config" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+  expect_eq "reach: reuse-only does not fail the gateway step" "$rc" "0"
+
+  # Pinned as source, not behavior: `|| die` is a product decision the founder
+  # owns, and a future edit that quietly adds one would otherwise only surface as
+  # a support ticket from a user who cannot pair a working gateway.
+  expect_eq "reach: the wizard call site is explicitly non-blocking" \
+    "$(declare -f configure_hermes | grep -c 'hermes_recall_scope_step "\[web\]" || true')" "1"
+
+  # --- --show-code, which pairs an ALREADY-configured gateway ---
+  # A profile is written once; the gateway keeps changing. Nothing in the saved
+  # profile or the live exposure checks can see a scope that drifted back.
+  reset_recall_run
+  recall_home "showcode"
+  rm -f "$HOME/$cfg"          # drifted back to Hermes's own wide default
+  REUSE_ONLY=true             # --show-code forces this; --dry-run is rejected
+  FS_URL=""
+  out=$(show_qr_recall_scope 2>&1); rc=$?
+  expect_eq "reach: show-code reports a drifted scope" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
+  expect_eq "reach: show-code never blocks the code" "$rc" "0"
+  case "$out" in *"api_server: [web]"*)
+      pass "reach: a gateway-only re-show suggests [web]" ;;
+    *) fail "reach: a gateway-only re-show suggests [web]" "$out" ;; esac
+  if [ -e "$HOME/$cfg" ]; then
+    fail "reach: show-code writes no Hermes config" "config.yaml was created"
+  else
+    pass "reach: show-code writes no Hermes config"
+  fi
+
+  # show_qr_recover_file_lane can legitimately downgrade a saved lane to
+  # gateway-only, so the suggested list follows the code actually being emitted.
+  # The test is the SAME (FS_URL && FS_CRED) pair build_pairing_payload_json uses:
+  # a recovered URL whose credential is gone carries no fileServer block, so
+  # suggesting `file` there would name a toolset the pairing does not use.
+  local saved_cred="${FS_CRED:-}"
+  reset_recall_run
+  REUSE_ONLY=true
+  FS_URL="https://files.example.test"
+  FS_CRED="fixture-file-secret"
+  out=$(show_qr_recall_scope 2>&1); rc=$?
+  case "$out" in *"api_server: [web, file]"*)
+      pass "reach: a re-show carrying a file lane suggests [web, file]" ;;
+    *) fail "reach: a re-show carrying a file lane suggests [web, file]" "$out" ;; esac
+
+  reset_recall_run
+  REUSE_ONLY=true
+  FS_URL="https://files.example.test"
+  FS_CRED=""
+  out=$(show_qr_recall_scope 2>&1); rc=$?
+  case "$out" in *"api_server: [web, file]"*)
+      fail "reach: an unrecoverable lane falls back to [web]" "suggested a lane the QR will not carry" ;;
+    *) pass "reach: an unrecoverable lane falls back to [web]" ;; esac
+  FS_CRED="$saved_cred"
+
+  reset_recall_run
+  GW_KIND="openclaw"
+  REUSE_ONLY=true
+  out=$(show_qr_recall_scope 2>&1); rc=$?
+  expect_eq "reach: show-code stays silent for a non-Hermes profile" "$out" ""
+  expect_eq "reach: show-code passes for a non-Hermes profile" "$rc" "0"
+
+  # Wiring, not behavior: running the whole re-show needs a live tailnet and a
+  # saved profile, but the ORDER is the part that matters — a stale profile must
+  # die in show_qr_check_live without collecting a warning it cannot act on, and
+  # verify_all must separate the finding from the code itself.
+  body=$(declare -f run_show_qr)
+  n_live=$(printf '%s\n' "$body" | grep -n 'show_qr_check_live' | head -1 | cut -d: -f1)
+  n_recall=$(printf '%s\n' "$body" | grep -n 'show_qr_recall_scope' | head -1 | cut -d: -f1)
+  n_verify=$(printf '%s\n' "$body" | grep -n 'verify_all' | head -1 | cut -d: -f1)
+  if [ -n "$n_live" ] && [ -n "$n_recall" ] && [ -n "$n_verify" ] \
+     && [ "$n_recall" -gt "$n_live" ] && [ "$n_recall" -lt "$n_verify" ]; then
+    pass "reach: the re-show reports between the drift gate and verification"
+  else
+    fail "reach: the re-show reports between the drift gate and verification" \
+      "live=$n_live recall=$n_recall verify=$n_verify"
+  fi
+
+  reset_recall_run
+  HOME="$saved_home"; GW_ID="$saved_id"; GW_AUTH="$saved_auth"; GW_TOKEN="$saved_token"
+  GW_LOCAL_PORT="$saved_port"; GW_HEALTH_PATH="$saved_health"; FS_URL="$saved_fs"
+}
+
 wait_ready() { # <stdout-file> <pid>
   local i=0 line
   READY_PORT=""
@@ -1432,6 +2098,11 @@ test_unsafe_cross_gateway_unit
 test_structural_unit_parsing
 test_systemd_unit_writer
 test_hermes_config
+test_hermes_recall_classification
+test_hermes_recall_edits
+test_hermes_recall_operator_flow
+test_hermes_recall_file_lane
+test_hermes_recall_reach
 test_hermes_guidance
 test_local_service_gate
 test_reply_candidate_parity

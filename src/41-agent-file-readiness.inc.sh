@@ -6,21 +6,50 @@
 # We inspect only these narrow YAML paths with a conservative stdlib parser.
 # Anchors, flow maps, non-local backends, and global file-tool disables are
 # deliberately "manual": guessing at them would broaden privileges silently.
+#
+# That same key decides something Conduck cares about even more than files: the
+# default API-server toolset carries Hermes's `memory` and `session_search`
+# tools, so an untouched Hermes answers a brand-new conversation from facts the
+# app never sent. Conduck replays the whole conversation every turn and owns the
+# history; a gateway that keeps its own contradicts that and pays for the hidden
+# context on every turn. No request/response check can see it — a remembering
+# gateway passes every wire check — so the scope is classified here, at the
+# point where the configuration is chosen, and reported before anything is
+# declared ready.
 HERMES_CONFIG_CHANGED_THIS_RUN=false
 HERMES_GUIDANCE_CHANGED_THIS_RUN=false
 HERMES_GUIDANCE_TARGET_THIS_RUN=""
 HERMES_RESIDUAL_REPORTED=false
+HERMES_SCOPE_CHANGED_THIS_RUN=false
+# Fail-safe defaults: a run that never manages to read the config must report
+# "I cannot tell", never silence. Silence would read as an all-clear.
+HERMES_RECALL_STATE="unknown"
+HERMES_RECALL_FIX="none"
+HERMES_RECALL_ITEMS=()
+HERMES_RECALL_SCOPE=""
+HERMES_RECALL_AFTER=""
+HERMES_RECALL_REPORTED=false
+# A no to the removal is a no for the whole run. Asking the same question again
+# at the next Hermes step would read as nagging, not as consent.
+HERMES_RECALL_DECLINED=false
+HERMES_ANALYSIS_STATUS=""
+HERMES_ANALYSIS_REASONS=()
+HERMES_ANALYSIS_CHANGES=()
 
 hermes_residual_state_note() {
   [ "${GW_KIND:-}" = "hermes" ] || return 0
   $HERMES_RESIDUAL_REPORTED && return 0
   local changed=false
   if $HERMES_CONFIG_CHANGED_THIS_RUN; then
-    note "The narrow Hermes config.yaml edit approved earlier remains in place (terminal.cwd / API-server file toolset only)."
+    note "The narrow Hermes config.yaml edit approved earlier remains in place (terminal.cwd / the API-server toolset list only)."
     changed=true
   fi
   if $HERMES_GUIDANCE_CHANGED_THIS_RUN; then
     note "The marker-delimited Conduck guidance block remains in ${HERMES_GUIDANCE_TARGET_THIS_RUN:-the Hermes workspace}."
+    changed=true
+  fi
+  if $HERMES_SCOPE_CHANGED_THIS_RUN; then
+    note "The approved removal of Hermes's recall tools from its API-server scope also remains in place."
     changed=true
   fi
   if $changed; then
@@ -29,11 +58,19 @@ hermes_residual_state_note() {
   fi
 }
 
-hermes_config_analysis() { # hermes_config_analysis <config> <workspace> [apply]
-  python3 - "$1" "$2" "${3:-analyze}" <<'PY'
+# hermes_config_analysis <config> <workspace> [analyze|recall|apply|apply-recall] [approved-scope-json]
+# `recall` classifies only the API-server recall scope (no workspace needed).
+# `apply-recall` removes ONLY the approved recall entries — it never touches
+# terminal.cwd or the file toolset. The 4th argument is the exact api_server
+# list the operator was shown when approving; a mismatch refuses the write, so
+# an edit made between the preview and the yes can never be silently overwritten.
+hermes_config_analysis() {
+  python3 - "$1" "$2" "${3:-analyze}" ${4+"$4"} <<'PY'
 import json, os, re, stat, sys, tempfile
 
 path, workspace, action = sys.argv[1:4]
+scope_expect = sys.argv[4] if len(sys.argv) > 4 else None
+recall_only = action in ("recall", "apply-recall")
 workspace = os.path.realpath(os.path.expanduser(workspace))
 if os.path.lexists(path) and os.path.islink(path):
     print("status\tmanual")
@@ -483,7 +520,10 @@ def sequence(section, name, allow_null=False):
         if vst != "OK":
             return "AMBIG", None, None
         return "OK", [decoded], ("inline", i, indent, end)
-    vals, j, item_indent = [], i + 1, None
+    # `items` carries each value with the exact line that holds it. Removing an
+    # approved entry deletes that one line instead of re-serialising the list,
+    # which would flatten indentation and drop the operator's own comments.
+    vals, items, j, item_indent = [], [], i + 1, None
     while j < end:
         s = content(lines[j])
         if not s or s.lstrip().startswith("#"):
@@ -507,8 +547,74 @@ def sequence(section, name, allow_null=False):
         ist, item = string_value(t[2:])
         if ist != "OK":
             return "AMBIG", None, None
-        vals.append(item); j += 1
-    return "OK", vals, ("block", i, indent, j, item_indent)
+        vals.append(item); items.append((j, item)); j += 1
+    return "OK", vals, ("block", i, indent, j, item_indent, items)
+
+# Hermes resolves an absent (or YAML-null) platform_toolsets.<platform> to that
+# platform's own default bundle, and the API server's default bundle carries the
+# `memory` and `session_search` tools. "No list" is therefore not "no recall" —
+# it is the widest recall there is, which is why an unwritten key is reported
+# rather than passed over.
+RECALL_TOOLSETS = {"memory", "session_search"}
+# Individually selectable Hermes toolsets in the releases this connector was
+# built against. A name that is NOT one of these — a plugin toolset, or one a
+# later release adds — is treated as unreadable rather than harmless: it may
+# carry recall of its own, and assuming otherwise would print a false all-clear.
+KNOWN_TOOLSETS = {
+    "web", "browser", "terminal", "file", "code_execution", "vision", "video",
+    "image_gen", "video_gen", "x_search", "tts", "stt", "skills", "todo",
+    "memory", "context_engine", "session_search", "clarify", "delegation",
+    "cronjob", "homeassistant", "spotify", "discord", "discord_admin",
+    "yuanbao", "computer_use"}
+
+def composite_bundle(name):
+    """True for a name that expands to a whole platform's tools."""
+    return name in ("all", "*") or name.startswith("hermes-")
+
+def scope_line_plain(meta):
+    """False when rewriting the api_server line would destroy a comment on it."""
+    if not meta or meta[0] != "inline":
+        return True
+    m = CHILD.match(content(lines[meta[1]]))
+    if not m:
+        return False
+    value = (m.group(3) or "").strip()
+    try:
+        return split_comment(value) == value
+    except ValueError:
+        return False
+
+def classify_recall(readable, st, vals, meta, disabled):
+    """(state, items, fixable) for recall reachable through the API server.
+
+    state    in-scope | default-wide | clear | unknown
+    fixable  literal  — plain entries this editor can delete by name
+             none     — anything else; the operator edits it themselves
+    """
+    if not readable or st in ("AMBIG", "FLOW"):
+        return ("unknown", [], "none")
+    globally_off = RECALL_TOOLSETS <= disabled
+    if st in ("MISSING", "NULL"):
+        return ("clear", [], "none") if globally_off else ("default-wide", [], "none")
+    if st != "OK":
+        return ("unknown", [], "none")
+    live = [v for v in vals if v not in disabled]
+    composites = [v for v in live if composite_bundle(v)]
+    hits = [v for v in live if v in RECALL_TOOLSETS]
+    opaque = [v for v in live if v not in KNOWN_TOOLSETS and not composite_bundle(v)]
+    if composites:
+        # A bundle name cannot be edited down to "everything except memory";
+        # deleting it would take the rest of that platform's tools with it.
+        return ("clear", [], "none") if globally_off else ("in-scope", composites, "none")
+    if hits:
+        # Deleting the named entries only proves the scope clean when every
+        # remaining name is one this connector actually knows.
+        if opaque or not scope_line_plain(meta):
+            return ("in-scope", hits, "none")
+        return ("in-scope", hits, "literal")
+    if opaque:
+        return ("unknown", opaque, "none")
+    return ("clear", [], "none")
 
 manual = []
 changes = []
@@ -521,41 +627,94 @@ if any(ANCHOR_OR_ALIAS.search(unquoted_yaml_code(content(line))) or
        for line in lines):
     manual.append("YAML anchors, aliases, or merge keys can change the effective target paths; this connector will not edit through them")
 
-bst, backend = scalar("terminal", "backend")
-if bst == "OK" and backend not in ("", "local"):
-    manual.append("terminal.backend is %r; a host WebDAV folder is not proven inside that backend" % backend)
-elif bst in ("AMBIG", "FLOW"):
-    manual.append("terminal.backend uses YAML syntax this connector will not guess at")
-
-cst, cwd = scalar("terminal", "cwd")
-if cst == "OK":
-    effective = os.path.realpath(os.path.expanduser(cwd))
-    if not os.path.isabs(os.path.expanduser(cwd)) or effective != workspace:
-        changes.append(("cwd", "terminal.cwd: %s -> %s" % (json.dumps(cwd), json.dumps(workspace))))
-elif cst in ("MISSING",):
-    changes.append(("cwd", "terminal.cwd: (absent) -> %s" % json.dumps(workspace)))
-else:
-    manual.append("terminal.cwd uses YAML syntax this connector will not guess at")
+# Whether the document itself is inside the editable subset. Captured before the
+# path-specific reasons below so a workspace mismatch never makes the toolset
+# look unreadable, or the other way round.
+root_readable = not manual
 
 pst, pvals, pmeta = sequence("platform_toolsets", "api_server")
+# `api_server:` with nothing under it is YAML null, not an empty list. Hermes
+# falls back to its wide default there, so treating it as "[]" would both
+# mis-state the before→after and silently narrow the whole scope to whatever
+# this connector appended.
+if pst == "OK" and pmeta and pmeta[0] == "block" and not pvals:
+    pst = "NULL"
+
+dst, dvals, _dmeta = sequence("agent", "disabled_toolsets", allow_null=True)
+disabled_toolsets = set(dvals) if dst == "OK" else set()
+
+recall_state, recall_items, recall_fix = classify_recall(
+    root_readable, pst, pvals, pmeta, disabled_toolsets)
+print("recall\t" + recall_state)
+print("recall_fix\t" + recall_fix)
+for item in recall_items:
+    print("recall_item\t" + item)
+if recall_fix == "literal":
+    # Both sides of the before→after, and the exact list the approval is bound
+    # to. The caller hands `recall_scope` straight back on apply, so a config
+    # edited between the preview and the yes refuses instead of overwriting.
+    print("recall_scope\t" + json.dumps(pvals))
+    print("recall_after\t" + json.dumps([v for v in pvals if v not in recall_items]))
+if action == "recall":
+    sys.exit(0)
+
+# The approved removal, re-proved against the file as it is right now.
+remove_targets = []
+if scope_expect is not None:
+    if recall_fix != "literal" or pst != "OK":
+        manual.append("the API-server recall entries are not in the plain list form this connector edits")
+    else:
+        try:
+            expected = json.loads(scope_expect)
+        except Exception:
+            expected = None
+        if expected != pvals:
+            manual.append("platform_toolsets.api_server changed after the exact edit was shown; re-run me")
+        else:
+            remove_targets = [v for v in pvals if v in recall_items]
+
+if not recall_only:
+    bst, backend = scalar("terminal", "backend")
+    if bst == "OK" and backend not in ("", "local"):
+        manual.append("terminal.backend is %r; a host WebDAV folder is not proven inside that backend" % backend)
+    elif bst in ("AMBIG", "FLOW"):
+        manual.append("terminal.backend uses YAML syntax this connector will not guess at")
+
+    cst, cwd = scalar("terminal", "cwd")
+    if cst == "OK":
+        effective = os.path.realpath(os.path.expanduser(cwd))
+        if not os.path.isabs(os.path.expanduser(cwd)) or effective != workspace:
+            changes.append(("cwd", "terminal.cwd: %s -> %s" % (json.dumps(cwd), json.dumps(workspace))))
+    elif cst in ("MISSING",):
+        changes.append(("cwd", "terminal.cwd: (absent) -> %s" % json.dumps(workspace)))
+    else:
+        manual.append("terminal.cwd uses YAML syntax this connector will not guess at")
+
 file_bundles = {"file", "all", "*", "hermes-api-server", "hermes-cli"}
-if pst == "OK" and not file_bundles.intersection(pvals):
-    changes.append(("toolset", "platform_toolsets.api_server: %s -> %s" %
-                    (json.dumps(pvals), json.dumps(pvals + ["file"]))))
+if pst == "OK":
+    # One projection, so an approved removal and the file toolset are shown and
+    # written as a single before→after rather than two overlapping ones.
+    want = [v for v in pvals if v not in remove_targets]
+    if not recall_only and not file_bundles.intersection(want):
+        want = want + ["file"]
+    if want != pvals:
+        changes.append(("toolset", "platform_toolsets.api_server: %s -> %s" %
+                        (json.dumps(pvals), json.dumps(want))))
 elif pst in ("AMBIG", "FLOW"):
     manual.append("platform_toolsets.api_server uses YAML syntax this connector will not guess at")
-# Missing api_server (or the whole map) means Hermes's own full API-server
-# default remains authoritative. The live sentinel still proves the installed
-# version rather than trusting that default on faith.
+# Missing or null api_server means Hermes's own full API-server default remains
+# authoritative, so its file tools are there. The live sentinel still proves the
+# installed version rather than trusting that default on faith.
 
-for key, blocked in (("disabled_toolsets", {"file", "hermes-api-server"}),
-                     ("disabled_tools", {"read_file", "write_file"})):
-    st, vals, meta = sequence("agent", key, allow_null=True)
-    if st == "OK" and blocked.intersection(vals):
-        manual.append("agent.%s globally disables %s; removing it would broaden other Hermes platforms" %
-                      (key, ", ".join(sorted(blocked.intersection(vals)))))
-    elif st in ("AMBIG", "FLOW"):
-        manual.append("agent.%s uses YAML syntax this connector will not guess at" % key)
+if not recall_only:
+    for key, blocked in (("disabled_toolsets", {"file", "hermes-api-server"}),
+                         ("disabled_tools", {"read_file", "write_file"})):
+        st, vals, meta = sequence("agent", key, allow_null=True)
+        if st == "OK" and blocked.intersection(vals):
+            manual.append("agent.%s globally disables %s; removing it would broaden other Hermes platforms" %
+                          (key, ", ".join(sorted(blocked.intersection(vals)))))
+        elif st in ("AMBIG", "FLOW"):
+            manual.append("agent.%s uses YAML syntax this connector will not guess at" % key)
 
 if manual:
     print("status\tmanual")
@@ -563,9 +722,12 @@ if manual:
     sys.exit(0)
 if not changes:
     print("status\tready")
-    print("reason\tfile toolset is not explicitly restricted and terminal.cwd matches the shared folder")
+    if recall_only:
+        print("reason\tthe API-server scope already carries no recall tools")
+    else:
+        print("reason\tfile toolset is not explicitly restricted and terminal.cwd matches the shared folder")
     sys.exit(0)
-if action != "apply":
+if action not in ("apply", "apply-recall"):
     print("status\tfix")
     for _, change in changes: print("change\t" + change)
     sys.exit(0)
@@ -590,12 +752,39 @@ def ensure_terminal(src):
         raise ValueError("terminal.cwd became ambiguous")
     return src
 
+def remove_recall_entries(src, targets, expected):
+    """Delete exactly the approved recall entries, or change nothing at all."""
+    global lines
+    lines = src
+    st, vals, meta = sequence("platform_toolsets", "api_server")
+    if st != "OK" or vals != expected:
+        raise ValueError("api_server list changed before the edit")
+    keep = [v for v in vals if v not in targets]
+    kind, i, indent = meta[0], meta[1], meta[2]
+    if kind == "inline":
+        if not scope_line_plain(meta):
+            raise ValueError("api_server line carries a comment")
+        src[i] = " " * indent + "api_server: " + json.dumps(keep) + "\n"
+        return src
+    if kind != "block":
+        raise ValueError("api_server is not in an editable list form")
+    for line_no, value in sorted(meta[5], reverse=True):
+        if value in targets:
+            del src[line_no]
+    if not keep:
+        # An emptied block key is YAML null, which would hand the wide default —
+        # memory included — straight back. Write the explicit empty list instead.
+        src[i] = " " * indent + "api_server: []\n"
+    return src
+
 def ensure_api_file(src):
     global lines
     lines = src
     st, vals, meta = sequence("platform_toolsets", "api_server")
     if st != "OK" or file_bundles.intersection(vals):
         return src
+    if meta[0] == "block" and not vals:
+        return src   # bare key: YAML null, so Hermes's wide default still applies
     kind, i, indent, end = meta[:4]
     if kind == "inline":
         prefix = " " * indent + "api_server: "
@@ -606,8 +795,14 @@ def ensure_api_file(src):
     return src
 
 try:
-    lines = ensure_terminal(lines)
-    if any(kind == "toolset" for kind, _ in changes):
+    # Order matters: remove first, then add, then one atomic write. Each step
+    # re-parses the buffer it is handed, so an insertion above the toolset key
+    # cannot leave a later step editing a stale line number.
+    if not recall_only:
+        lines = ensure_terminal(lines)
+    if remove_targets:
+        lines = remove_recall_entries(lines, remove_targets, pvals)
+    if not recall_only and any(kind == "toolset" for kind, _ in changes):
         lines = ensure_api_file(lines)
     data = "".join(lines)
     parent = os.path.dirname(path)
@@ -632,38 +827,227 @@ print("status\tapplied")
 PY
 }
 
-restart_hermes_for_file_config() {
+restart_hermes_for_config() {
   if [ "$OS" = "Linux" ] && have systemctl \
      && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
-    run_step "restart Hermes so its file-only config change applies" \
+    run_step "restart Hermes so the approved config change applies" \
       systemctl --user restart hermes-gateway.service
   else
-    print_and_wait "Restart Hermes however it runs on this machine so terminal.cwd and its API-server file toolset take effect." \
+    print_and_wait "Restart Hermes however it runs on this machine so the approved config change takes effect." \
       "systemctl --user restart hermes-gateway.service   # or your own restart method"
   fi
 }
 
-hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
-  local workspace="$1" cfg="$HOME/.hermes/config.yaml"
-  local tab line body status="" reasons=() changes=()
+# --- API-server recall scope --------------------------------------------------
+# The one reader for every analysis mode. It always re-arms the recall globals
+# first: a config it cannot read must report "unknown", never keep a previous
+# answer, because silence here would be read as an all-clear.
+hermes_analysis_read() { # hermes_analysis_read <config> <workspace> <action> [approved-scope]
+  local tab line
   tab=$(printf '\t')
+  HERMES_ANALYSIS_STATUS=""; HERMES_ANALYSIS_REASONS=(); HERMES_ANALYSIS_CHANGES=()
+  HERMES_RECALL_STATE="unknown"; HERMES_RECALL_FIX="none"
+  HERMES_RECALL_ITEMS=(); HERMES_RECALL_SCOPE=""; HERMES_RECALL_AFTER=""
   while IFS= read -r line; do
     case "$line" in
-      "status$tab"*) status="${line#status$tab}" ;;
-      "reason$tab"*) reasons+=("${line#reason$tab}") ;;
-      "change$tab"*) changes+=("${line#change$tab}") ;;
+      "status$tab"*)       HERMES_ANALYSIS_STATUS="${line#status$tab}" ;;
+      "reason$tab"*)       HERMES_ANALYSIS_REASONS+=("${line#reason$tab}") ;;
+      "change$tab"*)       HERMES_ANALYSIS_CHANGES+=("${line#change$tab}") ;;
+      "recall$tab"*)       HERMES_RECALL_STATE="${line#recall$tab}" ;;
+      "recall_fix$tab"*)   HERMES_RECALL_FIX="${line#recall_fix$tab}" ;;
+      "recall_item$tab"*)  HERMES_RECALL_ITEMS+=("${line#recall_item$tab}") ;;
+      "recall_scope$tab"*) HERMES_RECALL_SCOPE="${line#recall_scope$tab}" ;;
+      "recall_after$tab"*) HERMES_RECALL_AFTER="${line#recall_after$tab}" ;;
     esac
-  done < <(hermes_config_analysis "$cfg" "$workspace")
+  done < <(hermes_config_analysis "$1" "$2" "$3" ${4+"$4"})
+}
+
+hermes_recall_read() { # hermes_recall_read <config>
+  hermes_analysis_read "$1" "" recall
+}
+
+# One report per run, wherever the run first reaches a Hermes decision.
+hermes_recall_report() {
+  $HERMES_RECALL_REPORTED && return 0
+  HERMES_RECALL_REPORTED=true
+  local items
+  items=$(safe_display "$(printf '%s' "${HERMES_RECALL_ITEMS[*]-}")" 120)
+  say ""
+  say "  ${BOLD}Hermes memory scope${RESET} — will this gateway remember what Conduck never sent it?"
+  case "$HERMES_RECALL_STATE" in
+    clear)
+      ok "Nothing in this API-server toolset gives Hermes a memory of its own — the conversation stays Conduck's."
+      return 0 ;;
+    in-scope)
+      warn "This gateway's API-server scope carries Hermes's own recall: ${items// /, }." ;;
+    default-wide)
+      warn "This config names no API-server toolset, so Hermes uses its default bundle — memory and session search included." ;;
+    *)
+      warn "I cannot read this config's API-server toolset, so I cannot tell whether Hermes keeps its own memory." ;;
+  esac
+  say "  Conduck sends the whole conversation every turn and expects the gateway to keep"
+  say "  nothing of its own. One that remembers answers from things you never sent it, and"
+  say "  you pay for that hidden context on every turn."
+  say "  No connection check can see this, here or in --check-server: a remembering gateway"
+  say "  passes them all. Test it yourself — tell it something in one conversation, then ask"
+  say "  for it in a brand-new one. If it answers, the gateway is keeping its own history."
+  return 0
+}
+
+# What to change by hand, for every shape this connector will not rewrite.
+hermes_recall_manual_hint() { # hermes_recall_manual_hint <suggested-list>
+  local suggested="${1:-[web]}"
+  case "$HERMES_RECALL_STATE" in
+    clear) return 0 ;;
+    in-scope)
+      local entry bundle=false
+      for entry in ${HERMES_RECALL_ITEMS[@]+"${HERMES_RECALL_ITEMS[@]}"}; do
+        case "$entry" in hermes-*|all|'*') bundle=true ;; esac
+      done
+      if $bundle; then
+        say "  That name is a whole bundle, and Hermes's bundles carry its memory tools. In"
+        say "  ${BOLD}~/.hermes/config.yaml${RESET}, replace it with the toolsets you actually want —"
+        say "  for example ${BOLD}api_server: $suggested${RESET} — and restart Hermes."
+      else
+        say "  In ${BOLD}~/.hermes/config.yaml${RESET}, take memory and session_search out of the"
+        say "  platform_toolsets.api_server list, leave everything else, and restart Hermes."
+      fi ;;
+    default-wide)
+      say "  Name the toolsets yourself in ${BOLD}~/.hermes/config.yaml${RESET}, then restart Hermes:"
+      say "    platform_toolsets:"
+      say "      api_server: $suggested" ;;
+    *)
+      say "  Check platform_toolsets.api_server in ${BOLD}~/.hermes/config.yaml${RESET} yourself —"
+      say "  memory and session_search belong to your other Hermes surfaces, not to this one." ;;
+  esac
+  say "  This key is per-surface: your Hermes CLI and messaging surfaces keep their memory,"
+  say "  and so does anything else you point at this same API server."
+  return 0
+}
+
+# The one edit offered here, and only in its plainest form: named entries in an
+# explicit list. A bundle name, an unwritten key, or anything this parser cannot
+# read is described instead of rewritten — deleting a bundle would take a whole
+# platform's tools with it, and inventing a list where the user wrote none would
+# narrow far more than memory.
+hermes_recall_remove_step() { # hermes_recall_remove_step <config> -> 0 when the scope is proven clear
+  local cfg="$1" status
+  [ "$HERMES_RECALL_FIX" = "literal" ] || return 1
+  [ -n "$HERMES_RECALL_SCOPE" ] || return 1
+  say ""
+  say "  ${BOLD}platform_toolsets.api_server: $HERMES_RECALL_SCOPE -> $HERMES_RECALL_AFTER${RESET}"
+  say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
+  say "  surfaces are untouched — but anything else talking to this same API server loses"
+  say "  its memory too."
+  if ! confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+    note "Leaving it as it is."
+    HERMES_RECALL_DECLINED=true
+    return 1
+  fi
+  mutate_guard "remove only the recall entries from platform_toolsets.api_server in $cfg" || return 1
+  status=$(hermes_config_analysis "$cfg" "" apply-recall "$HERMES_RECALL_SCOPE" \
+    | awk -F '\t' '$1=="status"{print $2; exit}')
+  if [ "$status" != "applied" ]; then
+    warn "That edit could not be applied safely, so nothing was changed."
+    return 1
+  fi
+  HERMES_SCOPE_CHANGED_THIS_RUN=true
+  hermes_recall_read "$cfg"
+  if [ "$HERMES_RECALL_STATE" != "clear" ]; then
+    warn "The edit landed but the scope still does not read as memory-free."
+    return 1
+  fi
+  ok "Hermes's API-server scope re-checked — no memory or session-search tools left in it."
+  restart_hermes_for_config || {
+    warn "Hermes was not restarted, so it is still running with its old scope."
+    return 1
+  }
+  return 0
+}
+
+# The gate a caller can act on. Returns 0 only when this Hermes API server is
+# provably free of its own recall. Deciding what a nonzero result MEANS — stop
+# before pairing, or carry on with the warning — stays with the caller: refusing
+# to pair a gateway that chats fine is a product call, not a parser's.
+# --dry-run and --reuse-only report and return 0 by design; neither may block a
+# run whose whole promise is that it changes nothing.
+hermes_recall_scope_step() { # hermes_recall_scope_step [suggested-list]
+  [ "${GW_KIND:-}" = "hermes" ] || return 0
+  local cfg="$HOME/.hermes/config.yaml"
+  hermes_recall_read "$cfg"
+  hermes_recall_report
+  [ "$HERMES_RECALL_STATE" = "clear" ] && return 0
+  if $DRY_RUN; then
+    note "(dry-run: a real run offers to remove those entries, or shows you the exact edit)"
+    hermes_recall_manual_hint "${1:-[web]}"
+    return 0
+  fi
+  if $REUSE_ONLY; then
+    warn "(reuse-only: not changing Hermes config)"
+    hermes_recall_manual_hint "${1:-[web]}"
+    return 0
+  fi
+  if [ "$HERMES_RECALL_FIX" = "literal" ] && ! $HERMES_RECALL_DECLINED \
+     && hermes_recall_remove_step "$cfg"; then
+    return 0
+  fi
+  hermes_recall_manual_hint "${1:-[web]}"
+  return 1
+}
+
+hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
+  local workspace="$1" cfg="$HOME/.hermes/config.yaml"
+  local status approved_scope=""
+  hermes_analysis_read "$cfg" "$workspace" analyze
+  status="$HERMES_ANALYSIS_STATUS"
+
+  # The memory question comes before the file question, and gets its own answer:
+  # it decides what this file's single edit contains, and it matters just as much
+  # to a user who ends up declining the optional file lane.
+  hermes_recall_report
+  if [ "$HERMES_RECALL_STATE" != "clear" ]; then
+    if [ "$HERMES_RECALL_FIX" != "literal" ] || $DRY_RUN || $REUSE_ONLY \
+       || $HERMES_RECALL_DECLINED; then
+      hermes_recall_manual_hint "[web, file]"
+    elif [ "$status" = "fix" ] || [ "$status" = "ready" ]; then
+      say ""
+      say "  ${BOLD}platform_toolsets.api_server: $HERMES_RECALL_SCOPE -> $HERMES_RECALL_AFTER${RESET}"
+      say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
+      say "  surfaces are untouched — but anything else talking to this same API server loses"
+      say "  its memory too."
+      if confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+        approved_scope="$HERMES_RECALL_SCOPE"
+        # Re-read with the approval folded in, so the operator sees ONE
+        # before→after for this file rather than two overlapping ones.
+        hermes_analysis_read "$cfg" "$workspace" analyze "$approved_scope"
+        status="$HERMES_ANALYSIS_STATUS"
+      else
+        note "Leaving the API-server scope as it is."
+        HERMES_RECALL_DECLINED=true
+        hermes_recall_manual_hint "[web, file]"
+      fi
+    else
+      # File readiness is already unprovable here, but the memory scope is a
+      # different question about the same one line, and it decides how chat
+      # behaves whether or not file transfer goes ahead. Offer it on its own.
+      if hermes_recall_remove_step "$cfg"; then
+        hermes_analysis_read "$cfg" "$workspace" analyze
+        status="$HERMES_ANALYSIS_STATUS"
+      else
+        hermes_recall_manual_hint "[web, file]"
+      fi
+    fi
+  fi
 
   say ""
   say "  ${BOLD}Hermes file readiness${RESET} — can the API-server agent use this exact folder?"
   case "$status" in
     ready)
-      ok "Hermes config is file-lane-ready (${reasons[0]:-working root and file tools})."
+      ok "Hermes config is file-lane-ready (${HERMES_ANALYSIS_REASONS[0]:-working root and file tools})."
       return 0 ;;
     manual|"")
       warn "I cannot prove a safe Hermes file configuration:"
-      local r; for r in ${reasons[@]+"${reasons[@]}"}; do say "    $r"; done
+      local r; for r in ${HERMES_ANALYSIS_REASONS[@]+"${HERMES_ANALYSIS_REASONS[@]}"}; do say "    $r"; done
       warn "I will leave file transfer out rather than broaden Hermes privileges or guess at a remote/sandbox mount."
       return 1 ;;
     fix) ;;
@@ -672,12 +1056,17 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
       return 1 ;;
   esac
 
-  warn "Hermes needs these narrow changes before its API-server agent can use the lane:"
-  local c; for c in "${changes[@]}"; do say "    ${BOLD}$c${RESET}"; done
-  say "  Only the API-server's file toolset and this working-folder path are in scope;"
-  say "  no terminal, web, memory, or messaging-platform permissions are added."
+  if [ -n "$approved_scope" ]; then
+    warn "So here is the whole edit to Hermes's config, in one place:"
+  else
+    warn "Hermes needs these narrow changes before its API-server agent can use the lane:"
+  fi
+  local c; for c in "${HERMES_ANALYSIS_CHANGES[@]}"; do say "    ${BOLD}$c${RESET}"; done
+  say "  Only the API-server's toolset list and this working-folder path are in scope;"
+  say "  no terminal, web, or messaging-platform permissions are added, and nothing but"
+  say "  the entries shown above is taken away."
   if $DRY_RUN; then
-    for c in "${changes[@]}"; do plan_add "EDIT $cfg — $c"; done
+    for c in "${HERMES_ANALYSIS_CHANGES[@]}"; do plan_add "EDIT $cfg — $c"; done
     note "(dry-run: a real run asks before editing Hermes config)"
     return 0
   fi
@@ -685,26 +1074,34 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
     warn "(reuse-only: not changing Hermes config; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Apply exactly these Hermes file-lane changes?"; then
+  if ! confirm "  Apply exactly these Hermes changes?"; then
     note "Leaving the file lane out — chat is unaffected."
+    if [ -n "$approved_scope" ]; then
+      note "The API-server scope is unchanged too; nothing in this file was touched."
+    fi
     return 1
   fi
   mutate_guard "edit only terminal.cwd / platform_toolsets.api_server in $cfg" || return 1
-  status=$(hermes_config_analysis "$cfg" "$workspace" apply \
+  status=$(hermes_config_analysis "$cfg" "$workspace" apply ${approved_scope:+"$approved_scope"} \
     | awk -F '\t' '$1=="status"{print $2; exit}')
   if [ "$status" != "applied" ]; then
     warn "The Hermes config edit could not be applied safely — leaving the file lane out."
     return 1
   fi
   HERMES_CONFIG_CHANGED_THIS_RUN=true
-  status=$(hermes_config_analysis "$cfg" "$workspace" \
-    | awk -F '\t' '$1=="status"{print $2; exit}')
+  if [ -n "$approved_scope" ]; then HERMES_SCOPE_CHANGED_THIS_RUN=true; fi
+  hermes_analysis_read "$cfg" "$workspace" analyze
+  status="$HERMES_ANALYSIS_STATUS"
   if [ "$status" != "ready" ]; then
     warn "Hermes config did not re-check as file-ready — leaving the file lane out."
     return 1
   fi
+  if [ -n "$approved_scope" ] && [ "$HERMES_RECALL_STATE" != "clear" ]; then
+    warn "The recall entries were removed but the scope still does not read as memory-free."
+    hermes_recall_manual_hint "[web, file]"
+  fi
   ok "Hermes config re-checked — file toolset + working folder are aligned."
-  if ! restart_hermes_for_file_config; then
+  if ! restart_hermes_for_config; then
     warn "Hermes was not restarted, so the file change is not active — leaving the lane out."
     return 1
   fi

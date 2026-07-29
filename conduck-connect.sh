@@ -94,6 +94,19 @@
 #                                           # expert: permit a keyless
 #                                           # gateway on a public transport during setup
 #
+# Environment:
+#   CONDUCK_TOKEN=<token>                     # bearer token for a check, so it never
+#                                           # reaches your shell history or argv
+#   CONDUCK_CHECK_SERVER_MODEL=<model-id>
+#                                           # --check-server only: grade the model you
+#                                           # plan to use. Without it the named-model
+#                                           # checks take whichever id /v1/models lists
+#                                           # FIRST, so a server offering many models
+#                                           # can report FAIL or PASS purely on the
+#                                           # order it lists them. Continue into setup
+#                                           # and the pairing code carries the model
+#                                           # you named.
+#
 # Information:
 #   bash conduck-connect.sh --help            # show this complete public command reference
 #   bash conduck-connect.sh --version         # print the connector version and exit
@@ -546,6 +559,75 @@ mutate_guard() {  # mutate_guard "what would change"
 need() { command -v "$1" >/dev/null 2>&1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# The escalation prefix for a command that has to run as root. A hardcoded `sudo`
+# is wrong in three real environments: a root shell needs no prefix at all, the
+# minimal Alpine/Debian images that run as root ship no `sudo` binary (so the
+# prefixed command dies with "command not found"), and OpenBSD-lineage setups
+# carry `doas` instead. Empty output means "run it as root yourself" — the caller
+# prints the bare command rather than inventing a dependency.
+priv_prefix() { # priv_prefix -> sudo | doas | (empty)
+  [ "$(id -u 2>/dev/null)" = 0 ] && return 0
+  if have sudo; then printf 'sudo'
+  elif have doas; then printf 'doas'
+  fi
+}
+
+# The install line a Linux user can actually run. Detection is by BINARY
+# (`command -v`), never by parsing `/etc/os-release`: the binary is what the
+# printed command invokes, while `ID`/`ID_LIKE` lie on derivatives and on
+# containers built FROM another base. The caller presents it as *detected*, not
+# as "your distribution's command" — a box with two managers installed takes the
+# first probe, and the wording has to leave room for that.
+#
+# Package NAMES are mapped wherever they diverge from the command name, because a
+# confidently printed `pacman -S python3` dies with "target not found": worse than
+# generic advice, since it reads as authoritative and is wrong. Arch/Manjaro have
+# no `python3` package at all (their Python 3 is `python`), and Gentoo needs
+# category-qualified atoms. Never map onto a library package (`openssl-libs`,
+# `libssl3`) — those are routinely installed while the `openssl` CLI is missing,
+# which is exactly the case that got us here. An unrecognised manager prints
+# nothing, and the caller names the packages instead: honest beats wrong.
+linux_install_cmd() { # linux_install_cmd <command-name>… -> "<manager>\t<command>", or empty
+  local priv mgr pkgs="" body="" p
+  priv=$(priv_prefix); [ -n "$priv" ] && priv="$priv "
+  if   have apt-get;      then mgr="apt-get"
+  elif have dnf;          then mgr="dnf"
+  elif have yum;          then mgr="yum"
+  elif have zypper;       then mgr="zypper"
+  elif have pacman;       then mgr="pacman"
+  elif have apk;          then mgr="apk"
+  elif have xbps-install; then mgr="xbps-install"
+  elif have emerge;       then mgr="emerge"
+  else return 0
+  fi
+  for p in "$@"; do
+    case "$mgr:$p" in
+      pacman:python3) p="python" ;;
+      emerge:curl)    p="net-misc/curl" ;;
+      emerge:python3) p="dev-lang/python" ;;
+      emerge:openssl) p="dev-libs/openssl" ;;
+      emerge:rclone)  p="net-misc/rclone" ;;
+    esac
+    pkgs="$pkgs $p"
+  done
+  case "$mgr" in
+    apt-get)      body="${priv}apt-get update && ${priv}apt-get install -y$pkgs" ;;
+    dnf|yum)      body="${priv}$mgr install -y$pkgs" ;;
+    zypper)       body="${priv}zypper --non-interactive install$pkgs" ;;
+    # Arch does not support partial upgrades, so `-Sy` without `-u` is the classic
+    # way to break a box — and a setup wizard has no business prescribing a full
+    # system upgrade either. `-S --needed` is the non-expansive form; a stale
+    # package database is the user's own `pacman -Syu` to run.
+    pacman)       body="${priv}pacman -S --needed$pkgs" ;;
+    # --no-cache fetches the index inline: minimal images ship without one, and a
+    # bare `apk add` there fails with "unable to select packages".
+    apk)          body="${priv}apk add --no-cache$pkgs" ;;
+    xbps-install) body="${priv}xbps-install -Sy$pkgs" ;;
+    emerge)       body="${priv}emerge --ask$pkgs" ;;
+  esac
+  printf '%s\t%s' "$mgr" "$body"
+}
+
 # Collect ALL missing required tools and report together, with install hints.
 preflight() {
   local missing=()
@@ -557,7 +639,18 @@ preflight() {
   if [ ${#missing[@]} -gt 0 ]; then
     bad "Missing required tool(s): ${missing[*]}"
     case "$(uname -s)" in
-      Linux)  note "Install on Debian/Ubuntu:  sudo apt update && sudo apt install -y ${missing[*]}" ;;
+      Linux)
+        # This is the last thing the user reads before the hard exit below, so it
+        # has to be a command their box will accept — not Debian's.
+        local hint; hint=$(linux_install_cmd "${missing[@]}")
+        if [ -n "$hint" ]; then
+          note "Detected ${hint%%$'\t'*} — install with:  ${hint#*$'\t'}"
+          [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$(priv_prefix)" ] \
+            || note "Run that as root: this shell is neither root nor has sudo/doas."
+        else
+          note "Install with your distribution's package manager:  ${missing[*]}"
+        fi
+        ;;
       Darwin) note "Install with Homebrew:     brew install ${missing[*]}" ;;
     esac
     die "Install the tool(s) above, then re-run me."
@@ -1034,6 +1127,28 @@ configure_hermes() {
     GW_TOKEN=$(ask_secret "Paste the Hermes API server key (hidden)")
     [ -n "$GW_TOKEN" ] || die "An API key is required for Hermes."
   fi
+
+  # The API server's toolset list decides something no wire check can ever see:
+  # whether this gateway keeps a conversation memory of its own. Hermes's default
+  # api_server bundle carries `memory` and `session_search`, so a Hermes nobody has
+  # narrowed answers a brand-new conversation from facts Conduck never sent it —
+  # double-counting the history Conduck already replays in full, and billing for it
+  # every turn. A gateway in that state passes every check here and in
+  # --check-server. The optional file lane asks the same question later, but most
+  # Hermes users pair for chat and never reach it, so it has to be asked here too.
+  #
+  # LAST in this function on purpose: everything above can die (no ~/.hermes, an
+  # unwritable .env, no key), and editing config.yaml on a run that is about to
+  # abort would leave a change the user never got to use.
+  #
+  # `|| true` is the product decision, not an accident of there being no `set -e`:
+  # this step returns nonzero whenever the scope is not PROVABLY recall-free, which
+  # includes a fresh default install and any config the parser will not guess at.
+  # Report and offer, never block — a gateway that chats perfectly well is still
+  # pairable, and refusing to pair it is the founder's call, not this step's.
+  # --dry-run and --reuse-only report and change nothing.
+  hermes_recall_scope_step "[web]" || true
+
   GW_AUTH="bearer"
 }
 
@@ -1280,6 +1395,36 @@ snapshot_port() { # snapshot_port <port> <verb> [role] — record prior state + 
   else APPLIED+=("$p"$'\t'"$verb"$'\t'"${t:-EMPTY}"); fi
 }
 
+# Offer the higher-rights retry of a Tailscale command that just failed, and hand
+# it over for the user to run. Three states, because an empty `priv_prefix` means
+# two OPPOSITE things:
+#   sudo/doas present — offer the prefixed retry (the common case).
+#   already root      — there are no higher rights left to try, so reprinting the
+#                       identical command the user just watched fail is noise. Say
+#                       so and let the caller's status re-read decide the outcome:
+#                       the command can fail and the state still be right.
+#   neither           — the command is only runnable from a root shell. Print it
+#                       BARE with that instruction rather than guessing `sudo`: a
+#                       box without the binary answers "command not found", which
+#                       reads as a different fault than the one they have.
+# Never synthesises `su -c`: that assumes `su`, quotes badly around the two-command
+# form, and behaves inconsistently across systems.
+ts_priv_retry() { # ts_priv_retry <why> <bare-command>… -> 0 ran it, 1 declined, 2 no retry exists
+  local why="$1"; shift
+  local priv retry="" c
+  priv=$(priv_prefix)
+  if [ -z "$priv" ] && [ "$(id -u 2>/dev/null)" = 0 ]; then
+    warn "This shell is already root, so there are no higher rights to retry with — Tailscale itself refused it."
+    return 2
+  fi
+  for c in "$@"; do
+    [ -n "$c" ] || continue
+    retry="${retry:+$retry; }${priv:+$priv }$c"
+  done
+  [ -n "$priv" ] || why="$why This shell is not root and has neither sudo nor doas, so run it from a root shell."
+  print_and_wait "$why" "$retry"
+}
+
 # Run a serve/funnel mapping, then CONFIRM it actually took (never trust Enter).
 tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/false> <role>
   local httpsport="$1" localport="$2" funnel="$3" role="$4"
@@ -1315,10 +1460,17 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     snapshot_port "$httpsport" "$verb" "$role"
     if $demote; then tailscale funnel --https="$httpsport" off 2>/dev/null || true; fi
     $cmd || {
-      warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
-      local fallback="sudo $cmd"
-      $demote && fallback="sudo $demote_cmd; sudo $cmd"
-      print_and_wait "Tailscale serve/funnel often needs sudo (or operator rights)." "$fallback" || { return 1; }
+      warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
+      local retry_rc=0
+      if $demote; then
+        ts_priv_retry "Tailscale serve/funnel often needs operator or root rights." "$demote_cmd" "$cmd" || retry_rc=$?
+      else
+        ts_priv_retry "Tailscale serve/funnel often needs operator or root rights." "$cmd" || retry_rc=$?
+      fi
+      # 1 = the user declined the retry, so stop. 2 = a root shell had no retry to
+      # decline; fall through to the confirm below, which is the only thing that
+      # can tell a refused command from a refused-but-already-correct state.
+      [ "$retry_rc" = 1 ] && return 1
     }
   else
     return 1
@@ -1381,9 +1533,9 @@ ts_unmap() { # ts_unmap <port> <verb>
   mutate_guard "remove the old $verb mapping on port $port" || return 1
   snapshot_port "$port" "$verb" file        # record (in FS_APPLIED) so cleanup can restore it
   tailscale "$verb" --https="$port" off || {
-    warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
-    print_and_wait "Removing a Tailscale mapping often needs sudo (or operator rights)." \
-      "sudo tailscale $verb --https=$port off" || true
+    warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
+    ts_priv_retry "Removing a Tailscale mapping often needs operator or root rights." \
+      "tailscale $verb --https=$port off" || true
   }
   # FAIL CLOSED: only claim removal a status re-parse can prove.
   ts_targets
@@ -1512,9 +1664,9 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
     RESERVED_PORTS="$RESERVED_PORTS$rport "
     if ! { tailscale funnel --https="$rport" off \
            && tailscale serve --https="$rport" off; }; then
-      warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
-      print_and_wait "Removing a public Funnel often needs sudo (or operator rights)." \
-        "sudo $off_cmd; sudo tailscale serve --https=$rport off" || true
+      warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
+      ts_priv_retry "Removing a public Funnel often needs operator or root rights." \
+        "$off_cmd" "tailscale serve --https=$rport off" || true
     fi
     # FAIL CLOSED: an unreadable status is NOT proof of removal.
     ts_targets
@@ -1635,9 +1787,14 @@ choose_exposure() {
       if [ -z "$(tailscale_dns_name)" ]; then
         say ""
         warn "Tailscale is installed but not logged in on this machine."
-        warn "Run 'sudo tailscale up' to connect it to your tailnet (your private Tailscale"
+        # Unlike the three failure handlers, `tailscale up` has NOT been tried yet,
+        # so a bare command is the right print when this shell is already root.
+        local up_priv; up_priv=$(priv_prefix)
+        warn "Run '${up_priv:+$up_priv }tailscale up' to connect it to your tailnet (your private Tailscale"
         warn "network) — it opens a browser link to sign in the first time. Then re-run this"
         warn "script; it picks up where you left off."
+        [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$up_priv" ] \
+          || note "This shell is not root and has neither sudo nor doas — run that from a root shell."
         exit 0
       fi
       keyless_public_guard
@@ -2426,6 +2583,60 @@ existing_fs_config() {
   return 0
 }
 
+# systemd stops a user's manager — and every unit under it — shortly after that
+# user's LAST session ends, unless lingering is on; lingering is also what starts
+# the manager at boot. So a file lane that verifies green inside the SSH session
+# that created it is not yet a lane that survives logout or reboot, and this is a
+# 24/7 gateway product.
+#
+# Asked against `id -un`, never `$USER`: `$USER` is inherited across `su` and
+# `sudo -u` and can name an account whose linger state has nothing to do with the
+# user manager `systemctl --user` is actually driving — which would answer
+# "durable" about the wrong user and suppress the warning.
+fs_linger_enabled_linux() {
+  have loginctl || return 1
+  loginctl show-user "$(id -un 2>/dev/null)" 2>/dev/null | grep -q '^Linger=yes'
+}
+
+# Report — and offer to fix — the one setting that decides whether a green file
+# lane is still a file lane tomorrow. Runs for NEW and REUSED units alike: a lane
+# created without lingering is re-shipped by every later run, so checking only at
+# creation would warn exactly once and stay silent forever after. Never gates the
+# lane; it tells the truth in the same run that ships it.
+fs_report_linger_linux() {
+  fs_linger_enabled_linux && return 0
+  local u priv privcmd=()
+  u=$(id -un 2>/dev/null)
+  # `loginctl` is what both reads and sets lingering, so without it the honest
+  # answer is "unknown", never "off" — the two need different words.
+  if ! have loginctl; then
+    warn "No 'loginctl' on this box, so I can't tell whether systemd keeps '$u' services"
+    warn "running after logout. If it doesn't, the file lane stops answering when '$u' logs out."
+    return 0
+  fi
+  priv=$(priv_prefix); [ -n "$priv" ] && privcmd=("$priv")
+  warn "Lingering is off for '$u', so systemd stops this user's services shortly after"
+  warn "its last logout — the file lane would stop answering then, and not come back on reboot."
+  # --reuse-only forbids host changes, and offering this through run_step would
+  # reach mutate_guard's `die` — killing a run whose whole point was to re-emit an
+  # existing lane. State the fact, hand over the command, change nothing.
+  if $REUSE_ONLY && ! $DRY_RUN; then
+    note "(reuse-only: changing nothing.) Turn it on yourself with:  ${priv:+$priv }loginctl enable-linger $u"
+    return 0
+  fi
+  run_step "enable linger so the file server survives logout and reboot" \
+    ${privcmd[@]+"${privcmd[@]}"} loginctl enable-linger "$u" || true
+  $DRY_RUN && return 0
+  if fs_linger_enabled_linux; then
+    ok "Lingering is on for '$u' — the file server survives logout and reboot."
+    return 0
+  fi
+  warn "The file lane still ships in your setup code, but it only answers while '$u' has a"
+  warn "live session. Make it permanent any time with:  ${priv:+$priv }loginctl enable-linger $u"
+  [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$priv" ] || note "That one needs root (no sudo/doas here)."
+  return 0
+}
+
 # Write a per-gateway file-server unit that reads RCLONE_PASS from a 0600 env file
 # (credential never appears on the process command line / in `ps`).
 write_fs_unit_linux() { # write_fs_unit_linux <workspace>
@@ -2477,13 +2688,7 @@ EOF
     warn "Could not start the service — check 'systemctl --user status conduck-files-$GW_ID'."
     return 1
   fi
-  local user_name="${USER:-$(id -un)}"   # $USER can be unset under set -u (su/cron shells)
-  loginctl show-user "$user_name" 2>/dev/null | grep -q 'Linger=yes' || {
-    warn "User services stop at logout unless 'linger' is on (needed for a 24/7 box)."
-    run_step "enable linger so the file server survives logout/reboot" \
-      sudo loginctl enable-linger "$user_name" || \
-      note "Tip: 'sudo loginctl enable-linger $user_name' keeps user services running after logout."
-  }
+  fs_report_linger_linux
 }
 
 write_fs_unit_mac() { # write_fs_unit_mac <workspace>
@@ -3249,9 +3454,18 @@ setup_file_lane() {
   fi
 
   if ! have rclone; then
-    warn "rclone isn't installed (single binary; https://rclone.org/install/ —"
-    warn "brew install rclone / apt install rclone). Install it and re-run me,"
-    warn "or skip the file lane for now."
+    warn "rclone isn't installed. It's a single binary: https://rclone.org/install/"
+    # The upstream installer stays the primary route on purpose: distro rclone
+    # packages lag, and some repositories don't carry one at all, so a detected
+    # package command is the convenience path and never the only one offered.
+    local rc_hint="" rc_pm
+    if [ "$OS" = "Darwin" ]; then
+      rc_hint="brew install rclone"
+    else
+      rc_pm=$(linux_install_cmd rclone); [ -n "$rc_pm" ] && rc_hint="${rc_pm#*$'\t'}"
+    fi
+    [ -n "$rc_hint" ] && note "Or, if your package manager carries it:  $rc_hint"
+    warn "Install it and re-run me, or skip the file lane for now."
     return 0
   fi
 
@@ -3273,6 +3487,10 @@ setup_file_lane() {
       note "It still works and the QR is correct. To hide it, recreate the unit so rclone reads the"
       note "password from a 0600 env file ('RCLONE_PASS' / '--htpasswd'); newly-created units already do."
     fi
+    # A reused unit is shipped in this code exactly like a fresh one, so its
+    # durability is checked here too — a lane first created in a non-lingering
+    # session would otherwise be re-shipped silently by every later run.
+    [ "$OS" = "Linux" ] && fs_report_linger_linux
   else
     if $FS_EXISTING_UNSAFE; then
       warn "I will not overwrite or expose that existing unit. Repair/remove it explicitly, then re-run setup."
@@ -3283,14 +3501,19 @@ setup_file_lane() {
       FS_CRED=""; return 0
     fi
     # Keeping the file server running needs a service manager we know how to
-    # drive; on Linux that's a systemd USER session. Check BEFORE minting a
-    # credential or writing a unit that could never start.
+    # drive; on Linux that's a reachable systemd USER manager. Check BEFORE
+    # minting a credential or writing a unit that could never start. Named for
+    # what the probe actually proves: `show-environment` answers "a user manager
+    # is reachable from this shell", not "there is a login session".
     if [ "$OS" = "Linux" ] && ! { have systemctl && systemctl --user show-environment >/dev/null 2>&1; }; then
-      warn "No systemd user session here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
+      warn "No reachable systemd user manager here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
       warn "I can't keep a file server running in the background. Skipping the file lane; chat still works."
       note "If this box does run systemd, log in directly as this user (ssh, not 'su -') and re-run."
-      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:<free-port> --user conduck --dir-cache-time 1s' with the app-generated password exported as RCLONE_PASS, under your own supervisor."
-      FS_CRED=""; return 0
+      # The credential is minted much later, so this path has none to hand over —
+      # and nothing here can discover or adopt an OpenRC/runit/s6 service on a
+      # later run, so a manual lane is paired by hand in the app, not by me.
+      note "Advanced: under your own supervisor (OpenRC/runit/s6), run 'rclone serve webdav <folder> --addr 127.0.0.1:<free-port> --user conduck --dir-cache-time 1s' with a password YOU choose exported as RCLONE_PASS, expose that port the same way as the gateway, then enter that address and password in the app by hand — I can only pair a lane I created."
+      FS_CRED=""; FS_URL=""; return 0
     fi
     if ! allocate_fs_local_port; then
       warn "${FS_PORT_ALLOCATION_REASON:-Could not allocate a safe loopback port for a new file lane.}"
@@ -3495,21 +3718,50 @@ setup_file_lane() {
 # We inspect only these narrow YAML paths with a conservative stdlib parser.
 # Anchors, flow maps, non-local backends, and global file-tool disables are
 # deliberately "manual": guessing at them would broaden privileges silently.
+#
+# That same key decides something Conduck cares about even more than files: the
+# default API-server toolset carries Hermes's `memory` and `session_search`
+# tools, so an untouched Hermes answers a brand-new conversation from facts the
+# app never sent. Conduck replays the whole conversation every turn and owns the
+# history; a gateway that keeps its own contradicts that and pays for the hidden
+# context on every turn. No request/response check can see it — a remembering
+# gateway passes every wire check — so the scope is classified here, at the
+# point where the configuration is chosen, and reported before anything is
+# declared ready.
 HERMES_CONFIG_CHANGED_THIS_RUN=false
 HERMES_GUIDANCE_CHANGED_THIS_RUN=false
 HERMES_GUIDANCE_TARGET_THIS_RUN=""
 HERMES_RESIDUAL_REPORTED=false
+HERMES_SCOPE_CHANGED_THIS_RUN=false
+# Fail-safe defaults: a run that never manages to read the config must report
+# "I cannot tell", never silence. Silence would read as an all-clear.
+HERMES_RECALL_STATE="unknown"
+HERMES_RECALL_FIX="none"
+HERMES_RECALL_ITEMS=()
+HERMES_RECALL_SCOPE=""
+HERMES_RECALL_AFTER=""
+HERMES_RECALL_REPORTED=false
+# A no to the removal is a no for the whole run. Asking the same question again
+# at the next Hermes step would read as nagging, not as consent.
+HERMES_RECALL_DECLINED=false
+HERMES_ANALYSIS_STATUS=""
+HERMES_ANALYSIS_REASONS=()
+HERMES_ANALYSIS_CHANGES=()
 
 hermes_residual_state_note() {
   [ "${GW_KIND:-}" = "hermes" ] || return 0
   $HERMES_RESIDUAL_REPORTED && return 0
   local changed=false
   if $HERMES_CONFIG_CHANGED_THIS_RUN; then
-    note "The narrow Hermes config.yaml edit approved earlier remains in place (terminal.cwd / API-server file toolset only)."
+    note "The narrow Hermes config.yaml edit approved earlier remains in place (terminal.cwd / the API-server toolset list only)."
     changed=true
   fi
   if $HERMES_GUIDANCE_CHANGED_THIS_RUN; then
     note "The marker-delimited Conduck guidance block remains in ${HERMES_GUIDANCE_TARGET_THIS_RUN:-the Hermes workspace}."
+    changed=true
+  fi
+  if $HERMES_SCOPE_CHANGED_THIS_RUN; then
+    note "The approved removal of Hermes's recall tools from its API-server scope also remains in place."
     changed=true
   fi
   if $changed; then
@@ -3518,11 +3770,19 @@ hermes_residual_state_note() {
   fi
 }
 
-hermes_config_analysis() { # hermes_config_analysis <config> <workspace> [apply]
-  python3 - "$1" "$2" "${3:-analyze}" <<'PY'
+# hermes_config_analysis <config> <workspace> [analyze|recall|apply|apply-recall] [approved-scope-json]
+# `recall` classifies only the API-server recall scope (no workspace needed).
+# `apply-recall` removes ONLY the approved recall entries — it never touches
+# terminal.cwd or the file toolset. The 4th argument is the exact api_server
+# list the operator was shown when approving; a mismatch refuses the write, so
+# an edit made between the preview and the yes can never be silently overwritten.
+hermes_config_analysis() {
+  python3 - "$1" "$2" "${3:-analyze}" ${4+"$4"} <<'PY'
 import json, os, re, stat, sys, tempfile
 
 path, workspace, action = sys.argv[1:4]
+scope_expect = sys.argv[4] if len(sys.argv) > 4 else None
+recall_only = action in ("recall", "apply-recall")
 workspace = os.path.realpath(os.path.expanduser(workspace))
 if os.path.lexists(path) and os.path.islink(path):
     print("status\tmanual")
@@ -3972,7 +4232,10 @@ def sequence(section, name, allow_null=False):
         if vst != "OK":
             return "AMBIG", None, None
         return "OK", [decoded], ("inline", i, indent, end)
-    vals, j, item_indent = [], i + 1, None
+    # `items` carries each value with the exact line that holds it. Removing an
+    # approved entry deletes that one line instead of re-serialising the list,
+    # which would flatten indentation and drop the operator's own comments.
+    vals, items, j, item_indent = [], [], i + 1, None
     while j < end:
         s = content(lines[j])
         if not s or s.lstrip().startswith("#"):
@@ -3996,8 +4259,74 @@ def sequence(section, name, allow_null=False):
         ist, item = string_value(t[2:])
         if ist != "OK":
             return "AMBIG", None, None
-        vals.append(item); j += 1
-    return "OK", vals, ("block", i, indent, j, item_indent)
+        vals.append(item); items.append((j, item)); j += 1
+    return "OK", vals, ("block", i, indent, j, item_indent, items)
+
+# Hermes resolves an absent (or YAML-null) platform_toolsets.<platform> to that
+# platform's own default bundle, and the API server's default bundle carries the
+# `memory` and `session_search` tools. "No list" is therefore not "no recall" —
+# it is the widest recall there is, which is why an unwritten key is reported
+# rather than passed over.
+RECALL_TOOLSETS = {"memory", "session_search"}
+# Individually selectable Hermes toolsets in the releases this connector was
+# built against. A name that is NOT one of these — a plugin toolset, or one a
+# later release adds — is treated as unreadable rather than harmless: it may
+# carry recall of its own, and assuming otherwise would print a false all-clear.
+KNOWN_TOOLSETS = {
+    "web", "browser", "terminal", "file", "code_execution", "vision", "video",
+    "image_gen", "video_gen", "x_search", "tts", "stt", "skills", "todo",
+    "memory", "context_engine", "session_search", "clarify", "delegation",
+    "cronjob", "homeassistant", "spotify", "discord", "discord_admin",
+    "yuanbao", "computer_use"}
+
+def composite_bundle(name):
+    """True for a name that expands to a whole platform's tools."""
+    return name in ("all", "*") or name.startswith("hermes-")
+
+def scope_line_plain(meta):
+    """False when rewriting the api_server line would destroy a comment on it."""
+    if not meta or meta[0] != "inline":
+        return True
+    m = CHILD.match(content(lines[meta[1]]))
+    if not m:
+        return False
+    value = (m.group(3) or "").strip()
+    try:
+        return split_comment(value) == value
+    except ValueError:
+        return False
+
+def classify_recall(readable, st, vals, meta, disabled):
+    """(state, items, fixable) for recall reachable through the API server.
+
+    state    in-scope | default-wide | clear | unknown
+    fixable  literal  — plain entries this editor can delete by name
+             none     — anything else; the operator edits it themselves
+    """
+    if not readable or st in ("AMBIG", "FLOW"):
+        return ("unknown", [], "none")
+    globally_off = RECALL_TOOLSETS <= disabled
+    if st in ("MISSING", "NULL"):
+        return ("clear", [], "none") if globally_off else ("default-wide", [], "none")
+    if st != "OK":
+        return ("unknown", [], "none")
+    live = [v for v in vals if v not in disabled]
+    composites = [v for v in live if composite_bundle(v)]
+    hits = [v for v in live if v in RECALL_TOOLSETS]
+    opaque = [v for v in live if v not in KNOWN_TOOLSETS and not composite_bundle(v)]
+    if composites:
+        # A bundle name cannot be edited down to "everything except memory";
+        # deleting it would take the rest of that platform's tools with it.
+        return ("clear", [], "none") if globally_off else ("in-scope", composites, "none")
+    if hits:
+        # Deleting the named entries only proves the scope clean when every
+        # remaining name is one this connector actually knows.
+        if opaque or not scope_line_plain(meta):
+            return ("in-scope", hits, "none")
+        return ("in-scope", hits, "literal")
+    if opaque:
+        return ("unknown", opaque, "none")
+    return ("clear", [], "none")
 
 manual = []
 changes = []
@@ -4010,41 +4339,94 @@ if any(ANCHOR_OR_ALIAS.search(unquoted_yaml_code(content(line))) or
        for line in lines):
     manual.append("YAML anchors, aliases, or merge keys can change the effective target paths; this connector will not edit through them")
 
-bst, backend = scalar("terminal", "backend")
-if bst == "OK" and backend not in ("", "local"):
-    manual.append("terminal.backend is %r; a host WebDAV folder is not proven inside that backend" % backend)
-elif bst in ("AMBIG", "FLOW"):
-    manual.append("terminal.backend uses YAML syntax this connector will not guess at")
-
-cst, cwd = scalar("terminal", "cwd")
-if cst == "OK":
-    effective = os.path.realpath(os.path.expanduser(cwd))
-    if not os.path.isabs(os.path.expanduser(cwd)) or effective != workspace:
-        changes.append(("cwd", "terminal.cwd: %s -> %s" % (json.dumps(cwd), json.dumps(workspace))))
-elif cst in ("MISSING",):
-    changes.append(("cwd", "terminal.cwd: (absent) -> %s" % json.dumps(workspace)))
-else:
-    manual.append("terminal.cwd uses YAML syntax this connector will not guess at")
+# Whether the document itself is inside the editable subset. Captured before the
+# path-specific reasons below so a workspace mismatch never makes the toolset
+# look unreadable, or the other way round.
+root_readable = not manual
 
 pst, pvals, pmeta = sequence("platform_toolsets", "api_server")
+# `api_server:` with nothing under it is YAML null, not an empty list. Hermes
+# falls back to its wide default there, so treating it as "[]" would both
+# mis-state the before→after and silently narrow the whole scope to whatever
+# this connector appended.
+if pst == "OK" and pmeta and pmeta[0] == "block" and not pvals:
+    pst = "NULL"
+
+dst, dvals, _dmeta = sequence("agent", "disabled_toolsets", allow_null=True)
+disabled_toolsets = set(dvals) if dst == "OK" else set()
+
+recall_state, recall_items, recall_fix = classify_recall(
+    root_readable, pst, pvals, pmeta, disabled_toolsets)
+print("recall\t" + recall_state)
+print("recall_fix\t" + recall_fix)
+for item in recall_items:
+    print("recall_item\t" + item)
+if recall_fix == "literal":
+    # Both sides of the before→after, and the exact list the approval is bound
+    # to. The caller hands `recall_scope` straight back on apply, so a config
+    # edited between the preview and the yes refuses instead of overwriting.
+    print("recall_scope\t" + json.dumps(pvals))
+    print("recall_after\t" + json.dumps([v for v in pvals if v not in recall_items]))
+if action == "recall":
+    sys.exit(0)
+
+# The approved removal, re-proved against the file as it is right now.
+remove_targets = []
+if scope_expect is not None:
+    if recall_fix != "literal" or pst != "OK":
+        manual.append("the API-server recall entries are not in the plain list form this connector edits")
+    else:
+        try:
+            expected = json.loads(scope_expect)
+        except Exception:
+            expected = None
+        if expected != pvals:
+            manual.append("platform_toolsets.api_server changed after the exact edit was shown; re-run me")
+        else:
+            remove_targets = [v for v in pvals if v in recall_items]
+
+if not recall_only:
+    bst, backend = scalar("terminal", "backend")
+    if bst == "OK" and backend not in ("", "local"):
+        manual.append("terminal.backend is %r; a host WebDAV folder is not proven inside that backend" % backend)
+    elif bst in ("AMBIG", "FLOW"):
+        manual.append("terminal.backend uses YAML syntax this connector will not guess at")
+
+    cst, cwd = scalar("terminal", "cwd")
+    if cst == "OK":
+        effective = os.path.realpath(os.path.expanduser(cwd))
+        if not os.path.isabs(os.path.expanduser(cwd)) or effective != workspace:
+            changes.append(("cwd", "terminal.cwd: %s -> %s" % (json.dumps(cwd), json.dumps(workspace))))
+    elif cst in ("MISSING",):
+        changes.append(("cwd", "terminal.cwd: (absent) -> %s" % json.dumps(workspace)))
+    else:
+        manual.append("terminal.cwd uses YAML syntax this connector will not guess at")
+
 file_bundles = {"file", "all", "*", "hermes-api-server", "hermes-cli"}
-if pst == "OK" and not file_bundles.intersection(pvals):
-    changes.append(("toolset", "platform_toolsets.api_server: %s -> %s" %
-                    (json.dumps(pvals), json.dumps(pvals + ["file"]))))
+if pst == "OK":
+    # One projection, so an approved removal and the file toolset are shown and
+    # written as a single before→after rather than two overlapping ones.
+    want = [v for v in pvals if v not in remove_targets]
+    if not recall_only and not file_bundles.intersection(want):
+        want = want + ["file"]
+    if want != pvals:
+        changes.append(("toolset", "platform_toolsets.api_server: %s -> %s" %
+                        (json.dumps(pvals), json.dumps(want))))
 elif pst in ("AMBIG", "FLOW"):
     manual.append("platform_toolsets.api_server uses YAML syntax this connector will not guess at")
-# Missing api_server (or the whole map) means Hermes's own full API-server
-# default remains authoritative. The live sentinel still proves the installed
-# version rather than trusting that default on faith.
+# Missing or null api_server means Hermes's own full API-server default remains
+# authoritative, so its file tools are there. The live sentinel still proves the
+# installed version rather than trusting that default on faith.
 
-for key, blocked in (("disabled_toolsets", {"file", "hermes-api-server"}),
-                     ("disabled_tools", {"read_file", "write_file"})):
-    st, vals, meta = sequence("agent", key, allow_null=True)
-    if st == "OK" and blocked.intersection(vals):
-        manual.append("agent.%s globally disables %s; removing it would broaden other Hermes platforms" %
-                      (key, ", ".join(sorted(blocked.intersection(vals)))))
-    elif st in ("AMBIG", "FLOW"):
-        manual.append("agent.%s uses YAML syntax this connector will not guess at" % key)
+if not recall_only:
+    for key, blocked in (("disabled_toolsets", {"file", "hermes-api-server"}),
+                         ("disabled_tools", {"read_file", "write_file"})):
+        st, vals, meta = sequence("agent", key, allow_null=True)
+        if st == "OK" and blocked.intersection(vals):
+            manual.append("agent.%s globally disables %s; removing it would broaden other Hermes platforms" %
+                          (key, ", ".join(sorted(blocked.intersection(vals)))))
+        elif st in ("AMBIG", "FLOW"):
+            manual.append("agent.%s uses YAML syntax this connector will not guess at" % key)
 
 if manual:
     print("status\tmanual")
@@ -4052,9 +4434,12 @@ if manual:
     sys.exit(0)
 if not changes:
     print("status\tready")
-    print("reason\tfile toolset is not explicitly restricted and terminal.cwd matches the shared folder")
+    if recall_only:
+        print("reason\tthe API-server scope already carries no recall tools")
+    else:
+        print("reason\tfile toolset is not explicitly restricted and terminal.cwd matches the shared folder")
     sys.exit(0)
-if action != "apply":
+if action not in ("apply", "apply-recall"):
     print("status\tfix")
     for _, change in changes: print("change\t" + change)
     sys.exit(0)
@@ -4079,12 +4464,39 @@ def ensure_terminal(src):
         raise ValueError("terminal.cwd became ambiguous")
     return src
 
+def remove_recall_entries(src, targets, expected):
+    """Delete exactly the approved recall entries, or change nothing at all."""
+    global lines
+    lines = src
+    st, vals, meta = sequence("platform_toolsets", "api_server")
+    if st != "OK" or vals != expected:
+        raise ValueError("api_server list changed before the edit")
+    keep = [v for v in vals if v not in targets]
+    kind, i, indent = meta[0], meta[1], meta[2]
+    if kind == "inline":
+        if not scope_line_plain(meta):
+            raise ValueError("api_server line carries a comment")
+        src[i] = " " * indent + "api_server: " + json.dumps(keep) + "\n"
+        return src
+    if kind != "block":
+        raise ValueError("api_server is not in an editable list form")
+    for line_no, value in sorted(meta[5], reverse=True):
+        if value in targets:
+            del src[line_no]
+    if not keep:
+        # An emptied block key is YAML null, which would hand the wide default —
+        # memory included — straight back. Write the explicit empty list instead.
+        src[i] = " " * indent + "api_server: []\n"
+    return src
+
 def ensure_api_file(src):
     global lines
     lines = src
     st, vals, meta = sequence("platform_toolsets", "api_server")
     if st != "OK" or file_bundles.intersection(vals):
         return src
+    if meta[0] == "block" and not vals:
+        return src   # bare key: YAML null, so Hermes's wide default still applies
     kind, i, indent, end = meta[:4]
     if kind == "inline":
         prefix = " " * indent + "api_server: "
@@ -4095,8 +4507,14 @@ def ensure_api_file(src):
     return src
 
 try:
-    lines = ensure_terminal(lines)
-    if any(kind == "toolset" for kind, _ in changes):
+    # Order matters: remove first, then add, then one atomic write. Each step
+    # re-parses the buffer it is handed, so an insertion above the toolset key
+    # cannot leave a later step editing a stale line number.
+    if not recall_only:
+        lines = ensure_terminal(lines)
+    if remove_targets:
+        lines = remove_recall_entries(lines, remove_targets, pvals)
+    if not recall_only and any(kind == "toolset" for kind, _ in changes):
         lines = ensure_api_file(lines)
     data = "".join(lines)
     parent = os.path.dirname(path)
@@ -4121,38 +4539,227 @@ print("status\tapplied")
 PY
 }
 
-restart_hermes_for_file_config() {
+restart_hermes_for_config() {
   if [ "$OS" = "Linux" ] && have systemctl \
      && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
-    run_step "restart Hermes so its file-only config change applies" \
+    run_step "restart Hermes so the approved config change applies" \
       systemctl --user restart hermes-gateway.service
   else
-    print_and_wait "Restart Hermes however it runs on this machine so terminal.cwd and its API-server file toolset take effect." \
+    print_and_wait "Restart Hermes however it runs on this machine so the approved config change takes effect." \
       "systemctl --user restart hermes-gateway.service   # or your own restart method"
   fi
 }
 
-hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
-  local workspace="$1" cfg="$HOME/.hermes/config.yaml"
-  local tab line body status="" reasons=() changes=()
+# --- API-server recall scope --------------------------------------------------
+# The one reader for every analysis mode. It always re-arms the recall globals
+# first: a config it cannot read must report "unknown", never keep a previous
+# answer, because silence here would be read as an all-clear.
+hermes_analysis_read() { # hermes_analysis_read <config> <workspace> <action> [approved-scope]
+  local tab line
   tab=$(printf '\t')
+  HERMES_ANALYSIS_STATUS=""; HERMES_ANALYSIS_REASONS=(); HERMES_ANALYSIS_CHANGES=()
+  HERMES_RECALL_STATE="unknown"; HERMES_RECALL_FIX="none"
+  HERMES_RECALL_ITEMS=(); HERMES_RECALL_SCOPE=""; HERMES_RECALL_AFTER=""
   while IFS= read -r line; do
     case "$line" in
-      "status$tab"*) status="${line#status$tab}" ;;
-      "reason$tab"*) reasons+=("${line#reason$tab}") ;;
-      "change$tab"*) changes+=("${line#change$tab}") ;;
+      "status$tab"*)       HERMES_ANALYSIS_STATUS="${line#status$tab}" ;;
+      "reason$tab"*)       HERMES_ANALYSIS_REASONS+=("${line#reason$tab}") ;;
+      "change$tab"*)       HERMES_ANALYSIS_CHANGES+=("${line#change$tab}") ;;
+      "recall$tab"*)       HERMES_RECALL_STATE="${line#recall$tab}" ;;
+      "recall_fix$tab"*)   HERMES_RECALL_FIX="${line#recall_fix$tab}" ;;
+      "recall_item$tab"*)  HERMES_RECALL_ITEMS+=("${line#recall_item$tab}") ;;
+      "recall_scope$tab"*) HERMES_RECALL_SCOPE="${line#recall_scope$tab}" ;;
+      "recall_after$tab"*) HERMES_RECALL_AFTER="${line#recall_after$tab}" ;;
     esac
-  done < <(hermes_config_analysis "$cfg" "$workspace")
+  done < <(hermes_config_analysis "$1" "$2" "$3" ${4+"$4"})
+}
+
+hermes_recall_read() { # hermes_recall_read <config>
+  hermes_analysis_read "$1" "" recall
+}
+
+# One report per run, wherever the run first reaches a Hermes decision.
+hermes_recall_report() {
+  $HERMES_RECALL_REPORTED && return 0
+  HERMES_RECALL_REPORTED=true
+  local items
+  items=$(safe_display "$(printf '%s' "${HERMES_RECALL_ITEMS[*]-}")" 120)
+  say ""
+  say "  ${BOLD}Hermes memory scope${RESET} — will this gateway remember what Conduck never sent it?"
+  case "$HERMES_RECALL_STATE" in
+    clear)
+      ok "Nothing in this API-server toolset gives Hermes a memory of its own — the conversation stays Conduck's."
+      return 0 ;;
+    in-scope)
+      warn "This gateway's API-server scope carries Hermes's own recall: ${items// /, }." ;;
+    default-wide)
+      warn "This config names no API-server toolset, so Hermes uses its default bundle — memory and session search included." ;;
+    *)
+      warn "I cannot read this config's API-server toolset, so I cannot tell whether Hermes keeps its own memory." ;;
+  esac
+  say "  Conduck sends the whole conversation every turn and expects the gateway to keep"
+  say "  nothing of its own. One that remembers answers from things you never sent it, and"
+  say "  you pay for that hidden context on every turn."
+  say "  No connection check can see this, here or in --check-server: a remembering gateway"
+  say "  passes them all. Test it yourself — tell it something in one conversation, then ask"
+  say "  for it in a brand-new one. If it answers, the gateway is keeping its own history."
+  return 0
+}
+
+# What to change by hand, for every shape this connector will not rewrite.
+hermes_recall_manual_hint() { # hermes_recall_manual_hint <suggested-list>
+  local suggested="${1:-[web]}"
+  case "$HERMES_RECALL_STATE" in
+    clear) return 0 ;;
+    in-scope)
+      local entry bundle=false
+      for entry in ${HERMES_RECALL_ITEMS[@]+"${HERMES_RECALL_ITEMS[@]}"}; do
+        case "$entry" in hermes-*|all|'*') bundle=true ;; esac
+      done
+      if $bundle; then
+        say "  That name is a whole bundle, and Hermes's bundles carry its memory tools. In"
+        say "  ${BOLD}~/.hermes/config.yaml${RESET}, replace it with the toolsets you actually want —"
+        say "  for example ${BOLD}api_server: $suggested${RESET} — and restart Hermes."
+      else
+        say "  In ${BOLD}~/.hermes/config.yaml${RESET}, take memory and session_search out of the"
+        say "  platform_toolsets.api_server list, leave everything else, and restart Hermes."
+      fi ;;
+    default-wide)
+      say "  Name the toolsets yourself in ${BOLD}~/.hermes/config.yaml${RESET}, then restart Hermes:"
+      say "    platform_toolsets:"
+      say "      api_server: $suggested" ;;
+    *)
+      say "  Check platform_toolsets.api_server in ${BOLD}~/.hermes/config.yaml${RESET} yourself —"
+      say "  memory and session_search belong to your other Hermes surfaces, not to this one." ;;
+  esac
+  say "  This key is per-surface: your Hermes CLI and messaging surfaces keep their memory,"
+  say "  and so does anything else you point at this same API server."
+  return 0
+}
+
+# The one edit offered here, and only in its plainest form: named entries in an
+# explicit list. A bundle name, an unwritten key, or anything this parser cannot
+# read is described instead of rewritten — deleting a bundle would take a whole
+# platform's tools with it, and inventing a list where the user wrote none would
+# narrow far more than memory.
+hermes_recall_remove_step() { # hermes_recall_remove_step <config> -> 0 when the scope is proven clear
+  local cfg="$1" status
+  [ "$HERMES_RECALL_FIX" = "literal" ] || return 1
+  [ -n "$HERMES_RECALL_SCOPE" ] || return 1
+  say ""
+  say "  ${BOLD}platform_toolsets.api_server: $HERMES_RECALL_SCOPE -> $HERMES_RECALL_AFTER${RESET}"
+  say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
+  say "  surfaces are untouched — but anything else talking to this same API server loses"
+  say "  its memory too."
+  if ! confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+    note "Leaving it as it is."
+    HERMES_RECALL_DECLINED=true
+    return 1
+  fi
+  mutate_guard "remove only the recall entries from platform_toolsets.api_server in $cfg" || return 1
+  status=$(hermes_config_analysis "$cfg" "" apply-recall "$HERMES_RECALL_SCOPE" \
+    | awk -F '\t' '$1=="status"{print $2; exit}')
+  if [ "$status" != "applied" ]; then
+    warn "That edit could not be applied safely, so nothing was changed."
+    return 1
+  fi
+  HERMES_SCOPE_CHANGED_THIS_RUN=true
+  hermes_recall_read "$cfg"
+  if [ "$HERMES_RECALL_STATE" != "clear" ]; then
+    warn "The edit landed but the scope still does not read as memory-free."
+    return 1
+  fi
+  ok "Hermes's API-server scope re-checked — no memory or session-search tools left in it."
+  restart_hermes_for_config || {
+    warn "Hermes was not restarted, so it is still running with its old scope."
+    return 1
+  }
+  return 0
+}
+
+# The gate a caller can act on. Returns 0 only when this Hermes API server is
+# provably free of its own recall. Deciding what a nonzero result MEANS — stop
+# before pairing, or carry on with the warning — stays with the caller: refusing
+# to pair a gateway that chats fine is a product call, not a parser's.
+# --dry-run and --reuse-only report and return 0 by design; neither may block a
+# run whose whole promise is that it changes nothing.
+hermes_recall_scope_step() { # hermes_recall_scope_step [suggested-list]
+  [ "${GW_KIND:-}" = "hermes" ] || return 0
+  local cfg="$HOME/.hermes/config.yaml"
+  hermes_recall_read "$cfg"
+  hermes_recall_report
+  [ "$HERMES_RECALL_STATE" = "clear" ] && return 0
+  if $DRY_RUN; then
+    note "(dry-run: a real run offers to remove those entries, or shows you the exact edit)"
+    hermes_recall_manual_hint "${1:-[web]}"
+    return 0
+  fi
+  if $REUSE_ONLY; then
+    warn "(reuse-only: not changing Hermes config)"
+    hermes_recall_manual_hint "${1:-[web]}"
+    return 0
+  fi
+  if [ "$HERMES_RECALL_FIX" = "literal" ] && ! $HERMES_RECALL_DECLINED \
+     && hermes_recall_remove_step "$cfg"; then
+    return 0
+  fi
+  hermes_recall_manual_hint "${1:-[web]}"
+  return 1
+}
+
+hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
+  local workspace="$1" cfg="$HOME/.hermes/config.yaml"
+  local status approved_scope=""
+  hermes_analysis_read "$cfg" "$workspace" analyze
+  status="$HERMES_ANALYSIS_STATUS"
+
+  # The memory question comes before the file question, and gets its own answer:
+  # it decides what this file's single edit contains, and it matters just as much
+  # to a user who ends up declining the optional file lane.
+  hermes_recall_report
+  if [ "$HERMES_RECALL_STATE" != "clear" ]; then
+    if [ "$HERMES_RECALL_FIX" != "literal" ] || $DRY_RUN || $REUSE_ONLY \
+       || $HERMES_RECALL_DECLINED; then
+      hermes_recall_manual_hint "[web, file]"
+    elif [ "$status" = "fix" ] || [ "$status" = "ready" ]; then
+      say ""
+      say "  ${BOLD}platform_toolsets.api_server: $HERMES_RECALL_SCOPE -> $HERMES_RECALL_AFTER${RESET}"
+      say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
+      say "  surfaces are untouched — but anything else talking to this same API server loses"
+      say "  its memory too."
+      if confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+        approved_scope="$HERMES_RECALL_SCOPE"
+        # Re-read with the approval folded in, so the operator sees ONE
+        # before→after for this file rather than two overlapping ones.
+        hermes_analysis_read "$cfg" "$workspace" analyze "$approved_scope"
+        status="$HERMES_ANALYSIS_STATUS"
+      else
+        note "Leaving the API-server scope as it is."
+        HERMES_RECALL_DECLINED=true
+        hermes_recall_manual_hint "[web, file]"
+      fi
+    else
+      # File readiness is already unprovable here, but the memory scope is a
+      # different question about the same one line, and it decides how chat
+      # behaves whether or not file transfer goes ahead. Offer it on its own.
+      if hermes_recall_remove_step "$cfg"; then
+        hermes_analysis_read "$cfg" "$workspace" analyze
+        status="$HERMES_ANALYSIS_STATUS"
+      else
+        hermes_recall_manual_hint "[web, file]"
+      fi
+    fi
+  fi
 
   say ""
   say "  ${BOLD}Hermes file readiness${RESET} — can the API-server agent use this exact folder?"
   case "$status" in
     ready)
-      ok "Hermes config is file-lane-ready (${reasons[0]:-working root and file tools})."
+      ok "Hermes config is file-lane-ready (${HERMES_ANALYSIS_REASONS[0]:-working root and file tools})."
       return 0 ;;
     manual|"")
       warn "I cannot prove a safe Hermes file configuration:"
-      local r; for r in ${reasons[@]+"${reasons[@]}"}; do say "    $r"; done
+      local r; for r in ${HERMES_ANALYSIS_REASONS[@]+"${HERMES_ANALYSIS_REASONS[@]}"}; do say "    $r"; done
       warn "I will leave file transfer out rather than broaden Hermes privileges or guess at a remote/sandbox mount."
       return 1 ;;
     fix) ;;
@@ -4161,12 +4768,17 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
       return 1 ;;
   esac
 
-  warn "Hermes needs these narrow changes before its API-server agent can use the lane:"
-  local c; for c in "${changes[@]}"; do say "    ${BOLD}$c${RESET}"; done
-  say "  Only the API-server's file toolset and this working-folder path are in scope;"
-  say "  no terminal, web, memory, or messaging-platform permissions are added."
+  if [ -n "$approved_scope" ]; then
+    warn "So here is the whole edit to Hermes's config, in one place:"
+  else
+    warn "Hermes needs these narrow changes before its API-server agent can use the lane:"
+  fi
+  local c; for c in "${HERMES_ANALYSIS_CHANGES[@]}"; do say "    ${BOLD}$c${RESET}"; done
+  say "  Only the API-server's toolset list and this working-folder path are in scope;"
+  say "  no terminal, web, or messaging-platform permissions are added, and nothing but"
+  say "  the entries shown above is taken away."
   if $DRY_RUN; then
-    for c in "${changes[@]}"; do plan_add "EDIT $cfg — $c"; done
+    for c in "${HERMES_ANALYSIS_CHANGES[@]}"; do plan_add "EDIT $cfg — $c"; done
     note "(dry-run: a real run asks before editing Hermes config)"
     return 0
   fi
@@ -4174,26 +4786,34 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
     warn "(reuse-only: not changing Hermes config; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Apply exactly these Hermes file-lane changes?"; then
+  if ! confirm "  Apply exactly these Hermes changes?"; then
     note "Leaving the file lane out — chat is unaffected."
+    if [ -n "$approved_scope" ]; then
+      note "The API-server scope is unchanged too; nothing in this file was touched."
+    fi
     return 1
   fi
   mutate_guard "edit only terminal.cwd / platform_toolsets.api_server in $cfg" || return 1
-  status=$(hermes_config_analysis "$cfg" "$workspace" apply \
+  status=$(hermes_config_analysis "$cfg" "$workspace" apply ${approved_scope:+"$approved_scope"} \
     | awk -F '\t' '$1=="status"{print $2; exit}')
   if [ "$status" != "applied" ]; then
     warn "The Hermes config edit could not be applied safely — leaving the file lane out."
     return 1
   fi
   HERMES_CONFIG_CHANGED_THIS_RUN=true
-  status=$(hermes_config_analysis "$cfg" "$workspace" \
-    | awk -F '\t' '$1=="status"{print $2; exit}')
+  if [ -n "$approved_scope" ]; then HERMES_SCOPE_CHANGED_THIS_RUN=true; fi
+  hermes_analysis_read "$cfg" "$workspace" analyze
+  status="$HERMES_ANALYSIS_STATUS"
   if [ "$status" != "ready" ]; then
     warn "Hermes config did not re-check as file-ready — leaving the file lane out."
     return 1
   fi
+  if [ -n "$approved_scope" ] && [ "$HERMES_RECALL_STATE" != "clear" ]; then
+    warn "The recall entries were removed but the scope still does not read as memory-free."
+    hermes_recall_manual_hint "[web, file]"
+  fi
   ok "Hermes config re-checked — file toolset + working folder are aligned."
-  if ! restart_hermes_for_file_config; then
+  if ! restart_hermes_for_config; then
     warn "Hermes was not restarted, so the file change is not active — leaving the lane out."
     return 1
   fi
@@ -4791,17 +5411,28 @@ MODELS_CONTENT_TYPE=""  # the reply's Content-Type header ("" when the transfer 
                         # Captured for the DOCTOR only — the wizard mirrors the app, which
                         # tolerates mislabelled third-party gateways, so nothing here may
                         # tighten the wizard's grading.
-MODELS_ID_COUNT=0       # how many entries carried a usable string "id" (doctor: model-selection)
+MODELS_ID_COUNT=0       # how many DISTINCT usable ids were advertised (doctor: model-selection).
+                        # Distinct, not entries: the adapter contract grades a server that offers
+                        # exactly one model by a different normative rule than a multi-model one
+                        # (only the latter must answer an unknown id with 400 "model_not_found"),
+                        # so counting a duplicated entry twice would silently move a single-model
+                        # adapter into the stricter branch and fail it on a rule it is exempt from.
 MODELS_FIRST_ID=""      # the first usable id ("" when none) — the doctor's selection probe target
+MODELS_WANTED_FOUND=false # the optional 2nd argument's id was advertised. Membership, not the
+                        # roster: a caller that lets the operator NAME the model to grade must be
+                        # able to say "that id isn't in this server's list" without the script
+                        # retaining hundreds of ids it has no other use for.
 
 models_is_json() { # 1 arg: base URL — /v1/models must answer success + the canonical envelope
                    #   (JSON object with a top-level "data" ARRAY), not the Control-UI HTML.
+                   #   Optional 2nd arg: an id to test for membership (MODELS_WANTED_FOUND).
                    # Return codes: 0 ok · 1 unreachable/rejected/non-JSON · 2 HTML · 3 wrong shape.
                    # Sets MODELS_CURL_RC / MODELS_HTTP_CODE / MODELS_DATA_EMPTY /
                    # MODELS_NO_VALID_ID / MODELS_TIME either way.
-  local out statusline body
+  local out statusline body wanted="${2:-}"
   MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false
   MODELS_TIME=""; MODELS_CONTENT_TYPE=""; MODELS_ID_COUNT=0; MODELS_FIRST_ID=""
+  MODELS_WANTED_FOUND=false
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' \
         -H "Accept: application/json" "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
   # The -w line is "<code> <seconds> <content-type>"; the body is everything
@@ -4843,8 +5474,11 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   # parse_constant: NaN/Infinity are REJECTED — python accepts them by default
   # but Apple Foundation's parsers do not, and the script must never be laxer
   # than the app it green-lights for.
-  # On the envelope-OK paths the classifier also prints "<id-count>\t<first-id>"
-  # for the doctor's model-selection probe; the wizard captures and ignores it.
+  # On the envelope-OK paths the classifier also prints
+  # "<id-count>\t<wanted-advertised>\t<first-id>" for the doctor's model-selection
+  # probe; the wizard captures and ignores it. The membership answer is compared
+  # against the RAW advertised id, before the control-byte strip below, so an id
+  # the operator copied verbatim out of the server's own list still matches.
   # The id is stripped of C0 controls and DEL before it leaves the classifier —
   # TAB/CR/LF because they would break this tab-delimited line, the rest because
   # the id is printed in verdict lines a hostile gateway must not be able to
@@ -4852,8 +5486,8 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   # here: the same value becomes the chat payload's model and the paired
   # profile's model, where a long-but-legitimate id must survive intact.
   local pyout prc
-  pyout=$(printf '%s' "$body" | python3 -c '
-import json, sys
+  pyout=$(printf '%s' "$body" | MODELS_WANTED_ID="$wanted" python3 -c '
+import json, os, sys
 def bad(x): raise ValueError(x)
 try:
     d = json.load(sys.stdin, parse_constant=bad)
@@ -4862,15 +5496,30 @@ except Exception:
 if not (isinstance(d, dict) and isinstance(d.get("data"), list)):
     sys.exit(3)
 data = d["data"]
-ids = [x["id"] for x in data if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
+seen = set()
+ids = []
+for x in data:
+    if not (isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]):
+        continue
+    if x["id"] in seen:
+        continue
+    seen.add(x["id"])
+    ids.append(x["id"])
+want = os.environ.get("MODELS_WANTED_ID", "")
+found = "yes" if (want and want in ids) else "no"
 first = "".join(" " if (ord(c) < 0x20 or ord(c) == 0x7f) else c for c in (ids[0] if ids else ""))
-print("%d\t%s" % (len(ids), first))
+print("%d\t%s\t%s" % (len(ids), found, first))
 if not data:
     sys.exit(4)
 sys.exit(0 if ids else 5)' 2>/dev/null)
   prc=$?
   case "$pyout" in
-    *$'\t'*) MODELS_ID_COUNT="${pyout%%$'\t'*}"; MODELS_FIRST_ID="${pyout#*$'\t'}" ;;
+    *$'\t'*$'\t'*)
+      MODELS_ID_COUNT="${pyout%%$'\t'*}"
+      local rest="${pyout#*$'\t'}"
+      [ "${rest%%$'\t'*}" = "yes" ] && MODELS_WANTED_FOUND=true
+      MODELS_FIRST_ID="${rest#*$'\t'}"
+      ;;
   esac
   case "$MODELS_ID_COUNT" in ''|*[!0-9]*) MODELS_ID_COUNT=0 ;; esac
   case "$prc" in
@@ -5081,7 +5730,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.3). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.4). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -5120,7 +5769,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.3 harness=<ver>
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.4 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN> history_image=<…>
 #     stream=<…> image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
 #     file_transport=<…> file_access=<…> file_e2e=<…>
@@ -5144,7 +5793,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.3"
+DOCTOR_CONTRACT_REV="1.4"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
@@ -5292,6 +5941,94 @@ doctor_curl_negauth() { # doctor_curl_negauth <none|wrong> <curl args…>
   fi
 }
 
+# Does an auth rejection on THIS route poison the connection it answered on?
+# An adapter that replies 401 WITHOUT consuming the request body leaves those
+# bytes in the socket; on a persistent HTTP/1.1 connection the server then
+# reads them as the start of the NEXT request and answers 400 (or 414/431/
+# 501/505, depending on its parser) to whatever comes after. RFC 9112 is
+# explicit: a rejecting response must still consume the body, or close the
+# connection. Three independently built adapters shipped exactly this bug.
+#
+# The probe: two identical wrong-token requests ride ONE curl invocation joined
+# by `--next`, so curl reuses a single connection. Echoes
+# "<status-1> <status-2> <new-connections-on-2>". That last field is the
+# load-bearing evidence — 0 means curl really did reuse the connection, 1 means
+# it opened a fresh one (e.g. because the server correctly answered
+# `Connection: close`, or the pooled connection was dead), and a differing
+# second status then proves nothing at all. The caller reads all three; this
+# function makes no claim.
+#
+# `--next` RESETS every per-transfer option, so each half repeats its own
+# `-sS`/`--http1.1`/`--max-time`/`--noproxy`/headers; only `-q` is global and
+# has to stay first. Plain curl, never curl_gw — the REAL token must never ride
+# an auth-negative probe; the wrong token is the same fixed harmless literal
+# doctor_curl_negauth sends. `--http1.1` is pinned because HTTP/2 frames bodies
+# and cannot show this failure at all. Short timeouts: this is an explanatory
+# probe fired after an already-answered request, not another minute of waiting.
+doctor_desync_pair() { # doctor_desync_pair <curl args addressing the route…>
+  curl -q -sS --http1.1 --max-time 10 --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" \
+       -o /dev/null -w '%{http_code} ' "$@" \
+    --next -sS --http1.1 --max-time 10 --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" \
+       -o /dev/null -w '%{http_code} %{num_connects}' "$@" 2>/dev/null
+}
+
+# The undrained-body reading of a WRONG-token answer that isn't 401. This is
+# the single most misread verdict in the whole check: the message ("HTTP 400,
+# the contract pins 401") is literally true and causally wrong, and every
+# builder who hit it went hunting through a token comparison that was fine.
+# Only a route that CARRIES a body can leave bytes behind, so the models GET
+# never asks. Diagnostic only — d_say lines under the caller's single d_bad,
+# so check counts and the machine summary are untouched.
+#
+# Three honest outcomes, never one guess: the pair reproduced it on a proven
+# reused connection (say so plainly) · the pair's first request answered 401
+# where the standalone one answered $code, so the answer is not stable (report
+# that, and where to look) · the status repeats (their auth path really does
+# answer it — keep the drain theory to one hedged sentence).
+doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> <curl args…>
+  local id="$1" code="$2" a has_body=false desynced=false pair first second connects rest; shift 2
+  for a in "$@"; do
+    if [ "$a" = "-d" ]; then has_body=true; break; fi
+  done
+  $has_body || return 0
+  # Parse-level statuses only. A 403/405/429 is plausible middleware, not a
+  # desynced request stream, and guessing at those would just relocate the
+  # wild-goose chase.
+  case "$code" in 400|414|431|501|505) ;; *) return 0 ;; esac
+  pair=$(doctor_desync_pair "$@") || pair=""
+  first="${pair%% *}"; rest="${pair#* }"
+  second="${rest%% *}"; connects="${rest##* }"
+  # A differing second status only counts as evidence when curl proves it did
+  # NOT open a new connection (connects=0) and the difference is parse-level.
+  if [ "$first" = "401" ] && [ "$connects" = "0" ]; then
+    case "$second" in 400|414|431|501|505) desynced=true ;; esac
+  fi
+  if $desynced; then
+    d_say "$id" "(a follow-up probe got 401, then HTTP $second for the SAME request on the SAME reused"
+    d_say "$id" " connection — that is the signature of an undrained request body, not of a broken token"
+    d_say "$id" " check. A response that REJECTS a request must still consume that request's body (read"
+    d_say "$id" " the Content-Length bytes, drain the chunked stream) or answer \"Connection: close\" and"
+    d_say "$id" " close: whatever is left in the socket gets read as the start of the NEXT request, and"
+    d_say "$id" " that is what answered $second. Conduck reuses connections and so does any reverse proxy"
+    d_say "$id" " in front of you, so this breaks real turns — not just this check.)"
+  elif [ "$first" = "401" ]; then
+    d_say "$id" "(the identical probe answered 401 a moment later, so HTTP $code is not a stable answer from"
+    d_say "$id" " your auth code — check the path before you check the comparison. The usual cause is a 401"
+    d_say "$id" " that answers WITHOUT consuming the request body: those bytes stay in the socket and the"
+    d_say "$id" " next request on that kept-alive connection is parsed starting mid-body. A reverse proxy"
+    d_say "$id" " pooling upstream connections shows exactly this — which is why it can pass against"
+    d_say "$id" " http://127.0.0.1:<port> and fail through your HTTPS front. Compare those two runs.)"
+  else
+    d_say "$id" "(HTTP $code repeats on a fresh connection, so this really does look like your auth path"
+    d_say "$id" " answering — the contract wants 401 on both the missing and the wrong token. If it turns"
+    d_say "$id" " out to reproduce ONLY through your HTTPS front and not against http://127.0.0.1:<port>,"
+    d_say "$id" " suspect the other cause instead: a 401 that never consumes the request body leaves those"
+    d_say "$id" " bytes to be read as the next request on a pooled connection.)"
+  fi
+}
+
 # Check 1 — GET /v1/models with the REAL token: reachability + the canonical
 # envelope, via the same models_is_json the wizard trusts (the script must never
 # be laxer than the app it green-lights for). rc 1 = transport/status trouble →
@@ -5394,7 +6131,8 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
     200) d_bad "${idp}_WRONG" "auth ($route): WRONG token → 200 — the token isn't actually compared"
          d_say "${idp}_WRONG" "(compare byte-for-byte against the token you issued — e.g. hmac.compare_digest in Python)" ;;
     ""|000) d_bad "${idp}_WRONG" "auth ($route): WRONG token — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
-    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)" ;;
+    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)"
+         doctor_auth_wrong_diagnose "${idp}_WRONG" "$code" "$@" ;;
   esac
 }
 
@@ -5402,10 +6140,12 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
 # Testing only /v1/models would green-light a server that gates its model list
 # but leaves the tool-running /v1/chat/completions wide open: the exact hole
 # this check exists to catch. So both routes are probed. The chat probe carries
-# a minimal body (auth is meant to reject BEFORE the body is read); if a
-# vulnerable server instead RUNS the agent on the unauthenticated request, the
-# probe still fails — either 200 (caught) or a >30s timeout reported as a
-# failure (fail-safe, never a green pass).
+# a minimal body (auth is meant to reject before that body is PROCESSED — the
+# bytes must still be consumed off the socket, or the connection closed; see
+# doctor_desync_pair for what skipping that costs). If a vulnerable server
+# instead RUNS the agent on the unauthenticated request, the probe still fails
+# — either 200 (caught) or a >30s timeout reported as a failure (fail-safe,
+# never a green pass).
 doctor_auth_checks() {
   if [ "$GW_AUTH" != "bearer" ]; then
     d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
@@ -5425,19 +6165,50 @@ doctor_auth_checks() {
 # content-type / timing / BODY in DCC_* globals (memory only: the body is
 # never printed — these probes may run against a live personal agent, and this
 # script never logs message content; graders emit verdict words and lengths).
-DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
+#
+# DCC_CURL_RC keeps curl's own exit code when the transfer never completed — a
+# dead peer and a slow one are the same "no reply" to a caller that only sees
+# rc 1, and that lossy bucket is exactly how an adapter killed mid-turn reads
+# as a network fault. It is the WRAPPER's code: curl_gw returns 2 on its own
+# credential guard before curl ever runs (preflight makes that unreachable
+# here, but the code is not curl's to interpret if it ever fires).
+DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
 doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 iff transfer completed
   local out tail_ max_time="${2:-300}"
-  DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
+  DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
+  # `out=$(…) || { rc=$?; }` on purpose: inside `if ! out=$(…); then` the `$?`
+  # is the NEGATED status (0), and the real code would be lost.
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
         --max-time "$max_time" -H "Accept: application/json" \
-        -H "Content-Type: application/json" -d "$1" 2>/dev/null) || return 1
+        -H "Content-Type: application/json" -d "$1" 2>/dev/null) || { DCC_CURL_RC=$?; return 1; }
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
   DCC_TIME="${tail_%% *}"
   [ "$tail_" != "${tail_#* }" ] && DCC_CT="${tail_#* }"
   DCC_TIME=$(printf '%s' "$DCC_TIME" | awk '{printf "%.1f", $1}' 2>/dev/null)
   return 0
+}
+
+# What curl's exit code says about a transfer that never completed, in the
+# words a builder can act on. Deliberately hedged where curl is: 7 covers a
+# refused connection AND routing/firewall dead ends, and 52/56/18 are one story
+# told at three moments (peer gone before any reply · connection broken while
+# reading · reply cut off mid-body) — which one appears is decided by timing,
+# TLS and any proxy, so none of them PROVES a dead process on its own. The
+# caller's hint names that case; this line only reports what happened.
+doctor_transfer_reason() { # doctor_transfer_reason <curl exit code>
+  case "$1" in
+    6)  printf 'the hostname did not resolve' ;;
+    7)  printf 'could not connect to that address (refused, or blocked on the way)' ;;
+    18) printf 'the reply stopped mid-body' ;;
+    28) printf 'no complete answer within the time limit' ;;
+    35) printf 'the TLS connection failed' ;;
+    52) printf 'the server closed the connection without sending a reply' ;;
+    55) printf 'the connection broke while the request was still being sent' ;;
+    56) printf 'the connection broke while the reply was being read' ;;
+    60) printf 'this machine does not trust the server certificate' ;;
+    *)  printf 'transfer failed (curl exit %s)' "$1" ;;
+  esac
 }
 
 # doctor_chat_eval grades the reply in DCC_* against the contract's response
@@ -5455,7 +6226,9 @@ doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}" res verdict detail
   DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
   if ! doctor_chat_request "$1"; then
-    DCE_REASON="transfer failed (timed out or the connection dropped)"; DCE_HINT="transfer"; return 1
+    # DCE_HINT stays exactly "transfer" — the file lane keys on that literal to
+    # decide it may not grade the lane. The sub-case lives in DCC_CURL_RC.
+    DCE_REASON=$(doctor_transfer_reason "$DCC_CURL_RC"); DCE_HINT="transfer"; return 1
   fi
   # SSE despite a synchronous request is its own diagnosis — a JSON parse
   # error would bury the actual mistake.
@@ -5533,7 +6306,41 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
                 d_say "$id" " Conduck never accepts SSE; it may set the flag, but reads a synchronous reply)" ;;
         *)      d_say "$id" "(when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)" ;;
       esac ;;
+    transfer)
+      case "$DCC_CURL_RC" in
+        7|18|52|55|56)
+          d_say "$id" "(from out here a dead adapter and a broken network look identical — and it is usually"
+          d_say "$id" " the adapter: backgrounded from a terminal it dies with that shell or gets reaped"
+          d_say "$id" " mid-turn, and every later check then reports transport trouble that has nothing to do"
+          d_say "$id" " with the contract. Check it is still running, then keep it under something that"
+          d_say "$id" " restarts it — systemd, launchd, pm2, docker restart=always — before re-running me.)" ;;
+        28)
+          d_say "$id" "(nothing complete came back before the deadline — either the turn genuinely runs longer"
+          d_say "$id" " than that, or the adapter is wedged on this request. Its own log holds the request it"
+          d_say "$id" " never finished; Conduck gives up too, so a turn this slow fails in the app as well.)" ;;
+        35|60)
+          d_say "$id" "(the HTTPS front refused the connection, so the adapter behind it was never reached —"
+          d_say "$id" " run me ON the server against http://127.0.0.1:<port> to test the adapter itself first)" ;;
+      esac ;;
     http)
+      # A 5xx from a front-end proxy is about that proxy's UPSTREAM, never about
+      # the contract rule this request was testing — so it pre-empts the
+      # per-kind hints. Otherwise a dead adapter during the history turn reads
+      # as "you rejected the historical image", which is a wild-goose chase.
+      case "$DCC_CODE" in
+        502|503)
+          d_say "$id" "(a $DCC_CODE is the HTTPS front talking, not your adapter: the front is up but got"
+          d_say "$id" " nothing usable out of the adapter behind it. Most often that process is gone —"
+          d_say "$id" " backgrounded with no supervisor, or crashed on this turn — or it is bound to a"
+          d_say "$id" " different port than the front sends to; an overloaded or restarting adapter looks"
+          d_say "$id" " the same. Check it is running and supervised, then re-run me.)"
+          return 1 ;;
+        504)
+          d_say "$id" "(a 504 is the HTTPS front giving up on your adapter. Either the turn outruns the"
+          d_say "$id" " front's proxy timeout — agent turns are slow, raise it — or the adapter is wedged"
+          d_say "$id" " on this request and its own log will say so.)"
+          return 1 ;;
+      esac
       case "$kind" in
         history)
           d_say "$id" "(the contract forbids rejecting a request because of an image in an EARLIER message —"
@@ -5630,10 +6437,12 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 # ~1-in-9000 guess odds are accepted. The reply's content is never printed.
 # Build the semantic image probe (shared by --deep and --check-server): sets
 # IPG_CODE (the 4 digits) and IPG_PAYLOAD (the chat request carrying the PNG).
-# $CONDUCK_PROBE_MODEL (optional, exported by the caller) adds a "model" field
-# — the compat probe threads the advertised id through once it learns the
-# server requires one; the doctor never sets it (contract: absent model must
-# be tolerated).
+# $CONDUCK_PROBE_MODEL adds a "model" field when it is non-empty. EVERY caller
+# sets it explicitly, because the python reads the ENVIRONMENT: a caller that
+# merely omits it inherits whatever the operator happened to export, which
+# silently changes the request being graded. The compat probe threads the
+# advertised id through once it learns the server requires one; the doctor sets
+# it EMPTY (contract: an absent model must be tolerated).
 image_probe_gen() {
   local gen
   gen=$(python3 -c '
@@ -5680,7 +6489,15 @@ print(json.dumps(req))') \
 
 doctor_image_input_check() {
   local id="IMAGE_INPUT" code payload
-  image_probe_gen
+  # Shadowed, not inherited. $CONDUCK_PROBE_MODEL is internal plumbing for
+  # handing a value to python without argv, and the probe's python reads the
+  # ENVIRONMENT — so a variable the operator happens to have exported would
+  # silently put a "model" field in this request. The adapter contract makes
+  # tolerating an ABSENT model a REQUIREMENT, so a model here grades a different
+  # rule than the one this check exists to grade, and the adapter author would
+  # have no way to see why the verdict moved. --check-server sets it explicitly
+  # at its own call site; this one explicitly does not.
+  CONDUCK_PROBE_MODEL="" image_probe_gen
   code="$IPG_CODE"; payload="$IPG_PAYLOAD"
   if doctor_chat_eval "$payload" "$code"; then
     if [ "$DCE_TOKEN" = "yes" ]; then
@@ -6698,6 +7515,11 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 # (when ids exist), history-image tolerance (the poisoned-chat rule). The
 # image-input capability probe INFORMS but never fails — the app can't detect
 # a silently-dropped image either. No negative-auth request is ever sent.
+# Every verdict describes ONE model path — the operator's
+# $CONDUCK_CHECK_SERVER_MODEL, else the first advertised id, else the server's
+# model-less default — and the transcript says which, because on a fan-out
+# gateway the list order is arbitrary and a per-model capability graded as a
+# server property flips the same server between PASS and FAIL.
 # Semantic compatibility (client-owned history replay) is INVISIBLE here: a
 # stateful server passes this probe and still double-counts context — that
 # dimension needs its own test.
@@ -6705,6 +7527,24 @@ COMPAT_RAN=false
 COMPAT_CHECKS=0; COMPAT_FAILS=0
 COMPAT_MODELS="NOT_RUN"; COMPAT_CHAT="NOT_RUN"; COMPAT_HISTORY_IMAGE="NOT_RUN"
 COMPAT_IMAGE_INPUT="NOT_RUN"; COMPAT_MODEL_FIELD="NOT_RUN"
+
+# WHICH model these verdicts describe. A fan-out gateway is one endpoint in
+# front of hundreds of upstream models, and /v1/models lists them in an order
+# that has nothing to do with capability — so the first advertised id is a
+# SAMPLE, and a verdict reached on it is a fact about that route, never a grade
+# for the server as a whole. Without this the same server flips PASS↔FAIL purely
+# on the order it happens to list its models, which is how a working gateway
+# gets told it is broken.
+#   $CONDUCK_CHECK_SERVER_MODEL is the operator's override — the ONE public
+#   model input; the internal $CONDUCK_CHECK_MODEL/$CONDUCK_PROBE_MODEL names
+#   are command-scoped plumbing for handing a value to python without argv, and
+#   are deliberately not user knobs.
+# COMPAT_MODEL_ID doubles as the pairing answer: a setup handoff must pair
+# EXACTLY the model that was proven, and "" (the server_default case) correctly
+# means "leave the app's model selection open".
+COMPAT_WANTED_MODEL=""   # the operator's $CONDUCK_CHECK_SERVER_MODEL, verbatim
+COMPAT_MODEL_ID=""       # the id every model-bearing probe named ("" = none sent)
+COMPAT_MODEL_SOURCE="server_default"  # explicit | first_advertised | server_default
 
 c_ok()  { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); ok "[$id] $*"; }
 c_bad() { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); COMPAT_FAILS=$((COMPAT_FAILS+1)); bad "[$id] $*"; }
@@ -6796,7 +7636,10 @@ app_chat_eval() { # app_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}"
   CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
   if ! doctor_chat_request "$1"; then
-    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
+    # "timed out or the connection dropped" makes the operator guess between a
+    # dead host, a refused port, a TLS failure and a slow agent. curl already
+    # knows which; doctor_chat_request leaves its exit code in DCC_CURL_RC.
+    CCE_REASON=$(doctor_transfer_reason "$DCC_CURL_RC"); return 1
   fi
   app_chat_loaded_eval "$exp"
 }
@@ -6811,6 +7654,27 @@ compat_image_declined_detectable() {
   [ "$CCE_WIRE_CODE" = "image_unsupported" ] && return 0
   [ "$DCC_CODE" = "413" ] && return 0
   case "$DCC_CODE" in 400|404) ;; *) return 1 ;; esac
+  compat_image_message_matches
+}
+
+# Why did an image-bearing turn fail? The classifier above answers "would the app
+# recognize this refusal", which is the right question for the capability probe
+# and the wrong one for a history-image failure: it folds EVERY 413 into
+# "declined", and 413 means the payload was too big, not that the engine is
+# text-only. The two need different advice, so they get separated here.
+compat_image_failure_kind() { # -> image_unsupported | too_large | other
+  if [ "$CCE_WIRE_CODE" = "image_unsupported" ]; then printf 'image_unsupported\n'; return 0; fi
+  if [ "$DCC_CODE" = "413" ]; then printf 'too_large\n'; return 0; fi
+  case "$DCC_CODE" in
+    400|404) compat_image_message_matches && { printf 'image_unsupported\n'; return 0; } ;;
+  esac
+  printf 'other\n'
+}
+
+# The app's four vision regexes, applied to error.message when the OpenAI
+# envelope is present (the app deliberately scopes there to dodge metadata false
+# matches), else to the whole body. Callers own the status gating.
+compat_image_message_matches() {
   printf '%s' "$DCC_BODY" | python3 -c '
 import json, sys, re
 body = sys.stdin.read()
@@ -6868,6 +7732,8 @@ run_compat() {
   fi
   note "What this can't see: a server that keeps its OWN chat history will pass and still"
   note "double-count context — Conduck resends the full history every turn (client-owned)."
+  note "This grades ONE model path. Set CONDUCK_CHECK_SERVER_MODEL=<id> to grade the model"
+  note "you actually plan to use — otherwise a multi-model server is judged on one sample."
 
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
@@ -6901,12 +7767,17 @@ run_compat() {
   fi
   TRANSPORT=""
 
+  # Snapshot the operator's model choice ONCE, before any request: the graded
+  # model must never change mid-run, or the verdicts stop describing a single
+  # path and the optional setup handoff can no longer pair what was proven.
+  COMPAT_WANTED_MODEL="${CONDUCK_CHECK_SERVER_MODEL:-}"
+
   head_ "Server check — $GW_URL"
   COMPAT_RAN=true
 
   # -- models: direct-endpoint acceptance from Test Connection ----------------
   local rc=0 secs over
-  models_is_json "$GW_URL" || rc=$?
+  models_is_json "$GW_URL" "$COMPAT_WANTED_MODEL" || rc=$?
   secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
   over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
   if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
@@ -6965,6 +7836,23 @@ run_compat() {
     exit 1
   fi
 
+  # An explicit model choice is announced BEFORE the first chat turn, so the
+  # verdicts below are read against the right target — and so a typo'd id is
+  # visible as the cause of the failures it is about to produce, rather than
+  # being discovered several red lines later.
+  if [ -n "$COMPAT_WANTED_MODEL" ]; then
+    say ""
+    note "Grading the model you named: '$(safe_display "$COMPAT_WANTED_MODEL" 60)'."
+    if ! $MODELS_WANTED_FOUND; then
+      if [ "${MODELS_ID_COUNT:-0}" = "0" ]; then
+        note "(this server advertises no model ids at all — naming one is the only way to test it)"
+      else
+        note "(that id is NOT among the $MODELS_ID_COUNT this server advertises — check the spelling;"
+        note " grading it anyway, as you asked)"
+      fi
+    fi
+  fi
+
   say ""
   say "  Now the chat turns — graded with the app's actual decoder (empty-string replies are"
   say "  VALID, extra fields like tool_calls are tolerated, Content-Type is never read). Agents"
@@ -6978,11 +7866,16 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     || die "Could not build the test request (python3 failed)."
   if app_chat_eval "$payload_a"; then a_ok=true; else a_reason="$CCE_REASON"; a_code="$DCC_CODE"; fi
 
-  # One turn WITH the first advertised id (when one exists): the app sends the
-  # model the user picked from THIS server's /v1/models, so named selection
-  # must work too. Also the rescue path for servers that REQUIRE the field.
-  if [ -n "$MODELS_FIRST_ID" ]; then
-    payload_b=$(CONDUCK_CHECK_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
+  # One turn WITH a NAMED model: the app sends the model the user picked from
+  # THIS server's /v1/models, so named selection must work too. Also the rescue
+  # path for servers that REQUIRE the field. The operator's explicit choice wins
+  # over the first advertised id — on a fan-out gateway the first id is only a
+  # sample of the roster, and grading it as though it spoke for the server is
+  # what turns a working setup into a FAIL.
+  local named_model="$COMPAT_WANTED_MODEL"
+  [ -n "$named_model" ] || named_model="$MODELS_FIRST_ID"
+  if [ -n "$named_model" ]; then
+    payload_b=$(CONDUCK_CHECK_MODEL="$named_model" python3 -c 'import json, os
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                   "model": os.environ["CONDUCK_CHECK_MODEL"], "stream": False}))') \
       || die "Could not build the test request (python3 failed)."
@@ -7018,22 +7911,63 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   fi
 
   # -- named selection as its own verdict (when a model id exists) -------------
-  if [ -n "$MODELS_FIRST_ID" ]; then
+  if [ -n "$named_model" ]; then
+    local named_what="the first advertised model id"
+    [ -n "$COMPAT_WANTED_MODEL" ] && named_what="the model you named"
     if [ "$b_ok" = "true" ]; then
-      c_ok SERVER_MODEL_SELECT "the first advertised model id selects (the app sends what the user picked)"
+      c_ok SERVER_MODEL_SELECT "$named_what selects (the app sends what the user picked)"
     else
-      c_bad SERVER_MODEL_SELECT "a request naming the first advertised id fails — $b_reason"
-      c_say SERVER_MODEL_SELECT "(the app's model picker is fed from YOUR /v1/models — a listed id that can't"
-      c_say SERVER_MODEL_SELECT " be used breaks every user who picks it)"
+      c_bad SERVER_MODEL_SELECT "a request naming $named_what fails — $b_reason"
+      if [ -n "$COMPAT_WANTED_MODEL" ] && ! $MODELS_WANTED_FOUND; then
+        # Don't blame the server's picker for an id the server never offered.
+        c_say SERVER_MODEL_SELECT "(that id isn't in this server's /v1/models list, so this may just be a typo —"
+        c_say SERVER_MODEL_SELECT " unset CONDUCK_CHECK_SERVER_MODEL to grade the first id the server advertises)"
+      else
+        c_say SERVER_MODEL_SELECT "(the app's model picker is fed from YOUR /v1/models — a listed id that can't"
+        c_say SERVER_MODEL_SELECT " be used breaks every user who picks it)"
+      fi
     fi
   fi
 
-  # -- history image: the poisoned-chat rule (a REAL app requirement) ----------
-  # Once the server is known to REQUIRE a model, every later probe carries the
-  # advertised id — the app sends the user's configured model on EVERY turn,
-  # so a model-less later probe would fail a server real app traffic works on.
+  # -- which model the remaining probes grade, said out loud ------------------
+  # An explicit choice always wins. Otherwise: once the server is known to
+  # REQUIRE a model, every later probe carries the advertised id — the app sends
+  # the user's configured model on EVERY turn, so a model-less later probe would
+  # fail a server real app traffic works on. A server that accepts a model-less
+  # request keeps getting model-less probes, which grade its DEFAULT route.
   local probe_model=""
-  [ "$COMPAT_MODEL_FIELD" = "required" ] && probe_model="$MODELS_FIRST_ID"
+  if [ -n "$COMPAT_WANTED_MODEL" ]; then
+    probe_model="$COMPAT_WANTED_MODEL"; COMPAT_MODEL_SOURCE="explicit"
+  elif [ "$COMPAT_MODEL_FIELD" = "required" ]; then
+    probe_model="$MODELS_FIRST_ID"; COMPAT_MODEL_SOURCE="first_advertised"
+  else
+    COMPAT_MODEL_SOURCE="server_default"
+  fi
+  COMPAT_MODEL_ID="$probe_model"
+  # The explicit case already announced itself before the first chat turn.
+  case "$COMPAT_MODEL_SOURCE" in
+    explicit) ;;
+    *) say "" ;;
+  esac
+  case "$COMPAT_MODEL_SOURCE" in
+    explicit) ;;
+    first_advertised)
+      if [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+        note "Grading model '$(safe_display "$COMPAT_MODEL_ID" 60)' — the FIRST of $MODELS_ID_COUNT ids this server"
+        note "advertises, picked by ITS list order, not by capability. The rest are untested, so a"
+        note "failure below is a fact about THIS model's route, not a grade for the whole server."
+        note "Re-run with CONDUCK_CHECK_SERVER_MODEL=<id> to grade the model you plan to use."
+      else
+        note "Grading model '$(safe_display "$COMPAT_MODEL_ID" 60)' — the only id this server advertises."
+      fi
+      ;;
+    *)
+      note "The probes below send NO \"model\" field, so they grade whatever this server routes to"
+      note "by default — and nothing here proves two model-less requests reach the same model."
+      ;;
+  esac
+
+  # -- history image: the poisoned-chat rule (a REAL app requirement) ----------
   local payload_h
   payload_h=$(CONDUCK_PROBE_MODEL="$probe_model" python3 -c 'import json, os, zlib, struct, base64
 def chunk(t, d):
@@ -7058,7 +7992,23 @@ print(json.dumps(req))') \
     COMPAT_HISTORY_IMAGE="FAIL"
     c_bad SERVER_HISTORY_IMAGE "history image — $CCE_REASON"
     c_say SERVER_HISTORY_IMAGE "(Conduck resends the full history, so ONE photo anywhere in a conversation would"
-    c_say SERVER_HISTORY_IMAGE " permanently break every later turn of that chat in the app)"
+    c_say SERVER_HISTORY_IMAGE " permanently break every later turn of that chat — on the route just graded)"
+    # Name WHY, from the server's own answer, while DCC_*/CCE_* still hold it.
+    # This explains the failure; it never excuses it. A route that cannot read
+    # images is still required to drop or describe an OLD one and answer the new
+    # text turn, so this stays a real FAIL either way.
+    case "$(compat_image_failure_kind)" in
+      image_unsupported)
+        c_say SERVER_HISTORY_IMAGE "The server says this engine can't read images at all. That still fails: a route"
+        c_say SERVER_HISTORY_IMAGE "that can't see pictures is expected to ignore an OLD one and answer the new text." ;;
+      too_large)
+        c_say SERVER_HISTORY_IMAGE "HTTP 413 on a 1×1 PNG points at a request-size limit in front of the server, not"
+        c_say SERVER_HISTORY_IMAGE "at the engine — check the reverse proxy's max body size." ;;
+    esac
+    if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+      c_say SERVER_HISTORY_IMAGE "Only '$(safe_display "$COMPAT_MODEL_ID" 60)' was tested — the first of $MODELS_ID_COUNT advertised ids."
+      c_say SERVER_HISTORY_IMAGE "Before judging the server, re-run with CONDUCK_CHECK_SERVER_MODEL=<id> on another."
+    fi
   fi
 
   # -- image input: capability, informational — never fails the wire verdict ---
@@ -7078,27 +8028,57 @@ print(json.dumps(req))') \
   elif compat_image_declined_detectable; then
     COMPAT_IMAGE_INPUT="DECLINED"
     say "  ${GREEN}•${RESET} image input: DECLINED, detectably — the app recognizes this refusal and shows its"
-    say "    pictures-unsupported message (text chats are unaffected)"
+    if [ "$COMPAT_HISTORY_IMAGE" = "FAIL" ]; then
+      # "text chats are unaffected" is the normal case and a lie here: this route
+      # already failed the history-image turn, so a photo poisons the whole chat.
+      say "    pictures-unsupported message — but see the history-image failure above: on this"
+      say "    route a photo also breaks the TEXT turns that follow it in the same chat."
+    else
+      say "    pictures-unsupported message (text chats are unaffected)"
+    fi
   else
     COMPAT_IMAGE_INPUT="OPAQUE"
     warn "image input: image turns fail with an error the app can't classify ($CCE_REASON) —"
     say "    users see a generic failure instead of \"pictures aren't supported here\""
   fi
 
+  # One line naming the graded path, on BOTH verdicts. A PASS that reads as a
+  # blanket certificate and a FAIL that reads as a blanket condemnation are the
+  # same bug: neither run tested more than one model.
+  local graded_scope=""
+  case "$COMPAT_MODEL_SOURCE" in
+    explicit)         graded_scope="model '$(safe_display "$COMPAT_MODEL_ID" 60)' (the one you named)" ;;
+    first_advertised) graded_scope="model '$(safe_display "$COMPAT_MODEL_ID" 60)'"
+                      [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null \
+                        && graded_scope="$graded_scope — the first of $MODELS_ID_COUNT advertised, and the only one tested" ;;
+    *)                graded_scope="this server's default route (no \"model\" field was sent)" ;;
+  esac
+
   say ""
   if [ "$COMPAT_FAILS" = "0" ]; then
     ok "Server check: PASS — core text-chat compatibility is green ($COMPAT_CHECKS/$COMPAT_CHECKS wire checks)."
     say "  Image input is separate and informational: ${BOLD}$COMPAT_IMAGE_INPUT${RESET}."
-    say "  Two honest limits: this probe can't see STATEFULNESS (a server that keeps its own"
+    say "  Graded: $graded_scope."
+    say "  Three honest limits: this probe can't see STATEFULNESS (a server that keeps its own"
     say "  history will double-count context — Conduck resends the full history every turn),"
+    say "  it grades ONE model path and says nothing about any other model this server offers,"
     say "  and a pass here does NOT make this server a Conduck adapter (that's ${BOLD}--check-adapter${RESET})."
+    if [ "$COMPAT_MODEL_SOURCE" = "explicit" ]; then
+      # The setup handoff pairs $COMPAT_MODEL_ID — the model this run actually
+      # graded — so a deliberately-graded model is the one that gets carried.
+      note "Continuing into setup? The pairing code carries the model you named here."
+    fi
     if ! interactive_terminal; then
       say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
     fi
     return 0
   fi
   bad "Server check: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
-  say "  The app would hit the same walls. Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
+  say "  The app would hit the same walls on $graded_scope."
+  if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+    say "  That is not yet a verdict on the server: CONDUCK_CHECK_SERVER_MODEL=<id> grades another."
+  fi
+  say "  Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
   say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
   exit 1
 }
@@ -8744,10 +9724,37 @@ show_qr_check_live() {
   esac
 }
 
+# A profile is written once; the gateway it describes keeps changing afterwards. A
+# Hermes whose API-server scope was memory-free at pairing time can drift back —
+# an upgrade that rewrites config.yaml, another tool appending a toolset, a hand
+# edit — and neither the saved profile nor the live exposure checks above would
+# notice: a remembering gateway passes every one of them. So the scope is
+# re-classified before every successful re-emission, not only at setup.
+#
+# --show-code forces REUSE_ONLY, so this reports the finding and the by-hand fix
+# and returns 0 without opening config.yaml for writing. Offering the edit stays
+# with the wizard; a command whose whole promise is "changes no configuration"
+# must not grow a mutation prompt.
+show_qr_recall_scope() {
+  # The suggested replacement list has to match the code this run is about to
+  # emit, so the test is the SAME pair build_pairing_payload_json uses to decide
+  # whether a fileServer block is carried at all. show_qr_recover_file_lane can
+  # legitimately downgrade a saved file-lane profile to gateway-only when the
+  # credential is gone, and telling that operator to write `[web, file]` would
+  # suggest a toolset their pairing no longer uses.
+  local suggested="[web]"
+  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="[web, file]"; fi
+  hermes_recall_scope_step "$suggested" || true
+}
+
 # Orchestrate the --show-code path: pick → load → secrets → live-match gate, then the
 # UNCHANGED verify_all + emit_payload. No configuration/exposure mutates
 # (REUSE_ONLY is forced on), so APPLIED/FS_APPLIED stay empty. Verification can
 # still write and delete one small probe on an already-configured file lane.
+# The recall report sits after the drift gate and before verification: a stale
+# profile dies above without collecting an irrelevant warning it can't act on, and
+# verify_all's output then separates the finding from the code itself rather than
+# interrupting the operator at the moment of payoff.
 run_show_qr() {
   head_ "Re-show your pairing code — skips setup and changes no configuration"
   show_qr_pick_profile
@@ -8755,6 +9762,7 @@ run_show_qr() {
   show_qr_recover_gateway_secret
   show_qr_recover_file_lane
   show_qr_check_live
+  show_qr_recall_scope
   verify_all
   emit_payload
 }
@@ -8775,17 +9783,37 @@ prepare_setup_from_check() {
   fi
   GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
 
-  # A server check only proves a specific model is required when the model-less
-  # request failed and an advertised model succeeded. Reuse that proven model;
-  # otherwise leave selection open for the app instead of guessing among ids.
+  # A server check grades ONE model path, and the handoff must pair EXACTLY that
+  # path — deriving it a second time here is how a run that graded model X ends
+  # up pairing model Y. $COMPAT_MODEL_ID is the single answer the check already
+  # reached: the model the operator named, else the advertised id the server was
+  # proven to require, else "" — and "" is not a gap, it means the check passed
+  # WITHOUT a model field, so the app's model selection stays open. An adapter
+  # check names no model at all (its contract requires tolerating an absent one),
+  # so the kind guard, not the source, decides whether a model is carried.
+  # $COMPAT_MODEL_SOURCE is read for wording only; it holds its initial value on
+  # runs where --check-server never executed, so it can't stand in for the guard.
   GW_MODEL=""
-  if [ "$checked_kind" = "server" ] &&
-     [ "${COMPAT_MODEL_FIELD:-}" = "required" ] &&
-     [ -n "${MODELS_FIRST_ID:-}" ]; then
-    GW_MODEL="$MODELS_FIRST_ID"
-    # Model ids are opaque server-owned strings. Preserve the exact advertised id:
-    # LiteLLM routes and Hugging Face repository names can legitimately be long.
-    ok "Reusing the exact model ID the successful check required: $GW_MODEL"
+  if [ "$checked_kind" = "server" ]; then
+    # Model ids are opaque server-owned strings, so the id rides VERBATIM: it is
+    # the one that was actually proven, LiteLLM routes and Hugging Face
+    # repository names can legitimately be long, and a sanitised variant would
+    # pair something no request ever tested.
+    GW_MODEL="${COMPAT_MODEL_ID:-}"
+    # This line is the operator's last look at what their pairing code will
+    # carry, so it prints the WHOLE id — a truncated one cannot be checked
+    # against the server, and "exact" would be a lie. safe_display is still
+    # applied for its control-stripping: an explicitly named id is unvalidated
+    # operator input, and a stray newline or ANSI escape in it must not repaint
+    # this transcript. The bound is a flood stop, not a display truncation —
+    # a real model id is orders of magnitude shorter.
+    if [ -z "$GW_MODEL" ]; then
+      note "The check passed without naming a model, so the code leaves the app's model selection open."
+    elif [ "${COMPAT_MODEL_SOURCE:-}" = "explicit" ]; then
+      ok "Pairing the model you named and checked: $(safe_display "$GW_MODEL" 4096)"
+    else
+      ok "Reusing the exact model ID the successful check required: $(safe_display "$GW_MODEL" 4096)"
+    fi
   fi
 
   case "$checked_url" in

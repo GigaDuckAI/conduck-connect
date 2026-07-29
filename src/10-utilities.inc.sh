@@ -429,6 +429,75 @@ mutate_guard() {  # mutate_guard "what would change"
 need() { command -v "$1" >/dev/null 2>&1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# The escalation prefix for a command that has to run as root. A hardcoded `sudo`
+# is wrong in three real environments: a root shell needs no prefix at all, the
+# minimal Alpine/Debian images that run as root ship no `sudo` binary (so the
+# prefixed command dies with "command not found"), and OpenBSD-lineage setups
+# carry `doas` instead. Empty output means "run it as root yourself" — the caller
+# prints the bare command rather than inventing a dependency.
+priv_prefix() { # priv_prefix -> sudo | doas | (empty)
+  [ "$(id -u 2>/dev/null)" = 0 ] && return 0
+  if have sudo; then printf 'sudo'
+  elif have doas; then printf 'doas'
+  fi
+}
+
+# The install line a Linux user can actually run. Detection is by BINARY
+# (`command -v`), never by parsing `/etc/os-release`: the binary is what the
+# printed command invokes, while `ID`/`ID_LIKE` lie on derivatives and on
+# containers built FROM another base. The caller presents it as *detected*, not
+# as "your distribution's command" — a box with two managers installed takes the
+# first probe, and the wording has to leave room for that.
+#
+# Package NAMES are mapped wherever they diverge from the command name, because a
+# confidently printed `pacman -S python3` dies with "target not found": worse than
+# generic advice, since it reads as authoritative and is wrong. Arch/Manjaro have
+# no `python3` package at all (their Python 3 is `python`), and Gentoo needs
+# category-qualified atoms. Never map onto a library package (`openssl-libs`,
+# `libssl3`) — those are routinely installed while the `openssl` CLI is missing,
+# which is exactly the case that got us here. An unrecognised manager prints
+# nothing, and the caller names the packages instead: honest beats wrong.
+linux_install_cmd() { # linux_install_cmd <command-name>… -> "<manager>\t<command>", or empty
+  local priv mgr pkgs="" body="" p
+  priv=$(priv_prefix); [ -n "$priv" ] && priv="$priv "
+  if   have apt-get;      then mgr="apt-get"
+  elif have dnf;          then mgr="dnf"
+  elif have yum;          then mgr="yum"
+  elif have zypper;       then mgr="zypper"
+  elif have pacman;       then mgr="pacman"
+  elif have apk;          then mgr="apk"
+  elif have xbps-install; then mgr="xbps-install"
+  elif have emerge;       then mgr="emerge"
+  else return 0
+  fi
+  for p in "$@"; do
+    case "$mgr:$p" in
+      pacman:python3) p="python" ;;
+      emerge:curl)    p="net-misc/curl" ;;
+      emerge:python3) p="dev-lang/python" ;;
+      emerge:openssl) p="dev-libs/openssl" ;;
+      emerge:rclone)  p="net-misc/rclone" ;;
+    esac
+    pkgs="$pkgs $p"
+  done
+  case "$mgr" in
+    apt-get)      body="${priv}apt-get update && ${priv}apt-get install -y$pkgs" ;;
+    dnf|yum)      body="${priv}$mgr install -y$pkgs" ;;
+    zypper)       body="${priv}zypper --non-interactive install$pkgs" ;;
+    # Arch does not support partial upgrades, so `-Sy` without `-u` is the classic
+    # way to break a box — and a setup wizard has no business prescribing a full
+    # system upgrade either. `-S --needed` is the non-expansive form; a stale
+    # package database is the user's own `pacman -Syu` to run.
+    pacman)       body="${priv}pacman -S --needed$pkgs" ;;
+    # --no-cache fetches the index inline: minimal images ship without one, and a
+    # bare `apk add` there fails with "unable to select packages".
+    apk)          body="${priv}apk add --no-cache$pkgs" ;;
+    xbps-install) body="${priv}xbps-install -Sy$pkgs" ;;
+    emerge)       body="${priv}emerge --ask$pkgs" ;;
+  esac
+  printf '%s\t%s' "$mgr" "$body"
+}
+
 # Collect ALL missing required tools and report together, with install hints.
 preflight() {
   local missing=()
@@ -440,7 +509,18 @@ preflight() {
   if [ ${#missing[@]} -gt 0 ]; then
     bad "Missing required tool(s): ${missing[*]}"
     case "$(uname -s)" in
-      Linux)  note "Install on Debian/Ubuntu:  sudo apt update && sudo apt install -y ${missing[*]}" ;;
+      Linux)
+        # This is the last thing the user reads before the hard exit below, so it
+        # has to be a command their box will accept — not Debian's.
+        local hint; hint=$(linux_install_cmd "${missing[@]}")
+        if [ -n "$hint" ]; then
+          note "Detected ${hint%%$'\t'*} — install with:  ${hint#*$'\t'}"
+          [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$(priv_prefix)" ] \
+            || note "Run that as root: this shell is neither root nor has sudo/doas."
+        else
+          note "Install with your distribution's package manager:  ${missing[*]}"
+        fi
+        ;;
       Darwin) note "Install with Homebrew:     brew install ${missing[*]}" ;;
     esac
     die "Install the tool(s) above, then re-run me."

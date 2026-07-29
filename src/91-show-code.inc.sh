@@ -437,10 +437,37 @@ show_qr_check_live() {
   esac
 }
 
+# A profile is written once; the gateway it describes keeps changing afterwards. A
+# Hermes whose API-server scope was memory-free at pairing time can drift back —
+# an upgrade that rewrites config.yaml, another tool appending a toolset, a hand
+# edit — and neither the saved profile nor the live exposure checks above would
+# notice: a remembering gateway passes every one of them. So the scope is
+# re-classified before every successful re-emission, not only at setup.
+#
+# --show-code forces REUSE_ONLY, so this reports the finding and the by-hand fix
+# and returns 0 without opening config.yaml for writing. Offering the edit stays
+# with the wizard; a command whose whole promise is "changes no configuration"
+# must not grow a mutation prompt.
+show_qr_recall_scope() {
+  # The suggested replacement list has to match the code this run is about to
+  # emit, so the test is the SAME pair build_pairing_payload_json uses to decide
+  # whether a fileServer block is carried at all. show_qr_recover_file_lane can
+  # legitimately downgrade a saved file-lane profile to gateway-only when the
+  # credential is gone, and telling that operator to write `[web, file]` would
+  # suggest a toolset their pairing no longer uses.
+  local suggested="[web]"
+  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="[web, file]"; fi
+  hermes_recall_scope_step "$suggested" || true
+}
+
 # Orchestrate the --show-code path: pick → load → secrets → live-match gate, then the
 # UNCHANGED verify_all + emit_payload. No configuration/exposure mutates
 # (REUSE_ONLY is forced on), so APPLIED/FS_APPLIED stay empty. Verification can
 # still write and delete one small probe on an already-configured file lane.
+# The recall report sits after the drift gate and before verification: a stale
+# profile dies above without collecting an irrelevant warning it can't act on, and
+# verify_all's output then separates the finding from the code itself rather than
+# interrupting the operator at the moment of payoff.
 run_show_qr() {
   head_ "Re-show your pairing code — skips setup and changes no configuration"
   show_qr_pick_profile
@@ -448,6 +475,7 @@ run_show_qr() {
   show_qr_recover_gateway_secret
   show_qr_recover_file_lane
   show_qr_check_live
+  show_qr_recall_scope
   verify_all
   emit_payload
 }

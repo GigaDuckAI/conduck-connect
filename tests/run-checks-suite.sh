@@ -57,8 +57,20 @@ FILE_IDS="FILES_CONFIG FILES_WRITE_THROUGH FILES_AUTH_READ_MISSING FILES_AUTH_RE
 # The frozen schema=3 grammar — field order fixed; any change must bump schema=
 # (and this regex, and the freeze doc). The three file meters are NOT_REQUESTED
 # without --files; with it, each grades NOT_RUN|PASS|FAIL|ERROR independently.
+#
+# What is frozen is the GRAMMAR — field order, field names, enum values — plus the
+# two identity fields whose literals a consumer keys off (`schema=3`, `contract=v1`).
+# Free-moving VALUES are matched by shape, never pinned: `revision=`, `harness=`,
+# `checks=`, `failed=` and `exit=` all move without breaking a single parser, and
+# pinning one of them turns an ordinary version bump into dozens of false failures
+# in a suite that is supposed to be checking the grammar. Do NOT re-pin
+# `revision=` to a literal — the adapter contract revision moves on its own
+# schedule (it is also carried in the module header and on the website), and
+# nothing here or in CI cross-checks those markers, so a literal is a tripwire
+# with no owner rather than a review gate. The revision still has to be PRESENT,
+# in POSITION, and well-formed; that is what this regex is for.
 FMETER='(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR)'
-SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1\.3 harness=[0-9][0-9.]* profile=(basic|deep) core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport='$FMETER' file_access='$FMETER' file_e2e='$FMETER' checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
+SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=[0-9]+\.[0-9]+ harness=[0-9][0-9.]* profile=(basic|deep) core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport='$FMETER' file_access='$FMETER' file_e2e='$FMETER' checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
 
 # Retired summary prefixes. The schema bump renamed CONDUCK_DOCTOR ->
 # CONDUCK_CHECK_ADAPTER and CONDUCK_COMPAT -> CONDUCK_CHECK_SERVER; consumers read
@@ -1539,11 +1551,16 @@ run_long_model_handoff_case() {
   # Pure handoff → payload proof using the production functions. This avoids
   # opening a real exposure while still proving the exact value that entered
   # prepare_setup_from_check is the value serialized into the pairing payload.
-  local prepare_func payload_func payload
+  local prepare_func payload_func display_func payload
   prepare_func=$(sed -n '/^prepare_setup_from_check()/,/^}/p' "$SCRIPT")
   payload_func=$(sed -n '/^build_pairing_payload_json()/,/^}/p' "$SCRIPT")
+  # prepare_setup_from_check now routes the paired id through safe_display for the
+  # transcript line, so the extracted set must carry it or the case fails on a
+  # missing command rather than on the behaviour it is meant to grade.
+  display_func=$(sed -n '/^safe_display()/,/^}/p' "$SCRIPT")
   payload=$(FUNCS="$prepare_func
-$payload_func" LONG_MODEL="$long_model" bash -c '
+$payload_func
+$display_func" LONG_MODEL="$long_model" bash -c '
 eval "$FUNCS"
 ask() { printf "%s" "$2"; }
 slug() { printf "%s" "$1" | tr "[:upper:]" "[:lower:]" | tr -cs "a-z0-9" "-"; }
@@ -1562,8 +1579,8 @@ TRANSPORT=""
 SCOPE=""
 FS_URL=""
 FS_CRED=""
-COMPAT_MODEL_FIELD="required"
-MODELS_FIRST_ID="$LONG_MODEL"
+COMPAT_MODEL_ID="$LONG_MODEL"
+COMPAT_MODEL_SOURCE="first_advertised"
 PAYLOAD_VERSION=1
 prepare_setup_from_check server
 TRANSPORT="public"
@@ -2604,6 +2621,16 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" file-lane-readiness "*) true ;; *) fal
   else
     FAIL=$((FAIL+1))
     printf 'SUITE ✗ file-lane-readiness — focused suite failed\n'
+  fi
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" host-environment "*) true ;; *) false ;; esac; then
+  if bash "$HERE/run-host-environment-suite.sh"; then
+    PASS=$((PASS+1))
+    printf 'SUITE ✓ host-environment\n'
+  else
+    FAIL=$((FAIL+1))
+    printf 'SUITE ✗ host-environment — focused suite failed\n'
   fi
 fi
 

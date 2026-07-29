@@ -539,6 +539,60 @@ existing_fs_config() {
   return 0
 }
 
+# systemd stops a user's manager — and every unit under it — shortly after that
+# user's LAST session ends, unless lingering is on; lingering is also what starts
+# the manager at boot. So a file lane that verifies green inside the SSH session
+# that created it is not yet a lane that survives logout or reboot, and this is a
+# 24/7 gateway product.
+#
+# Asked against `id -un`, never `$USER`: `$USER` is inherited across `su` and
+# `sudo -u` and can name an account whose linger state has nothing to do with the
+# user manager `systemctl --user` is actually driving — which would answer
+# "durable" about the wrong user and suppress the warning.
+fs_linger_enabled_linux() {
+  have loginctl || return 1
+  loginctl show-user "$(id -un 2>/dev/null)" 2>/dev/null | grep -q '^Linger=yes'
+}
+
+# Report — and offer to fix — the one setting that decides whether a green file
+# lane is still a file lane tomorrow. Runs for NEW and REUSED units alike: a lane
+# created without lingering is re-shipped by every later run, so checking only at
+# creation would warn exactly once and stay silent forever after. Never gates the
+# lane; it tells the truth in the same run that ships it.
+fs_report_linger_linux() {
+  fs_linger_enabled_linux && return 0
+  local u priv privcmd=()
+  u=$(id -un 2>/dev/null)
+  # `loginctl` is what both reads and sets lingering, so without it the honest
+  # answer is "unknown", never "off" — the two need different words.
+  if ! have loginctl; then
+    warn "No 'loginctl' on this box, so I can't tell whether systemd keeps '$u' services"
+    warn "running after logout. If it doesn't, the file lane stops answering when '$u' logs out."
+    return 0
+  fi
+  priv=$(priv_prefix); [ -n "$priv" ] && privcmd=("$priv")
+  warn "Lingering is off for '$u', so systemd stops this user's services shortly after"
+  warn "its last logout — the file lane would stop answering then, and not come back on reboot."
+  # --reuse-only forbids host changes, and offering this through run_step would
+  # reach mutate_guard's `die` — killing a run whose whole point was to re-emit an
+  # existing lane. State the fact, hand over the command, change nothing.
+  if $REUSE_ONLY && ! $DRY_RUN; then
+    note "(reuse-only: changing nothing.) Turn it on yourself with:  ${priv:+$priv }loginctl enable-linger $u"
+    return 0
+  fi
+  run_step "enable linger so the file server survives logout and reboot" \
+    ${privcmd[@]+"${privcmd[@]}"} loginctl enable-linger "$u" || true
+  $DRY_RUN && return 0
+  if fs_linger_enabled_linux; then
+    ok "Lingering is on for '$u' — the file server survives logout and reboot."
+    return 0
+  fi
+  warn "The file lane still ships in your setup code, but it only answers while '$u' has a"
+  warn "live session. Make it permanent any time with:  ${priv:+$priv }loginctl enable-linger $u"
+  [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$priv" ] || note "That one needs root (no sudo/doas here)."
+  return 0
+}
+
 # Write a per-gateway file-server unit that reads RCLONE_PASS from a 0600 env file
 # (credential never appears on the process command line / in `ps`).
 write_fs_unit_linux() { # write_fs_unit_linux <workspace>
@@ -590,13 +644,7 @@ EOF
     warn "Could not start the service — check 'systemctl --user status conduck-files-$GW_ID'."
     return 1
   fi
-  local user_name="${USER:-$(id -un)}"   # $USER can be unset under set -u (su/cron shells)
-  loginctl show-user "$user_name" 2>/dev/null | grep -q 'Linger=yes' || {
-    warn "User services stop at logout unless 'linger' is on (needed for a 24/7 box)."
-    run_step "enable linger so the file server survives logout/reboot" \
-      sudo loginctl enable-linger "$user_name" || \
-      note "Tip: 'sudo loginctl enable-linger $user_name' keeps user services running after logout."
-  }
+  fs_report_linger_linux
 }
 
 write_fs_unit_mac() { # write_fs_unit_mac <workspace>
@@ -1362,9 +1410,18 @@ setup_file_lane() {
   fi
 
   if ! have rclone; then
-    warn "rclone isn't installed (single binary; https://rclone.org/install/ —"
-    warn "brew install rclone / apt install rclone). Install it and re-run me,"
-    warn "or skip the file lane for now."
+    warn "rclone isn't installed. It's a single binary: https://rclone.org/install/"
+    # The upstream installer stays the primary route on purpose: distro rclone
+    # packages lag, and some repositories don't carry one at all, so a detected
+    # package command is the convenience path and never the only one offered.
+    local rc_hint="" rc_pm
+    if [ "$OS" = "Darwin" ]; then
+      rc_hint="brew install rclone"
+    else
+      rc_pm=$(linux_install_cmd rclone); [ -n "$rc_pm" ] && rc_hint="${rc_pm#*$'\t'}"
+    fi
+    [ -n "$rc_hint" ] && note "Or, if your package manager carries it:  $rc_hint"
+    warn "Install it and re-run me, or skip the file lane for now."
     return 0
   fi
 
@@ -1386,6 +1443,10 @@ setup_file_lane() {
       note "It still works and the QR is correct. To hide it, recreate the unit so rclone reads the"
       note "password from a 0600 env file ('RCLONE_PASS' / '--htpasswd'); newly-created units already do."
     fi
+    # A reused unit is shipped in this code exactly like a fresh one, so its
+    # durability is checked here too — a lane first created in a non-lingering
+    # session would otherwise be re-shipped silently by every later run.
+    [ "$OS" = "Linux" ] && fs_report_linger_linux
   else
     if $FS_EXISTING_UNSAFE; then
       warn "I will not overwrite or expose that existing unit. Repair/remove it explicitly, then re-run setup."
@@ -1396,14 +1457,19 @@ setup_file_lane() {
       FS_CRED=""; return 0
     fi
     # Keeping the file server running needs a service manager we know how to
-    # drive; on Linux that's a systemd USER session. Check BEFORE minting a
-    # credential or writing a unit that could never start.
+    # drive; on Linux that's a reachable systemd USER manager. Check BEFORE
+    # minting a credential or writing a unit that could never start. Named for
+    # what the probe actually proves: `show-environment` answers "a user manager
+    # is reachable from this shell", not "there is a login session".
     if [ "$OS" = "Linux" ] && ! { have systemctl && systemctl --user show-environment >/dev/null 2>&1; }; then
-      warn "No systemd user session here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
+      warn "No reachable systemd user manager here (Alpine/OpenRC, some containers, or a su/sudo shell) —"
       warn "I can't keep a file server running in the background. Skipping the file lane; chat still works."
       note "If this box does run systemd, log in directly as this user (ssh, not 'su -') and re-run."
-      note "Advanced: run 'rclone serve webdav <folder> --addr 127.0.0.1:<free-port> --user conduck --dir-cache-time 1s' with the app-generated password exported as RCLONE_PASS, under your own supervisor."
-      FS_CRED=""; return 0
+      # The credential is minted much later, so this path has none to hand over —
+      # and nothing here can discover or adopt an OpenRC/runit/s6 service on a
+      # later run, so a manual lane is paired by hand in the app, not by me.
+      note "Advanced: under your own supervisor (OpenRC/runit/s6), run 'rclone serve webdav <folder> --addr 127.0.0.1:<free-port> --user conduck --dir-cache-time 1s' with a password YOU choose exported as RCLONE_PASS, expose that port the same way as the gateway, then enter that address and password in the app by hand — I can only pair a lane I created."
+      FS_CRED=""; FS_URL=""; return 0
     fi
     if ! allocate_fs_local_port; then
       warn "${FS_PORT_ALLOCATION_REASON:-Could not allocate a safe loopback port for a new file lane.}"

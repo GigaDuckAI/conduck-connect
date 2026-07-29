@@ -15,17 +15,37 @@ prepare_setup_from_check() {
   fi
   GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
 
-  # A server check only proves a specific model is required when the model-less
-  # request failed and an advertised model succeeded. Reuse that proven model;
-  # otherwise leave selection open for the app instead of guessing among ids.
+  # A server check grades ONE model path, and the handoff must pair EXACTLY that
+  # path — deriving it a second time here is how a run that graded model X ends
+  # up pairing model Y. $COMPAT_MODEL_ID is the single answer the check already
+  # reached: the model the operator named, else the advertised id the server was
+  # proven to require, else "" — and "" is not a gap, it means the check passed
+  # WITHOUT a model field, so the app's model selection stays open. An adapter
+  # check names no model at all (its contract requires tolerating an absent one),
+  # so the kind guard, not the source, decides whether a model is carried.
+  # $COMPAT_MODEL_SOURCE is read for wording only; it holds its initial value on
+  # runs where --check-server never executed, so it can't stand in for the guard.
   GW_MODEL=""
-  if [ "$checked_kind" = "server" ] &&
-     [ "${COMPAT_MODEL_FIELD:-}" = "required" ] &&
-     [ -n "${MODELS_FIRST_ID:-}" ]; then
-    GW_MODEL="$MODELS_FIRST_ID"
-    # Model ids are opaque server-owned strings. Preserve the exact advertised id:
-    # LiteLLM routes and Hugging Face repository names can legitimately be long.
-    ok "Reusing the exact model ID the successful check required: $GW_MODEL"
+  if [ "$checked_kind" = "server" ]; then
+    # Model ids are opaque server-owned strings, so the id rides VERBATIM: it is
+    # the one that was actually proven, LiteLLM routes and Hugging Face
+    # repository names can legitimately be long, and a sanitised variant would
+    # pair something no request ever tested.
+    GW_MODEL="${COMPAT_MODEL_ID:-}"
+    # This line is the operator's last look at what their pairing code will
+    # carry, so it prints the WHOLE id — a truncated one cannot be checked
+    # against the server, and "exact" would be a lie. safe_display is still
+    # applied for its control-stripping: an explicitly named id is unvalidated
+    # operator input, and a stray newline or ANSI escape in it must not repaint
+    # this transcript. The bound is a flood stop, not a display truncation —
+    # a real model id is orders of magnitude shorter.
+    if [ -z "$GW_MODEL" ]; then
+      note "The check passed without naming a model, so the code leaves the app's model selection open."
+    elif [ "${COMPAT_MODEL_SOURCE:-}" = "explicit" ]; then
+      ok "Pairing the model you named and checked: $(safe_display "$GW_MODEL" 4096)"
+    else
+      ok "Reusing the exact model ID the successful check required: $(safe_display "$GW_MODEL" 4096)"
+    fi
   fi
 
   case "$checked_url" in

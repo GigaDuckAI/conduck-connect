@@ -41,17 +41,28 @@ MODELS_CONTENT_TYPE=""  # the reply's Content-Type header ("" when the transfer 
                         # Captured for the DOCTOR only — the wizard mirrors the app, which
                         # tolerates mislabelled third-party gateways, so nothing here may
                         # tighten the wizard's grading.
-MODELS_ID_COUNT=0       # how many entries carried a usable string "id" (doctor: model-selection)
+MODELS_ID_COUNT=0       # how many DISTINCT usable ids were advertised (doctor: model-selection).
+                        # Distinct, not entries: the adapter contract grades a server that offers
+                        # exactly one model by a different normative rule than a multi-model one
+                        # (only the latter must answer an unknown id with 400 "model_not_found"),
+                        # so counting a duplicated entry twice would silently move a single-model
+                        # adapter into the stricter branch and fail it on a rule it is exempt from.
 MODELS_FIRST_ID=""      # the first usable id ("" when none) — the doctor's selection probe target
+MODELS_WANTED_FOUND=false # the optional 2nd argument's id was advertised. Membership, not the
+                        # roster: a caller that lets the operator NAME the model to grade must be
+                        # able to say "that id isn't in this server's list" without the script
+                        # retaining hundreds of ids it has no other use for.
 
 models_is_json() { # 1 arg: base URL — /v1/models must answer success + the canonical envelope
                    #   (JSON object with a top-level "data" ARRAY), not the Control-UI HTML.
+                   #   Optional 2nd arg: an id to test for membership (MODELS_WANTED_FOUND).
                    # Return codes: 0 ok · 1 unreachable/rejected/non-JSON · 2 HTML · 3 wrong shape.
                    # Sets MODELS_CURL_RC / MODELS_HTTP_CODE / MODELS_DATA_EMPTY /
                    # MODELS_NO_VALID_ID / MODELS_TIME either way.
-  local out statusline body
+  local out statusline body wanted="${2:-}"
   MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false
   MODELS_TIME=""; MODELS_CONTENT_TYPE=""; MODELS_ID_COUNT=0; MODELS_FIRST_ID=""
+  MODELS_WANTED_FOUND=false
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' \
         -H "Accept: application/json" "$1/v1/models" 2>/dev/null) || { MODELS_CURL_RC=$?; return 1; }
   # The -w line is "<code> <seconds> <content-type>"; the body is everything
@@ -93,8 +104,11 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   # parse_constant: NaN/Infinity are REJECTED — python accepts them by default
   # but Apple Foundation's parsers do not, and the script must never be laxer
   # than the app it green-lights for.
-  # On the envelope-OK paths the classifier also prints "<id-count>\t<first-id>"
-  # for the doctor's model-selection probe; the wizard captures and ignores it.
+  # On the envelope-OK paths the classifier also prints
+  # "<id-count>\t<wanted-advertised>\t<first-id>" for the doctor's model-selection
+  # probe; the wizard captures and ignores it. The membership answer is compared
+  # against the RAW advertised id, before the control-byte strip below, so an id
+  # the operator copied verbatim out of the server's own list still matches.
   # The id is stripped of C0 controls and DEL before it leaves the classifier —
   # TAB/CR/LF because they would break this tab-delimited line, the rest because
   # the id is printed in verdict lines a hostile gateway must not be able to
@@ -102,8 +116,8 @@ models_is_json() { # 1 arg: base URL — /v1/models must answer success + the ca
   # here: the same value becomes the chat payload's model and the paired
   # profile's model, where a long-but-legitimate id must survive intact.
   local pyout prc
-  pyout=$(printf '%s' "$body" | python3 -c '
-import json, sys
+  pyout=$(printf '%s' "$body" | MODELS_WANTED_ID="$wanted" python3 -c '
+import json, os, sys
 def bad(x): raise ValueError(x)
 try:
     d = json.load(sys.stdin, parse_constant=bad)
@@ -112,15 +126,30 @@ except Exception:
 if not (isinstance(d, dict) and isinstance(d.get("data"), list)):
     sys.exit(3)
 data = d["data"]
-ids = [x["id"] for x in data if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
+seen = set()
+ids = []
+for x in data:
+    if not (isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]):
+        continue
+    if x["id"] in seen:
+        continue
+    seen.add(x["id"])
+    ids.append(x["id"])
+want = os.environ.get("MODELS_WANTED_ID", "")
+found = "yes" if (want and want in ids) else "no"
 first = "".join(" " if (ord(c) < 0x20 or ord(c) == 0x7f) else c for c in (ids[0] if ids else ""))
-print("%d\t%s" % (len(ids), first))
+print("%d\t%s\t%s" % (len(ids), found, first))
 if not data:
     sys.exit(4)
 sys.exit(0 if ids else 5)' 2>/dev/null)
   prc=$?
   case "$pyout" in
-    *$'\t'*) MODELS_ID_COUNT="${pyout%%$'\t'*}"; MODELS_FIRST_ID="${pyout#*$'\t'}" ;;
+    *$'\t'*$'\t'*)
+      MODELS_ID_COUNT="${pyout%%$'\t'*}"
+      local rest="${pyout#*$'\t'}"
+      [ "${rest%%$'\t'*}" = "yes" ] && MODELS_WANTED_FOUND=true
+      MODELS_FIRST_ID="${rest#*$'\t'}"
+      ;;
   esac
   case "$MODELS_ID_COUNT" in ''|*[!0-9]*) MODELS_ID_COUNT=0 ;; esac
   case "$prc" in

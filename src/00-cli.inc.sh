@@ -94,6 +94,19 @@
 #                                           # expert: permit a keyless
 #                                           # gateway on a public transport during setup
 #
+# Environment:
+#   CONDUCK_TOKEN=<token>                     # bearer token for a check, so it never
+#                                           # reaches your shell history or argv
+#   CONDUCK_CHECK_SERVER_MODEL=<model-id>
+#                                           # --check-server only: grade the model you
+#                                           # plan to use. Without it the named-model
+#                                           # checks take whichever id /v1/models lists
+#                                           # FIRST, so a server offering many models
+#                                           # can report FAIL or PASS purely on the
+#                                           # order it lists them. Continue into setup
+#                                           # and the pairing code carries the model
+#                                           # you named.
+#
 # Information:
 #   bash conduck-connect.sh --help            # show this complete public command reference
 #   bash conduck-connect.sh --version         # print the connector version and exit

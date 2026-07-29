@@ -167,6 +167,36 @@ snapshot_port() { # snapshot_port <port> <verb> [role] — record prior state + 
   else APPLIED+=("$p"$'\t'"$verb"$'\t'"${t:-EMPTY}"); fi
 }
 
+# Offer the higher-rights retry of a Tailscale command that just failed, and hand
+# it over for the user to run. Three states, because an empty `priv_prefix` means
+# two OPPOSITE things:
+#   sudo/doas present — offer the prefixed retry (the common case).
+#   already root      — there are no higher rights left to try, so reprinting the
+#                       identical command the user just watched fail is noise. Say
+#                       so and let the caller's status re-read decide the outcome:
+#                       the command can fail and the state still be right.
+#   neither           — the command is only runnable from a root shell. Print it
+#                       BARE with that instruction rather than guessing `sudo`: a
+#                       box without the binary answers "command not found", which
+#                       reads as a different fault than the one they have.
+# Never synthesises `su -c`: that assumes `su`, quotes badly around the two-command
+# form, and behaves inconsistently across systems.
+ts_priv_retry() { # ts_priv_retry <why> <bare-command>… -> 0 ran it, 1 declined, 2 no retry exists
+  local why="$1"; shift
+  local priv retry="" c
+  priv=$(priv_prefix)
+  if [ -z "$priv" ] && [ "$(id -u 2>/dev/null)" = 0 ]; then
+    warn "This shell is already root, so there are no higher rights to retry with — Tailscale itself refused it."
+    return 2
+  fi
+  for c in "$@"; do
+    [ -n "$c" ] || continue
+    retry="${retry:+$retry; }${priv:+$priv }$c"
+  done
+  [ -n "$priv" ] || why="$why This shell is not root and has neither sudo nor doas, so run it from a root shell."
+  print_and_wait "$why" "$retry"
+}
+
 # Run a serve/funnel mapping, then CONFIRM it actually took (never trust Enter).
 tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/false> <role>
   local httpsport="$1" localport="$2" funnel="$3" role="$4"
@@ -202,10 +232,17 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     snapshot_port "$httpsport" "$verb" "$role"
     if $demote; then tailscale funnel --https="$httpsport" off 2>/dev/null || true; fi
     $cmd || {
-      warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
-      local fallback="sudo $cmd"
-      $demote && fallback="sudo $demote_cmd; sudo $cmd"
-      print_and_wait "Tailscale serve/funnel often needs sudo (or operator rights)." "$fallback" || { return 1; }
+      warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
+      local retry_rc=0
+      if $demote; then
+        ts_priv_retry "Tailscale serve/funnel often needs operator or root rights." "$demote_cmd" "$cmd" || retry_rc=$?
+      else
+        ts_priv_retry "Tailscale serve/funnel often needs operator or root rights." "$cmd" || retry_rc=$?
+      fi
+      # 1 = the user declined the retry, so stop. 2 = a root shell had no retry to
+      # decline; fall through to the confirm below, which is the only thing that
+      # can tell a refused command from a refused-but-already-correct state.
+      [ "$retry_rc" = 1 ] && return 1
     }
   else
     return 1
@@ -268,9 +305,9 @@ ts_unmap() { # ts_unmap <port> <verb>
   mutate_guard "remove the old $verb mapping on port $port" || return 1
   snapshot_port "$port" "$verb" file        # record (in FS_APPLIED) so cleanup can restore it
   tailscale "$verb" --https="$port" off || {
-    warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
-    print_and_wait "Removing a Tailscale mapping often needs sudo (or operator rights)." \
-      "sudo tailscale $verb --https=$port off" || true
+    warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
+    ts_priv_retry "Removing a Tailscale mapping often needs operator or root rights." \
+      "tailscale $verb --https=$port off" || true
   }
   # FAIL CLOSED: only claim removal a status re-parse can prove.
   ts_targets
@@ -399,9 +436,9 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
     RESERVED_PORTS="$RESERVED_PORTS$rport "
     if ! { tailscale funnel --https="$rport" off \
            && tailscale serve --https="$rport" off; }; then
-      warn "Tailscale refused that — often missing rights (sudo), or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
-      print_and_wait "Removing a public Funnel often needs sudo (or operator rights)." \
-        "sudo $off_cmd; sudo tailscale serve --https=$rport off" || true
+      warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
+      ts_priv_retry "Removing a public Funnel often needs operator or root rights." \
+        "$off_cmd" "tailscale serve --https=$rport off" || true
     fi
     # FAIL CLOSED: an unreadable status is NOT proof of removal.
     ts_targets
@@ -522,9 +559,14 @@ choose_exposure() {
       if [ -z "$(tailscale_dns_name)" ]; then
         say ""
         warn "Tailscale is installed but not logged in on this machine."
-        warn "Run 'sudo tailscale up' to connect it to your tailnet (your private Tailscale"
+        # Unlike the three failure handlers, `tailscale up` has NOT been tried yet,
+        # so a bare command is the right print when this shell is already root.
+        local up_priv; up_priv=$(priv_prefix)
+        warn "Run '${up_priv:+$up_priv }tailscale up' to connect it to your tailnet (your private Tailscale"
         warn "network) — it opens a browser link to sign in the first time. Then re-run this"
         warn "script; it picks up where you left off."
+        [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$up_priv" ] \
+          || note "This shell is not root and has neither sudo nor doas — run that from a root shell."
         exit 0
       fi
       keyless_public_guard

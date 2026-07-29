@@ -1,7 +1,7 @@
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.3). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.4). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -40,7 +40,7 @@
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.3 harness=<ver>
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.4 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN> history_image=<…>
 #     stream=<…> image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
 #     file_transport=<…> file_access=<…> file_e2e=<…>
@@ -64,7 +64,7 @@
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.3"
+DOCTOR_CONTRACT_REV="1.4"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
@@ -212,6 +212,94 @@ doctor_curl_negauth() { # doctor_curl_negauth <none|wrong> <curl args…>
   fi
 }
 
+# Does an auth rejection on THIS route poison the connection it answered on?
+# An adapter that replies 401 WITHOUT consuming the request body leaves those
+# bytes in the socket; on a persistent HTTP/1.1 connection the server then
+# reads them as the start of the NEXT request and answers 400 (or 414/431/
+# 501/505, depending on its parser) to whatever comes after. RFC 9112 is
+# explicit: a rejecting response must still consume the body, or close the
+# connection. Three independently built adapters shipped exactly this bug.
+#
+# The probe: two identical wrong-token requests ride ONE curl invocation joined
+# by `--next`, so curl reuses a single connection. Echoes
+# "<status-1> <status-2> <new-connections-on-2>". That last field is the
+# load-bearing evidence — 0 means curl really did reuse the connection, 1 means
+# it opened a fresh one (e.g. because the server correctly answered
+# `Connection: close`, or the pooled connection was dead), and a differing
+# second status then proves nothing at all. The caller reads all three; this
+# function makes no claim.
+#
+# `--next` RESETS every per-transfer option, so each half repeats its own
+# `-sS`/`--http1.1`/`--max-time`/`--noproxy`/headers; only `-q` is global and
+# has to stay first. Plain curl, never curl_gw — the REAL token must never ride
+# an auth-negative probe; the wrong token is the same fixed harmless literal
+# doctor_curl_negauth sends. `--http1.1` is pinned because HTTP/2 frames bodies
+# and cannot show this failure at all. Short timeouts: this is an explanatory
+# probe fired after an already-answered request, not another minute of waiting.
+doctor_desync_pair() { # doctor_desync_pair <curl args addressing the route…>
+  curl -q -sS --http1.1 --max-time 10 --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" \
+       -o /dev/null -w '%{http_code} ' "$@" \
+    --next -sS --http1.1 --max-time 10 --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" \
+       -o /dev/null -w '%{http_code} %{num_connects}' "$@" 2>/dev/null
+}
+
+# The undrained-body reading of a WRONG-token answer that isn't 401. This is
+# the single most misread verdict in the whole check: the message ("HTTP 400,
+# the contract pins 401") is literally true and causally wrong, and every
+# builder who hit it went hunting through a token comparison that was fine.
+# Only a route that CARRIES a body can leave bytes behind, so the models GET
+# never asks. Diagnostic only — d_say lines under the caller's single d_bad,
+# so check counts and the machine summary are untouched.
+#
+# Three honest outcomes, never one guess: the pair reproduced it on a proven
+# reused connection (say so plainly) · the pair's first request answered 401
+# where the standalone one answered $code, so the answer is not stable (report
+# that, and where to look) · the status repeats (their auth path really does
+# answer it — keep the drain theory to one hedged sentence).
+doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> <curl args…>
+  local id="$1" code="$2" a has_body=false desynced=false pair first second connects rest; shift 2
+  for a in "$@"; do
+    if [ "$a" = "-d" ]; then has_body=true; break; fi
+  done
+  $has_body || return 0
+  # Parse-level statuses only. A 403/405/429 is plausible middleware, not a
+  # desynced request stream, and guessing at those would just relocate the
+  # wild-goose chase.
+  case "$code" in 400|414|431|501|505) ;; *) return 0 ;; esac
+  pair=$(doctor_desync_pair "$@") || pair=""
+  first="${pair%% *}"; rest="${pair#* }"
+  second="${rest%% *}"; connects="${rest##* }"
+  # A differing second status only counts as evidence when curl proves it did
+  # NOT open a new connection (connects=0) and the difference is parse-level.
+  if [ "$first" = "401" ] && [ "$connects" = "0" ]; then
+    case "$second" in 400|414|431|501|505) desynced=true ;; esac
+  fi
+  if $desynced; then
+    d_say "$id" "(a follow-up probe got 401, then HTTP $second for the SAME request on the SAME reused"
+    d_say "$id" " connection — that is the signature of an undrained request body, not of a broken token"
+    d_say "$id" " check. A response that REJECTS a request must still consume that request's body (read"
+    d_say "$id" " the Content-Length bytes, drain the chunked stream) or answer \"Connection: close\" and"
+    d_say "$id" " close: whatever is left in the socket gets read as the start of the NEXT request, and"
+    d_say "$id" " that is what answered $second. Conduck reuses connections and so does any reverse proxy"
+    d_say "$id" " in front of you, so this breaks real turns — not just this check.)"
+  elif [ "$first" = "401" ]; then
+    d_say "$id" "(the identical probe answered 401 a moment later, so HTTP $code is not a stable answer from"
+    d_say "$id" " your auth code — check the path before you check the comparison. The usual cause is a 401"
+    d_say "$id" " that answers WITHOUT consuming the request body: those bytes stay in the socket and the"
+    d_say "$id" " next request on that kept-alive connection is parsed starting mid-body. A reverse proxy"
+    d_say "$id" " pooling upstream connections shows exactly this — which is why it can pass against"
+    d_say "$id" " http://127.0.0.1:<port> and fail through your HTTPS front. Compare those two runs.)"
+  else
+    d_say "$id" "(HTTP $code repeats on a fresh connection, so this really does look like your auth path"
+    d_say "$id" " answering — the contract wants 401 on both the missing and the wrong token. If it turns"
+    d_say "$id" " out to reproduce ONLY through your HTTPS front and not against http://127.0.0.1:<port>,"
+    d_say "$id" " suspect the other cause instead: a 401 that never consumes the request body leaves those"
+    d_say "$id" " bytes to be read as the next request on a pooled connection.)"
+  fi
+}
+
 # Check 1 — GET /v1/models with the REAL token: reachability + the canonical
 # envelope, via the same models_is_json the wizard trusts (the script must never
 # be laxer than the app it green-lights for). rc 1 = transport/status trouble →
@@ -314,7 +402,8 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
     200) d_bad "${idp}_WRONG" "auth ($route): WRONG token → 200 — the token isn't actually compared"
          d_say "${idp}_WRONG" "(compare byte-for-byte against the token you issued — e.g. hmac.compare_digest in Python)" ;;
     ""|000) d_bad "${idp}_WRONG" "auth ($route): WRONG token — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
-    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)" ;;
+    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)"
+         doctor_auth_wrong_diagnose "${idp}_WRONG" "$code" "$@" ;;
   esac
 }
 
@@ -322,10 +411,12 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
 # Testing only /v1/models would green-light a server that gates its model list
 # but leaves the tool-running /v1/chat/completions wide open: the exact hole
 # this check exists to catch. So both routes are probed. The chat probe carries
-# a minimal body (auth is meant to reject BEFORE the body is read); if a
-# vulnerable server instead RUNS the agent on the unauthenticated request, the
-# probe still fails — either 200 (caught) or a >30s timeout reported as a
-# failure (fail-safe, never a green pass).
+# a minimal body (auth is meant to reject before that body is PROCESSED — the
+# bytes must still be consumed off the socket, or the connection closed; see
+# doctor_desync_pair for what skipping that costs). If a vulnerable server
+# instead RUNS the agent on the unauthenticated request, the probe still fails
+# — either 200 (caught) or a >30s timeout reported as a failure (fail-safe,
+# never a green pass).
 doctor_auth_checks() {
   if [ "$GW_AUTH" != "bearer" ]; then
     d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
@@ -345,19 +436,50 @@ doctor_auth_checks() {
 # content-type / timing / BODY in DCC_* globals (memory only: the body is
 # never printed — these probes may run against a live personal agent, and this
 # script never logs message content; graders emit verdict words and lengths).
-DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
+#
+# DCC_CURL_RC keeps curl's own exit code when the transfer never completed — a
+# dead peer and a slow one are the same "no reply" to a caller that only sees
+# rc 1, and that lossy bucket is exactly how an adapter killed mid-turn reads
+# as a network fault. It is the WRAPPER's code: curl_gw returns 2 on its own
+# credential guard before curl ever runs (preflight makes that unreachable
+# here, but the code is not curl's to interpret if it ever fires).
+DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
 doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 iff transfer completed
   local out tail_ max_time="${2:-300}"
-  DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""
+  DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
+  # `out=$(…) || { rc=$?; }` on purpose: inside `if ! out=$(…); then` the `$?`
+  # is the NEGATED status (0), and the real code would be lost.
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
         --max-time "$max_time" -H "Accept: application/json" \
-        -H "Content-Type: application/json" -d "$1" 2>/dev/null) || return 1
+        -H "Content-Type: application/json" -d "$1" 2>/dev/null) || { DCC_CURL_RC=$?; return 1; }
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
   DCC_TIME="${tail_%% *}"
   [ "$tail_" != "${tail_#* }" ] && DCC_CT="${tail_#* }"
   DCC_TIME=$(printf '%s' "$DCC_TIME" | awk '{printf "%.1f", $1}' 2>/dev/null)
   return 0
+}
+
+# What curl's exit code says about a transfer that never completed, in the
+# words a builder can act on. Deliberately hedged where curl is: 7 covers a
+# refused connection AND routing/firewall dead ends, and 52/56/18 are one story
+# told at three moments (peer gone before any reply · connection broken while
+# reading · reply cut off mid-body) — which one appears is decided by timing,
+# TLS and any proxy, so none of them PROVES a dead process on its own. The
+# caller's hint names that case; this line only reports what happened.
+doctor_transfer_reason() { # doctor_transfer_reason <curl exit code>
+  case "$1" in
+    6)  printf 'the hostname did not resolve' ;;
+    7)  printf 'could not connect to that address (refused, or blocked on the way)' ;;
+    18) printf 'the reply stopped mid-body' ;;
+    28) printf 'no complete answer within the time limit' ;;
+    35) printf 'the TLS connection failed' ;;
+    52) printf 'the server closed the connection without sending a reply' ;;
+    55) printf 'the connection broke while the request was still being sent' ;;
+    56) printf 'the connection broke while the reply was being read' ;;
+    60) printf 'this machine does not trust the server certificate' ;;
+    *)  printf 'transfer failed (curl exit %s)' "$1" ;;
+  esac
 }
 
 # doctor_chat_eval grades the reply in DCC_* against the contract's response
@@ -375,7 +497,9 @@ doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}" res verdict detail
   DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
   if ! doctor_chat_request "$1"; then
-    DCE_REASON="transfer failed (timed out or the connection dropped)"; DCE_HINT="transfer"; return 1
+    # DCE_HINT stays exactly "transfer" — the file lane keys on that literal to
+    # decide it may not grade the lane. The sub-case lives in DCC_CURL_RC.
+    DCE_REASON=$(doctor_transfer_reason "$DCC_CURL_RC"); DCE_HINT="transfer"; return 1
   fi
   # SSE despite a synchronous request is its own diagnosis — a JSON parse
   # error would bury the actual mistake.
@@ -453,7 +577,41 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
                 d_say "$id" " Conduck never accepts SSE; it may set the flag, but reads a synchronous reply)" ;;
         *)      d_say "$id" "(when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)" ;;
       esac ;;
+    transfer)
+      case "$DCC_CURL_RC" in
+        7|18|52|55|56)
+          d_say "$id" "(from out here a dead adapter and a broken network look identical — and it is usually"
+          d_say "$id" " the adapter: backgrounded from a terminal it dies with that shell or gets reaped"
+          d_say "$id" " mid-turn, and every later check then reports transport trouble that has nothing to do"
+          d_say "$id" " with the contract. Check it is still running, then keep it under something that"
+          d_say "$id" " restarts it — systemd, launchd, pm2, docker restart=always — before re-running me.)" ;;
+        28)
+          d_say "$id" "(nothing complete came back before the deadline — either the turn genuinely runs longer"
+          d_say "$id" " than that, or the adapter is wedged on this request. Its own log holds the request it"
+          d_say "$id" " never finished; Conduck gives up too, so a turn this slow fails in the app as well.)" ;;
+        35|60)
+          d_say "$id" "(the HTTPS front refused the connection, so the adapter behind it was never reached —"
+          d_say "$id" " run me ON the server against http://127.0.0.1:<port> to test the adapter itself first)" ;;
+      esac ;;
     http)
+      # A 5xx from a front-end proxy is about that proxy's UPSTREAM, never about
+      # the contract rule this request was testing — so it pre-empts the
+      # per-kind hints. Otherwise a dead adapter during the history turn reads
+      # as "you rejected the historical image", which is a wild-goose chase.
+      case "$DCC_CODE" in
+        502|503)
+          d_say "$id" "(a $DCC_CODE is the HTTPS front talking, not your adapter: the front is up but got"
+          d_say "$id" " nothing usable out of the adapter behind it. Most often that process is gone —"
+          d_say "$id" " backgrounded with no supervisor, or crashed on this turn — or it is bound to a"
+          d_say "$id" " different port than the front sends to; an overloaded or restarting adapter looks"
+          d_say "$id" " the same. Check it is running and supervised, then re-run me.)"
+          return 1 ;;
+        504)
+          d_say "$id" "(a 504 is the HTTPS front giving up on your adapter. Either the turn outruns the"
+          d_say "$id" " front's proxy timeout — agent turns are slow, raise it — or the adapter is wedged"
+          d_say "$id" " on this request and its own log will say so.)"
+          return 1 ;;
+      esac
       case "$kind" in
         history)
           d_say "$id" "(the contract forbids rejecting a request because of an image in an EARLIER message —"
@@ -550,10 +708,12 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 # ~1-in-9000 guess odds are accepted. The reply's content is never printed.
 # Build the semantic image probe (shared by --deep and --check-server): sets
 # IPG_CODE (the 4 digits) and IPG_PAYLOAD (the chat request carrying the PNG).
-# $CONDUCK_PROBE_MODEL (optional, exported by the caller) adds a "model" field
-# — the compat probe threads the advertised id through once it learns the
-# server requires one; the doctor never sets it (contract: absent model must
-# be tolerated).
+# $CONDUCK_PROBE_MODEL adds a "model" field when it is non-empty. EVERY caller
+# sets it explicitly, because the python reads the ENVIRONMENT: a caller that
+# merely omits it inherits whatever the operator happened to export, which
+# silently changes the request being graded. The compat probe threads the
+# advertised id through once it learns the server requires one; the doctor sets
+# it EMPTY (contract: an absent model must be tolerated).
 image_probe_gen() {
   local gen
   gen=$(python3 -c '
@@ -600,7 +760,15 @@ print(json.dumps(req))') \
 
 doctor_image_input_check() {
   local id="IMAGE_INPUT" code payload
-  image_probe_gen
+  # Shadowed, not inherited. $CONDUCK_PROBE_MODEL is internal plumbing for
+  # handing a value to python without argv, and the probe's python reads the
+  # ENVIRONMENT — so a variable the operator happens to have exported would
+  # silently put a "model" field in this request. The adapter contract makes
+  # tolerating an ABSENT model a REQUIREMENT, so a model here grades a different
+  # rule than the one this check exists to grade, and the adapter author would
+  # have no way to see why the verdict moved. --check-server sets it explicitly
+  # at its own call site; this one explicitly does not.
+  CONDUCK_PROBE_MODEL="" image_probe_gen
   code="$IPG_CODE"; payload="$IPG_PAYLOAD"
   if doctor_chat_eval "$payload" "$code"; then
     if [ "$DCE_TOKEN" = "yes" ]; then

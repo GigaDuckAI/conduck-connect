@@ -13,6 +13,11 @@
 # (when ids exist), history-image tolerance (the poisoned-chat rule). The
 # image-input capability probe INFORMS but never fails — the app can't detect
 # a silently-dropped image either. No negative-auth request is ever sent.
+# Every verdict describes ONE model path — the operator's
+# $CONDUCK_CHECK_SERVER_MODEL, else the first advertised id, else the server's
+# model-less default — and the transcript says which, because on a fan-out
+# gateway the list order is arbitrary and a per-model capability graded as a
+# server property flips the same server between PASS and FAIL.
 # Semantic compatibility (client-owned history replay) is INVISIBLE here: a
 # stateful server passes this probe and still double-counts context — that
 # dimension needs its own test.
@@ -20,6 +25,24 @@ COMPAT_RAN=false
 COMPAT_CHECKS=0; COMPAT_FAILS=0
 COMPAT_MODELS="NOT_RUN"; COMPAT_CHAT="NOT_RUN"; COMPAT_HISTORY_IMAGE="NOT_RUN"
 COMPAT_IMAGE_INPUT="NOT_RUN"; COMPAT_MODEL_FIELD="NOT_RUN"
+
+# WHICH model these verdicts describe. A fan-out gateway is one endpoint in
+# front of hundreds of upstream models, and /v1/models lists them in an order
+# that has nothing to do with capability — so the first advertised id is a
+# SAMPLE, and a verdict reached on it is a fact about that route, never a grade
+# for the server as a whole. Without this the same server flips PASS↔FAIL purely
+# on the order it happens to list its models, which is how a working gateway
+# gets told it is broken.
+#   $CONDUCK_CHECK_SERVER_MODEL is the operator's override — the ONE public
+#   model input; the internal $CONDUCK_CHECK_MODEL/$CONDUCK_PROBE_MODEL names
+#   are command-scoped plumbing for handing a value to python without argv, and
+#   are deliberately not user knobs.
+# COMPAT_MODEL_ID doubles as the pairing answer: a setup handoff must pair
+# EXACTLY the model that was proven, and "" (the server_default case) correctly
+# means "leave the app's model selection open".
+COMPAT_WANTED_MODEL=""   # the operator's $CONDUCK_CHECK_SERVER_MODEL, verbatim
+COMPAT_MODEL_ID=""       # the id every model-bearing probe named ("" = none sent)
+COMPAT_MODEL_SOURCE="server_default"  # explicit | first_advertised | server_default
 
 c_ok()  { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); ok "[$id] $*"; }
 c_bad() { local id="$1"; shift; COMPAT_CHECKS=$((COMPAT_CHECKS+1)); COMPAT_FAILS=$((COMPAT_FAILS+1)); bad "[$id] $*"; }
@@ -111,7 +134,10 @@ app_chat_eval() { # app_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}"
   CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
   if ! doctor_chat_request "$1"; then
-    CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
+    # "timed out or the connection dropped" makes the operator guess between a
+    # dead host, a refused port, a TLS failure and a slow agent. curl already
+    # knows which; doctor_chat_request leaves its exit code in DCC_CURL_RC.
+    CCE_REASON=$(doctor_transfer_reason "$DCC_CURL_RC"); return 1
   fi
   app_chat_loaded_eval "$exp"
 }
@@ -126,6 +152,27 @@ compat_image_declined_detectable() {
   [ "$CCE_WIRE_CODE" = "image_unsupported" ] && return 0
   [ "$DCC_CODE" = "413" ] && return 0
   case "$DCC_CODE" in 400|404) ;; *) return 1 ;; esac
+  compat_image_message_matches
+}
+
+# Why did an image-bearing turn fail? The classifier above answers "would the app
+# recognize this refusal", which is the right question for the capability probe
+# and the wrong one for a history-image failure: it folds EVERY 413 into
+# "declined", and 413 means the payload was too big, not that the engine is
+# text-only. The two need different advice, so they get separated here.
+compat_image_failure_kind() { # -> image_unsupported | too_large | other
+  if [ "$CCE_WIRE_CODE" = "image_unsupported" ]; then printf 'image_unsupported\n'; return 0; fi
+  if [ "$DCC_CODE" = "413" ]; then printf 'too_large\n'; return 0; fi
+  case "$DCC_CODE" in
+    400|404) compat_image_message_matches && { printf 'image_unsupported\n'; return 0; } ;;
+  esac
+  printf 'other\n'
+}
+
+# The app's four vision regexes, applied to error.message when the OpenAI
+# envelope is present (the app deliberately scopes there to dodge metadata false
+# matches), else to the whole body. Callers own the status gating.
+compat_image_message_matches() {
   printf '%s' "$DCC_BODY" | python3 -c '
 import json, sys, re
 body = sys.stdin.read()
@@ -183,6 +230,8 @@ run_compat() {
   fi
   note "What this can't see: a server that keeps its OWN chat history will pass and still"
   note "double-count context — Conduck resends the full history every turn (client-owned)."
+  note "This grades ONE model path. Set CONDUCK_CHECK_SERVER_MODEL=<id> to grade the model"
+  note "you actually plan to use — otherwise a multi-model server is judged on one sample."
 
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
@@ -216,12 +265,17 @@ run_compat() {
   fi
   TRANSPORT=""
 
+  # Snapshot the operator's model choice ONCE, before any request: the graded
+  # model must never change mid-run, or the verdicts stop describing a single
+  # path and the optional setup handoff can no longer pair what was proven.
+  COMPAT_WANTED_MODEL="${CONDUCK_CHECK_SERVER_MODEL:-}"
+
   head_ "Server check — $GW_URL"
   COMPAT_RAN=true
 
   # -- models: direct-endpoint acceptance from Test Connection ----------------
   local rc=0 secs over
-  models_is_json "$GW_URL" || rc=$?
+  models_is_json "$GW_URL" "$COMPAT_WANTED_MODEL" || rc=$?
   secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
   over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
   if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
@@ -280,6 +334,23 @@ run_compat() {
     exit 1
   fi
 
+  # An explicit model choice is announced BEFORE the first chat turn, so the
+  # verdicts below are read against the right target — and so a typo'd id is
+  # visible as the cause of the failures it is about to produce, rather than
+  # being discovered several red lines later.
+  if [ -n "$COMPAT_WANTED_MODEL" ]; then
+    say ""
+    note "Grading the model you named: '$(safe_display "$COMPAT_WANTED_MODEL" 60)'."
+    if ! $MODELS_WANTED_FOUND; then
+      if [ "${MODELS_ID_COUNT:-0}" = "0" ]; then
+        note "(this server advertises no model ids at all — naming one is the only way to test it)"
+      else
+        note "(that id is NOT among the $MODELS_ID_COUNT this server advertises — check the spelling;"
+        note " grading it anyway, as you asked)"
+      fi
+    fi
+  fi
+
   say ""
   say "  Now the chat turns — graded with the app's actual decoder (empty-string replies are"
   say "  VALID, extra fields like tool_calls are tolerated, Content-Type is never read). Agents"
@@ -293,11 +364,16 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     || die "Could not build the test request (python3 failed)."
   if app_chat_eval "$payload_a"; then a_ok=true; else a_reason="$CCE_REASON"; a_code="$DCC_CODE"; fi
 
-  # One turn WITH the first advertised id (when one exists): the app sends the
-  # model the user picked from THIS server's /v1/models, so named selection
-  # must work too. Also the rescue path for servers that REQUIRE the field.
-  if [ -n "$MODELS_FIRST_ID" ]; then
-    payload_b=$(CONDUCK_CHECK_MODEL="$MODELS_FIRST_ID" python3 -c 'import json, os
+  # One turn WITH a NAMED model: the app sends the model the user picked from
+  # THIS server's /v1/models, so named selection must work too. Also the rescue
+  # path for servers that REQUIRE the field. The operator's explicit choice wins
+  # over the first advertised id — on a fan-out gateway the first id is only a
+  # sample of the roster, and grading it as though it spoke for the server is
+  # what turns a working setup into a FAIL.
+  local named_model="$COMPAT_WANTED_MODEL"
+  [ -n "$named_model" ] || named_model="$MODELS_FIRST_ID"
+  if [ -n "$named_model" ]; then
+    payload_b=$(CONDUCK_CHECK_MODEL="$named_model" python3 -c 'import json, os
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                   "model": os.environ["CONDUCK_CHECK_MODEL"], "stream": False}))') \
       || die "Could not build the test request (python3 failed)."
@@ -333,22 +409,63 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   fi
 
   # -- named selection as its own verdict (when a model id exists) -------------
-  if [ -n "$MODELS_FIRST_ID" ]; then
+  if [ -n "$named_model" ]; then
+    local named_what="the first advertised model id"
+    [ -n "$COMPAT_WANTED_MODEL" ] && named_what="the model you named"
     if [ "$b_ok" = "true" ]; then
-      c_ok SERVER_MODEL_SELECT "the first advertised model id selects (the app sends what the user picked)"
+      c_ok SERVER_MODEL_SELECT "$named_what selects (the app sends what the user picked)"
     else
-      c_bad SERVER_MODEL_SELECT "a request naming the first advertised id fails — $b_reason"
-      c_say SERVER_MODEL_SELECT "(the app's model picker is fed from YOUR /v1/models — a listed id that can't"
-      c_say SERVER_MODEL_SELECT " be used breaks every user who picks it)"
+      c_bad SERVER_MODEL_SELECT "a request naming $named_what fails — $b_reason"
+      if [ -n "$COMPAT_WANTED_MODEL" ] && ! $MODELS_WANTED_FOUND; then
+        # Don't blame the server's picker for an id the server never offered.
+        c_say SERVER_MODEL_SELECT "(that id isn't in this server's /v1/models list, so this may just be a typo —"
+        c_say SERVER_MODEL_SELECT " unset CONDUCK_CHECK_SERVER_MODEL to grade the first id the server advertises)"
+      else
+        c_say SERVER_MODEL_SELECT "(the app's model picker is fed from YOUR /v1/models — a listed id that can't"
+        c_say SERVER_MODEL_SELECT " be used breaks every user who picks it)"
+      fi
     fi
   fi
 
-  # -- history image: the poisoned-chat rule (a REAL app requirement) ----------
-  # Once the server is known to REQUIRE a model, every later probe carries the
-  # advertised id — the app sends the user's configured model on EVERY turn,
-  # so a model-less later probe would fail a server real app traffic works on.
+  # -- which model the remaining probes grade, said out loud ------------------
+  # An explicit choice always wins. Otherwise: once the server is known to
+  # REQUIRE a model, every later probe carries the advertised id — the app sends
+  # the user's configured model on EVERY turn, so a model-less later probe would
+  # fail a server real app traffic works on. A server that accepts a model-less
+  # request keeps getting model-less probes, which grade its DEFAULT route.
   local probe_model=""
-  [ "$COMPAT_MODEL_FIELD" = "required" ] && probe_model="$MODELS_FIRST_ID"
+  if [ -n "$COMPAT_WANTED_MODEL" ]; then
+    probe_model="$COMPAT_WANTED_MODEL"; COMPAT_MODEL_SOURCE="explicit"
+  elif [ "$COMPAT_MODEL_FIELD" = "required" ]; then
+    probe_model="$MODELS_FIRST_ID"; COMPAT_MODEL_SOURCE="first_advertised"
+  else
+    COMPAT_MODEL_SOURCE="server_default"
+  fi
+  COMPAT_MODEL_ID="$probe_model"
+  # The explicit case already announced itself before the first chat turn.
+  case "$COMPAT_MODEL_SOURCE" in
+    explicit) ;;
+    *) say "" ;;
+  esac
+  case "$COMPAT_MODEL_SOURCE" in
+    explicit) ;;
+    first_advertised)
+      if [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+        note "Grading model '$(safe_display "$COMPAT_MODEL_ID" 60)' — the FIRST of $MODELS_ID_COUNT ids this server"
+        note "advertises, picked by ITS list order, not by capability. The rest are untested, so a"
+        note "failure below is a fact about THIS model's route, not a grade for the whole server."
+        note "Re-run with CONDUCK_CHECK_SERVER_MODEL=<id> to grade the model you plan to use."
+      else
+        note "Grading model '$(safe_display "$COMPAT_MODEL_ID" 60)' — the only id this server advertises."
+      fi
+      ;;
+    *)
+      note "The probes below send NO \"model\" field, so they grade whatever this server routes to"
+      note "by default — and nothing here proves two model-less requests reach the same model."
+      ;;
+  esac
+
+  # -- history image: the poisoned-chat rule (a REAL app requirement) ----------
   local payload_h
   payload_h=$(CONDUCK_PROBE_MODEL="$probe_model" python3 -c 'import json, os, zlib, struct, base64
 def chunk(t, d):
@@ -373,7 +490,23 @@ print(json.dumps(req))') \
     COMPAT_HISTORY_IMAGE="FAIL"
     c_bad SERVER_HISTORY_IMAGE "history image — $CCE_REASON"
     c_say SERVER_HISTORY_IMAGE "(Conduck resends the full history, so ONE photo anywhere in a conversation would"
-    c_say SERVER_HISTORY_IMAGE " permanently break every later turn of that chat in the app)"
+    c_say SERVER_HISTORY_IMAGE " permanently break every later turn of that chat — on the route just graded)"
+    # Name WHY, from the server's own answer, while DCC_*/CCE_* still hold it.
+    # This explains the failure; it never excuses it. A route that cannot read
+    # images is still required to drop or describe an OLD one and answer the new
+    # text turn, so this stays a real FAIL either way.
+    case "$(compat_image_failure_kind)" in
+      image_unsupported)
+        c_say SERVER_HISTORY_IMAGE "The server says this engine can't read images at all. That still fails: a route"
+        c_say SERVER_HISTORY_IMAGE "that can't see pictures is expected to ignore an OLD one and answer the new text." ;;
+      too_large)
+        c_say SERVER_HISTORY_IMAGE "HTTP 413 on a 1×1 PNG points at a request-size limit in front of the server, not"
+        c_say SERVER_HISTORY_IMAGE "at the engine — check the reverse proxy's max body size." ;;
+    esac
+    if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+      c_say SERVER_HISTORY_IMAGE "Only '$(safe_display "$COMPAT_MODEL_ID" 60)' was tested — the first of $MODELS_ID_COUNT advertised ids."
+      c_say SERVER_HISTORY_IMAGE "Before judging the server, re-run with CONDUCK_CHECK_SERVER_MODEL=<id> on another."
+    fi
   fi
 
   # -- image input: capability, informational — never fails the wire verdict ---
@@ -393,27 +526,57 @@ print(json.dumps(req))') \
   elif compat_image_declined_detectable; then
     COMPAT_IMAGE_INPUT="DECLINED"
     say "  ${GREEN}•${RESET} image input: DECLINED, detectably — the app recognizes this refusal and shows its"
-    say "    pictures-unsupported message (text chats are unaffected)"
+    if [ "$COMPAT_HISTORY_IMAGE" = "FAIL" ]; then
+      # "text chats are unaffected" is the normal case and a lie here: this route
+      # already failed the history-image turn, so a photo poisons the whole chat.
+      say "    pictures-unsupported message — but see the history-image failure above: on this"
+      say "    route a photo also breaks the TEXT turns that follow it in the same chat."
+    else
+      say "    pictures-unsupported message (text chats are unaffected)"
+    fi
   else
     COMPAT_IMAGE_INPUT="OPAQUE"
     warn "image input: image turns fail with an error the app can't classify ($CCE_REASON) —"
     say "    users see a generic failure instead of \"pictures aren't supported here\""
   fi
 
+  # One line naming the graded path, on BOTH verdicts. A PASS that reads as a
+  # blanket certificate and a FAIL that reads as a blanket condemnation are the
+  # same bug: neither run tested more than one model.
+  local graded_scope=""
+  case "$COMPAT_MODEL_SOURCE" in
+    explicit)         graded_scope="model '$(safe_display "$COMPAT_MODEL_ID" 60)' (the one you named)" ;;
+    first_advertised) graded_scope="model '$(safe_display "$COMPAT_MODEL_ID" 60)'"
+                      [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null \
+                        && graded_scope="$graded_scope — the first of $MODELS_ID_COUNT advertised, and the only one tested" ;;
+    *)                graded_scope="this server's default route (no \"model\" field was sent)" ;;
+  esac
+
   say ""
   if [ "$COMPAT_FAILS" = "0" ]; then
     ok "Server check: PASS — core text-chat compatibility is green ($COMPAT_CHECKS/$COMPAT_CHECKS wire checks)."
     say "  Image input is separate and informational: ${BOLD}$COMPAT_IMAGE_INPUT${RESET}."
-    say "  Two honest limits: this probe can't see STATEFULNESS (a server that keeps its own"
+    say "  Graded: $graded_scope."
+    say "  Three honest limits: this probe can't see STATEFULNESS (a server that keeps its own"
     say "  history will double-count context — Conduck resends the full history every turn),"
+    say "  it grades ONE model path and says nothing about any other model this server offers,"
     say "  and a pass here does NOT make this server a Conduck adapter (that's ${BOLD}--check-adapter${RESET})."
+    if [ "$COMPAT_MODEL_SOURCE" = "explicit" ]; then
+      # The setup handoff pairs $COMPAT_MODEL_ID — the model this run actually
+      # graded — so a deliberately-graded model is the one that gets carried.
+      note "Continuing into setup? The pairing code carries the model you named here."
+    fi
     if ! interactive_terminal; then
       say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
     fi
     return 0
   fi
   bad "Server check: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
-  say "  The app would hit the same walls. Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
+  say "  The app would hit the same walls on $graded_scope."
+  if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+    say "  That is not yet a verdict on the server: CONDUCK_CHECK_SERVER_MODEL=<id> grades another."
+  fi
+  say "  Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
   say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
   exit 1
 }

@@ -309,6 +309,28 @@ configure_hermes() {
     GW_TOKEN=$(ask_secret "Paste the Hermes API server key (hidden)")
     [ -n "$GW_TOKEN" ] || die "An API key is required for Hermes."
   fi
+
+  # The API server's toolset list decides something no wire check can ever see:
+  # whether this gateway keeps a conversation memory of its own. Hermes's default
+  # api_server bundle carries `memory` and `session_search`, so a Hermes nobody has
+  # narrowed answers a brand-new conversation from facts Conduck never sent it —
+  # double-counting the history Conduck already replays in full, and billing for it
+  # every turn. A gateway in that state passes every check here and in
+  # --check-server. The optional file lane asks the same question later, but most
+  # Hermes users pair for chat and never reach it, so it has to be asked here too.
+  #
+  # LAST in this function on purpose: everything above can die (no ~/.hermes, an
+  # unwritable .env, no key), and editing config.yaml on a run that is about to
+  # abort would leave a change the user never got to use.
+  #
+  # `|| true` is the product decision, not an accident of there being no `set -e`:
+  # this step returns nonzero whenever the scope is not PROVABLY recall-free, which
+  # includes a fresh default install and any config the parser will not guess at.
+  # Report and offer, never block — a gateway that chats perfectly well is still
+  # pairable, and refusing to pair it is the founder's call, not this step's.
+  # --dry-run and --reuse-only report and change nothing.
+  hermes_recall_scope_step "[web]" || true
+
   GW_AUTH="bearer"
 }
 

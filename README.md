@@ -135,6 +135,20 @@ The diagnostic deliberately does not follow HTTP redirects or forward your crede
 
 Four wire checks cover core text-chat compatibility: models envelope + 15-second limit, chat decode, advertised-model selection, and history-image tolerance. The image-capability result (`VERIFIED` / `DECLINED` / `IGNORED` / `OPAQUE`) is separate and informational; it never changes the core PASS/FAIL verdict. Servers that require a `model` field pass with a `model=required` note—in the app, pick a model in gateway settings. Android is still a work-in-progress client and is not the compatibility authority yet.
 
+### Checking a specific model (`CONDUCK_CHECK_SERVER_MODEL`)
+
+The check first asks your server with no model name at all, and then — whenever one is available — asks again naming a model. Left to itself, the one it names is whichever id `/v1/models` happens to return first, and that order has nothing to do with what any of those models can do. On a server that fronts many models that has a sharp edge: the same server can come back FAIL or PASS purely on the order it lists them, so the verdict you get may be about a model you were never going to use.
+
+Name the one you actually plan to use:
+
+```bash
+CONDUCK_CHECK_SERVER_MODEL='llama-3.3-70b' bash conduck-connect.sh --check-server http://127.0.0.1:4000
+```
+
+Every request in that run that carries a model name then carries that one, and the transcript says which model each verdict describes. The requests that deliberately test model-less behavior still leave it out — that is a separate thing worth knowing about your server. An id your server does not advertise is checked anyway; you just get a note that it is not in the list, in case it is a typo. Leave the variable unset and nothing about the run changes: it falls back to the first advertised id, or to whatever your server routes to by default when it answers without a model field at all.
+
+If you continue into setup, the pairing code keeps the routing the check actually proved — the model you named, or no model name at all when what got tested was the server's own default route.
+
 The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_SERVER schema=2 … wire=PASS|FAIL …`); exit `0` means core text-chat compatibility is green. It does **not** certify image understanding, public reachability, HTTPS certificate trust, or make the server a Conduck adapter (that is `--check-adapter`). Statefulness is also invisible on the wire: Conduck resends the full conversation every turn, so a server that keeps its own history will silently double-count context.
 
 ## Trust posture
