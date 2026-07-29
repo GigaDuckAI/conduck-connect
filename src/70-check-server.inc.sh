@@ -566,6 +566,20 @@ print(json.dumps(req))') \
       # graded — so a deliberately-graded model is the one that gets carried.
       note "Continuing into setup? The pairing code carries the model you named here."
     fi
+    # Statefulness is invisible ON THE WIRE, not always invisible: when the address
+    # that just passed matches this machine's own Hermes API-server settings, the
+    # answer is readable from ~/.hermes/config.yaml. Latched here — and only on a
+    # PASS of THIS check, never from --check-adapter — because the handoff clears
+    # $GW_URL to rebuild it as an HTTPS address, so this is the last point at which
+    # the graded address still exists to be attributed.
+    if hermes_settings_match_url "$GW_URL"; then
+      CHECK_HANDOFF_LOCAL_HERMES=true
+      if interactive_terminal; then
+        say "  On statefulness I am not fully blind here: this address matches this machine's Hermes"
+        say "  API-server settings, so continuing into setup reads that install's own config and says"
+        say "  whether this gateway keeps a memory of its own."
+      fi
+    fi
     if ! interactive_terminal; then
       say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
     fi

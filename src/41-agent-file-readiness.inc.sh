@@ -883,7 +883,14 @@ hermes_recall_report() {
     default-wide)
       warn "This config names no API-server toolset, so Hermes uses its default bundle — memory and session search included." ;;
     *)
-      warn "I cannot read this config's API-server toolset, so I cannot tell whether Hermes keeps its own memory." ;;
+      # `classify_recall` leaves $items non-empty here only when it read the list
+      # fine but recognised none of the names — a different problem, and a
+      # different fix, from a list it could not read at all.
+      if [ -n "$items" ]; then
+        warn "I can read this API-server list, but I do not recognise ${items// /, } — so I cannot tell whether it carries Hermes's own memory."
+      else
+        warn "I cannot read this config's API-server toolset, so I cannot tell whether Hermes keeps its own memory."
+      fi ;;
   esac
   say "  Conduck sends the whole conversation every turn and expects the gateway to keep"
   say "  nothing of its own. One that remembers answers from things you never sent it, and"

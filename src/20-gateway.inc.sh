@@ -10,6 +10,16 @@ GW_TOKEN=""
 GW_MODEL=""        # optional explicit model (generic servers like vLLM/Ollama)
 GW_URL=""          # final https URL
 
+# A --check-server handoff pairs the ONE address the check graded, so its gateway
+# kind is "custom" no matter what answered — see prepare_setup_from_check. This
+# latch carries the single Hermes fact that survives that decision: the checked
+# address matched this machine's own Hermes API-server settings. It is set only
+# by a PASSING --check-server (never by --check-adapter, which grades a different
+# contract), and it only ever unlocks a report and an offer. It must never stand
+# in for GW_KIND: an address match is not authority to run Hermes-specific
+# configuration steps the check never verified.
+CHECK_HANDOFF_LOCAL_HERMES=false
+
 detect_gateway() {
   head_ "Step 1 — find your gateway"
   # Legacy --generic: the caller already declared "a server I configured myself",
@@ -241,10 +251,14 @@ configure_hermes() {
 
   # 8645 is Hermes's OTHER OpenAI door: the tool-less `hermes proxy`. It chats
   # fine, so nothing downstream would fail — the user would just silently lose
-  # tools, skills, and memory. Challenge it here; verification can't catch it.
+  # tools and skills. Challenge it here; verification can't catch it.
+  # Hermes's own recall is deliberately NOT in that list: Conduck replays the
+  # whole conversation every turn, so a gateway-side memory is not a capability
+  # this pairing wants on either port, and naming it as one here would sell the
+  # 8642 API server on the very thing the API-server scope step offers to remove.
   if [ "$GW_LOCAL_PORT" = "8645" ]; then
     warn "API_SERVER_PORT is 8645 — the port of the tool-less 'hermes proxy', not the full-agent API server (default 8642)."
-    say  "  Both can chat, but only the full-agent API server carries Hermes's tools, skills, and memory."
+    say  "  Both can chat, but only the full-agent API server carries Hermes's tools and skills."
     if $DRY_RUN; then
       note "(dry-run: a real run asks whether to continue with 8645)"
     elif $REUSE_ONLY; then
@@ -310,28 +324,138 @@ configure_hermes() {
     [ -n "$GW_TOKEN" ] || die "An API key is required for Hermes."
   fi
 
-  # The API server's toolset list decides something no wire check can ever see:
-  # whether this gateway keeps a conversation memory of its own. Hermes's default
-  # api_server bundle carries `memory` and `session_search`, so a Hermes nobody has
-  # narrowed answers a brand-new conversation from facts Conduck never sent it —
-  # double-counting the history Conduck already replays in full, and billing for it
-  # every turn. A gateway in that state passes every check here and in
-  # --check-server. The optional file lane asks the same question later, but most
-  # Hermes users pair for chat and never reach it, so it has to be asked here too.
-  #
-  # LAST in this function on purpose: everything above can die (no ~/.hermes, an
-  # unwritable .env, no key), and editing config.yaml on a run that is about to
-  # abort would leave a change the user never got to use.
-  #
-  # `|| true` is the product decision, not an accident of there being no `set -e`:
-  # this step returns nonzero whenever the scope is not PROVABLY recall-free, which
-  # includes a fresh default install and any config the parser will not guess at.
-  # Report and offer, never block — a gateway that chats perfectly well is still
-  # pairable, and refusing to pair it is the founder's call, not this step's.
-  # --dry-run and --reuse-only report and change nothing.
-  hermes_recall_scope_step "[web]" || true
-
   GW_AUTH="bearer"
+
+  # The API-server toolset list decides something no wire check can ever see —
+  # whether this gateway keeps a conversation memory of its own — and it is asked
+  # once per run by hermes_recall_post_file_lane_step, after the optional file lane
+  # has had its say. Deliberately not here: the file lane rewrites the SAME
+  # `platform_toolsets.api_server` line, so settling it in this function edits and
+  # restarts Hermes twice for one line, on a run exposure can still abort.
+}
+
+# --- "is the address I just checked this machine's Hermes?" -------------------
+# Correlation, never identity. Nothing in a static file proves which process owns
+# a listening port: a reverse proxy, a container publishing 8642, or a stale
+# ~/.hermes/.env can all make another engine look like Hermes. So every reachable
+# declaration has to agree, and anything that does not read cleanly answers NO —
+# silence is the safe failure here. Claiming a remote gateway keeps a memory it
+# does not keep is worse than never mentioning it.
+#
+# Deliberately NOT a port test. Requiring the bind address, the port, an enabled
+# API server, and the exact credential the check actually authenticated with
+# means an unrelated service that merely happens to sit on 8642 stays silent.
+hermes_settings_match_url() { # hermes_settings_match_url <checked-url> -> 0 when every declaration agrees
+  # ${HOME:-} on purpose: --check-server is contracted to run in a bare CI shell
+  # that may have no HOME at all, and `set -u` would abort the whole check on an
+  # unset one. An empty HOME simply finds no install, which is the right answer.
+  local url="$1" envf="${HOME:-}/.hermes/.env"
+  local rest hostport host port declared_host declared_port key
+
+  # https means the app is pairing an address off this box (doctor_accept_url only
+  # ever admits plain http toward 127.*/localhost/[::1]), and a tailnet or proxy
+  # hostname in front of this same Hermes is exactly the case that must not be
+  # claimed: from here it is indistinguishable from someone else's gateway.
+  case "$url" in
+    [Hh][Tt][Tt][Pp]://?*) rest="${url#*://}" ;;
+    *) return 1 ;;
+  esac
+  # A base path routes one listener to many services — http://127.0.0.1:8642/other
+  # can be anything at all — so only the bare authority is attributable.
+  hostport="${rest%%/*}"
+  [ "$hostport" = "$rest" ] || return 1
+  case "$hostport" in
+    '['*']'*) host="${hostport%%]*}"; host="${host#\[}"; port="${hostport##*]}"; port="${port#:}" ;;
+    *:*)      host="${hostport%%:*}"; port="${hostport##*:}" ;;
+    *)        host="$hostport"; port="80" ;;
+  esac
+  [ -n "$port" ] || port="80"
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+
+  [ -f "$envf" ] && [ -r "$envf" ] || return 1
+  [ "$(env_get "$envf" "API_SERVER_ENABLED")" = "true" ] || return 1
+
+  # hermes_api_server_port's 8642 fallback is right for SETUP (Hermes itself falls
+  # back the same way) and wrong as evidence: a declaration this connector cannot
+  # read is not a statement that the thing on 8642 is Hermes. Read it raw instead.
+  declared_port=$(env_get "$envf" "API_SERVER_PORT")
+  if [ -n "$declared_port" ]; then
+    show_qr_is_port "$declared_port" || return 1
+  else
+    declared_port="8642"
+  fi
+  [ "$port" = "$declared_port" ] || return 1
+
+  declared_host=$(env_get "$envf" "API_SERVER_HOST")
+  declared_host=$(printf '%s' "$declared_host" | tr '[:upper:]' '[:lower:]')
+  case "$declared_host" in
+    ""|127.0.0.1|localhost)
+      # Hermes's own default bind, and what this wizard writes. 127.0.0.2 answering
+      # while Hermes holds 127.0.0.1 is a different listener, not this one.
+      [ "$host" = "127.0.0.1" ] || [ "$host" = "localhost" ] || return 1 ;;
+    0.0.0.0|'::'|'*') ;;                       # wildcard bind: any loopback address reaches it
+    '::1') [ "$host" = "::1" ] || return 1 ;;
+    *) [ "$host" = "$declared_host" ] || return 1 ;;
+  esac
+
+  # The credential is the strongest evidence available without a fingerprinting
+  # request: the check AUTHENTICATED with this exact string, so the live listener
+  # accepts the key Hermes's own .env declares. A keyless check, a check with some
+  # other token, or a Hermes that declares no key all fail the equality below —
+  # each of them leaves nothing to correlate, which is an answer of no.
+  key=$(env_get "$envf" "API_SERVER_KEY")
+  [ "${GW_AUTH:-}" = "bearer" ] || return 1
+  [ -n "${GW_TOKEN:-}" ] || return 1
+  [ "$GW_TOKEN" = "$key" ] || return 1
+  return 0
+}
+
+# The frozen recall step guards on GW_KIND, and a check handoff must keep its
+# "custom" kind — that kind decides the paired profile, the health path, the
+# file-lane unit naming, and which agent-side steps are allowed to touch Hermes.
+# A `local` shadows the global for the duration of the call only, so the step
+# sees the gateway it is being asked about while the run keeps pairing exactly
+# what it checked. The latches the step sets stay global, as they must.
+hermes_recall_checked_handoff_step() { # hermes_recall_checked_handoff_step <suggested-list>
+  local GW_KIND="hermes"
+  hermes_recall_scope_step "$1" || true
+}
+
+# The one place the API-server memory question is asked during setup, for every
+# route into it. It sits after the optional file lane because that step asks about
+# the SAME `platform_toolsets.api_server` line: letting it go first turns two
+# edits and two Hermes restarts into one combined before→after, and leaves every
+# host change as late in the run as it can be. A run that never reaches the lane —
+# declined, no rclone, chat-only — still lands here.
+#
+# $HERMES_RECALL_REPORTED is the whole no-double-ask gate: the file-lane step
+# reports before every recall decision it makes, so a true latch means the
+# question was already put to this operator, whatever they answered. Back
+# navigation cannot re-open it either, because nothing above this point asks.
+#
+# `|| true` is the product decision, not an accident of there being no `set -e`:
+# the step returns nonzero whenever the scope is not PROVABLY recall-free, which
+# includes a fresh default install and any config the parser will not guess at.
+# Report and offer, never block — a gateway that chats perfectly well is still
+# pairable, and refusing to pair it is the founder's call, not this step's.
+hermes_recall_post_file_lane_step() {
+  $HERMES_RECALL_REPORTED && return 0
+  # Suggest the scope the code being paired actually needs — the same (URL, cred)
+  # pair the payload builder uses to decide whether a file lane rides at all.
+  local suggested="[web]"
+  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="[web, file]"; fi
+  if [ "${GW_KIND:-}" = "hermes" ]; then
+    hermes_recall_scope_step "$suggested" || true
+  elif $CHECK_HANDOFF_LOCAL_HERMES; then
+    # Say why a Hermes finding is appearing on a gateway this run calls "custom",
+    # and say exactly how strong the claim is. A settings match is not proof of
+    # which process holds the port, and this line must not pretend otherwise.
+    say ""
+    note "This address matches this machine's Hermes API-server settings — same bind address and port, and the check authenticated with the key in ~/.hermes/.env."
+    note "That is a settings match, not proof of which process holds that port, so read what follows against your own install."
+    hermes_recall_checked_handoff_step "$suggested"
+  fi
+  return 0
 }
 
 # Probe a local OpenAI-compatible server for its model list; if exactly one model

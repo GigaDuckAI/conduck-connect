@@ -52,7 +52,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1\.3 harness=[0-9][0-9.]* profile=(basic|deep) core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_access=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_e2e=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
+SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=[0-9]+\.[0-9]+ harness=[0-9][0-9.]* profile=(basic|deep) core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_access=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_e2e=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
 
 PASS=0; FAIL=0
 # The dumped file is an argument, not always doctor.out: a case that dies before

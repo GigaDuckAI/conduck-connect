@@ -129,15 +129,21 @@ source "$ROOT/src/70-check-server.inc.sh"
 source "$ROOT/src/91-show-code.inc.sh"
 FS_UNIT_ACTIVE_IMPL=$(declare -f fs_unit_active)
 
-# The chat-only reach of the recall step is a property of the REAL configure_hermes,
-# so the real one is lifted rather than re-stated here. Sourcing all of
-# src/20-gateway.inc.sh would re-initialise the GW_* globals this suite sets above
-# (GW_ID in particular), which is why only the two functions are taken. The declare
-# guard turns a rename into a loud build failure instead of a silently skipped test.
+# The reach of the recall step is a property of the REAL setup functions, so they
+# are lifted rather than re-stated here. Sourcing all of src/20-gateway.inc.sh
+# would re-initialise the GW_* globals this suite sets above (GW_ID in
+# particular), which is why only these are taken. Each declare guard turns a
+# rename into a loud build failure instead of a silently skipped test.
 # hermes_api_server_port comes along because configure_hermes calls it.
-eval "$(sed -n '/^hermes_api_server_port()/,/^}/p;/^configure_hermes()/,/^}/p' "$ROOT/src/20-gateway.inc.sh")"
-declare -F configure_hermes >/dev/null || { echo "could not lift configure_hermes out of src/20-gateway.inc.sh" >&2; exit 2; }
-declare -F hermes_api_server_port >/dev/null || { echo "could not lift hermes_api_server_port out of src/20-gateway.inc.sh" >&2; exit 2; }
+eval "$(sed -n '/^hermes_api_server_port()/,/^}/p;/^configure_hermes()/,/^}/p;/^hermes_settings_match_url()/,/^}/p;/^hermes_recall_checked_handoff_step()/,/^}/p;/^hermes_recall_post_file_lane_step()/,/^}/p' "$ROOT/src/20-gateway.inc.sh")"
+for lifted in configure_hermes hermes_api_server_port hermes_settings_match_url \
+              hermes_recall_checked_handoff_step hermes_recall_post_file_lane_step; do
+  declare -F "$lifted" >/dev/null \
+    || { echo "could not lift $lifted out of src/20-gateway.inc.sh" >&2; exit 2; }
+done
+# The --check-server handoff latch, at its source default: only a passing server
+# check may set it, and this suite must start every case from "not attributed".
+CHECK_HANDOFF_LOCAL_HERMES=false
 
 # The focused gate test only needs the observable omission behavior; exposure
 # rollback is covered by the assembled-script regression suite.
@@ -1040,6 +1046,7 @@ reset_recall_run() {
   DRY_RUN=false
   REUSE_ONLY=false
   GW_KIND="hermes"
+  CHECK_HANDOFF_LOCAL_HERMES=false
 }
 
 recall_home() { # <tag> — a fresh $HOME whose ~/.hermes looks like a working install
@@ -1424,15 +1431,34 @@ test_hermes_recall_file_lane() {
 # The reach of the report — the point of wiring it beyond the OPTIONAL file lane.
 # A chat-only Hermes user never runs hermes_file_readiness_step, so without these
 # call sites the common case never learns its gateway is stateful.
-# configure_hermes sets GW_TOKEN/GW_AUTH/GW_LOCAL_PORT in the caller's shell, so it
-# must NOT be graded through a command substitution — a subshell would swallow
-# exactly the globals these cases check. Its transcript goes to a file instead and
-# comes back in $out.
+# configure_hermes sets GW_TOKEN/GW_AUTH/GW_LOCAL_PORT in the caller's shell, and
+# the post-file-lane step sets the run-long recall latches in it, so NEITHER may be
+# graded through a command substitution — a subshell would swallow exactly the
+# globals these cases check. Their transcripts go to a file instead and come back
+# in $out.
 run_configure_hermes() {
   configure_hermes > "$TMP/reach-configure.out" 2>&1
   local rc=$?
   out=$(cat "$TMP/reach-configure.out")
   return $rc
+}
+run_post_recall_step() {
+  hermes_recall_post_file_lane_step > "$TMP/reach-post.out" 2>&1
+  local rc=$?
+  out=$(cat "$TMP/reach-post.out")
+  return $rc
+}
+run_file_readiness_step() { # run_file_readiness_step <workspace>
+  hermes_file_readiness_step "$1" > "$TMP/reach-lane.out" 2>&1
+  local rc=$?
+  out=$(cat "$TMP/reach-lane.out")
+  return $rc
+}
+# Restarts are the operator-visible cost of an edit, and the whole reason the
+# question is asked after the file lane rather than before it. Both stub
+# runners print a marked line, so one transcript can be counted either way.
+count_hermes_restarts() { # count_hermes_restarts <transcript>
+  printf '%s\n' "$1" | grep -c '^\[\(by-hand\|run_step\)\].*[Rr]estart Hermes'
 }
 
 test_hermes_recall_reach() {
@@ -1441,100 +1467,195 @@ test_hermes_recall_reach() {
   local saved_home="$HOME" saved_id="${GW_ID:-}" saved_auth="${GW_AUTH:-}"
   local saved_token="${GW_TOKEN:-}" saved_port="${GW_LOCAL_PORT:-}"
   local saved_health="${GW_HEALTH_PATH:-}" saved_fs="${FS_URL:-}"
-  local out rc body n_live n_recall n_verify cfg=".hermes/config.yaml"
+  local out rc body src n_live n_recall n_verify n_lane n_dry cfg=".hermes/config.yaml"
+  local ws="$TMP/reach-ws"
+  mkdir -p "$ws"
 
-  # --- the pairing wizard's chat-only path ---
+  # --- the gateway step settles the API server, and NOT the memory question ---
+  # Both are the same one line in config.yaml as the optional file lane's toolset
+  # edit, so settling it here would edit and restart Hermes twice for one line —
+  # on a run exposure can still abort.
   reset_recall_run
   recall_home "wizard"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="y"
+  run_configure_hermes; rc=$?
+  expect_eq "reach: the gateway step reports no memory finding" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "0"
+  expect_eq "reach: the gateway step asks nothing about the scope" \
+    "$(printf '%s' "$out" | grep -c '\[confirm\]')" "0"
+  expect_eq "reach: the gateway step edits no Hermes config" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+  # The product call: report and offer, NEVER block. A gateway that chats fine is
+  # still pairable; a fresh Hermes is default-wide, so a blocking gate anywhere in
+  # this flow would stop nearly every new user until they hand-edit YAML.
+  expect_eq "reach: the gateway step never blocks" "$rc" "0"
+  expect_eq "reach: the gateway step still completes the gateway config" "$GW_AUTH" "bearer"
+  expect_eq "reach: the gateway step still reads the API server key" \
+    "$GW_TOKEN" "fixture-api-server-key"
+  expect_eq "reach: the gateway step no longer settles the memory question" \
+    "$(declare -f configure_hermes | grep -c 'hermes_recall')" "0"
+  # The 8645-vs-8642 challenge sells the full-agent API server on what the proxy
+  # really lacks — tools and skills. Recall is not on that list: Conduck replays
+  # the whole conversation every turn, so naming a gateway-side memory as a
+  # capability here would contradict the removal this same run offers.
+  expect_eq "reach: the 8645 challenge names tools and skills" \
+    "$(declare -f configure_hermes | grep -c "carries Hermes's tools and skills")" "1"
+  expect_eq "reach: the 8645 challenge does not sell memory as a capability" \
+    "$(declare -f configure_hermes | grep -ci 'memory')" "0"
+
+  # …and the same run reaches the operator after the file lane has had its say.
+  FS_URL=""; FS_CRED=""
+  run_post_recall_step; rc=$?
+  expect_eq "reach: the post-file-lane step reports" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
+  expect_eq "reach: the post-file-lane step applies an accepted removal" \
+    "$(grep -c 'api_server: \["web"\]' "$HOME/$cfg")" "1"
+  expect_eq "reach: the post-file-lane step never blocks" "$rc" "0"
+
+  # A chat-only run — the file lane declined, or rclone missing — is exactly the
+  # case that has no other route to the finding.
+  reset_recall_run
   printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
   CONFIRM_ANSWER="n"
-  run_configure_hermes; rc=$?
-  expect_eq "reach: configure_hermes reports on a default-wide config" \
+  run_post_recall_step; rc=$?
+  expect_eq "reach: a chat-only run still reports a default-wide config" \
     "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
-  # The product call: report and offer, NEVER block. A gateway that chats fine is
-  # still pairable; a fresh Hermes is default-wide, so a blocking gate here would
-  # stop nearly every new user until they hand-edit YAML.
-  expect_eq "reach: configure_hermes never blocks on an unproven scope" "$rc" "0"
-  expect_eq "reach: configure_hermes still completes the gateway config" "$GW_AUTH" "bearer"
-  expect_eq "reach: configure_hermes still reads the API server key" \
-    "$GW_TOKEN" "fixture-api-server-key"
-  # The step runs LAST, after the API server and its key are settled: everything
-  # above it can die, and a config.yaml edit on a run about to abort would leave a
-  # change the user never got to use.
-  n_live=$(printf '%s\n' "$out" | grep -n 'API server already enabled' | head -1 | cut -d: -f1)
-  n_recall=$(printf '%s\n' "$out" | grep -n 'Hermes memory scope' | head -1 | cut -d: -f1)
-  if [ -n "$n_live" ] && [ -n "$n_recall" ] && [ "$n_recall" -gt "$n_live" ]; then
-    pass "reach: the memory report follows the API-server result"
-  else
-    fail "reach: the memory report follows the API-server result" "enabled=$n_live recall=$n_recall"
-  fi
-
-  reset_recall_run
-  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
-  CONFIRM_ANSWER="y"
-  run_configure_hermes; rc=$?
-  expect_eq "reach: configure_hermes applies an accepted removal" \
-    "$(grep -c 'api_server: \["web"\]' "$HOME/$cfg")" "1"
-  expect_eq "reach: an accepted removal still returns zero" "$rc" "0"
+  case "$out" in *"default bundle"*) pass "reach: a chat-only run names the wide default" ;;
+    *) fail "reach: a chat-only run names the wide default" "$out" ;; esac
+  expect_eq "reach: a chat-only run never blocks" "$rc" "0"
 
   reset_recall_run
   printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
   CONFIRM_ANSWER="n"
-  run_configure_hermes; rc=$?
-  expect_eq "reach: a declined removal does not fail the gateway step" "$rc" "0"
+  run_post_recall_step; rc=$?
+  expect_eq "reach: a declined removal does not fail setup" "$rc" "0"
   expect_eq "reach: a declined removal changes nothing" \
     "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
-
-  # The exposure menu's "b" returns to the gateway choice, so configure_hermes can
-  # run twice in one process. The second pass must not re-open a settled question.
-  reset_recall_run
-  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
-  CONFIRM_ANSWER="n"
-  run_configure_hermes
+  # A no is a no for the whole run, and so is any other settled answer: the step
+  # is reached once per run, and a second reach must not re-open the question.
   CONFIRM_ANSWER="y"
-  run_configure_hermes; rc=$?
+  run_post_recall_step; rc=$?
   case "$out" in *"[confirm]"*)
-      fail "reach: back-navigation does not re-ask the memory question" "asked again" ;;
-    *) pass "reach: back-navigation does not re-ask the memory question" ;; esac
-  expect_eq "reach: back-navigation changes nothing after a no" \
+      fail "reach: a second reach does not re-ask the memory question" "asked again" ;;
+    *) pass "reach: a second reach does not re-ask the memory question" ;; esac
+  expect_eq "reach: a second reach changes nothing after a no" \
     "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
-  expect_eq "reach: back-navigation still completes the gateway step" "$rc" "0"
+  expect_eq "reach: a second reach still returns zero" "$rc" "0"
+
+  # The point of going after the lane: ONE before→after, ONE write, ONE restart
+  # for a line both steps want to change — and no second question afterwards.
+  reset_recall_run
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="y"
+  run_file_readiness_step "$ws"; rc=$?
+  expect_eq "reach: the lane folds recall and file into one edit" \
+    "$(grep -c 'api_server: \["web", "file"\]' "$HOME/$cfg")" "1"
+  expect_eq "reach: the combined edit restarts Hermes once" \
+    "$(count_hermes_restarts "$out")" "1"
+  run_post_recall_step
+  expect_eq "reach: a lane that already asked leaves the later step silent" "$out" ""
+
+  # The same silence when the lane's answer leaves the scope unfixed. The question
+  # was put to this operator once; repeating the by-hand fix a screen later is
+  # nagging, not information — a no, and a shape this connector will not rewrite.
+  reset_recall_run
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="n"
+  run_file_readiness_step "$ws"
+  expect_eq "reach: the lane put the question" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
+  run_post_recall_step
+  expect_eq "reach: a removal declined in the lane is not re-offered" "$out" ""
+
+  reset_recall_run
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$HOME/$cfg"
+  CONFIRM_ANSWER="y"
+  run_file_readiness_step "$ws"
+  run_post_recall_step
+  expect_eq "reach: a shape the lane already explained is not explained twice" "$out" ""
 
   reset_recall_run
   printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "file"]' > "$HOME/$cfg"
   CONFIRM_ANSWER="y"
-  run_configure_hermes; rc=$?
+  run_post_recall_step; rc=$?
   expect_eq "reach: a clean scope is reported as clean" \
     "$(printf '%s' "$out" | grep -c "stays Conduck's")" "1"
   case "$out" in *"[confirm]"*) fail "reach: a clean scope asks nothing" "prompted anyway" ;;
     *) pass "reach: a clean scope asks nothing" ;; esac
 
+  # The suggested replacement list follows the code this run will actually emit,
+  # exactly as the --show-code re-emit does.
+  reset_recall_run
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
+  FS_URL="https://files.example.test"; FS_CRED="fixture-file-secret"
+  run_post_recall_step
+  case "$out" in *"api_server: [web, file]"*)
+      pass "reach: a run carrying a file lane suggests [web, file]" ;;
+    *) fail "reach: a run carrying a file lane suggests [web, file]" "$out" ;; esac
+  reset_recall_run
+  FS_URL="https://files.example.test"; FS_CRED=""
+  run_post_recall_step
+  case "$out" in *"api_server: [web, file]"*)
+      fail "reach: a lane the code will not carry falls back to [web]" "suggested an unused toolset" ;;
+    *) pass "reach: a lane the code will not carry falls back to [web]" ;; esac
+  FS_URL=""; FS_CRED=""
+
+  # A run whose whole promise is that it changes nothing may report but never gate.
   reset_recall_run
   printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
   CONFIRM_ANSWER="y"
   DRY_RUN=true
-  run_configure_hermes; rc=$?
-  expect_eq "reach: dry-run reports through configure_hermes" \
+  run_post_recall_step; rc=$?
+  expect_eq "reach: dry-run reports the finding it would act on" \
     "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
   expect_eq "reach: dry-run changes no Hermes config" \
     "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
-  expect_eq "reach: dry-run does not fail the gateway step" "$rc" "0"
+  expect_eq "reach: dry-run does not fail setup" "$rc" "0"
 
   reset_recall_run
   CONFIRM_ANSWER="y"
   REUSE_ONLY=true
-  run_configure_hermes; rc=$?
-  expect_eq "reach: reuse-only reports through configure_hermes" \
+  run_post_recall_step; rc=$?
+  expect_eq "reach: reuse-only reports the finding" \
     "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
   expect_eq "reach: reuse-only changes no Hermes config" \
     "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
-  expect_eq "reach: reuse-only does not fail the gateway step" "$rc" "0"
+  expect_eq "reach: reuse-only does not fail setup" "$rc" "0"
+
+  reset_recall_run
+  GW_KIND="openclaw"
+  run_post_recall_step; rc=$?
+  expect_eq "reach: a non-Hermes gateway stays silent" "$out" ""
+  expect_eq "reach: a non-Hermes gateway passes" "$rc" "0"
 
   # Pinned as source, not behavior: `|| die` is a product decision the founder
   # owns, and a future edit that quietly adds one would otherwise only surface as
   # a support ticket from a user who cannot pair a working gateway.
-  expect_eq "reach: the wizard call site is explicitly non-blocking" \
-    "$(declare -f configure_hermes | grep -c 'hermes_recall_scope_step "\[web\]" || true')" "1"
+  expect_eq "reach: both setup call sites are explicitly non-blocking" \
+    "$(declare -f hermes_recall_post_file_lane_step hermes_recall_checked_handoff_step \
+       | grep -c 'hermes_recall_scope_step .* || true')" "2"
+  expect_eq "reach: neither setup call site can die" \
+    "$(declare -f hermes_recall_post_file_lane_step hermes_recall_checked_handoff_step \
+       | grep -c '\bdie\b')" "0"
+
+  # Wiring, not behavior: run_setup needs a whole wizard run to exercise, but the
+  # ORDER is the part that matters — after the file lane so one line is edited
+  # once, and before the dry-run exit so a planned run still reports.
+  src=$(sed -n '/^run_setup()/,/^}/p' "$ROOT/src/99-main.inc.sh")
+  n_lane=$(printf '%s\n' "$src" | grep -n '^  setup_file_lane$' | head -1 | cut -d: -f1)
+  n_recall=$(printf '%s\n' "$src" | grep -n '^  hermes_recall_post_file_lane_step$' | head -1 | cut -d: -f1)
+  n_dry=$(printf '%s\n' "$src" | grep -n 'print_plan' | head -1 | cut -d: -f1)
+  if [ -n "$n_lane" ] && [ -n "$n_recall" ] && [ -n "$n_dry" ] \
+     && [ "$n_recall" -gt "$n_lane" ] && [ "$n_recall" -lt "$n_dry" ]; then
+    pass "reach: setup asks after the file lane and before the dry-run exit"
+  else
+    fail "reach: setup asks after the file lane and before the dry-run exit" \
+      "lane=$n_lane recall=$n_recall plan=$n_dry"
+  fi
 
   # --- --show-code, which pairs an ALREADY-configured gateway ---
   # A profile is written once; the gateway keeps changing. Nothing in the saved
@@ -1608,6 +1729,160 @@ test_hermes_recall_reach() {
   reset_recall_run
   HOME="$saved_home"; GW_ID="$saved_id"; GW_AUTH="$saved_auth"; GW_TOKEN="$saved_token"
   GW_LOCAL_PORT="$saved_port"; GW_HEALTH_PATH="$saved_health"; FS_URL="$saved_fs"
+}
+
+# --- the --check-server handoff ----------------------------------------------
+# A check that passes offers to continue into setup with the address it graded,
+# and that handoff pairs it as a CUSTOM server — the check proved one endpoint,
+# not a gateway product. So the Hermes question has to be reached by attribution
+# instead of by kind, and attribution has to be conservative in ONE direction:
+# telling someone their unrelated gateway keeps a memory it does not keep is
+# worse than never mentioning it. Every case below that is not a full match must
+# stay silent.
+handoff_env() { # handoff_env <line...> — writes ~/.hermes/.env for the fixture home
+  printf '%s\n' "$@" > "$HOME/.hermes/.env"
+}
+
+test_hermes_checked_handoff() {
+  local saved_home="$HOME" saved_auth="${GW_AUTH:-}" saved_token="${GW_TOKEN:-}"
+  local saved_kind="${GW_KIND:-}" saved_fs="${FS_URL:-}" out rc src
+  local key="fixture-api-server-key"
+
+  HOME="$TMP/handoff-home"; rm -rf "$HOME"; mkdir -p "$HOME/.hermes"
+  GW_AUTH="bearer"; GW_TOKEN="$key"
+  handoff_env 'API_SERVER_ENABLED=true' 'API_SERVER_HOST=127.0.0.1' \
+    'API_SERVER_PORT=8642' "API_SERVER_KEY=$key"
+
+  expect_true "handoff: a full settings match attributes the address" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+  expect_true "handoff: localhost reaches the same 127.0.0.1 bind" \
+    hermes_settings_match_url "http://localhost:8642"
+  expect_false "handoff: another port on the same host is another service" \
+    hermes_settings_match_url "http://127.0.0.1:8643"
+  # 127.0.0.2 is a different listener, and a base path can route one listener to
+  # anything at all — neither is the address Hermes declares.
+  expect_false "handoff: another loopback bind is another listener" \
+    hermes_settings_match_url "http://127.0.0.2:8642"
+  expect_false "handoff: a base path is not attributable" \
+    hermes_settings_match_url "http://127.0.0.1:8642/proxy"
+  # The remote case this exists to protect: Hermes installed here, gateway
+  # somewhere else. A tailnet name in front of THIS Hermes lands here too, and
+  # silence is the right answer for both — from here they are indistinguishable.
+  expect_false "handoff: an https address is never claimed as this machine" \
+    hermes_settings_match_url "https://gw.example.test:8642"
+  # Same address, same port, https — a TLS terminator in front of anything at all.
+  # The scheme alone has to refuse it, or the loopback checks below would attribute
+  # whatever sits behind someone else's certificate.
+  expect_false "handoff: an https loopback address is not attributed either" \
+    hermes_settings_match_url "https://localhost:8642"
+  expect_false "handoff: an IPv6 address against an IPv4 bind stays silent" \
+    hermes_settings_match_url "http://[::1]:8642"
+
+  handoff_env 'API_SERVER_ENABLED=true' 'API_SERVER_HOST=::1' \
+    'API_SERVER_PORT=8642' "API_SERVER_KEY=$key"
+  expect_true "handoff: an IPv6 bind matches its own address" \
+    hermes_settings_match_url "http://[::1]:8642"
+  handoff_env 'API_SERVER_ENABLED=true' 'API_SERVER_HOST=0.0.0.0' \
+    'API_SERVER_PORT=8642' "API_SERVER_KEY=$key"
+  expect_true "handoff: a wildcard bind answers on any loopback address" \
+    hermes_settings_match_url "http://127.0.0.2:8642"
+
+  # Hermes's own default port, declared by omission.
+  handoff_env 'API_SERVER_ENABLED=true' "API_SERVER_KEY=$key"
+  expect_true "handoff: an undeclared port falls back to 8642 like Hermes does" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+  # …but a declaration this connector cannot read is NOT a statement that the
+  # thing on 8642 is Hermes, so it must not inherit that fallback.
+  handoff_env 'API_SERVER_ENABLED=true' 'API_SERVER_PORT=8642 # the full-agent server' \
+    "API_SERVER_KEY=$key"
+  expect_false "handoff: an unreadable port declaration attributes nothing" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+
+  handoff_env 'API_SERVER_ENABLED=false' 'API_SERVER_PORT=8642' "API_SERVER_KEY=$key"
+  expect_false "handoff: a disabled API server attributes nothing" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+  handoff_env 'API_SERVER_ENABLED=true' 'API_SERVER_PORT=8642'
+  expect_false "handoff: no declared key leaves nothing to correlate" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+
+  # The credential is the strongest evidence available without fingerprinting the
+  # listener: the check AUTHENTICATED with it. A different token, or none, is not
+  # this Hermes as far as anything on disk can prove.
+  handoff_env 'API_SERVER_ENABLED=true' 'API_SERVER_PORT=8642' "API_SERVER_KEY=$key"
+  GW_TOKEN="some-other-token"
+  expect_false "handoff: a different credential is a different service" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+  GW_AUTH="none"; GW_TOKEN=""
+  expect_false "handoff: a keyless check attributes nothing" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+  GW_AUTH="bearer"; GW_TOKEN="$key"
+
+  rm -f "$HOME/.hermes/.env"
+  expect_false "handoff: no Hermes install attributes nothing" \
+    hermes_settings_match_url "http://127.0.0.1:8642"
+  handoff_env 'API_SERVER_ENABLED=true' 'API_SERVER_PORT=8642' "API_SERVER_KEY=$key"
+
+  # --- what the attributed handoff actually does ---
+  # The kind stays custom: the app pairs exactly the address the check graded,
+  # and an address match is not authority to run Hermes-specific setup steps.
+  reset_recall_run
+  GW_KIND="custom"
+  CHECK_HANDOFF_LOCAL_HERMES=true
+  FS_URL=""; FS_CRED=""
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/.hermes/config.yaml"
+  CONFIRM_ANSWER="y"
+  run_post_recall_step; rc=$?
+  expect_eq "handoff: an attributed handoff reports the memory scope" \
+    "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
+  case "$out" in *"matches this machine's Hermes API-server settings"*)
+      pass "handoff: the report says why a Hermes finding appears on a custom gateway" ;;
+    *) fail "handoff: the report says why a Hermes finding appears on a custom gateway" "$out" ;; esac
+  case "$out" in *"not proof of which process holds that port"*)
+      pass "handoff: the report claims a settings match, not certainty" ;;
+    *) fail "handoff: the report claims a settings match, not certainty" "$out" ;; esac
+  expect_eq "handoff: an accepted removal is applied" \
+    "$(grep -c 'api_server: \["web"\]' "$HOME/.hermes/config.yaml")" "1"
+  expect_eq "handoff: the paired gateway kind is untouched" "$GW_KIND" "custom"
+  expect_eq "handoff: an attributed handoff never blocks" "$rc" "0"
+
+  reset_recall_run
+  GW_KIND="custom"
+  CHECK_HANDOFF_LOCAL_HERMES=true
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/.hermes/config.yaml"
+  CONFIRM_ANSWER="n"
+  run_post_recall_step; rc=$?
+  expect_eq "handoff: a declined removal changes nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/.hermes/config.yaml")" "1"
+  expect_eq "handoff: a declined removal never blocks" "$rc" "0"
+  expect_eq "handoff: a declined removal leaves the kind alone" "$GW_KIND" "custom"
+
+  # An unattributed custom gateway is the ordinary case: a server this run knows
+  # nothing about, and nothing is what it says.
+  reset_recall_run
+  GW_KIND="custom"
+  CONFIRM_ANSWER="y"
+  run_post_recall_step; rc=$?
+  expect_eq "handoff: an unattributed custom gateway stays silent" "$out" ""
+  expect_eq "handoff: an unattributed custom gateway passes" "$rc" "0"
+  expect_eq "handoff: an unattributed custom gateway changes nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/.hermes/config.yaml")" "1"
+
+  # Only a passing --check-server may attribute, and only while the graded
+  # address still exists: the handoff clears GW_URL to rebuild it as HTTPS.
+  src=$(sed -n '/^run_compat()/,/^}/p' "$ROOT/src/70-check-server.inc.sh")
+  expect_eq "handoff: the server check is the only thing that sets the latch" \
+    "$(printf '%s\n' "$src" | grep -c 'CHECK_HANDOFF_LOCAL_HERMES=true')" "1"
+  # …and it sets it only under the settings match. An unconditional latch would
+  # hand every passing check a Hermes finding about somebody else's gateway.
+  expect_eq "handoff: the server check latches only on a settings match" \
+    "$(printf '%s\n' "$src" | grep -A1 'if hermes_settings_match_url' \
+       | grep -c 'CHECK_HANDOFF_LOCAL_HERMES=true')" "1"
+  expect_eq "handoff: no other module sets the latch" \
+    "$(grep -l 'CHECK_HANDOFF_LOCAL_HERMES=true' "$ROOT"/src/*.inc.sh | wc -l | tr -d ' ')" "1"
+
+  reset_recall_run
+  HOME="$saved_home"; GW_AUTH="$saved_auth"; GW_TOKEN="$saved_token"
+  GW_KIND="$saved_kind"; FS_URL="$saved_fs"
 }
 
 wait_ready() { # <stdout-file> <pid>
@@ -2103,6 +2378,7 @@ test_hermes_recall_edits
 test_hermes_recall_operator_flow
 test_hermes_recall_file_lane
 test_hermes_recall_reach
+test_hermes_checked_handoff
 test_hermes_guidance
 test_local_service_gate
 test_reply_candidate_parity

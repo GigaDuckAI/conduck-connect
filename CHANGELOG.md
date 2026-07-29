@@ -4,6 +4,52 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The body-drain rejection is now a counted conformance check, not just a
+  diagnosis.** `AUTH_CHAT_REJECT_BODY` grades what the diagnostic could only
+  describe: after an early `401`, the adapter must either drain the request body
+  or close the connection, so the next request on a reused keep-alive connection
+  is still parsed from its own first byte. It fails only on positive evidence — a
+  proven desync, or completed answers that contradict each other — because a
+  conformance check that reddens under load is one people learn to ignore; a
+  throttled burst (`429`/`503`) and a probe that never completes both pass with a
+  note instead. `Expect:` is pinned empty: left alone, a server that rejects
+  immediately makes curl skip sending the body at all, and an adapter that never
+  drains would have graded clean. Connection reuse is only provable
+  client-to-proxy, so the check states what it saw and claims no cause through a
+  proxy.
+- **The test fixture had the very bug the check exists to catch.** Driven down
+  one connection it answered `401 400 0` — our own reference adapter left the
+  body unread, which means every builder reading it for guidance was reading the
+  defect. Draining is now structural rather than a per-call-site habit: one
+  `reject_hygiene` routine behind every early rejection, bounded (64 KiB, 5 s)
+  and closing instead on chunked, malformed, duplicate, or oversized
+  `Content-Length`. A successful `GET` carrying a body desynced the connection
+  too, and no longer does.
+- **Hermes's own recall is settled once, after the file-lane step — and a
+  `--check-server` handoff now reaches it at all.** A run that checked a local
+  Hermes and continued into setup pairs it as a custom server, so the recall
+  notice never fired for exactly the users most likely to hit it. The
+  attribution is latched while the check is still passing (by the later step the
+  checked URL no longer exists), and only on a real match: scheme, bare
+  authority, bind address, port, API-server enabled, and the exact key the check
+  authenticated with. A remote gateway, a base path, a different key, a keyless
+  check, a disabled API server, or an unreadable port declaration all stay
+  silent — a settings match is correlation, and the wording says "matches"
+  rather than claiming identity. Both steps write the same `config.yaml` line, so
+  a file-lane Hermes user is now asked once and restarted once instead of twice.
+- **Copy no longer sells gateway-side memory as something you get.** Leaving
+  Hermes's recall on means paying for the thread twice — the gateway replays
+  history the app already sent, measured at 13.3k prompt tokens against 540 for
+  the same turn. The `8645` proxy warning drops "recall" from what you give up
+  there (it is a bare model relay: tools and skills are the loss, and conflating
+  the two axes muddied both), and an unreadable API-server toolset is now
+  distinguished from one that reads fine but names toolsets we do not recognise —
+  a different problem with a different fix.
+- The rclone integration script pinned `revision=1\.3` in its summary regex, so
+  it was stale the moment the contract moved and no suite runs it to notice. It
+  matches any revision now; the grammar is what is frozen per `schema=`, not the
+  revision number.
+
 - **`--check-server` no longer grades an arbitrary model and calls the result a
   verdict on the server.** It probed with whichever id `/v1/models` listed first,
   so an aggregator fronting hundreds of models could report FAIL or PASS purely

@@ -48,8 +48,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Every check id the deep profile can emit, sorted — the pass-mode inventory.
-ALL_IDS="AUTH_CHAT_MISSING AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC HISTORY_IMAGE IMAGE_INPUT MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
-BASIC_IDS="AUTH_CHAT_MISSING AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC HISTORY_IMAGE MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
+ALL_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC HISTORY_IMAGE IMAGE_INPUT MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
+BASIC_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC HISTORY_IMAGE MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
 # The complete green file-lane inventory on a fully-conformant --files run — the
 # ids appended to the core inventory when a pass case carries --files.
 FILE_IDS="FILES_CONFIG FILES_WRITE_THROUGH FILES_AUTH_READ_MISSING FILES_AUTH_READ_WRONG FILES_AUTH_WRITE_MISSING FILES_AUTH_WRITE_WRONG FILES_READ_FRESH FILES_PROBE_COMPAT FILES_NESTED FILE_COPY_BYTES FILE_REPLY_REFERENCE FILE_E2E FILES_DELETE"
@@ -84,8 +84,8 @@ ESC=$(printf '\033')
 # (answering the hidden prompt with Enter) against the fixture's open mode.
 CASES='
 good|good|--deep|no|0|-|profile=deep core=PASS history_image=PASS stream=PASS image_input=VERIFIED file_transport=NOT_REQUESTED file_access=NOT_REQUESTED file_e2e=NOT_REQUESTED exit=0
-good-basic|good||no|0|-|profile=basic core=PASS history_image=PASS stream=PASS image_input=NOT_RUN checks=9 failed=0 exit=0
-direct-check-adapter|good||no|0|-|profile=basic core=PASS checks=9 failed=0 exit=0
+good-basic|good||no|0|-|profile=basic core=PASS history_image=PASS stream=PASS image_input=NOT_RUN checks=10 failed=0 exit=0
+direct-check-adapter|good||no|0|-|profile=basic core=PASS checks=10 failed=0 exit=0
 require-accept|require-accept|--deep|no|0|-|core=PASS image_input=VERIFIED exit=0
 app-success-2xx|app-success-2xx|--deep|no|1|MODELS_ENVELOPE|core=FAIL checks=1 failed=1 exit=1
 chat-success-201|chat-success-201|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE,IMAGE_INPUT,MODEL_SELECTION,STREAM_SYNC|core=FAIL history_image=FAIL stream=FAIL image_input=FAIL exit=1
@@ -99,6 +99,8 @@ auth-models-any-token|auth-models-any-token|--deep|no|1|AUTH_MODELS_WRONG|core=F
 auth-chat-none-ok|auth-chat-none-ok|--deep|no|1|AUTH_CHAT_MISSING|core=FAIL exit=1
 auth-chat-any-token|auth-chat-any-token|--deep|no|1|AUTH_CHAT_WRONG|core=FAIL exit=1
 auth-403|auth-403|--deep|no|1|AUTH_MODELS_MISSING|core=FAIL exit=1
+reject-no-drain|reject-no-drain|--deep|no|1|AUTH_CHAT_REJECT_BODY|core=FAIL history_image=PASS stream=PASS image_input=VERIFIED exit=1
+reject-close|reject-close|--deep|no|0|-|core=PASS history_image=PASS stream=PASS image_input=VERIFIED exit=0
 models-bare-array|models-bare-array|--deep|no|1|MODELS_ENVELOPE|core=FAIL history_image=NOT_RUN stream=NOT_RUN image_input=NOT_RUN checks=1 failed=1 exit=1
 models-html|models-html|--deep|no|1|MODELS_ENVELOPE|core=FAIL history_image=NOT_RUN exit=1
 models-empty-data|models-empty-data|--deep|no|1|MODELS_ENVELOPE|core=FAIL history_image=PASS stream=PASS exit=1
@@ -2216,6 +2218,207 @@ run_no_ansi_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# --- the rejected-body check only grades an actual rejection -----------------
+# AUTH_CHAT_REJECT_BODY asks what a rejection did with the body it rejected, so
+# it must not run when nothing was rejected. Two ways that happens, both proven
+# here rather than assumed: a chat route that ACCEPTS a wrong token (there was no
+# rejection, and the failing AUTH_CHAT_WRONG line already carries the diagnosis —
+# a second red would double-bill one fault), and a keyless run (no auth at all).
+# A skip is invisible in the failed-ID set, which is exactly why it needs its own
+# case: a check that quietly started PASSING here would look identical from the
+# outside. So this asserts the id is absent from the whole transcript, and that
+# the run it rode on still produced the failure it was supposed to.
+run_reject_body_gate_case() { # run_reject_body_gate_case <wrong-token-ok|keyless>
+  local kind="$1" name="reject-body-not-graded-$1" mode expect token rc=0
+  if [ "$kind" = "keyless" ]; then
+    mode="open"; expect="AUTH_NOT_ENFORCED"; token=""
+  else
+    mode="auth-chat-any-token"; expect="AUTH_CHAT_WRONG"; token="$TOKEN"
+  fi
+  start_fixture "$mode" || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
+  TERM=dumb CONDUCK_TOKEN="$token" bash "$SCRIPT" --check-adapter "http://127.0.0.1:$PORT" \
+    > "$TMP/doctor.out" 2>&1 < /dev/null || rc=$?
+  stop_fixture
+  if [ "$rc" != "1" ]; then
+    fail_case "$name" "exit $rc, expected 1"; return
+  fi
+  if ! grep -qF "✗ [$expect]" "$TMP/doctor.out"; then
+    fail_case "$name" "the run produced no $expect failure, so it proves nothing about the gate"; return
+  fi
+  if grep -qF '[AUTH_CHAT_REJECT_BODY]' "$TMP/doctor.out"; then
+    fail_case "$name" "the rejected-body check ran with no rejection to grade"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- the rejected-body verdict matrix ----------------------------------------
+# The fixture can produce the three outcomes a real adapter produces — the body
+# drained, the connection closed, neither — and those are the rows the
+# reject-no-drain/reject-close cases cover. It cannot produce the outcomes this
+# check exists to be CAREFUL about: a throttled burst, a probe that never
+# completed, a result too mangled to read. Those decide whether a CORRECT adapter
+# gets wrongly reddened, which is the failure mode that costs the most, so they
+# are driven here against the SHIPPED functions with only the probe stubbed.
+# "401 400" is the load-bearing row: two fields, not three, and a loose reader
+# slices it into 401/400/400 and reports a desync that nothing observed.
+# The verdict is graded as <PASS-or-FAIL>:<which-branch>, not just red/green: two
+# different readings of the same evidence can both be a FAIL while telling the
+# builder to go looking in two different places, and "it failed" would call that
+# a match. The tag comes from a phrase unique to each branch's verdict line.
+run_reject_body_matrix_isolated() { # <function-source> <pair-output>
+  FUNCS="$1" PAIR="$2" bash -c '
+eval "$FUNCS"
+DOCTOR_CONTRACT_REV="1.4"
+tag() { case "$*" in
+  *"ONE reused connection"*)   printf "reused" ;;
+  *"down one connection"*)     printf "unstable" ;;
+  *"(busy)"*)                  printf "busy" ;;
+  *"SAME connection"*)         printf "same" ;;
+  *"closed the connection"*)   printf "closed" ;;
+  *"never completed"*)         printf "none" ;;
+  *)                           printf "unrecognised" ;;
+esac; }
+d_ok()  { shift; printf "OK:%s\n" "$(tag "$@")"; }
+d_bad() { shift; printf "BAD:%s\n" "$(tag "$@")"; }
+d_say() { :; }
+doctor_desync_pair() { printf "%s" "$PAIR"; }
+doctor_reject_body_check https://gw.example.test/v1/chat/completions
+'
+}
+
+run_reject_body_matrix_case() {
+  local name="reject-body-verdict-matrix" funcs pair want got
+  funcs=$(extract_funcs doctor_parse_level_status doctor_busy_status \
+                        doctor_desync_parse doctor_reject_body_check)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'doctor_reject_body_check()'; then
+    fail_case "$name" "could not extract the rejected-body check from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+  while IFS='|' read -r pair want; do
+    [ -n "$want" ] || continue
+    got=$(run_reject_body_matrix_isolated "$funcs" "$pair" 2>&1)
+    printf -- '--- pair "%s" want %s ---\n%s\n' "$pair" "$want" "$got" >> "$TMP/doctor.out"
+    if [ "$got" != "$want" ]; then
+      fail_case "$name" "pair '$pair' graded '$got', expected '$want'"; return
+    fi
+  done <<EOF
+401 401 0|OK:same
+401 401 2|OK:closed
+401 400 0|BAD:reused
+401 414 0|BAD:reused
+401 431 0|BAD:reused
+401 501 0|BAD:reused
+401 505 0|BAD:reused
+429 400 0|BAD:reused
+503 431 0|BAD:reused
+401 429 0|OK:busy
+401 503 0|OK:busy
+429 429 0|OK:busy
+401 400 1|BAD:unstable
+401 403 0|BAD:unstable
+401 500 0|BAD:unstable
+400 400 0|BAD:unstable
+200 200 0|BAD:unstable
+|OK:none
+000 000 0|OK:none
+401 000 0|OK:none
+401 400|OK:none
+401 400 0 7|OK:none
+401 400 x|OK:none
+EOF
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- the fixture's own rejection hygiene -------------------------------------
+# Proven directly, not through the adapter check, because the check only ever
+# exercises ONE rejection shape (auth) and only two requests deep. The fixture
+# also rejects unknown paths, wrong methods, and — in require-accept mode — a
+# missing Accept header, each of them before the body has been read; and one
+# handler INSTANCE serves a whole keep-alive connection, so a per-request flag
+# left unreset would drain the first request and skip every one after it. So this
+# drives a single connection through all of it and ends on a real authenticated
+# turn: the ordinary, perfectly-valid request whose corruption is the entire
+# point of the rule. num_connects must be 1 only on the opening transfer — any
+# later 1 means the connection was dropped rather than kept clean.
+run_fixture_rejection_reuse_case() {
+  local name="fixture-rejections-keep-the-connection-usable" body got want
+  body='{"messages":[{"role":"user","content":"Reply with exactly: pong"}],"stream":false}'
+  start_fixture good || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
+  got=$(curl -q -sS --http1.1 --max-time 15 --noproxy '*' \
+      -H 'Expect:' -H 'Content-Type: application/json' -H 'Authorization: Bearer wrong-token' \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects} ' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" \
+    --next -sS --http1.1 --max-time 15 --noproxy '*' \
+      -H 'Expect:' -H 'Content-Type: application/json' -H 'Authorization: Bearer wrong-token' \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects} ' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" \
+    --next -sS --http1.1 --max-time 15 --noproxy '*' \
+      -H 'Expect:' -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects} ' \
+      "http://127.0.0.1:$PORT/v1/no-such-route" \
+    --next -sS --http1.1 --max-time 15 --noproxy '*' -X PUT \
+      -H 'Expect:' -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects} ' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" \
+    --next -sS --http1.1 --max-time 15 --noproxy '*' \
+      -H 'Expect:' -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects}' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" 2>&1)
+  stop_fixture
+  want='401:1 401:0 404:0 405:0 200:0'
+  printf -- '--- good: 401 401 404 405 200 down one connection ---\n%s\n' "$got" > "$TMP/doctor.out"
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "one connection through four rejections gave '$got', expected '$want'"; return
+  fi
+  # The Accept rejection lives in its own mode. Same rule: 406 first, then a real
+  # turn on the SAME connection has to be answered as if nothing happened.
+  start_fixture require-accept || { fail_case "$name" "require-accept fixture failed to start"; stop_fixture; return; }
+  got=$(curl -q -sS --http1.1 --max-time 15 --noproxy '*' \
+      -H 'Expect:' -H 'Accept: text/plain' -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects} ' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" \
+    --next -sS --http1.1 --max-time 15 --noproxy '*' \
+      -H 'Expect:' -H 'Accept: application/json' -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects}' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" 2>&1)
+  stop_fixture
+  want='406:1 200:0'
+  printf -- '--- require-accept: 406 then a real turn ---\n%s\n' "$got" >> "$TMP/doctor.out"
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "406 then a real turn gave '$got', expected '$want'"; return
+  fi
+  # A SUCCESSFUL answer to a request that carried an unexpected body desyncs the
+  # connection exactly the same way a rejection does — nothing about the rule is
+  # specific to errors. Nobody sends a body on a GET, which is precisely why this
+  # would rot unnoticed. A PATCH gets http.server's own 501, which closes; that
+  # is the lawful other half and is asserted here rather than assumed.
+  start_fixture good || { fail_case "$name" "second good fixture failed to start"; stop_fixture; return; }
+  got=$(curl -q -sS --http1.1 --max-time 15 --noproxy '*' -X GET \
+      -H 'Expect:' -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects} ' \
+      "http://127.0.0.1:$PORT/v1/models" \
+    --next -sS --http1.1 --max-time 15 --noproxy '*' -X PATCH \
+      -H 'Expect:' -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects} ' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" \
+    --next -sS --http1.1 --max-time 15 --noproxy '*' \
+      -H 'Expect:' -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+      -d "$body" -o /dev/null -w '%{http_code}:%{num_connects}' \
+      "http://127.0.0.1:$PORT/v1/chat/completions" 2>&1)
+  stop_fixture
+  want='200:1 501:0 200:1'
+  printf -- '--- GET with a body, PATCH, then a real turn ---\n%s\n' "$got" >> "$TMP/doctor.out"
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "a bodied GET then PATCH then a real turn gave '$got', expected '$want'"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 # --- fail-closed auth --------------------------------------------------------
 # CONDUCK_TOKEN unset + no answer possible (EOF) must DIE, not silently grade the
 # target keyless: inferring no-auth from a MISSING answer reports AUTH_* failures
@@ -2528,6 +2731,22 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" no-ansi-when-redirected "*) true ;; *) false ;; esac; then
   run_no_ansi_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" reject-body-verdict-matrix "*) true ;; *) false ;; esac; then
+  run_reject_body_matrix_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" fixture-rejections-keep-the-connection-usable "*) true ;; *) false ;; esac; then
+  run_fixture_rejection_reuse_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" reject-body-not-graded-wrong-token-ok "*) true ;; *) false ;; esac; then
+  run_reject_body_gate_case wrong-token-ok
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" reject-body-not-graded-keyless "*) true ;; *) false ;; esac; then
+  run_reject_body_gate_case keyless
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" auth-eof-dies-server "*) true ;; *) false ;; esac; then

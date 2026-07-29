@@ -124,6 +124,14 @@ run_setup() {
   fi
 
   setup_file_lane
+  # The Hermes API-server memory question, asked once per run for every route in:
+  # the gateway menu's Hermes, and a --check-server handoff whose checked address
+  # matched this machine's Hermes settings (where GW_KIND is deliberately
+  # "custom"). AFTER setup_file_lane because that step asks about the same
+  # `platform_toolsets.api_server` line — going second turns two edits and two
+  # Hermes restarts into one — and BEFORE the dry-run exit, so a planned run
+  # reports the finding it would have acted on.
+  hermes_recall_post_file_lane_step
   if $DRY_RUN; then
     print_plan
     exit 0

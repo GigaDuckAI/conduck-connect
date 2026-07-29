@@ -828,6 +828,16 @@ GW_TOKEN=""
 GW_MODEL=""        # optional explicit model (generic servers like vLLM/Ollama)
 GW_URL=""          # final https URL
 
+# A --check-server handoff pairs the ONE address the check graded, so its gateway
+# kind is "custom" no matter what answered — see prepare_setup_from_check. This
+# latch carries the single Hermes fact that survives that decision: the checked
+# address matched this machine's own Hermes API-server settings. It is set only
+# by a PASSING --check-server (never by --check-adapter, which grades a different
+# contract), and it only ever unlocks a report and an offer. It must never stand
+# in for GW_KIND: an address match is not authority to run Hermes-specific
+# configuration steps the check never verified.
+CHECK_HANDOFF_LOCAL_HERMES=false
+
 detect_gateway() {
   head_ "Step 1 — find your gateway"
   # Legacy --generic: the caller already declared "a server I configured myself",
@@ -1059,10 +1069,14 @@ configure_hermes() {
 
   # 8645 is Hermes's OTHER OpenAI door: the tool-less `hermes proxy`. It chats
   # fine, so nothing downstream would fail — the user would just silently lose
-  # tools, skills, and memory. Challenge it here; verification can't catch it.
+  # tools and skills. Challenge it here; verification can't catch it.
+  # Hermes's own recall is deliberately NOT in that list: Conduck replays the
+  # whole conversation every turn, so a gateway-side memory is not a capability
+  # this pairing wants on either port, and naming it as one here would sell the
+  # 8642 API server on the very thing the API-server scope step offers to remove.
   if [ "$GW_LOCAL_PORT" = "8645" ]; then
     warn "API_SERVER_PORT is 8645 — the port of the tool-less 'hermes proxy', not the full-agent API server (default 8642)."
-    say  "  Both can chat, but only the full-agent API server carries Hermes's tools, skills, and memory."
+    say  "  Both can chat, but only the full-agent API server carries Hermes's tools and skills."
     if $DRY_RUN; then
       note "(dry-run: a real run asks whether to continue with 8645)"
     elif $REUSE_ONLY; then
@@ -1128,28 +1142,138 @@ configure_hermes() {
     [ -n "$GW_TOKEN" ] || die "An API key is required for Hermes."
   fi
 
-  # The API server's toolset list decides something no wire check can ever see:
-  # whether this gateway keeps a conversation memory of its own. Hermes's default
-  # api_server bundle carries `memory` and `session_search`, so a Hermes nobody has
-  # narrowed answers a brand-new conversation from facts Conduck never sent it —
-  # double-counting the history Conduck already replays in full, and billing for it
-  # every turn. A gateway in that state passes every check here and in
-  # --check-server. The optional file lane asks the same question later, but most
-  # Hermes users pair for chat and never reach it, so it has to be asked here too.
-  #
-  # LAST in this function on purpose: everything above can die (no ~/.hermes, an
-  # unwritable .env, no key), and editing config.yaml on a run that is about to
-  # abort would leave a change the user never got to use.
-  #
-  # `|| true` is the product decision, not an accident of there being no `set -e`:
-  # this step returns nonzero whenever the scope is not PROVABLY recall-free, which
-  # includes a fresh default install and any config the parser will not guess at.
-  # Report and offer, never block — a gateway that chats perfectly well is still
-  # pairable, and refusing to pair it is the founder's call, not this step's.
-  # --dry-run and --reuse-only report and change nothing.
-  hermes_recall_scope_step "[web]" || true
-
   GW_AUTH="bearer"
+
+  # The API-server toolset list decides something no wire check can ever see —
+  # whether this gateway keeps a conversation memory of its own — and it is asked
+  # once per run by hermes_recall_post_file_lane_step, after the optional file lane
+  # has had its say. Deliberately not here: the file lane rewrites the SAME
+  # `platform_toolsets.api_server` line, so settling it in this function edits and
+  # restarts Hermes twice for one line, on a run exposure can still abort.
+}
+
+# --- "is the address I just checked this machine's Hermes?" -------------------
+# Correlation, never identity. Nothing in a static file proves which process owns
+# a listening port: a reverse proxy, a container publishing 8642, or a stale
+# ~/.hermes/.env can all make another engine look like Hermes. So every reachable
+# declaration has to agree, and anything that does not read cleanly answers NO —
+# silence is the safe failure here. Claiming a remote gateway keeps a memory it
+# does not keep is worse than never mentioning it.
+#
+# Deliberately NOT a port test. Requiring the bind address, the port, an enabled
+# API server, and the exact credential the check actually authenticated with
+# means an unrelated service that merely happens to sit on 8642 stays silent.
+hermes_settings_match_url() { # hermes_settings_match_url <checked-url> -> 0 when every declaration agrees
+  # ${HOME:-} on purpose: --check-server is contracted to run in a bare CI shell
+  # that may have no HOME at all, and `set -u` would abort the whole check on an
+  # unset one. An empty HOME simply finds no install, which is the right answer.
+  local url="$1" envf="${HOME:-}/.hermes/.env"
+  local rest hostport host port declared_host declared_port key
+
+  # https means the app is pairing an address off this box (doctor_accept_url only
+  # ever admits plain http toward 127.*/localhost/[::1]), and a tailnet or proxy
+  # hostname in front of this same Hermes is exactly the case that must not be
+  # claimed: from here it is indistinguishable from someone else's gateway.
+  case "$url" in
+    [Hh][Tt][Tt][Pp]://?*) rest="${url#*://}" ;;
+    *) return 1 ;;
+  esac
+  # A base path routes one listener to many services — http://127.0.0.1:8642/other
+  # can be anything at all — so only the bare authority is attributable.
+  hostport="${rest%%/*}"
+  [ "$hostport" = "$rest" ] || return 1
+  case "$hostport" in
+    '['*']'*) host="${hostport%%]*}"; host="${host#\[}"; port="${hostport##*]}"; port="${port#:}" ;;
+    *:*)      host="${hostport%%:*}"; port="${hostport##*:}" ;;
+    *)        host="$hostport"; port="80" ;;
+  esac
+  [ -n "$port" ] || port="80"
+  host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+
+  [ -f "$envf" ] && [ -r "$envf" ] || return 1
+  [ "$(env_get "$envf" "API_SERVER_ENABLED")" = "true" ] || return 1
+
+  # hermes_api_server_port's 8642 fallback is right for SETUP (Hermes itself falls
+  # back the same way) and wrong as evidence: a declaration this connector cannot
+  # read is not a statement that the thing on 8642 is Hermes. Read it raw instead.
+  declared_port=$(env_get "$envf" "API_SERVER_PORT")
+  if [ -n "$declared_port" ]; then
+    show_qr_is_port "$declared_port" || return 1
+  else
+    declared_port="8642"
+  fi
+  [ "$port" = "$declared_port" ] || return 1
+
+  declared_host=$(env_get "$envf" "API_SERVER_HOST")
+  declared_host=$(printf '%s' "$declared_host" | tr '[:upper:]' '[:lower:]')
+  case "$declared_host" in
+    ""|127.0.0.1|localhost)
+      # Hermes's own default bind, and what this wizard writes. 127.0.0.2 answering
+      # while Hermes holds 127.0.0.1 is a different listener, not this one.
+      [ "$host" = "127.0.0.1" ] || [ "$host" = "localhost" ] || return 1 ;;
+    0.0.0.0|'::'|'*') ;;                       # wildcard bind: any loopback address reaches it
+    '::1') [ "$host" = "::1" ] || return 1 ;;
+    *) [ "$host" = "$declared_host" ] || return 1 ;;
+  esac
+
+  # The credential is the strongest evidence available without a fingerprinting
+  # request: the check AUTHENTICATED with this exact string, so the live listener
+  # accepts the key Hermes's own .env declares. A keyless check, a check with some
+  # other token, or a Hermes that declares no key all fail the equality below —
+  # each of them leaves nothing to correlate, which is an answer of no.
+  key=$(env_get "$envf" "API_SERVER_KEY")
+  [ "${GW_AUTH:-}" = "bearer" ] || return 1
+  [ -n "${GW_TOKEN:-}" ] || return 1
+  [ "$GW_TOKEN" = "$key" ] || return 1
+  return 0
+}
+
+# The frozen recall step guards on GW_KIND, and a check handoff must keep its
+# "custom" kind — that kind decides the paired profile, the health path, the
+# file-lane unit naming, and which agent-side steps are allowed to touch Hermes.
+# A `local` shadows the global for the duration of the call only, so the step
+# sees the gateway it is being asked about while the run keeps pairing exactly
+# what it checked. The latches the step sets stay global, as they must.
+hermes_recall_checked_handoff_step() { # hermes_recall_checked_handoff_step <suggested-list>
+  local GW_KIND="hermes"
+  hermes_recall_scope_step "$1" || true
+}
+
+# The one place the API-server memory question is asked during setup, for every
+# route into it. It sits after the optional file lane because that step asks about
+# the SAME `platform_toolsets.api_server` line: letting it go first turns two
+# edits and two Hermes restarts into one combined before→after, and leaves every
+# host change as late in the run as it can be. A run that never reaches the lane —
+# declined, no rclone, chat-only — still lands here.
+#
+# $HERMES_RECALL_REPORTED is the whole no-double-ask gate: the file-lane step
+# reports before every recall decision it makes, so a true latch means the
+# question was already put to this operator, whatever they answered. Back
+# navigation cannot re-open it either, because nothing above this point asks.
+#
+# `|| true` is the product decision, not an accident of there being no `set -e`:
+# the step returns nonzero whenever the scope is not PROVABLY recall-free, which
+# includes a fresh default install and any config the parser will not guess at.
+# Report and offer, never block — a gateway that chats perfectly well is still
+# pairable, and refusing to pair it is the founder's call, not this step's.
+hermes_recall_post_file_lane_step() {
+  $HERMES_RECALL_REPORTED && return 0
+  # Suggest the scope the code being paired actually needs — the same (URL, cred)
+  # pair the payload builder uses to decide whether a file lane rides at all.
+  local suggested="[web]"
+  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="[web, file]"; fi
+  if [ "${GW_KIND:-}" = "hermes" ]; then
+    hermes_recall_scope_step "$suggested" || true
+  elif $CHECK_HANDOFF_LOCAL_HERMES; then
+    # Say why a Hermes finding is appearing on a gateway this run calls "custom",
+    # and say exactly how strong the claim is. A settings match is not proof of
+    # which process holds the port, and this line must not pretend otherwise.
+    say ""
+    note "This address matches this machine's Hermes API-server settings — same bind address and port, and the check authenticated with the key in ~/.hermes/.env."
+    note "That is a settings match, not proof of which process holds that port, so read what follows against your own install."
+    hermes_recall_checked_handoff_step "$suggested"
+  fi
+  return 0
 }
 
 # Probe a local OpenAI-compatible server for its model list; if exactly one model
@@ -4595,7 +4719,14 @@ hermes_recall_report() {
     default-wide)
       warn "This config names no API-server toolset, so Hermes uses its default bundle — memory and session search included." ;;
     *)
-      warn "I cannot read this config's API-server toolset, so I cannot tell whether Hermes keeps its own memory." ;;
+      # `classify_recall` leaves $items non-empty here only when it read the list
+      # fine but recognised none of the names — a different problem, and a
+      # different fix, from a list it could not read at all.
+      if [ -n "$items" ]; then
+        warn "I can read this API-server list, but I do not recognise ${items// /, } — so I cannot tell whether it carries Hermes's own memory."
+      else
+        warn "I cannot read this config's API-server toolset, so I cannot tell whether Hermes keeps its own memory."
+      fi ;;
   esac
   say "  Conduck sends the whole conversation every turn and expects the gateway to keep"
   say "  nothing of its own. One that remembers answers from things you never sent it, and"
@@ -5743,7 +5874,10 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # without pretending to be an attacker or a sloppy client — that auth is
 # actually ENFORCED (a missing or wrong token must 401; the adapter that
 # forgot its token check passes verify and gets a green QR while sitting wide
-# open with tool access), that an ABSENT "model" field is tolerated, that
+# open with tool access), that a REJECTED request leaves its connection usable
+# for the NEXT one (the rejected body drained, or the connection closed — the
+# one fault a by-hand curl structurally cannot find, because every curl command
+# opens its own connection), that an ABSENT "model" field is tolerated, that
 # unknown request fields are ignored, that a supplied model id really selects
 # (or answers 400 + code "model_not_found"), that an image in an EARLIER
 # message can never poison the chat (forward it or replace it with the
@@ -5808,6 +5942,10 @@ DOCTOR_IMAGE_INPUT="NOT_RUN"
 DOCTOR_FILE_TRANSPORT="NOT_REQUESTED"
 DOCTOR_FILE_ACCESS="NOT_REQUESTED"
 DOCTOR_FILE_E2E="NOT_REQUESTED"
+# The status the LAST doctor_auth_route wrong-token probe got. AUTH_CHAT_REJECT_BODY
+# grades what a rejection did with the body it rejected, so it only has something
+# to grade when the route actually rejected: this is that precondition.
+DOCTOR_AUTH_WRONG_CODE=""
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
   # IMAGE_INPUT grades an optional capability's honesty; FILES_*/FILE_* grade
@@ -5963,15 +6101,71 @@ doctor_curl_negauth() { # doctor_curl_negauth <none|wrong> <curl args…>
 # has to stay first. Plain curl, never curl_gw — the REAL token must never ride
 # an auth-negative probe; the wrong token is the same fixed harmless literal
 # doctor_curl_negauth sends. `--http1.1` is pinned because HTTP/2 frames bodies
-# and cannot show this failure at all. Short timeouts: this is an explanatory
-# probe fired after an already-answered request, not another minute of waiting.
-doctor_desync_pair() { # doctor_desync_pair <curl args addressing the route…>
-  curl -q -sS --http1.1 --max-time 10 --noproxy '*' \
-       -H "Authorization: Bearer conduck-check-wrong-token" \
+# and cannot show this failure at all.
+#
+# `-H 'Expect:'` deletes curl's `Expect: 100-continue`, and that is load-bearing
+# rather than tidiness: with it, a server that answers 401 straight away makes
+# curl skip sending the body at ALL, so there is nothing left over and the probe
+# would report a clean connection for an adapter that never drains anything.
+# curl only adds the header above a ~1 KB body today, so nothing changes now —
+# pinning it keeps the probe honest if this body ever grows.
+#
+# The per-transfer time limit is the caller's, because the two callers want
+# different ones: the diagnostic path passes 10 (an explanatory probe fired
+# after an already-answered request has no business adding another minute),
+# while the counted check passes the same 30 its own precondition already
+# proved this route answers within — there, a probe that merely ran out of time
+# would otherwise turn into a verdict about the adapter.
+doctor_desync_pair() { # doctor_desync_pair <max-seconds> <curl args addressing the route…>
+  local t="$1"; shift
+  curl -q -sS --http1.1 --max-time "$t" --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" -H 'Expect:' \
        -o /dev/null -w '%{http_code} ' "$@" \
-    --next -sS --http1.1 --max-time 10 --noproxy '*' \
-       -H "Authorization: Bearer conduck-check-wrong-token" \
+    --next -sS --http1.1 --max-time "$t" --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" -H 'Expect:' \
        -o /dev/null -w '%{http_code} %{num_connects}' "$@" 2>/dev/null
+}
+
+# The statuses an HTTP request PARSER emits when it starts reading in the middle
+# of something that is not a request line — the fingerprint of a connection that
+# still holds the body of an already-answered request. One list, shared by both
+# readers of a desync pair (the counted check and the diagnostic), so the two can
+# never drift into disagreeing about what the same evidence means.
+doctor_parse_level_status() { # doctor_parse_level_status <http-status>
+  case "$1" in 400|414|431|501|505) return 0 ;; esac
+  return 1
+}
+
+# Busy/overloaded — the two statuses the contract itself lets an adapter answer
+# instead of running a turn. The counted check refuses to grade a pair carrying
+# one: it fires four rejected requests at a single route inside a second, and an
+# adapter that throttles that burst is being careful, not broken. Blaming its
+# body handling for a throttle is exactly the false FAIL this check must not emit.
+doctor_busy_status() { # doctor_busy_status <http-status>
+  case "$1" in 429|503) return 0 ;; esac
+  return 1
+}
+
+# Split one doctor_desync_pair result into DSP_FIRST/DSP_SECOND/DSP_CONNECTS.
+# rc 1 unless it is EXACTLY three fields, both statuses are three digits not
+# starting with 0 (so curl's "000" — no answer at all — never reads as a status),
+# and the connect count is a plain number. The strictness is the whole point: a
+# truncated or empty result must FAIL to parse rather than get reinterpreted, or
+# "the probe never ran" quietly becomes a confident verdict about an adapter that
+# did nothing wrong. (`"401 400"` really does slice into 401/400/400 otherwise.)
+DSP_FIRST=""; DSP_SECOND=""; DSP_CONNECTS=""
+doctor_desync_parse() { # doctor_desync_parse <pair-output>
+  local raw="$1" f s c
+  DSP_FIRST=""; DSP_SECOND=""; DSP_CONNECTS=""
+  case "$raw" in *' '*' '*) ;; *) return 1 ;; esac     # at least three fields…
+  f="${raw%% *}"; raw="${raw#* }"
+  s="${raw%% *}"; c="${raw#* }"
+  case "$c" in *' '*) return 1 ;; esac                 # …and no more than three
+  case "$f" in [1-9][0-9][0-9]) ;; *) return 1 ;; esac
+  case "$s" in [1-9][0-9][0-9]) ;; *) return 1 ;; esac
+  case "$c" in ''|*[!0-9]*) return 1 ;; esac
+  DSP_FIRST="$f"; DSP_SECOND="$s"; DSP_CONNECTS="$c"
+  return 0
 }
 
 # The undrained-body reading of a WRONG-token answer that isn't 401. This is
@@ -5988,7 +6182,7 @@ doctor_desync_pair() { # doctor_desync_pair <curl args addressing the route…>
 # that, and where to look) · the status repeats (their auth path really does
 # answer it — keep the drain theory to one hedged sentence).
 doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> <curl args…>
-  local id="$1" code="$2" a has_body=false desynced=false pair first second connects rest; shift 2
+  local id="$1" code="$2" a has_body=false desynced=false pair first="" second="" connects=""; shift 2
   for a in "$@"; do
     if [ "$a" = "-d" ]; then has_body=true; break; fi
   done
@@ -5996,14 +6190,15 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
   # Parse-level statuses only. A 403/405/429 is plausible middleware, not a
   # desynced request stream, and guessing at those would just relocate the
   # wild-goose chase.
-  case "$code" in 400|414|431|501|505) ;; *) return 0 ;; esac
-  pair=$(doctor_desync_pair "$@") || pair=""
-  first="${pair%% *}"; rest="${pair#* }"
-  second="${rest%% *}"; connects="${rest##* }"
+  doctor_parse_level_status "$code" || return 0
+  pair=$(doctor_desync_pair 10 "$@") || pair=""
+  if doctor_desync_parse "$pair"; then
+    first="$DSP_FIRST"; second="$DSP_SECOND"; connects="$DSP_CONNECTS"
+  fi
   # A differing second status only counts as evidence when curl proves it did
   # NOT open a new connection (connects=0) and the difference is parse-level.
-  if [ "$first" = "401" ] && [ "$connects" = "0" ]; then
-    case "$second" in 400|414|431|501|505) desynced=true ;; esac
+  if [ "$first" = "401" ] && [ "$connects" = "0" ] && doctor_parse_level_status "$second"; then
+    desynced=true
   fi
   if $desynced; then
     d_say "$id" "(a follow-up probe got 401, then HTTP $second for the SAME request on the SAME reused"
@@ -6020,13 +6215,107 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
     d_say "$id" " next request on that kept-alive connection is parsed starting mid-body. A reverse proxy"
     d_say "$id" " pooling upstream connections shows exactly this — which is why it can pass against"
     d_say "$id" " http://127.0.0.1:<port> and fail through your HTTPS front. Compare those two runs.)"
-  else
+  elif [ -n "$first" ]; then
     d_say "$id" "(HTTP $code repeats on a fresh connection, so this really does look like your auth path"
     d_say "$id" " answering — the contract wants 401 on both the missing and the wrong token. If it turns"
     d_say "$id" " out to reproduce ONLY through your HTTPS front and not against http://127.0.0.1:<port>,"
     d_say "$id" " suspect the other cause instead: a 401 that never consumes the request body leaves those"
     d_say "$id" " bytes to be read as the next request on a pooled connection.)"
+  else
+    # The pair produced no readable evidence, so every sentence above would be an
+    # invention. Say only what is true, and name the run that answers it.
+    d_say "$id" "(the follow-up probe that separates a genuine auth answer from an undrained request body"
+    d_say "$id" " never completed, so this run can't tell you which it is. Run me ON the adapter's own host"
+    d_say "$id" " against http://127.0.0.1:<port> for the reading with nothing in between.)"
   fi
+}
+
+# Contract 1.4, normative: a response that REJECTS a request before that
+# request's body has been consumed must still read and discard the remainder, or
+# send "Connection: close" and close. Skip both and the leftover bytes are read
+# as the start of the NEXT request on that connection — a request that was
+# itself perfectly fine. Three of five independent from-scratch adapter builds
+# shipped exactly this. It cannot be found by hand: every plain curl command
+# opens its own connection, so a loopback self-test structurally cannot see it,
+# and it surfaces only behind the pooling HTTPS front the adapter is actually
+# deployed behind (Cloudflare Tunnel, Tailscale Serve, nginx) as unexplained
+# failures on unrelated requests. That is why this is a COUNTED check and not
+# only the diagnosis above: the diagnosis fires after some OTHER check already
+# went red, so an adapter that never trips that path ships with the bug intact.
+#
+# Preconditions, both the caller's: bearer auth, and a standalone wrong-token
+# probe that already answered 401. Without a real rejection there is no rejected
+# body to grade, and the not-401 case belongs to doctor_auth_wrong_diagnose.
+#
+# What green means here is "no follow-up failure observed", never "internals
+# proven". %{num_connects}=0 proves the CLIENT reused its connection; behind a
+# reverse proxy that is the connection to the PROXY, and which upstream
+# connection the proxy then picked is not knowable from out here. So a failure is
+# reported as what was SEEN — identical requests, different answers — and never
+# as a cause this vantage point cannot establish.
+#
+# FAIL needs positive evidence. Everything that merely fails to PRODUCE evidence
+# — a probe that never completed, an adapter throttling the burst with 429/503 —
+# counts green with a note saying so. A check that reddens a CORRECT adapter is
+# worse than no check: it sends its builder auditing code that was never wrong.
+doctor_reject_body_check() { # doctor_reject_body_check <curl args addressing the chat POST route…>
+  local id="AUTH_CHAT_REJECT_BODY" pair first second connects
+  pair=$(doctor_desync_pair 30 "$@") || pair=""
+  if ! doctor_desync_parse "$pair"; then
+    # One retry, and only for this outcome: an incomplete transfer is the one
+    # thing a second attempt can genuinely resolve. A 429 is never retried —
+    # repeating the burst makes a throttle more likely, not less.
+    pair=$(doctor_desync_pair 30 "$@") || pair=""
+  fi
+  if ! doctor_desync_parse "$pair"; then
+    d_ok "$id" "rejected-request body — the follow-up probe never completed, so nothing was observed"
+    d_say "$id" "(two more wrong-token requests down ONE connection would have shown whether a rejected"
+    d_say "$id" " request's body is left behind for the next request to trip over; neither finished, so"
+    d_say "$id" " this run has no evidence either way and does not hold that against you. For the reading"
+    d_say "$id" " with nothing in between, run me ON the adapter's host against http://127.0.0.1:<port>.)"
+    return 0
+  fi
+  first="$DSP_FIRST"; second="$DSP_SECOND"; connects="$DSP_CONNECTS"
+  if [ "$first" = "401" ] && [ "$second" = "401" ]; then
+    if [ "$connects" = "0" ]; then
+      d_ok "$id" "rejected-request body — a second identical request on the SAME connection still → 401"
+    else
+      # The contract recommends exactly this for a 401 (draining an
+      # unauthenticated peer's body does the work the rejection existed to
+      # avoid), so it is a first-class pass, not a lucky one.
+      d_ok "$id" "rejected-request body — the 401 closed the connection; the identical retry → 401"
+    fi
+    return 0
+  fi
+  if [ "$connects" = "0" ] && [ "$second" != "$first" ] && doctor_parse_level_status "$second"; then
+    d_bad "$id" "rejected-request body — identical requests → $first then HTTP $second on ONE reused connection"
+    d_say "$id" "(that is the signature of a rejection answered WITHOUT consuming the request's body: the"
+    d_say "$id" " leftover bytes are read as the start of the next request, and that is what answered"
+    d_say "$id" " $second. Contract revision $DOCTOR_CONTRACT_REV: a response that rejects a request must still read and"
+    d_say "$id" " discard the rest of that body, or send \"Connection: close\" and close after it. For a 401"
+    d_say "$id" " closing is usually the better half — draining an unauthenticated peer performs exactly the"
+    d_say "$id" " work the rejection existed to avoid. Conduck reuses connections and so does every reverse"
+    d_say "$id" " proxy, so this breaks ordinary turns that are themselves perfectly fine. From out here I"
+    d_say "$id" " can only prove MY connection was reused — which upstream connection a front picked isn't"
+    d_say "$id" " visible, so confirm it on the adapter's own host against http://127.0.0.1:<port>.)"
+    return 1
+  fi
+  if doctor_busy_status "$first" || doctor_busy_status "$second"; then
+    d_ok "$id" "rejected-request body — the route answered $first then $second (busy), so it wasn't graded"
+    d_say "$id" "(this probe fires four rejected requests at one route inside a second, and throttling that"
+    d_say "$id" " burst is careful rather than broken, so it is not counted against you. It does mean this"
+    d_say "$id" " run proves nothing about what happens to a rejected request's body — re-run me when the"
+    d_say "$id" " route is idle if you want that answered.)"
+    return 0
+  fi
+  d_bad "$id" "rejected-request body — the wrong token → 401 alone, but $first then $second down one connection"
+  d_say "$id" "(the same request got two different-looking answers seconds apart, so something in the path"
+  d_say "$id" " is not deciding consistently. The usual cause is a rejection answered without consuming the"
+  d_say "$id" " request's body: the leftovers desync whichever pooled connection they land on, so the damage"
+  d_say "$id" " shows up on a LATER request rather than this one. Contract revision $DOCTOR_CONTRACT_REV: drain the remainder,"
+  d_say "$id" " or answer \"Connection: close\" and close after it. Check the HTTPS front too — it pools"
+  d_say "$id" " upstream connections, so one poisoned connection resurfaces on requests that are fine.)"
+  return 1
 }
 
 # Check 1 — GET /v1/models with the REAL token: reachability + the canonical
@@ -6126,6 +6415,7 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
     d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → HTTP $code (the contract pins exactly 401)"
   fi
   code=$(doctor_curl_negauth wrong -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || code=""
+  DOCTOR_AUTH_WRONG_CODE="$code"
   case "$code" in
     401) d_ok "${idp}_WRONG" "auth ($route): WRONG token → 401 (enforced)" ;;
     200) d_bad "${idp}_WRONG" "auth ($route): WRONG token → 200 — the token isn't actually compared"
@@ -6147,6 +6437,7 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
 # — either 200 (caught) or a >30s timeout reported as a failure (fail-safe,
 # never a green pass).
 doctor_auth_checks() {
+  local body='{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
   if [ "$GW_AUTH" != "bearer" ]; then
     d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
     d_say AUTH_NOT_ENFORCED "(the contract requires a bearer token on EVERY route — a keyless adapter that can run"
@@ -6155,8 +6446,18 @@ doctor_auth_checks() {
   fi
   doctor_auth_route AUTH_MODELS "/v1/models" "$GW_URL/v1/models"
   doctor_auth_route AUTH_CHAT "/v1/chat/completions" "$GW_URL/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d '{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
+    -H "Content-Type: application/json" -d "$body"
+  # Only a route that really REJECTED has a rejected body to be graded on, so
+  # the counted check runs on the chat POST and only after its own wrong-token
+  # probe answered 401. Never on /v1/models: a GET carries no body, so there is
+  # nothing that could be left behind. When the 401 didn't happen, the failing
+  # AUTH_CHAT_WRONG line already carries doctor_auth_wrong_diagnose's reading —
+  # counting a second red for the same fault would just double-bill it.
+  if [ "$DOCTOR_AUTH_WRONG_CODE" = "401" ]; then
+    doctor_reject_body_check "$GW_URL/v1/chat/completions" \
+      -H "Content-Type: application/json" -d "$body"
+  fi
+  return 0
 }
 
 # ---- one real chat turn: transport + grading, shared by every chat probe ----
@@ -8068,6 +8369,20 @@ print(json.dumps(req))') \
       # graded — so a deliberately-graded model is the one that gets carried.
       note "Continuing into setup? The pairing code carries the model you named here."
     fi
+    # Statefulness is invisible ON THE WIRE, not always invisible: when the address
+    # that just passed matches this machine's own Hermes API-server settings, the
+    # answer is readable from ~/.hermes/config.yaml. Latched here — and only on a
+    # PASS of THIS check, never from --check-adapter — because the handoff clears
+    # $GW_URL to rebuild it as an HTTPS address, so this is the last point at which
+    # the graded address still exists to be attributed.
+    if hermes_settings_match_url "$GW_URL"; then
+      CHECK_HANDOFF_LOCAL_HERMES=true
+      if interactive_terminal; then
+        say "  On statefulness I am not fully blind here: this address matches this machine's Hermes"
+        say "  API-server settings, so continuing into setup reads that install's own config and says"
+        say "  whether this gateway keeps a memory of its own."
+      fi
+    fi
     if ! interactive_terminal; then
       say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
     fi
@@ -9892,6 +10207,14 @@ run_setup() {
   fi
 
   setup_file_lane
+  # The Hermes API-server memory question, asked once per run for every route in:
+  # the gateway menu's Hermes, and a --check-server handoff whose checked address
+  # matched this machine's Hermes settings (where GW_KIND is deliberately
+  # "custom"). AFTER setup_file_lane because that step asks about the same
+  # `platform_toolsets.api_server` line — going second turns two edits and two
+  # Hermes restarts into one — and BEFORE the dry-run exit, so a planned run
+  # reports the finding it would have acted on.
+  hermes_recall_post_file_lane_step
   if $DRY_RUN; then
     print_plan
     exit 0

@@ -14,7 +14,10 @@
 # without pretending to be an attacker or a sloppy client — that auth is
 # actually ENFORCED (a missing or wrong token must 401; the adapter that
 # forgot its token check passes verify and gets a green QR while sitting wide
-# open with tool access), that an ABSENT "model" field is tolerated, that
+# open with tool access), that a REJECTED request leaves its connection usable
+# for the NEXT one (the rejected body drained, or the connection closed — the
+# one fault a by-hand curl structurally cannot find, because every curl command
+# opens its own connection), that an ABSENT "model" field is tolerated, that
 # unknown request fields are ignored, that a supplied model id really selects
 # (or answers 400 + code "model_not_found"), that an image in an EARLIER
 # message can never poison the chat (forward it or replace it with the
@@ -79,6 +82,10 @@ DOCTOR_IMAGE_INPUT="NOT_RUN"
 DOCTOR_FILE_TRANSPORT="NOT_REQUESTED"
 DOCTOR_FILE_ACCESS="NOT_REQUESTED"
 DOCTOR_FILE_E2E="NOT_REQUESTED"
+# The status the LAST doctor_auth_route wrong-token probe got. AUTH_CHAT_REJECT_BODY
+# grades what a rejection did with the body it rejected, so it only has something
+# to grade when the route actually rejected: this is that precondition.
+DOCTOR_AUTH_WRONG_CODE=""
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
   # IMAGE_INPUT grades an optional capability's honesty; FILES_*/FILE_* grade
@@ -234,15 +241,71 @@ doctor_curl_negauth() { # doctor_curl_negauth <none|wrong> <curl args…>
 # has to stay first. Plain curl, never curl_gw — the REAL token must never ride
 # an auth-negative probe; the wrong token is the same fixed harmless literal
 # doctor_curl_negauth sends. `--http1.1` is pinned because HTTP/2 frames bodies
-# and cannot show this failure at all. Short timeouts: this is an explanatory
-# probe fired after an already-answered request, not another minute of waiting.
-doctor_desync_pair() { # doctor_desync_pair <curl args addressing the route…>
-  curl -q -sS --http1.1 --max-time 10 --noproxy '*' \
-       -H "Authorization: Bearer conduck-check-wrong-token" \
+# and cannot show this failure at all.
+#
+# `-H 'Expect:'` deletes curl's `Expect: 100-continue`, and that is load-bearing
+# rather than tidiness: with it, a server that answers 401 straight away makes
+# curl skip sending the body at ALL, so there is nothing left over and the probe
+# would report a clean connection for an adapter that never drains anything.
+# curl only adds the header above a ~1 KB body today, so nothing changes now —
+# pinning it keeps the probe honest if this body ever grows.
+#
+# The per-transfer time limit is the caller's, because the two callers want
+# different ones: the diagnostic path passes 10 (an explanatory probe fired
+# after an already-answered request has no business adding another minute),
+# while the counted check passes the same 30 its own precondition already
+# proved this route answers within — there, a probe that merely ran out of time
+# would otherwise turn into a verdict about the adapter.
+doctor_desync_pair() { # doctor_desync_pair <max-seconds> <curl args addressing the route…>
+  local t="$1"; shift
+  curl -q -sS --http1.1 --max-time "$t" --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" -H 'Expect:' \
        -o /dev/null -w '%{http_code} ' "$@" \
-    --next -sS --http1.1 --max-time 10 --noproxy '*' \
-       -H "Authorization: Bearer conduck-check-wrong-token" \
+    --next -sS --http1.1 --max-time "$t" --noproxy '*' \
+       -H "Authorization: Bearer conduck-check-wrong-token" -H 'Expect:' \
        -o /dev/null -w '%{http_code} %{num_connects}' "$@" 2>/dev/null
+}
+
+# The statuses an HTTP request PARSER emits when it starts reading in the middle
+# of something that is not a request line — the fingerprint of a connection that
+# still holds the body of an already-answered request. One list, shared by both
+# readers of a desync pair (the counted check and the diagnostic), so the two can
+# never drift into disagreeing about what the same evidence means.
+doctor_parse_level_status() { # doctor_parse_level_status <http-status>
+  case "$1" in 400|414|431|501|505) return 0 ;; esac
+  return 1
+}
+
+# Busy/overloaded — the two statuses the contract itself lets an adapter answer
+# instead of running a turn. The counted check refuses to grade a pair carrying
+# one: it fires four rejected requests at a single route inside a second, and an
+# adapter that throttles that burst is being careful, not broken. Blaming its
+# body handling for a throttle is exactly the false FAIL this check must not emit.
+doctor_busy_status() { # doctor_busy_status <http-status>
+  case "$1" in 429|503) return 0 ;; esac
+  return 1
+}
+
+# Split one doctor_desync_pair result into DSP_FIRST/DSP_SECOND/DSP_CONNECTS.
+# rc 1 unless it is EXACTLY three fields, both statuses are three digits not
+# starting with 0 (so curl's "000" — no answer at all — never reads as a status),
+# and the connect count is a plain number. The strictness is the whole point: a
+# truncated or empty result must FAIL to parse rather than get reinterpreted, or
+# "the probe never ran" quietly becomes a confident verdict about an adapter that
+# did nothing wrong. (`"401 400"` really does slice into 401/400/400 otherwise.)
+DSP_FIRST=""; DSP_SECOND=""; DSP_CONNECTS=""
+doctor_desync_parse() { # doctor_desync_parse <pair-output>
+  local raw="$1" f s c
+  DSP_FIRST=""; DSP_SECOND=""; DSP_CONNECTS=""
+  case "$raw" in *' '*' '*) ;; *) return 1 ;; esac     # at least three fields…
+  f="${raw%% *}"; raw="${raw#* }"
+  s="${raw%% *}"; c="${raw#* }"
+  case "$c" in *' '*) return 1 ;; esac                 # …and no more than three
+  case "$f" in [1-9][0-9][0-9]) ;; *) return 1 ;; esac
+  case "$s" in [1-9][0-9][0-9]) ;; *) return 1 ;; esac
+  case "$c" in ''|*[!0-9]*) return 1 ;; esac
+  DSP_FIRST="$f"; DSP_SECOND="$s"; DSP_CONNECTS="$c"
+  return 0
 }
 
 # The undrained-body reading of a WRONG-token answer that isn't 401. This is
@@ -259,7 +322,7 @@ doctor_desync_pair() { # doctor_desync_pair <curl args addressing the route…>
 # that, and where to look) · the status repeats (their auth path really does
 # answer it — keep the drain theory to one hedged sentence).
 doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> <curl args…>
-  local id="$1" code="$2" a has_body=false desynced=false pair first second connects rest; shift 2
+  local id="$1" code="$2" a has_body=false desynced=false pair first="" second="" connects=""; shift 2
   for a in "$@"; do
     if [ "$a" = "-d" ]; then has_body=true; break; fi
   done
@@ -267,14 +330,15 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
   # Parse-level statuses only. A 403/405/429 is plausible middleware, not a
   # desynced request stream, and guessing at those would just relocate the
   # wild-goose chase.
-  case "$code" in 400|414|431|501|505) ;; *) return 0 ;; esac
-  pair=$(doctor_desync_pair "$@") || pair=""
-  first="${pair%% *}"; rest="${pair#* }"
-  second="${rest%% *}"; connects="${rest##* }"
+  doctor_parse_level_status "$code" || return 0
+  pair=$(doctor_desync_pair 10 "$@") || pair=""
+  if doctor_desync_parse "$pair"; then
+    first="$DSP_FIRST"; second="$DSP_SECOND"; connects="$DSP_CONNECTS"
+  fi
   # A differing second status only counts as evidence when curl proves it did
   # NOT open a new connection (connects=0) and the difference is parse-level.
-  if [ "$first" = "401" ] && [ "$connects" = "0" ]; then
-    case "$second" in 400|414|431|501|505) desynced=true ;; esac
+  if [ "$first" = "401" ] && [ "$connects" = "0" ] && doctor_parse_level_status "$second"; then
+    desynced=true
   fi
   if $desynced; then
     d_say "$id" "(a follow-up probe got 401, then HTTP $second for the SAME request on the SAME reused"
@@ -291,13 +355,107 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
     d_say "$id" " next request on that kept-alive connection is parsed starting mid-body. A reverse proxy"
     d_say "$id" " pooling upstream connections shows exactly this — which is why it can pass against"
     d_say "$id" " http://127.0.0.1:<port> and fail through your HTTPS front. Compare those two runs.)"
-  else
+  elif [ -n "$first" ]; then
     d_say "$id" "(HTTP $code repeats on a fresh connection, so this really does look like your auth path"
     d_say "$id" " answering — the contract wants 401 on both the missing and the wrong token. If it turns"
     d_say "$id" " out to reproduce ONLY through your HTTPS front and not against http://127.0.0.1:<port>,"
     d_say "$id" " suspect the other cause instead: a 401 that never consumes the request body leaves those"
     d_say "$id" " bytes to be read as the next request on a pooled connection.)"
+  else
+    # The pair produced no readable evidence, so every sentence above would be an
+    # invention. Say only what is true, and name the run that answers it.
+    d_say "$id" "(the follow-up probe that separates a genuine auth answer from an undrained request body"
+    d_say "$id" " never completed, so this run can't tell you which it is. Run me ON the adapter's own host"
+    d_say "$id" " against http://127.0.0.1:<port> for the reading with nothing in between.)"
   fi
+}
+
+# Contract 1.4, normative: a response that REJECTS a request before that
+# request's body has been consumed must still read and discard the remainder, or
+# send "Connection: close" and close. Skip both and the leftover bytes are read
+# as the start of the NEXT request on that connection — a request that was
+# itself perfectly fine. Three of five independent from-scratch adapter builds
+# shipped exactly this. It cannot be found by hand: every plain curl command
+# opens its own connection, so a loopback self-test structurally cannot see it,
+# and it surfaces only behind the pooling HTTPS front the adapter is actually
+# deployed behind (Cloudflare Tunnel, Tailscale Serve, nginx) as unexplained
+# failures on unrelated requests. That is why this is a COUNTED check and not
+# only the diagnosis above: the diagnosis fires after some OTHER check already
+# went red, so an adapter that never trips that path ships with the bug intact.
+#
+# Preconditions, both the caller's: bearer auth, and a standalone wrong-token
+# probe that already answered 401. Without a real rejection there is no rejected
+# body to grade, and the not-401 case belongs to doctor_auth_wrong_diagnose.
+#
+# What green means here is "no follow-up failure observed", never "internals
+# proven". %{num_connects}=0 proves the CLIENT reused its connection; behind a
+# reverse proxy that is the connection to the PROXY, and which upstream
+# connection the proxy then picked is not knowable from out here. So a failure is
+# reported as what was SEEN — identical requests, different answers — and never
+# as a cause this vantage point cannot establish.
+#
+# FAIL needs positive evidence. Everything that merely fails to PRODUCE evidence
+# — a probe that never completed, an adapter throttling the burst with 429/503 —
+# counts green with a note saying so. A check that reddens a CORRECT adapter is
+# worse than no check: it sends its builder auditing code that was never wrong.
+doctor_reject_body_check() { # doctor_reject_body_check <curl args addressing the chat POST route…>
+  local id="AUTH_CHAT_REJECT_BODY" pair first second connects
+  pair=$(doctor_desync_pair 30 "$@") || pair=""
+  if ! doctor_desync_parse "$pair"; then
+    # One retry, and only for this outcome: an incomplete transfer is the one
+    # thing a second attempt can genuinely resolve. A 429 is never retried —
+    # repeating the burst makes a throttle more likely, not less.
+    pair=$(doctor_desync_pair 30 "$@") || pair=""
+  fi
+  if ! doctor_desync_parse "$pair"; then
+    d_ok "$id" "rejected-request body — the follow-up probe never completed, so nothing was observed"
+    d_say "$id" "(two more wrong-token requests down ONE connection would have shown whether a rejected"
+    d_say "$id" " request's body is left behind for the next request to trip over; neither finished, so"
+    d_say "$id" " this run has no evidence either way and does not hold that against you. For the reading"
+    d_say "$id" " with nothing in between, run me ON the adapter's host against http://127.0.0.1:<port>.)"
+    return 0
+  fi
+  first="$DSP_FIRST"; second="$DSP_SECOND"; connects="$DSP_CONNECTS"
+  if [ "$first" = "401" ] && [ "$second" = "401" ]; then
+    if [ "$connects" = "0" ]; then
+      d_ok "$id" "rejected-request body — a second identical request on the SAME connection still → 401"
+    else
+      # The contract recommends exactly this for a 401 (draining an
+      # unauthenticated peer's body does the work the rejection existed to
+      # avoid), so it is a first-class pass, not a lucky one.
+      d_ok "$id" "rejected-request body — the 401 closed the connection; the identical retry → 401"
+    fi
+    return 0
+  fi
+  if [ "$connects" = "0" ] && [ "$second" != "$first" ] && doctor_parse_level_status "$second"; then
+    d_bad "$id" "rejected-request body — identical requests → $first then HTTP $second on ONE reused connection"
+    d_say "$id" "(that is the signature of a rejection answered WITHOUT consuming the request's body: the"
+    d_say "$id" " leftover bytes are read as the start of the next request, and that is what answered"
+    d_say "$id" " $second. Contract revision $DOCTOR_CONTRACT_REV: a response that rejects a request must still read and"
+    d_say "$id" " discard the rest of that body, or send \"Connection: close\" and close after it. For a 401"
+    d_say "$id" " closing is usually the better half — draining an unauthenticated peer performs exactly the"
+    d_say "$id" " work the rejection existed to avoid. Conduck reuses connections and so does every reverse"
+    d_say "$id" " proxy, so this breaks ordinary turns that are themselves perfectly fine. From out here I"
+    d_say "$id" " can only prove MY connection was reused — which upstream connection a front picked isn't"
+    d_say "$id" " visible, so confirm it on the adapter's own host against http://127.0.0.1:<port>.)"
+    return 1
+  fi
+  if doctor_busy_status "$first" || doctor_busy_status "$second"; then
+    d_ok "$id" "rejected-request body — the route answered $first then $second (busy), so it wasn't graded"
+    d_say "$id" "(this probe fires four rejected requests at one route inside a second, and throttling that"
+    d_say "$id" " burst is careful rather than broken, so it is not counted against you. It does mean this"
+    d_say "$id" " run proves nothing about what happens to a rejected request's body — re-run me when the"
+    d_say "$id" " route is idle if you want that answered.)"
+    return 0
+  fi
+  d_bad "$id" "rejected-request body — the wrong token → 401 alone, but $first then $second down one connection"
+  d_say "$id" "(the same request got two different-looking answers seconds apart, so something in the path"
+  d_say "$id" " is not deciding consistently. The usual cause is a rejection answered without consuming the"
+  d_say "$id" " request's body: the leftovers desync whichever pooled connection they land on, so the damage"
+  d_say "$id" " shows up on a LATER request rather than this one. Contract revision $DOCTOR_CONTRACT_REV: drain the remainder,"
+  d_say "$id" " or answer \"Connection: close\" and close after it. Check the HTTPS front too — it pools"
+  d_say "$id" " upstream connections, so one poisoned connection resurfaces on requests that are fine.)"
+  return 1
 }
 
 # Check 1 — GET /v1/models with the REAL token: reachability + the canonical
@@ -397,6 +555,7 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
     d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → HTTP $code (the contract pins exactly 401)"
   fi
   code=$(doctor_curl_negauth wrong -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || code=""
+  DOCTOR_AUTH_WRONG_CODE="$code"
   case "$code" in
     401) d_ok "${idp}_WRONG" "auth ($route): WRONG token → 401 (enforced)" ;;
     200) d_bad "${idp}_WRONG" "auth ($route): WRONG token → 200 — the token isn't actually compared"
@@ -418,6 +577,7 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
 # — either 200 (caught) or a >30s timeout reported as a failure (fail-safe,
 # never a green pass).
 doctor_auth_checks() {
+  local body='{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
   if [ "$GW_AUTH" != "bearer" ]; then
     d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
     d_say AUTH_NOT_ENFORCED "(the contract requires a bearer token on EVERY route — a keyless adapter that can run"
@@ -426,8 +586,18 @@ doctor_auth_checks() {
   fi
   doctor_auth_route AUTH_MODELS "/v1/models" "$GW_URL/v1/models"
   doctor_auth_route AUTH_CHAT "/v1/chat/completions" "$GW_URL/v1/chat/completions" \
-    -H "Content-Type: application/json" \
-    -d '{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
+    -H "Content-Type: application/json" -d "$body"
+  # Only a route that really REJECTED has a rejected body to be graded on, so
+  # the counted check runs on the chat POST and only after its own wrong-token
+  # probe answered 401. Never on /v1/models: a GET carries no body, so there is
+  # nothing that could be left behind. When the 401 didn't happen, the failing
+  # AUTH_CHAT_WRONG line already carries doctor_auth_wrong_diagnose's reading —
+  # counting a second red for the same fault would just double-bill it.
+  if [ "$DOCTOR_AUTH_WRONG_CODE" = "401" ]; then
+    doctor_reject_body_check "$GW_URL/v1/chat/completions" \
+      -H "Content-Type: application/json" -d "$body"
+  fi
+  return 0
 }
 
 # ---- one real chat turn: transport + grading, shared by every chat probe ----

@@ -28,6 +28,13 @@ Modes ("good" behavior unless listed):
     auth-chat-none-ok    /v1/chat/completions answers without a token
     auth-chat-any-token  /v1/chat/completions accepts a wrong token
     auth-403             /v1/models answers 403 (not 401) to a missing token
+    reject-no-drain      answers a rejection (401/404/405/406/early 400) without
+                         consuming the request body AND keeps the connection
+                         alive — the shape contract 1.4 forbids, and the bug
+                         three of five clean-room adapter builds shipped
+    reject-close         never drains either, but ends every rejection with
+                         Connection: close — the contract's other allowed half,
+                         and the one it recommends for 401. Must stay GREEN.
     models-bare-array    /v1/models returns a bare JSON array (no envelope)
     models-empty-data    /v1/models returns {"data": []}
     models-no-id         /v1/models entries carry no usable "id" string
@@ -128,6 +135,16 @@ FILE_MODES = {"files-good", "files-no-write", "files-late-write",
               "files-no-reference", "files-reference-substring", "files-slow"}
 LATE_DELAY = float(os.environ.get("CONDUCK_FILES_LATE_DELAY", "1.5"))
 SLOW_DELAY = float(os.environ.get("CONDUCK_FILES_SLOW_DELAY", "6.0"))
+
+# Bounds on draining the body of a request this fixture is about to reject.
+# Both are load-bearing, not decoration. The cap keeps the alternative honest:
+# reading an unauthenticated peer's body without limit performs exactly the work
+# the rejection existed to avoid, so past the cap the connection is CLOSED
+# instead — the contract's other allowed half. The timeout covers the case a
+# byte cap alone cannot: a peer that announces a length and then stops sending,
+# which would otherwise hold this thread open forever.
+DRAIN_LIMIT = 64 * 1024
+DRAIN_TIMEOUT = 5.0
 
 
 def handle_file_turn(mode, files_dir, text):
@@ -298,12 +315,24 @@ def make_handler(mode, token, models):
         def log_message(self, fmt, *args):        # no request logging, ever
             pass
 
+        # ---- per-request state ----
+        # One handler INSTANCE serves every request on a keep-alive connection,
+        # so anything tracked per request has to be reset here or request 2
+        # inherits request 1's answers — which for body_read would mean skipping
+        # a drain that never happened.
+        def handle_one_request(self):
+            self.body_read = False
+            self.force_close = False
+            BaseHTTPRequestHandler.handle_one_request(self)
+
         # ---- plumbing ----
         def send_json(self, status, obj, content_type="application/json"):
             body = json.dumps(obj).encode()
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if self.force_close:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
 
@@ -312,8 +341,72 @@ def make_handler(mode, token, models):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if self.force_close:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
+
+        def drain_body(self):
+            """Read and discard whatever is left of this request's body.
+
+            True when the socket is clean and the connection may be reused;
+            False when the body cannot be consumed SAFELY — chunked framing, an
+            absent/malformed/duplicated Content-Length, one past DRAIN_LIMIT, or
+            a read that stalls or ends early — in which case the caller must
+            close instead. Both outcomes satisfy the contract; only doing
+            neither corrupts the next request on the connection.
+            """
+            if self.body_read:
+                return True
+            self.body_read = True
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                return False
+            lens = self.headers.get_all("Content-Length") or []
+            if not lens:
+                return True                       # nothing framed, nothing left
+            if len(lens) != 1:
+                return False                      # conflicting framing
+            raw = str(lens[0]).strip()
+            if not raw.isdigit():                 # negative, "+5", "1_0", junk
+                return False
+            left = int(raw)
+            if left > DRAIN_LIMIT:
+                return False
+            old = None
+            try:
+                old = self.connection.gettimeout()
+                self.connection.settimeout(DRAIN_TIMEOUT)
+                while left > 0:
+                    got = self.rfile.read(min(left, 8192))
+                    if not got:                   # peer stopped mid-body
+                        return False
+                    left -= len(got)
+                return True
+            except Exception:
+                return False
+            finally:
+                try:
+                    self.connection.settimeout(old)
+                except Exception:
+                    pass
+
+        def reject_hygiene(self):
+            """Leave the connection safe for the NEXT request.
+
+            Contract 1.4: a response that rejects a request before that request's
+            body has been consumed must read and discard the remainder, or send
+            Connection: close and close after the response. Whichever half is
+            taken, the bytes must not still be sitting in the socket when the
+            next request is parsed. Python's http.server does neither on its own
+            and only escapes the corruption while it is left in its default
+            non-persistent HTTP/1.0 mode — this fixture pins HTTP/1.1, so it has
+            to do the work a real adapter has to do.
+            """
+            if mode == "reject-no-drain":         # the deliberate bug
+                return
+            if mode == "reject-close" or not self.drain_body():
+                self.force_close = True
+                self.close_connection = True
 
         def send_redirect(self, status, location):
             self.send_response(status)
@@ -323,12 +416,19 @@ def make_handler(mode, token, models):
             self.end_headers()
             self.close_connection = True
 
+        # Every error answer this fixture sends goes through here, which is why
+        # the connection hygiene lives here too: a rejection is exactly the
+        # response that may be sent before the body was read, and routing them
+        # all through one place is what makes "every early rejection" a fact
+        # rather than an audit of call sites. Errors raised AFTER the body was
+        # read cost nothing extra — drain_body sees body_read and returns.
         def err(self, status, message, code=None, etype="invalid_request_error"):
             e = {"message": message, "type": etype}
             if mode == "error-missing-type":
                 del e["type"]
             if code:
                 e["code"] = code
+            self.reject_hygiene()
             self.send_json(status, {"error": e})
 
         def auth_ok(self, route):
@@ -353,6 +453,16 @@ def make_handler(mode, token, models):
 
         # ---- routes ----
         def do_GET(self):
+            # A GET is not supposed to carry a body, and no Conduck client sends
+            # one — but if one arrives it still has to come off the socket before
+            # the next request is parsed, exactly like a rejected body, or this
+            # persistent connection desyncs on a request that did nothing wrong.
+            # Deliberately NOT routed through reject_hygiene: the reject-* modes
+            # each mean one precise thing about REJECTIONS, and a successful GET
+            # is not one. (do_POST needs no equivalent — it reads the body itself.)
+            if not self.drain_body():
+                self.force_close = True
+                self.close_connection = True
             path = self.path.split("?")[0]
             final = path == "/final/v1/models"
             if path not in ("/v1/models", "/final/v1/models"):
@@ -394,7 +504,9 @@ def make_handler(mode, token, models):
                 return self.err(406, "Accept: application/json is required.")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                req = json.loads(self.rfile.read(length))
+                raw = self.rfile.read(length)
+                self.body_read = True             # consumed: nothing to drain
+                req = json.loads(raw)
                 if not isinstance(req, dict):
                     raise ValueError
             except Exception:
