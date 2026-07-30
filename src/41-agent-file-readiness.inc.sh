@@ -828,14 +828,23 @@ PY
 }
 
 restart_hermes_for_config() {
+  local restarted=1
   if [ "$OS" = "Linux" ] && have systemctl \
      && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
     run_step "restart Hermes so the approved config change applies" \
-      systemctl --user restart hermes-gateway.service
+      systemctl --user restart hermes-gateway.service && restarted=0
   else
     print_and_wait "Restart Hermes however it runs on this machine so the approved config change takes effect." \
-      "systemctl --user restart hermes-gateway.service   # or your own restart method"
+      "systemctl --user restart hermes-gateway.service   # or your own restart method" && restarted=0
   fi
+  # Hermes's API server is not listening the moment the restart command returns,
+  # and BOTH callers walk straight into config and lane decisions about it. Same
+  # defect class as the OpenClaw restarts, so the same bounded wait. HTTP-safe is
+  # TRUE: what the operator approved here is agent-side config, nowhere near the
+  # HTTP layer. On a --check-server handoff the gateway is paired as `custom` and
+  # GW_HEALTH_PATH is empty, so the wait says it cannot tell rather than guessing.
+  [ "$restarted" -eq 0 ] && gw_note_restart_and_wait "Hermes configuration change" true
+  return "$restarted"
 }
 
 # --- API-server recall scope --------------------------------------------------

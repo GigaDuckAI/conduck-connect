@@ -82,6 +82,20 @@ ESC=$(printf '\033')
 # Case table: name|fixture-mode|adapter-args|keyless|expected-exit|expected-failed-ids(comma)|required summary fragments(space-sep)
 # expected-failed-ids "-" = none. keyless=yes runs the adapter check WITHOUT a token
 # (answering the hidden prompt with Enter) against the fixture's open mode.
+#
+# The four require-model-* rows are one family, and they are read together. Three
+# probes deliberately send no "model" field, so an adapter that REQUIRES one fails
+# all of them for a single reason: the family proves the check names that reason
+# ONCE (require-model → only CHAT_BASIC red, every capability genuinely measured),
+# still catches a SECOND real fault under it (require-model-reject-history,
+# require-model-drop-image), and refuses to invent a cause when it cannot attribute
+# the failure at all (require-model-strict-fields). run_case's per-name hooks assert
+# the wording, because the exit code alone cannot tell a true explanation from a
+# false one. Every row in the family pins its three capability meters, and that is
+# the load-bearing half: the meters are the only part a machine consumer reads, so
+# a run that measured nothing must say NOT_RUN there (require-model-strict-fields)
+# and a run that measured with a borrowed model must still report what it measured
+# (require-model), never the missing-model failure a third time.
 CASES='
 good|good|--deep|no|0|-|profile=deep core=PASS history_image=PASS stream=PASS image_input=VERIFIED file_transport=NOT_REQUESTED file_access=NOT_REQUESTED file_e2e=NOT_REQUESTED exit=0
 good-basic|good||no|0|-|profile=basic core=PASS history_image=PASS stream=PASS image_input=NOT_RUN checks=10 failed=0 exit=0
@@ -107,7 +121,11 @@ models-empty-data|models-empty-data|--deep|no|1|MODELS_ENVELOPE|core=FAIL histor
 models-no-id|models-no-id|--deep|no|1|MODELS_ENVELOPE|core=FAIL exit=1
 models-slow|models-slow|--deep|no|1|MODELS_ENVELOPE|core=FAIL exit=1
 wrong-content-type-models|wrong-content-type-models|--deep|no|1|MODELS_ENVELOPE|core=FAIL exit=1
-require-model|require-model|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE,IMAGE_INPUT,STREAM_SYNC|history_image=FAIL stream=FAIL image_input=FAIL exit=1
+require-model|require-model|--deep|no|1|CHAT_BASIC|core=FAIL history_image=PASS stream=PASS image_input=VERIFIED failed=1 exit=1
+require-model-reject-history|require-model-reject-history|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE|core=FAIL history_image=FAIL stream=PASS image_input=VERIFIED failed=2 exit=1
+require-model-drop-image|require-model-drop-image|--deep|no|1|CHAT_BASIC,IMAGE_INPUT|core=FAIL history_image=PASS stream=PASS image_input=UNVERIFIED failed=2 exit=1
+require-model-strict-fields|require-model-strict-fields|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE,IMAGE_INPUT,STREAM_SYNC|core=FAIL history_image=NOT_RUN stream=NOT_RUN image_input=NOT_RUN failed=4 exit=1
+strict-fields-image-413|strict-fields-image-413|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE,IMAGE_INPUT,STREAM_SYNC|core=FAIL history_image=FAIL stream=NOT_RUN image_input=FAIL failed=4 exit=1
 reject-unknown-field|reject-unknown-field|--deep|no|1|CHAT_BASIC|core=FAIL exit=1
 bogus-model-200|bogus-model-200|--deep|no|1|MODEL_SELECTION|core=FAIL exit=1
 error-missing-type|error-missing-type|--deep|no|1|MODEL_SELECTION|core=FAIL exit=1
@@ -329,10 +347,126 @@ run_case() { # run_case <table-row>
   if [ "$nfail" != "$nlines" ]; then
     fail_case "$name" "summary failed=$nfail but $nlines ✗ verdict lines"; return
   fi
+  # Every FAIL exit owes the reader the way out. This grade holds software written
+  # FOR Conduck to Conduck's own rules, so third-party OpenAI-compatible software is
+  # EXPECTED to fail it and its owner did nothing wrong — a closing line pointing
+  # only at the adapter contract leaves them reading a wall of red as "unusable"
+  # when the app pairs with it fine. Asserted on EVERY red row, including the ones
+  # that abort early at /v1/models, and asserted ABSENT on every green one: a PASS
+  # has nothing to steer anyone away from.
+  if [ "$expexit" = "0" ]; then
+    if grep -qF "Didn't write this server yourself?" "$TMP/doctor.out"; then
+      fail_case "$name" "a PASS printed the not-yours way out"; return
+    fi
+  else
+    if ! grep -qF "Didn't write this server yourself?" "$TMP/doctor.out"; then
+      fail_case "$name" "a FAIL exit gave no way out for someone else's server"; return
+    fi
+    if ! grep -qF 'can the app talk to this server?' "$TMP/doctor.out"; then
+      fail_case "$name" "the way out doesn't offer --check-server"; return
+    fi
+    if ! grep -qF "a failed grade here doesn't block that" "$TMP/doctor.out"; then
+      fail_case "$name" "the way out doesn't say pairing is still possible"; return
+    fi
+  fi
+  # Per-name wording assertions. A confidently WRONG explanation costs more trust
+  # than a missing one, and neither the exit code nor the failed-ID set can see the
+  # difference — only the words can.
   case "$name" in
     *redirect-*)
       if ! grep -qF 'final server URL directly' "$TMP/doctor.out"; then
         fail_case "$name" "redirect failure omitted the direct-final-URL hint"; return
+      fi
+      ;;
+    require-model)
+      if ! grep -qF 'REQUIRES that field' "$TMP/doctor.out"; then
+        fail_case "$name" "the missing-model fault was not named plainly"; return
+      fi
+      if grep -qF 'poison every later turn' "$TMP/doctor.out"; then
+        fail_case "$name" "a missing-model failure was retold as history poisoning"; return
+      fi
+      if grep -qF 'must not be rejected' "$TMP/doctor.out"; then
+        fail_case "$name" "a missing-model failure was retold as a streaming fault"; return
+      fi
+      # Said ONCE. The whole defect was one cause told three times, so a fix that
+      # merely swapped three false stories for three true ones is not the fix.
+      local named
+      named=$(grep -c 'REQUIRES that field' "$TMP/doctor.out")
+      if [ "$named" != "1" ]; then
+        fail_case "$name" "the missing-model fault was named $named times, expected once"; return
+      fi
+      # …and every verdict that BORROWED a model says so on itself. Without this a
+      # green history_image/stream/image_input reads as a pass under the contract's
+      # model-less conditions — the one condition the probe could not run under.
+      local scoped id
+      scoped=$(grep -c 'measured with "model"' "$TMP/doctor.out")
+      if [ "$scoped" != "3" ]; then
+        fail_case "$name" "$scoped verdicts named the borrowed model, expected 3 (history, stream, image)"; return
+      fi
+      for id in HISTORY_IMAGE STREAM_SYNC IMAGE_INPUT; do
+        if ! grep -qF "[$id] (measured with \"model\"" "$TMP/doctor.out"; then
+          fail_case "$name" "[$id] passed without saying a model was supplied for it"; return
+        fi
+      done
+      # CHAT_BASIC is the one probe that really did run model-less; claiming a
+      # borrowed model on ITS verdict would misreport the evidence for the failure.
+      if grep -qF '[CHAT_BASIC] (measured with "model"' "$TMP/doctor.out"; then
+        fail_case "$name" "CHAT_BASIC claimed a borrowed model on the model-less turn it graded"; return
+      fi
+      ;;
+    require-model-reject-history)
+      # The mirror image of the case above: with the model supplied, the history
+      # rejection is REAL, so its explanation must still fire. A "fix" that simply
+      # stopped saying it would pass require-model and hide this fault.
+      if ! grep -qF 'poison every later turn' "$TMP/doctor.out"; then
+        fail_case "$name" "a real history-image rejection lost its explanation"; return
+      fi
+      ;;
+    require-model-drop-image)
+      if ! grep -qF 'the engine never saw the image' "$TMP/doctor.out"; then
+        fail_case "$name" "a real silent image drop lost its explanation"; return
+      fi
+      ;;
+    strict-fields-image-413)
+      # 413 is NOT a maybe-missing-model status: the contract spends it on a
+      # request-size limit, and this server said so. An unattributable model
+      # question must not swallow a cause the server stated outright — the image
+      # probes keep their own verdict while the model-less TEXT probe stays ungraded.
+      if grep -qF "[HISTORY_IMAGE] (this request deliberately carries no" "$TMP/doctor.out"; then
+        fail_case "$name" "a stated 413 size limit was reported as an ungraded model question"; return
+      fi
+      if grep -qF "[IMAGE_INPUT] (this request also carries no" "$TMP/doctor.out"; then
+        fail_case "$name" "a stated 413 size limit was reported as an ungraded model question"; return
+      fi
+      # The text-only stream probe has no image, so it really is the ambiguous one.
+      if ! grep -qF "[STREAM_SYNC] (this request deliberately carries no" "$TMP/doctor.out"; then
+        fail_case "$name" "the genuinely ambiguous model-less probe was graded anyway"; return
+      fi
+      # …and the stated cause is what gets reported. A size limit told as a
+      # history-poisoning fault is the same invented explanation in a new place.
+      if ! grep -qF '413 is a request-size limit answering' "$TMP/doctor.out"; then
+        fail_case "$name" "a stated 413 size limit was not named as the cause"; return
+      fi
+      if grep -qF 'poison every later turn' "$TMP/doctor.out"; then
+        fail_case "$name" "a stated 413 size limit was retold as history poisoning"; return
+      fi
+      ;;
+    require-model-strict-fields)
+      if ! grep -qF "can't tell the two rules apart" "$TMP/doctor.out"; then
+        fail_case "$name" "an unattributable failure was not reported as ungraded"; return
+      fi
+      if grep -qF 'poison every later turn' "$TMP/doctor.out"; then
+        fail_case "$name" "an unattributable failure was retold as history poisoning"; return
+      fi
+      if grep -qF 'must not be rejected' "$TMP/doctor.out"; then
+        fail_case "$name" "an unattributable failure was retold as a streaming fault"; return
+      fi
+      ;;
+    sse-on-stream-true)
+      # The stream hint has to describe what the app DOES — all four of its call
+      # sites send "stream": false — not a rule about what it would accept.
+      if ! grep -qF 'always sends "stream": false' "$TMP/doctor.out"; then
+        fail_case "$name" "the stream hint doesn't say the app always sends stream: false"; return
       fi
       ;;
   esac
@@ -552,6 +686,71 @@ run_signal_cleanup() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# A --check-adapter FAIL must not strand the person reading it. This grade holds
+# software written FOR Conduck to Conduck-specific rules, and third-party
+# OpenAI-compatible software (LiteLLM, Open WebUI, Ollama) is EXPECTED to fail it
+# while working perfectly with the app — its owner did nothing wrong. Pointing only
+# at the contract docs tells that reader to go fix someone else's server. So both
+# failure exits carry the way out, and a PASS carries none of it.
+#
+# Two exits, because they are reached by different paths and only one of them was
+# ever likely to be remembered: the full FAIL after the checks run, and the early
+# abort when /v1/models does not meet the envelope rule (stricter than the app's own
+# Test Connection, so third-party software genuinely stops there).
+run_adapter_fail_wayout_case() {
+  local name="adapter-fail-offers-the-way-out" rc=0 mode
+  for mode in reject-history-image models-bare-array; do
+    start_fixture "$mode" || { fail_case "$name" "fixture $mode failed to start"; stop_fixture; return; }
+    rc=0
+    TERM=dumb CONDUCK_TOKEN="$TOKEN" bash "$SCRIPT" --check-adapter "http://127.0.0.1:$PORT" \
+      > "$TMP/doctor.out" 2>&1 < /dev/null || rc=$?
+    stop_fixture
+    if [ "$rc" != "1" ]; then
+      fail_case "$name" "mode $mode exited $rc, expected 1"; return
+    fi
+    # Non-vacuous: the two modes really do leave by the two different exits.
+    case "$mode" in
+      reject-history-image)
+        grep -qF 'checks failed.' "$TMP/doctor.out" || {
+          fail_case "$name" "mode $mode did not reach the full FAIL exit"; return; } ;;
+      models-bare-array)
+        grep -qF 'so I stopped here' "$TMP/doctor.out" || {
+          fail_case "$name" "mode $mode did not reach the early /v1/models abort"; return; } ;;
+    esac
+    # FACT 1 — someone who did not write this server is told the red may not be theirs.
+    if ! grep -qiE "did(n.t| not) write this|did(n.t| not) build this" "$TMP/doctor.out"; then
+      fail_case "$name" "mode $mode never addressed a reader who did not write the server"; return
+    fi
+    # FACT 2 — named concretely enough to recognise the software in front of them.
+    if ! grep -qiE 'ollama|litellm|open ?webui' "$TMP/doctor.out"; then
+      fail_case "$name" "mode $mode named no third-party server that is expected to fail"; return
+    fi
+    # FACT 3 — the check to run instead, and FACT 4 — pairing still available.
+    if ! grep -qF -- '--check-server' "$TMP/doctor.out"; then
+      fail_case "$name" "mode $mode did not offer --check-server as the way out"; return
+    fi
+    if ! grep -qF -- '--setup' "$TMP/doctor.out"; then
+      fail_case "$name" "mode $mode did not say the server can still be paired"; return
+    fi
+  done
+
+  # …and none of it on a PASS. A green adapter's author has no third-party server to
+  # be reassured about, and hedging a clean pass reads as doubt about the pass.
+  start_fixture good || { fail_case "$name" "fixture good failed to start"; stop_fixture; return; }
+  rc=0
+  TERM=dumb CONDUCK_TOKEN="$TOKEN" bash "$SCRIPT" --check-adapter "http://127.0.0.1:$PORT" \
+    > "$TMP/doctor.out" 2>&1 < /dev/null || rc=$?
+  stop_fixture
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "the conformant fixture exited $rc, expected 0"; return
+  fi
+  if grep -qiE "did(n.t| not) write this|did(n.t| not) build this" "$TMP/doctor.out"; then
+    fail_case "$name" "a PASSING adapter check hedged itself with the not-yours way out"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 # ========================================================== --check-server ====
 # The server check matches the current Apple app's
 # direct-endpoint request/body acceptance — NOT redirects or the adapter contract.
@@ -669,6 +868,19 @@ run_server_case() { # run_server_case <table-row>
       fi
       ;;
   esac
+  # A server advertising more than one model id, graded on ONE path the TOOL chose
+  # (here the model-less default route — a server that answers model-less requests
+  # never reaches the first-advertised fallback). The way to grade another model has
+  # to reach the operator on that path too, in the failure note AND in the closing
+  # line, or a fan-out gateway is told it is broken on the strength of one draw.
+  if [ "$name" = "server-reject-history-image" ]; then
+    if ! grep -qF 'This turn named no model, so it graded the default route' "$TMP/doctor.out"; then
+      fail_case "$name" "the failure never said which path it graded"; return
+    fi
+    if ! grep -qF 'CONDUCK_CHECK_SERVER_MODEL=<id> grades the model you plan to use' "$TMP/doctor.out"; then
+      fail_case "$name" "the multi-model hint never reached the closing FAIL"; return
+    fi
+  fi
   if [ "$name" = "server-direct-check" ] &&
      ! grep -qF 'bash conduck-connect.sh --setup' "$TMP/doctor.out"; then
     fail_case "$name" "PASS output omitted the explicit --setup handoff"; return
@@ -1165,6 +1377,152 @@ run_own_https_trust_gate_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# Drive the PRODUCTION exposure menu and its `?` explainer without touching the
+# host: `?` prints the comparison and `b` goes back, so no branch past the menu is
+# ever entered and nothing is ever exposed. The explainer has to print on STDERR
+# here — the real require_choice runs inside a command substitution, so help text
+# on stdout would BE the answer. Its lines are tagged so the menu rows and the
+# explainer can be graded apart.
+# Args: <function-source> <cloudflared-present: yes|no>.
+run_exposure_menu_isolated() {
+  FUNCS="$1" CF_PRESENT="$2" bash -c '
+eval "$FUNCS"
+say()   { printf "%s\n" "$*"; }
+note()  { printf "%s\n" "$*"; }
+head_() { printf "%s\n" "$*"; }
+ok()    { printf "OK %s\n" "$*"; }
+warn()  { printf "WARN %s\n" "$*"; }
+die()   { printf "DIE %s\n" "$*"; exit 1; }
+have()  { case "$1" in cloudflared) [ "$CF_PRESENT" = yes ] ;; *) return 1 ;; esac; }
+ts_targets()         { :; }
+tailscale_dns_name() { printf ""; }
+require_choice() {
+  printf "PROMPT %s\n" "$1" >&2
+  "$3" | sed "s/^/EXPLAINER /" >&2
+  printf "b\n"
+}
+BOLD=""; RESET=""; DIM=""
+DRY_RUN=true
+SETUP_FROM_CHECK=false
+GW_URL=""
+GW_LOCAL_PORT="8080"
+choose_exposure
+' 2>&1
+}
+
+# The exposure menu is where a user commits to who can reach their gateway, so a
+# row that is easy to misread costs them a wrong exposure or a purchase they did
+# not need. Two rows carry that weight. Row 3 wants a domain the user manages in
+# Cloudflare; row 4 is where a `cloudflared tunnel --url` quick tunnel belongs —
+# by far the commonest casual way one of these gateways gets exposed. Row 3's
+# "✓ cloudflared found" is the only cloudflared word on the menu unless row 4
+# names the quick-tunnel address, so an unnamed quick tunnel points its own user
+# at the single option that asks them to buy a domain. The rows are also graded
+# for terseness and for staying a no-default, unrecommended choice: an explainer
+# that grows into the menu is how a terse row becomes a paragraph nobody reads.
+run_exposure_menu_quick_tunnel_case() {
+  local name="exposure-menu-places-the-quick-tunnel" funcs out out_nocf rc
+  local row3 row4 explainer prompt row lines
+
+  funcs=$(extract_funcs choose_exposure explain_exposure_paths)
+  if [ -z "$funcs" ] ||
+     ! printf '%s\n' "$funcs" | grep -qF 'choose_exposure()' ||
+     ! printf '%s\n' "$funcs" | grep -qF 'explain_exposure_paths()'; then
+    fail_case "$name" "could not extract the exposure menu from the release artifact"; return
+  fi
+
+  rc=0
+  out=$(run_exposure_menu_isolated "$funcs" yes) || rc=$?
+  printf -- '--- menu, cloudflared present ---\n%s\n' "$out" > "$TMP/doctor.out"
+  # 10 is the menu's own go-back status: 'b' was taken, no exposure was attempted.
+  if [ "$rc" != "10" ]; then
+    fail_case "$name" "the menu did not go back on 'b' (status $rc) — the rows below may come from another path"; return
+  fi
+  for row in 1 2 3 4; do
+    if ! printf '%s\n' "$out" | grep -qF "  $row)"; then
+      fail_case "$name" "the menu no longer prints row $row"; return
+    fi
+  done
+
+  row3=$(printf '%s\n' "$out" | grep '^  3)')
+  row4=$(printf '%s\n' "$out" | grep '^  4)')
+  # Non-vacuous: the cloudflared detection this case reasons about is really live.
+  if ! printf '%s\n' "$row3" | grep -qF 'cloudflared found'; then
+    fail_case "$name" "row 3 did not report the cloudflared this run has — the stub is not wired"; return
+  fi
+  # Row 4 must be recognisable to someone holding a quick-tunnel address: the
+  # *.trycloudflare.com shape they are looking at, and Cloudflare's own name for it.
+  if ! printf '%s\n' "$row4" | grep -qiF 'trycloudflare.com' ||
+     ! printf '%s\n' "$row4" | grep -qiF 'quick tunnel'; then
+    fail_case "$name" "row 4 does not name the quick tunnel or its *.trycloudflare.com address"; return
+  fi
+  # …and row 3 must not claim it. Option 3 asks for a hostname in a zone the user
+  # manages; a quick-tunnel address has no such zone, so that row is a dead end.
+  if printf '%s\n' "$row3" | grep -qiF 'trycloudflare'; then
+    fail_case "$name" "row 3 claims the quick-tunnel address, which its flow cannot use"; return
+  fi
+  # Terse by design: one consequence plus one decisive constraint. Every row stays
+  # at its title line plus a single body line.
+  for row in 1 2 3 4; do
+    lines=$(printf '%s\n' "$out" | awk -v tag="  $row)" '
+      substr($0, 1, length(tag)) == tag { f = 1; n = 1; next }
+      f && $0 ~ /^[[:space:]]*$/ { exit }
+      f { n++ }
+      END { print n + 0 }
+    ')
+    if [ "$lines" -gt 2 ]; then
+      fail_case "$name" "menu row $row grew to $lines lines — the rows are one consequence plus one constraint"; return
+    fi
+  done
+  # Still an explicit choice with no default and no favourite.
+  prompt=$(printf '%s\n' "$out" | grep '^PROMPT ')
+  if ! printf '%s\n' "$prompt" | grep -qF 'Choose 1-4'; then
+    fail_case "$name" "the menu prompt no longer asks for an explicit 1-4"; return
+  fi
+  if printf '%s\n' "$out" | grep -qiE 'recommend|\(default'; then
+    fail_case "$name" "the menu or its comparison started recommending one of the four paths"; return
+  fi
+
+  # The `?` comparison has to agree with the row it explains, or the two drift and
+  # the user gets a different answer depending on which one they read.
+  explainer=$(printf '%s\n' "$out" | grep '^EXPLAINER ' | tr '\n' ' ')
+  if [ -z "$explainer" ]; then
+    fail_case "$name" "the '?' comparison printed nothing"; return
+  fi
+  for row in '1)' '2)' '3)' '4)'; do
+    case "$explainer" in *"$row"*) ;; *)
+      fail_case "$name" "the '?' comparison stopped explaining option $row"; return ;;
+    esac
+  done
+  if ! printf '%s\n' "$explainer" | grep -qiF 'trycloudflare.com' ||
+     ! printf '%s\n' "$explainer" | grep -qiF 'cloudflared tunnel --url'; then
+    fail_case "$name" "the '?' comparison does not name the quick tunnel or the command that prints its address"; return
+  fi
+  # Facts, not phrasing: reword freely and EXTEND the alternation. The pointer has
+  # to place the quick tunnel on 4 rather than 3 — that is the whole confusion.
+  if ! printf '%s\n' "$explainer" | grep -qiE 'this one, not 3|this option, not 3|option 4, not 3|not option 3|belongs here'; then
+    fail_case "$name" "the '?' comparison no longer places the quick tunnel on option 4 rather than 3"; return
+  fi
+
+  # A host with no cloudflared: the cue is about the address the user HOLDS, not
+  # about a binary on this box, so it must not disappear with the detection.
+  rc=0
+  out_nocf=$(run_exposure_menu_isolated "$funcs" no) || rc=$?
+  printf -- '--- menu, cloudflared absent ---\n%s\n' "$out_nocf" >> "$TMP/doctor.out"
+  if [ "$rc" != "10" ]; then
+    fail_case "$name" "the menu did not go back on 'b' without cloudflared (status $rc)"; return
+  fi
+  if ! printf '%s\n' "$out_nocf" | grep '^  3)' | grep -qF 'not installed'; then
+    fail_case "$name" "row 3 reported cloudflared on a host without it — the stub is not wired"; return
+  fi
+  if ! printf '%s\n' "$out_nocf" | grep '^  4)' | grep -qiF 'trycloudflare.com'; then
+    fail_case "$name" "the quick-tunnel cue is gated on a local cloudflared, so a tunnel run elsewhere is unnamed"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_profile_legacy_file_reach_case() {
   local name="profile-legacy-file-reach-fallback" rc=0 state="$TMP/legacy-file-reach-state"
   local resolver live_check
@@ -1337,13 +1695,15 @@ walk(json.load(open(os.environ["PROF"])))
 }
 
 # Drive the PRODUCTION emit_payload in isolation so the warning it prints can be
-# graded in both shapes it has. The file-lane pair is the ONLY input that varies:
-# an empty pair is a run with no file lane, exactly as build_pairing_payload_json
-# reads it. Output helpers are stubbed to plain text (no colour), with warn()
-# tagged so the assertions can isolate the warning block from the rest of Step 6.
-# Args: <function-source> <file-server-url> <file-server-credential>.
+# graded in both shapes it has. The file-lane pair and the gateway kind are the
+# ONLY inputs that vary: an empty pair is a run with no file lane, exactly as
+# build_pairing_payload_json reads it, and the kind decides whether the screen
+# offers the two follow-up check commands at all. Output helpers are stubbed to
+# plain text (no colour), with warn() tagged so the assertions can isolate the
+# warning block from the rest of Step 6.
+# Args: <function-source> <file-server-url> <file-server-credential> [gateway-kind].
 run_emit_payload_isolated() {
-  FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" bash -c '
+  FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" GW_KIND_IN="${4:-custom}" bash -c '
 eval "$FUNCS"
 say()   { printf "%s\n" "$*"; }
 warn()  { printf "WARNLINE %s\n" "$*"; }
@@ -1358,7 +1718,7 @@ VERIFY_FAILED=false
 FS_ROLLBACK_INCOMPLETE=false
 EMITTED=false
 PAYLOAD_VERSION=1
-GW_KIND="custom"
+GW_KIND="$GW_KIND_IN"
 GW_NAME="Warning probe"
 GW_URL="https://gw.example.test"
 GW_AUTH="bearer"
@@ -1473,6 +1833,72 @@ run_pairing_warning_case() {
   control=$(run_emit_payload_isolated "$unguarded" "" "" | grep '^WARNLINE ' | tr '\n' ' ')
   if ! warning_states "$control" 'credential|shared folder|file server|file-server'; then
     fail_case "$name" "the file-lane check did not see an unconditional file-server clause — it proves nothing"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Every command printed on a SUCCESS screen reads as "do this next", so one that
+# is EXPECTED to fail has to say so where it is printed. `--check-adapter` grades a
+# stricter contract than the app's own wire: generic OpenAI-compatible software
+# pairs fine and then legitimately fails that grade (honouring `stream: true` with
+# SSE is correct OpenAI behaviour; keyless is fine app-side), and a fresh user
+# reads that FAIL as proof the setup they just completed is broken. The failure
+# branch offers the same two commands to a user who already knows something is
+# wrong; this case grades the success screen, where the FAIL has no context.
+#
+# Facts, never the paragraph — extend an alternation when rewording, and do not
+# remove a fact. The helper is the same flattened-grep the warning case uses.
+run_pairing_check_suggestion_case() {
+  local name="pairing-adapter-suggestion-names-its-outcome"
+  local emit out_custom out_openclaw flat_custom flat_openclaw
+
+  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
+    fail_case "$name" "could not extract emit_payload from the release artifact"; return
+  fi
+
+  out_custom=$(run_emit_payload_isolated "$emit" "" "" custom) \
+    || { printf '%s\n' "$out_custom" > "$TMP/doctor.out"
+         fail_case "$name" "emit_payload failed to run for a custom gateway"; return; }
+  out_openclaw=$(run_emit_payload_isolated "$emit" "" "" openclaw) \
+    || { printf '%s\n' "$out_openclaw" > "$TMP/doctor.out"
+         fail_case "$name" "emit_payload failed to run for an OpenClaw gateway"; return; }
+  printf -- '--- success screen, custom gateway ---\n%s\n--- success screen, OpenClaw gateway ---\n%s\n' \
+    "$out_custom" "$out_openclaw" > "$TMP/doctor.out"
+
+  # Non-vacuous: both runs really reached the emit, and the custom one really does
+  # still offer the adapter grade — the thing the caveat below is about.
+  if ! printf '%s\n' "$out_custom" | grep -qF 'conduck-setup:v1:' ||
+     ! printf '%s\n' "$out_openclaw" | grep -qF 'conduck-setup:v1:'; then
+    fail_case "$name" "emit_payload printed no pairing code — the screen proves nothing"; return
+  fi
+  if ! printf '%s\n' "$out_custom" | grep -qF -- '--check-adapter'; then
+    fail_case "$name" "the success screen no longer offers the adapter grade to a custom gateway"; return
+  fi
+
+  flat_custom=$(printf '%s\n' "$out_custom" | tr '\n' ' ')
+  # FACT 1 — the grade is scoped to software built for Conduck.
+  if ! warning_states "$flat_custom" 'built (specifically )?for Conduck'; then
+    fail_case "$name" "the screen no longer scopes the adapter grade to software built for Conduck"; return
+  fi
+  # FACT 2 — software that is not built for Conduck is EXPECTED to fail it, named
+  # concretely enough that a user can place the server they just paired.
+  if ! warning_states "$flat_custom" 'expected to fail|fail rules|is not a (fault|problem)|(does not|doesn.t) mean|means nothing' ||
+     ! warning_states "$flat_custom" 'ollama|litellm|open ?webui|vllm'; then
+    fail_case "$name" "the screen no longer says generic software is expected to fail the adapter grade"; return
+  fi
+  # FACT 3 — that FAIL does not undo the pairing this same screen just handed over.
+  if ! warning_states "$flat_custom" '(does not|doesn.t) undo the pairing|pairing above (still )?(stands|holds)|pairing (above )?is still complete'; then
+    fail_case "$name" "the screen no longer says a failed adapter grade leaves the pairing intact"; return
+  fi
+
+  # The caveat is not free-floating: a gateway that is never offered the grade must
+  # not be told about failing it either.
+  flat_openclaw=$(printf '%s\n' "$out_openclaw" | tr '\n' ' ')
+  if warning_states "$flat_openclaw" '[-][-]check-adapter|adapter grade'; then
+    fail_case "$name" "an OpenClaw pairing was shown adapter-grade text meant for custom servers"; return
   fi
 
   PASS=$((PASS+1))
@@ -2194,6 +2620,84 @@ run_ci_gate_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# An address that fails verification must not end the run. By the time it fails the
+# operator has already entered the token — in the field a ~300-character JWT — and
+# making them paste it again to try the neighbouring address (a sub-path, a
+# different port) is the tool wasting their time. The check re-asks for the ADDRESS
+# and keeps the credential. Two regressions this case exists to catch: the token
+# prompt appearing twice, and a first attempt's red surviving into the summary of a
+# second attempt that passed.
+run_server_url_reask_case() {
+  local name="server-url-reask-keeps-token" rc=0 dead input prompts summary frag
+  start_fixture good || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
+  # A port nothing listens on — bound, read back, released — so the first attempt
+  # fails on curl's connection-refused rather than on a timeout.
+  dead=$(python3 -c 'import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()') \
+    || { fail_case "$name" "could not reserve an unused port"; stop_fixture; return; }
+  # address that fails · token · the working address · EOT (the PTY stays open, so
+  # the handoff question needs a real EOF to mean "no").
+  input="http://127.0.0.1:$dead"$'\n'"$TOKEN"$'\n'"http://127.0.0.1:$PORT"$'\n\004'
+  PTY_ENV=()
+  pty_run 90 "$input" --check-server > "$TMP/doctor.out" 2>&1 || rc=$?
+  stop_fixture
+  if grep -qF 'PTY TIMEOUT' "$TMP/doctor.out"; then
+    fail_case "$name" "the re-ask blocked instead of accepting a second address"; return
+  fi
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "the retried address did not finish green (exit $rc)"; return
+  fi
+  prompts=$(grep -c 'Bearer token the server expects' "$TMP/doctor.out")
+  if [ "$prompts" != "1" ]; then
+    fail_case "$name" "the token was asked for $prompts times, expected 1"; return
+  fi
+  if ! grep -qF 'The token you already entered is kept' "$TMP/doctor.out"; then
+    fail_case "$name" "the re-ask never said the token is kept"; return
+  fi
+  if [ "$(grep -c '^CONDUCK_CHECK_SERVER schema=' "$TMP/doctor.out")" != "1" ]; then
+    fail_case "$name" "expected exactly 1 CONDUCK_CHECK_SERVER summary line"; return
+  fi
+  # Grepped, not tail -1: on an INTERACTIVE pass the summary deliberately prints
+  # BEFORE the optional setup handoff, so the last line is that question.
+  # tr -d '\r': a PTY turns every \n into \r\n, which would break the $ anchor.
+  summary=$(grep '^CONDUCK_CHECK_SERVER schema=' "$TMP/doctor.out" | tr -d '\r')
+  if ! printf '%s\n' "$summary" | grep -Eq "$SERVER_SUMMARY_RE"; then
+    fail_case "$name" "not a valid CONDUCK_CHECK_SERVER schema=2 summary: $summary"; return
+  fi
+  # One `case` per fragment, never one glob chaining them: adjacent fields share
+  # the space between them, so a chained pattern consumes it once and can never
+  # match the next literal.
+  for frag in wire=PASS models=PASS failed=0 exit=0; do
+    case " $summary " in *" $frag "*) ;; *)
+      fail_case "$name" "the failed first address bled into the retried summary ('$frag' missing): $summary"; return ;;
+    esac
+  done
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The HTML diagnosis has to name the cause that actually explains it in the field:
+# the OpenAI API living under a sub-path of the address given. Open WebUI is the
+# common one — its site root answers GET /v1/models with app HTML under HTTP 200.
+run_server_html_subpath_hint_case() {
+  local name="server-html-names-the-subpath" rc=0
+  start_fixture models-html || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
+  TERM=dumb CONDUCK_TOKEN="$TOKEN" bash "$SCRIPT" --check-server "http://127.0.0.1:$PORT" \
+    > "$TMP/doctor.out" 2>&1 < /dev/null || rc=$?
+  stop_fixture
+  if [ "$rc" != "1" ]; then
+    fail_case "$name" "exit $rc, expected 1"; return
+  fi
+  if ! grep -qF 'SUB-PATH' "$TMP/doctor.out"; then
+    fail_case "$name" "the HTML diagnosis never names a sub-path API"; return
+  fi
+  if ! grep -qF '<url>/api' "$TMP/doctor.out"; then
+    fail_case "$name" "the HTML diagnosis gives no concrete sub-path to try"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 # Colour is gated on `[ -t 1 ]`, NOT on $TERM: a redirected or piped run must be
 # ANSI-free even under a colour-capable TERM, or every [CHECK_ID] parser reading
 # a log file gets escape soup. Asserted on the real check path, where those
@@ -2709,6 +3213,10 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" own-https-requires-trusted-cert "*) tr
   run_own_https_trust_gate_case
 fi
 
+if [ -z "$ONLY" ] || case " $ONLY " in *" exposure-menu-places-the-quick-tunnel "*) true ;; *) false ;; esac; then
+  run_exposure_menu_quick_tunnel_case
+fi
+
 if [ -z "$ONLY" ] || case " $ONLY " in *" profile-legacy-file-reach-fallback "*) true ;; *) false ;; esac; then
   run_profile_legacy_file_reach_case
 fi
@@ -2721,12 +3229,28 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-warning-states-what-the-code-i
   run_pairing_warning_case
 fi
 
+if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-adapter-suggestion-names-its-outcome "*) true ;; *) false ;; esac; then
+  run_pairing_check_suggestion_case
+fi
+
 if [ -z "$ONLY" ] || case " $ONLY " in *" help-lists-public-meta-flags "*) true ;; *) false ;; esac; then
   run_help_surface_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" ci-gate-no-handoff "*) true ;; *) false ;; esac; then
   run_ci_gate_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" adapter-fail-offers-the-way-out "*) true ;; *) false ;; esac; then
+  run_adapter_fail_wayout_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" server-url-reask-keeps-token "*) true ;; *) false ;; esac; then
+  run_server_url_reask_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" server-html-names-the-subpath "*) true ;; *) false ;; esac; then
+  run_server_html_subpath_hint_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" no-ansi-when-redirected "*) true ;; *) false ;; esac; then

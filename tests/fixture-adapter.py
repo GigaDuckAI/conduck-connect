@@ -50,6 +50,22 @@ Modes ("good" behavior unless listed):
     require-model        400 when the request has no "model" field
     require-long-model   same, but its only advertised model id is over 100
                          characters (opaque ids must survive pairing exactly)
+    require-model-reject-history  requires a model AND 400s an EARLIER-message
+                         image — the model requirement must not hide the second
+                         fault, so HISTORY_IMAGE has to stay red for the REAL
+                         reason once the check starts supplying a model
+    require-model-drop-image  requires a model AND silently ignores a
+                         current-turn image (same proof for the image probe)
+    require-model-strict-fields  requires a model AND 400s an unknown field, so
+                         the retry that would confirm the model requirement fails
+                         too and the cause stays unattributable — the checker must
+                         then say it is NOT grading the later probes rather than
+                         inventing a cause for them
+    strict-fields-image-413  the same unattributable setup, but ANY request
+                         carrying an image answers 413. The contract spends 413 on
+                         a request-size limit, so this failure has a real cause the
+                         server stated plainly — the checker must report THAT, not
+                         fold it into "could not tell the two rules apart"
     reject-unknown-field 400 when the request carries an unknown field
     bogus-model-200      accepts an unknown model id while advertising two
     sse-despite-false    streams SSE when "stream" is false (correct on true)
@@ -133,6 +149,21 @@ class LoopbackHTTPServer(HTTPServer):
 FILE_MODES = {"files-good", "files-no-write", "files-late-write",
               "files-wrong-bytes", "files-no-final-newline",
               "files-no-reference", "files-reference-substring", "files-slow"}
+
+# Every mode that rejects a chat request carrying no "model" field. Three probes
+# deliberately omit it, so on a model-requiring adapter they all fail for that one
+# reason — which is exactly the confusion the checker has to see through. The
+# require-model-* composites pair the requirement with a SECOND, real fault, so a
+# check that starts supplying a model can be proven to still catch it rather than
+# to have papered over it.
+REQUIRE_MODEL_MODES = {"require-model", "require-long-model",
+                       "require-model-reject-history", "require-model-drop-image",
+                       "require-model-strict-fields", "strict-fields-image-413"}
+# Modes that 400 an unknown request field. Paired with a model requirement this is
+# what makes a missing-model failure UNATTRIBUTABLE: the confirming retry carries
+# the unknown field too, so it fails for the second reason and proves nothing.
+STRICT_FIELD_MODES = {"reject-unknown-field", "require-model-strict-fields",
+                      "strict-fields-image-413"}
 LATE_DELAY = float(os.environ.get("CONDUCK_FILES_LATE_DELAY", "1.5"))
 SLOW_DELAY = float(os.environ.get("CONDUCK_FILES_SLOW_DELAY", "6.0"))
 
@@ -512,10 +543,22 @@ def make_handler(mode, token, models):
             except Exception:
                 return self.err(400, "Body is not a JSON object.")
 
-            if mode == "reject-unknown-field":
+            if mode in STRICT_FIELD_MODES:
                 unknown = set(req) - KNOWN_FIELDS
                 if unknown:
                     return self.err(400, "Unknown request field.")
+
+            # A request-size limit in front of the engine, answered BEFORE the model
+            # check on purpose: that is the order a reverse proxy imposes it in, and
+            # it is the only order in which a model-less image probe can come back
+            # 413 rather than "model is required".
+            if mode == "strict-fields-image-413":
+                for m in (req.get("messages") or []):
+                    c = m.get("content") if isinstance(m, dict) else None
+                    if isinstance(c, list) and any(
+                            isinstance(part, dict) and part.get("type") == "image_url"
+                            for part in c):
+                        return self.err(413, "Request body too large.")
 
             msgs = req.get("messages")
             if not isinstance(msgs, list) or not msgs:
@@ -524,7 +567,7 @@ def make_handler(mode, token, models):
                 return self.err(400, "Final message must have role user.")
 
             model = req.get("model")
-            if mode in ("require-model", "require-long-model") and model is None:
+            if mode in REQUIRE_MODEL_MODES and model is None:
                 return self.err(400, "model is required.")
             if model is not None and model not in models:
                 ignore = (mode == "bogus-model-200"
@@ -554,14 +597,14 @@ def make_handler(mode, token, models):
                         if mode == "decline-other-code":
                             return self.err(400, "This adapter cannot read images.",
                                             code="unsupported_image")
-                        if mode != "silent-drop-image":
+                        if mode not in ("silent-drop-image", "require-model-drop-image"):
                             raw = data_url_bytes((part.get("image_url") or {}).get("url", ""))
                             if raw is not None:
                                 got = decode_digit_png(raw)
                                 if got is not None:
                                     digit_code = got
                     else:
-                        if mode == "reject-history-image":
+                        if mode in ("reject-history-image", "require-model-reject-history"):
                             return self.err(400, "Image in conversation history.")
                         # good/text-only: earlier image is forwarded (we ARE the
                         # engine, so 'forward' = accept) or disclosed — never fatal.

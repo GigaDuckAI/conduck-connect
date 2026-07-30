@@ -489,6 +489,9 @@ explain_exposure_paths() {
   say "     trusts by itself; a certificate you signed yourself does not qualify, and"
   say "     there is no way for the app to make an exception (I explain the free ways"
   say "     to get a real one if yours doesn't pass)."
+  say "     A cloudflared quick tunnel is this one, not 3: the *.trycloudflare.com"
+  say "     address 'cloudflared tunnel --url' prints comes with a certificate your"
+  say "     devices already trust, and it needs no domain of your own."
   say "     Apple Watch:       works on its own IF that address works without a VPN."
   say ""
   say "  You can re-run this script any time and pick a different path."
@@ -526,7 +529,12 @@ choose_exposure() {
   say "  3) ${BOLD}Cloudflare Tunnel${RESET} — public  ($cf_state)"
   say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
   say ""
-  say "  4) ${BOLD}I already run my own HTTPS for it${RESET}"
+  # The parenthetical names the commonest casual exposure of all, `cloudflared tunnel
+  # --url`. Its address belongs to option 4; unnamed here, a quick-tunnel user reads
+  # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
+  # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
+  # would hide it whenever the tunnel runs from another terminal, host, or PATH.
+  say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
   say "     You give the https:// address; its certificate has to be one your devices already trust."
   say ""
   if $SETUP_FROM_CHECK; then

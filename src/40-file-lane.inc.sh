@@ -1167,6 +1167,139 @@ emit("ops", json.dumps(ops))
 PY
 }
 
+# A gateway needs a moment after a restart before it answers again: on a stock
+# OpenClaw Docker install `docker compose restart` returns in about a second and
+# /healthz first answers about five seconds later. Grading it inside that window
+# fails a gateway that is merely booting, and the honest remedy is to wait — so
+# the waiting lives beside the restart that caused it, not in the grading.
+GW_RESTART_WAIT_SECONDS=60      # wall-clock budget for one restart's boot
+GW_RESTART_WAIT_MAX_PROBES=90   # hard backstop: `date` is wall time, not monotonic, so a
+                                # clock stepped backwards mid-wait must not extend the loop
+
+# Facts about a restart THIS run asked for. Recorded because a user whose gateway
+# was still coming back reads "some checks failed" as "I broke it" and undoes a
+# change that was correct.
+#   GW_RESTART_COMPLETED_EPOCH — empty until a restart this run asked for has
+#     completed; then the epoch second at which it completed. A declined restart,
+#     a restart command that exited non-zero, and a dry run all leave it empty.
+#   GW_RESTART_LOCAL_WAIT_TIMED_OUT — the wait below spent its whole budget and
+#     the gateway never answered. Deliberately a fact, not a verdict: it says the
+#     wait expired, never that a later failure was caused by the restart.
+#   GW_RESTART_WHAT — what the operator just approved, as a noun phrase, so the
+#     two messages below name THEIR OWN change. Three callers restart a gateway
+#     (the chat-endpoint flag, OpenClaw's tool policy, a Hermes config change);
+#     naming the wrong one is worse than naming none, because it reassures the
+#     operator about a change they did not make.
+#   GW_RESTART_WHAT_HTTP_SAFE — may we honestly say the change itself cannot
+#     break the gateway's HTTP? True for a tool policy and for Hermes's
+#     agent-side config, both of which sit nowhere near the HTTP layer. FALSE for
+#     the chat-endpoint flag, which IS that layer — enabling a route should only
+#     ever add one, but this is not the place to promise it.
+GW_RESTART_COMPLETED_EPOCH=""
+GW_RESTART_LOCAL_WAIT_TIMED_OUT=false
+GW_RESTART_WHAT="configuration change"
+GW_RESTART_WHAT_HTTP_SAFE=false
+
+# Wait for a gateway this run restarted to answer its local health endpoint
+# again. Bounded twice over (deadline + probe cap), and it gates NOTHING: a
+# gateway that is genuinely broken still reaches Step 5 and still fails there.
+# All this removes is the grading of a gateway that had not finished booting.
+#
+# The probe is verification's own local_health_ok on purpose: the wait and the
+# check that follows it must accept exactly the same answers. A stricter wait
+# would sit out its whole budget on a gateway the check would have passed; a
+# laxer one hands off early, which is the bug this exists to fix.
+#
+# Two answers a second apart are required. One is not proof — a container that
+# starts, answers once and dies would otherwise be reported ready, and so would
+# an old process still listening on its way down.
+gw_wait_local_health_after_restart() { # -> 0 answering again · 1 budget spent
+  if [ -z "${GW_LOCAL_PORT:-}" ] || [ -z "${GW_HEALTH_PATH:-}" ]; then
+    # Nothing local to watch (no health route, or an address that isn't this
+    # machine's), so there is no honest moment to wait for. Verification is then
+    # the first thing that touches the gateway, exactly as it was before.
+    note "There's no local health endpoint here, so I can't tell when the gateway is back."
+    note "If the checks below fail, give it a minute and re-run me."
+    return 0
+  fi
+  local url="http://127.0.0.1:$GW_LOCAL_PORT$GW_HEALTH_PATH"
+  local now deadline="" probes=0
+  now=$(date +%s 2>/dev/null) || now=""
+  case "$now" in ''|*[!0-9]*) ;; *) deadline=$((now + GW_RESTART_WAIT_SECONDS)) ;; esac
+
+  say "  Waiting for the gateway to answer $GW_HEALTH_PATH again after the restart"
+  say "  (up to ${GW_RESTART_WAIT_SECONDS}s — a restarted gateway takes a few seconds to come back)…"
+  while [ "$probes" -lt "$GW_RESTART_WAIT_MAX_PROBES" ]; do
+    probes=$((probes+1))
+    if local_health_ok "$url"; then
+      sleep 1
+      probes=$((probes+1))
+      if local_health_ok "$url"; then
+        ok "The gateway is answering again."
+        return 0
+      fi
+      # A single answer that didn't hold: keep waiting rather than grade it here.
+    fi
+    if [ -n "$deadline" ]; then
+      now=$(date +%s 2>/dev/null) || now=""
+      case "$now" in ''|*[!0-9]*) break ;; esac
+      [ "$now" -ge "$deadline" ] && break
+    fi
+    sleep 1
+  done
+
+  GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+  warn "The gateway still hasn't answered $GW_HEALTH_PATH about ${GW_RESTART_WAIT_SECONDS}s after the restart finished."
+  note "The $GW_RESTART_WHAT is saved either way — this wait didn't undo it."
+  note "The checks below still run and may fail while the gateway is coming back. Give it a"
+  note "minute and re-run me; if the same check fails again, treat it as a real problem."
+  return 1
+}
+
+# The one restart fact worth repeating at the very end of a failed run: by then
+# the readiness warning above has scrolled away, and the transcript the operator
+# is actually looking at when they decide whether to undo their change is the
+# failure epilogue. Silent unless the dedicated wait genuinely expired — a
+# models/auth/TLS failure after a gateway that came back fine is not timing, and
+# a blanket "maybe it was the restart" would excuse a real breakage forever.
+gw_restart_timing_note() {
+  [ -n "$GW_RESTART_COMPLETED_EPOCH" ] || return 0
+  $GW_RESTART_LOCAL_WAIT_TIMED_OUT || return 0
+  say ""
+  warn "One of those may be timing: the gateway hadn't answered $GW_HEALTH_PATH again within"
+  warn "${GW_RESTART_WAIT_SECONDS}s of the restart this run asked for, so it may still have been coming back."
+  if $GW_RESTART_WHAT_HTTP_SAFE; then
+    note "The $GW_RESTART_WHAT is saved, and it cannot break a gateway's HTTP — the restart it"
+    note "needed is what interrupted this check."
+  else
+    note "The $GW_RESTART_WHAT is saved — the restart it needed is what interrupted this check."
+  fi
+  note "Give it a minute and re-run me; if the same check fails again, the"
+  note "restart is no longer a likely explanation."
+  return 0
+}
+
+# Record that a restart this run asked for has completed, then wait for the
+# gateway. Called on BOTH restart routes (the one we run, and the one the
+# operator confirms by hand) — the boot window is identical either way, and
+# pressing Enter is the only signal available on the second route.
+# Always returns 0: a spent wait is evidence, never a reason to abandon the lane.
+# The tool-policy step is the only caller, which is why the two messages above
+# name the tool-policy change by name — a second caller has to generalise them
+# rather than tell a Hermes user their tool policy is safe.
+gw_note_restart_and_wait() { # gw_note_restart_and_wait [<what> [<http-safe>]]
+  GW_RESTART_WHAT="${1:-configuration change}"
+  GW_RESTART_WHAT_HTTP_SAFE=false
+  [ "${2:-false}" = "true" ] && GW_RESTART_WHAT_HTTP_SAFE=true
+  GW_RESTART_COMPLETED_EPOCH=""
+  GW_RESTART_LOCAL_WAIT_TIMED_OUT=false   # reset per attempt: an earlier timeout
+                                          # must not be read as this restart's
+  $DRY_RUN && return 0                    # nothing was restarted, so nothing to wait for
+  GW_RESTART_COMPLETED_EPOCH=$(date +%s 2>/dev/null) || GW_RESTART_COMPLETED_EPOCH=""
+  gw_wait_local_health_after_restart || true
+  return 0
+}
+
 # Check OpenClaw's tool policy for the file lane; offer the exact fix through
 # the same config-set + restart machinery as the Step-2 endpoint enable.
 # Returns 0 = lane proceeds, 1 = user chose to drop the lane. Declining the FIX
@@ -1210,7 +1343,9 @@ openclaw_tool_policy_step() {
   # status = fix | manual — the policy would break agent file transfer.
   warn "This tool policy would break agent file transfer:"
   say  "    $reason"
-  local applied=false
+  # Two separate facts, never conflated: the policy landed in openclaw.json, and
+  # the running gateway picked it up. Re-reading the config proves only the first.
+  local policy_saved=false restart_done=false
   if [ "$status" = "fix" ]; then
     say ""
     say "  The fix — ONLY these keys change; edit, apply_patch, exec and everything"
@@ -1227,29 +1362,45 @@ openclaw_tool_policy_step() {
         if run_step "allow the agent's file tools in OpenClaw's tool policy" \
           docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
             dist/index.js config set --batch-json "$ops"; then
-          run_step "restart the gateway so the policy applies" \
-            docker compose --project-directory "$compose_dir" restart openclaw-gateway || true
-          applied=true
+          policy_saved=true
+          if run_step "restart the gateway so the policy applies" \
+            docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
+            restart_done=true
+            gw_note_restart_and_wait "tool-policy change" true
+          fi
         fi
       else
         local joined=""; local m
         for m in "${cmds[@]}"; do joined="${joined:+$joined && }$m"; done
+        # One step covers both halves here, so its confirmation is the only signal
+        # available for either — the same boot window follows an operator's own
+        # restart, so the same wait follows it.
         if print_and_wait "Not the standard Docker setup — apply the policy change with your install's CLI, then restart the gateway." \
-          "$joined"; then applied=true; fi
+          "$joined"; then
+          policy_saved=true
+          restart_done=true
+          gw_note_restart_and_wait "tool-policy change" true
+        fi
       fi
     fi
-    if $applied && ! $DRY_RUN; then
+    if $policy_saved && ! $DRY_RUN; then
       # Re-read rather than trust: config set can no-op silently (wrong CLI,
       # wrong file) and verification below never exercises agent tools.
       # awk -F'\t', not sed \t — BSD sed treats \t as a literal 't'.
       local recheck; recheck=$(openclaw_tools_analysis "$cfg" | awk -F '\t' '$1=="status"{print $2; exit}')
       if [ "$recheck" = "ok" ]; then
-        ok "Tool policy re-checked — now file-transfer-ready."
+        ok "Tool policy re-checked — openclaw.json is file-transfer-ready."
+        # The re-read proves the FILE, so a policy the running gateway never
+        # reloaded may not say what the config now says.
+        if ! $restart_done; then
+          warn "The gateway was not restarted, so it is still running with its old policy."
+          note "Restart it when you can; until then the agent still can't open the files Conduck uploads."
+        fi
         return 0
       fi
       warn "The policy still doesn't look file-transfer-ready after the change — re-check"
       warn "tools.deny / tools.allow in openclaw.json by hand."
-    elif $applied; then
+    elif $policy_saved; then
       return 0   # dry-run: planned, nothing to re-check
     fi
   fi
@@ -1399,16 +1550,9 @@ setup_file_lane() {
   say "  shared the same way as the gateway."
   if ! confirm "  Set it up?"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
 
-  # OpenClaw: check the agent-side half FIRST — before any unit or exposure
-  # work, so a user who bails out here leaves nothing behind. (Byte transport
-  # is only half the lane; the tool policy decides whether the agent may
-  # actually read/return the files.)
-  if [ "$GW_KIND" = "openclaw" ] && ! openclaw_tool_policy_step; then
-    note "Leaving the file lane out — fix the tool policy, then re-run me to add it."
-    FS_CRED=""; FS_URL=""
-    return 0
-  fi
-
+  # rclone FIRST, because asking is free: without it no lane can be built at all,
+  # and changing a foreign gateway's tool policy (and restarting it) for a lane
+  # that cannot exist is a change made for nothing.
   if ! have rclone; then
     warn "rclone isn't installed. It's a single binary: https://rclone.org/install/"
     # The upstream installer stays the primary route on purpose: distro rclone
@@ -1421,7 +1565,22 @@ setup_file_lane() {
       rc_pm=$(linux_install_cmd rclone); [ -n "$rc_pm" ] && rc_hint="${rc_pm#*$'\t'}"
     fi
     [ -n "$rc_hint" ] && note "Or, if your package manager carries it:  $rc_hint"
-    warn "Install it and re-run me, or skip the file lane for now."
+    # This is not the end of the run: setup continues and pairs the gateway. Say
+    # so — read as a dead end, the sensible-looking reaction is to abandon a setup
+    # that was about to succeed.
+    note "Nothing else stops here: setup continues without file transfer, and chat (including"
+    note "pasted images) still works. If the checks below pass you get a chat-only setup code."
+    note "Install rclone whenever you like and re-run me to add file transfer."
+    return 0
+  fi
+
+  # OpenClaw: check the agent-side half BEFORE any unit or exposure work, so a
+  # user who bails out here leaves nothing behind. (Byte transport is only half
+  # the lane; the tool policy decides whether the agent may actually read/return
+  # the files.)
+  if [ "$GW_KIND" = "openclaw" ] && ! openclaw_tool_policy_step; then
+    note "Leaving the file lane out — fix the tool policy, then re-run me to add it."
+    FS_CRED=""; FS_URL=""
     return 0
   fi
 

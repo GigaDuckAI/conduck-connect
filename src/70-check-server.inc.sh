@@ -21,6 +21,11 @@
 # Semantic compatibility (client-owned history replay) is INVISIBLE here: a
 # stateful server passes this probe and still double-counts context — that
 # dimension needs its own test.
+# An address whose /v1/models fails re-asks for the ADDRESS and keeps the token
+# already entered (interactive runs only — a scripted one exits 1 on the first
+# failure). The credential is the expensive input to re-type, the address is the
+# cheap one, and the two most common first tries are a typo and a site root whose
+# OpenAI API lives one path segment deeper.
 COMPAT_RAN=false
 COMPAT_CHECKS=0; COMPAT_FAILS=0
 COMPAT_MODELS="NOT_RUN"; COMPAT_CHAT="NOT_RUN"; COMPAT_HISTORY_IMAGE="NOT_RUN"
@@ -206,6 +211,104 @@ compat_on_exit() {
   compat_summary "$rc"
 }
 
+# A base address that fails verification RE-ASKS instead of ending the run. The
+# token is already in hand — often a 300-character JWT — and an operator who
+# mistyped the address, or pointed at a site root whose OpenAI API lives under a
+# sub-path, should be able to try the neighbour without pasting the credential
+# again. rc 0 = $GW_URL now holds a new address to grade; rc 1 = nothing left to
+# try (not a terminal, an empty answer, or the input ended), and the caller owns
+# the exit. Same acceptance rule as the first prompt — https anywhere, plain http
+# only toward this machine — so the retry can't relax what the first ask enforced.
+compat_reask_url() {
+  local reply url
+  interactive_terminal || return 1
+  say ""
+  say "  Another address to try? The token you already entered is kept — Enter to stop."
+  while true; do
+    read -r -p "  URL (Enter to stop) > " reply || return 1
+    case "$reply" in '') return 1 ;; esac
+    if url=$(doctor_accept_url "$reply"); then
+      GW_URL="$url"
+      apply_gateway_url_normalization
+      return 0
+    fi
+    if url_has_userinfo "$reply"; then
+      warn "$URL_USERINFO_HINT"; continue
+    fi
+    case "$reply" in
+      [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." ;;
+      *) warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." ;;
+    esac
+  done
+}
+
+# GET /v1/models at the address in $GW_URL, graded exactly the way the app's Test
+# Connection grades it, with the verdict line and its diagnosis. rc 0 = this
+# address is usable and the rest of the run can proceed; rc 1 = it is not, and the
+# caller decides whether to ask for another address or end the run. Sets
+# COMPAT_MODELS either way; every $MODELS_* fact the later probes read is left as
+# this attempt found it.
+compat_models_check() {
+  local rc=0 secs over why=""
+  models_is_json "$GW_URL" "$COMPAT_WANTED_MODEL" || rc=$?
+  secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
+  over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
+  if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
+    COMPAT_MODELS="PASS"
+    c_ok SERVER_MODELS "GET /v1/models — the app's Test Connection passes (${secs}s)"
+    # Content-Type is NOT graded: the app parses the bytes and never reads the
+    # header (this is a deliberate divergence from the adapter contract).
+    if $MODELS_DATA_EMPTY; then
+      c_say SERVER_MODELS "(\"data\" is empty — the app reports \"connected, no models yet\"; chat needs the"
+      c_say SERVER_MODELS " server to answer without a model field)"
+    elif $MODELS_NO_VALID_ID; then
+      c_say SERVER_MODELS "(entries carry no usable \"id\" string — the app can't offer a model picker;"
+      c_say SERVER_MODELS " fine as long as the server answers without a model field)"
+    fi
+    return 0
+  fi
+  COMPAT_MODELS="FAIL"
+  if [ "$rc" = "0" ]; then
+    c_bad SERVER_MODELS "GET /v1/models — answered, but took ${secs}s (the app's Test Connection gives up at 15s)"
+  elif [ "$rc" = "2" ]; then
+    c_bad SERVER_MODELS "GET /v1/models — an HTML page (HTTP ${MODELS_HTTP_CODE:-?}), not JSON"
+    c_say SERVER_MODELS "(something else answered — a login page, a reverse proxy, a wrong base address, or the"
+    c_say SERVER_MODELS " OpenAI-compatible API sitting under a SUB-PATH of this one. Open WebUI is the common"
+    c_say SERVER_MODELS " case: its site root answers with the app's own HTML under HTTP 200 and its API lives"
+    c_say SERVER_MODELS " at <url>/api — so try this same address with /api on the end.)"
+  elif [ "$rc" = "3" ]; then
+    c_bad SERVER_MODELS "GET /v1/models — answers, but not the shape the app requires"
+    c_say SERVER_MODELS "(the app needs a JSON OBJECT whose top-level \"data\" is an ARRAY — a bare array or"
+    c_say SERVER_MODELS " {\"models\": …} fails its Test Connection; some servers have a separate OpenAI-compatible"
+    c_say SERVER_MODELS " path that answers correctly — point the app at THAT base URL)"
+  else
+    if [ "${MODELS_CURL_RC:-0}" != "0" ]; then
+      case "$MODELS_CURL_RC" in
+        6)  why="DNS lookup failed — that hostname doesn't resolve" ;;
+        7)  why="connection refused — nothing is listening there (wrong port? not started?)" ;;
+        28) why="timed out — no answer from the host" ;;
+        35|60) why="TLS problem — the app requires a certificate this machine would trust too" ;;
+        *)  why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
+      esac
+    else
+      case "$MODELS_HTTP_CODE" in
+        401|403) if [ "${GW_AUTH:-}" = "none" ]; then
+                   why="HTTP $MODELS_HTTP_CODE and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+                 else
+                   why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way"
+                 fi ;;
+        3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
+        404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
+        5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
+        2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
+        *)       why="HTTP ${MODELS_HTTP_CODE:-?}" ;;
+      esac
+    fi
+    c_bad SERVER_MODELS "GET /v1/models — $why"
+  fi
+  return 1
+}
+
 run_compat() {
   trap compat_on_exit EXIT
   trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
@@ -270,69 +373,23 @@ run_compat() {
   # path and the optional setup handoff can no longer pair what was proven.
   COMPAT_WANTED_MODEL="${CONDUCK_CHECK_SERVER_MODEL:-}"
 
-  head_ "Server check — $GW_URL"
-  COMPAT_RAN=true
-
   # -- models: direct-endpoint acceptance from Test Connection ----------------
-  local rc=0 secs over
-  models_is_json "$GW_URL" "$COMPAT_WANTED_MODEL" || rc=$?
-  secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
-  over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
-  if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
-    COMPAT_MODELS="PASS"
-    c_ok SERVER_MODELS "GET /v1/models — the app's Test Connection passes (${secs}s)"
-    # Content-Type is NOT graded: the app parses the bytes and never reads the
-    # header (this is a deliberate divergence from the adapter contract).
-    if $MODELS_DATA_EMPTY; then
-      c_say SERVER_MODELS "(\"data\" is empty — the app reports \"connected, no models yet\"; chat needs the"
-      c_say SERVER_MODELS " server to answer without a model field)"
-    elif $MODELS_NO_VALID_ID; then
-      c_say SERVER_MODELS "(entries carry no usable \"id\" string — the app can't offer a model picker;"
-      c_say SERVER_MODELS " fine as long as the server answers without a model field)"
-    fi
-  else
-    COMPAT_MODELS="FAIL"
-    if [ "$rc" = "0" ]; then
-      c_bad SERVER_MODELS "GET /v1/models — answered, but took ${secs}s (the app's Test Connection gives up at 15s)"
-    elif [ "$rc" = "2" ]; then
-      c_bad SERVER_MODELS "GET /v1/models — an HTML page (HTTP ${MODELS_HTTP_CODE:-?}), not JSON"
-      c_say SERVER_MODELS "(something else answered — a login page, a reverse proxy, or a wrong base address)"
-    elif [ "$rc" = "3" ]; then
-      c_bad SERVER_MODELS "GET /v1/models — answers, but not the shape the app requires"
-      c_say SERVER_MODELS "(the app needs a JSON OBJECT whose top-level \"data\" is an ARRAY — a bare array or"
-      c_say SERVER_MODELS " {\"models\": …} fails its Test Connection; some servers have a separate OpenAI-compatible"
-      c_say SERVER_MODELS " path that answers correctly — point the app at THAT base URL)"
-    else
-      local why=""
-      if [ "${MODELS_CURL_RC:-0}" != "0" ]; then
-        case "$MODELS_CURL_RC" in
-          6)  why="DNS lookup failed — that hostname doesn't resolve" ;;
-          7)  why="connection refused — nothing is listening there (wrong port? not started?)" ;;
-          28) why="timed out — no answer from the host" ;;
-          35|60) why="TLS problem — the app requires a certificate this machine would trust too" ;;
-          *)  why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
-        esac
-      else
-        case "$MODELS_HTTP_CODE" in
-          401|403) if [ "${GW_AUTH:-}" = "none" ]; then
-                     why="HTTP $MODELS_HTTP_CODE and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
-                   else
-                     why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way"
-                   fi ;;
-          3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
-          404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
-          5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
-          2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
-          *)       why="HTTP ${MODELS_HTTP_CODE:-?}" ;;
-        esac
-      fi
-      c_bad SERVER_MODELS "GET /v1/models — $why"
-    fi
+  # A failing address re-asks rather than ending the run (compat_reask_url): the
+  # token is already entered, and making the operator paste a long one again to
+  # try the neighbouring address is the tool wasting their time. Each attempt
+  # re-arms the counters, so the summary describes the address that was actually
+  # graded and never carries a previous attempt's red into a later PASS.
+  while true; do
+    head_ "Server check — $GW_URL"
+    COMPAT_RAN=true
+    COMPAT_CHECKS=0; COMPAT_FAILS=0; COMPAT_MODELS="NOT_RUN"
+    compat_models_check && break
+    compat_reask_url && continue
     say ""
     bad "Server check: FAIL — the app's Test Connection fails here, so nothing else can work."
     say "  Fix that first, then re-run me. Testing an adapter you BUILT? Use ${BOLD}--check-adapter${RESET}."
     exit 1
-  fi
+  done
 
   # An explicit model choice is announced BEFORE the first chat turn, so the
   # verdicts below are read against the right target — and so a typo'd id is
@@ -384,9 +441,15 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="optional"
     c_ok SERVER_CHAT "chat without a \"model\" field — decoded by the app's rules (${CCE_LEN:-?} chars)"
   elif [ "$b_ok" = "true" ]; then
-    # Only the statuses the app's own model-required heuristics accept
-    # (400/404/413/422) may be read as "needs a model" — a transient 429/5xx
-    # that happened to clear by the second turn must not claim that.
+    # Only the statuses the app's own model-required gate accepts may be read as
+    # "needs a model" — a transient 429/5xx that happened to clear by the second
+    # turn must not claim that. This list stays INLINE and stays wider than the
+    # adapter check's: this command asks whether the APP can talk to the server, so
+    # it mirrors the app's own status gate (413 included, because the app reaches
+    # its model-required path from there too). The adapter check grades contract
+    # conformance instead and excludes 413, which the contract spends on a
+    # request-size limit. Different questions, different bars — one shared list
+    # would quietly move one of the two verdicts.
     case "$a_code" in
       400|404|413|422)
         COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="required"
@@ -503,9 +566,20 @@ print(json.dumps(req))') \
         c_say SERVER_HISTORY_IMAGE "HTTP 413 on a 1×1 PNG points at a request-size limit in front of the server, not"
         c_say SERVER_HISTORY_IMAGE "at the engine — check the reverse proxy's max body size." ;;
     esac
-    if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-      c_say SERVER_HISTORY_IMAGE "Only '$(safe_display "$COMPAT_MODEL_ID" 60)' was tested — the first of $MODELS_ID_COUNT advertised ids."
-      c_say SERVER_HISTORY_IMAGE "Before judging the server, re-run with CONDUCK_CHECK_SERVER_MODEL=<id> on another."
+    # Whenever THIS run picked the graded path rather than the operator, one model
+    # out of many was a lottery draw. That is as true of the model-less default
+    # route as it is of the first advertised id — and it is the default route a
+    # fan-out gateway with hundreds of ids usually lands on, because a server that
+    # answers a model-less request never becomes first_advertised at all.
+    if [ "$COMPAT_MODEL_SOURCE" != "explicit" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+      if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ]; then
+        c_say SERVER_HISTORY_IMAGE "Only '$(safe_display "$COMPAT_MODEL_ID" 60)' was tested — the first of $MODELS_ID_COUNT advertised ids."
+      else
+        c_say SERVER_HISTORY_IMAGE "This turn named no model, so it graded the default route — one path out of the"
+        c_say SERVER_HISTORY_IMAGE "$MODELS_ID_COUNT model ids this server advertises."
+      fi
+      c_say SERVER_HISTORY_IMAGE "Before judging the server, re-run with CONDUCK_CHECK_SERVER_MODEL=<id> on the one"
+      c_say SERVER_HISTORY_IMAGE "you actually plan to use."
     fi
   fi
 
@@ -587,8 +661,14 @@ print(json.dumps(req))') \
   fi
   bad "Server check: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
   say "  The app would hit the same walls on $graded_scope."
-  if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-    say "  That is not yet a verdict on the server: CONDUCK_CHECK_SERVER_MODEL=<id> grades another."
+  # Same gate as the history-image note above, and for the same reason: the hint
+  # belongs to every run where the TOOL chose the graded path, not only to the
+  # first-advertised one. A server that accepts a model-less request never reaches
+  # first_advertised, so gating on that source alone hid this line from exactly the
+  # fan-out gateways whose 300-plus untested models make it matter most.
+  if [ "$COMPAT_MODEL_SOURCE" != "explicit" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+    say "  That is not yet a verdict on the server: it advertises $MODELS_ID_COUNT model ids and this run"
+    say "  graded one path. CONDUCK_CHECK_SERVER_MODEL=<id> grades the model you plan to use."
   fi
   say "  Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
   say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"

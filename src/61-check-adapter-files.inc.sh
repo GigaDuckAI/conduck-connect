@@ -894,6 +894,10 @@ run_doctor() {
     bad "Adapter check: FAIL — /v1/models isn't answering correctly, so I stopped here."
     say "  Fix that first (every other check would only fail the same way), then re-run me."
     say "  The contract, with a copy-paste self-test: ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+    # The same way out as the full FAIL below: this envelope rule is stricter than
+    # the app's own Test Connection (Content-Type is graded, an empty "data" is a
+    # failure), so third-party software can stop here and still work with the app.
+    doctor_not_yours_hint
     exit 1
   fi
 
@@ -931,21 +935,21 @@ print(json.dumps({"messages": [
         {"type": "image_url", "image_url": {"url": uri}}]},
     {"role": "user", "content": "Reply with exactly: pong"}], "stream": False}))') \
     || die "Could not build the history-image test request (python3 failed)."
-  if doctor_chat_check HISTORY_IMAGE "chat: image in an EARLIER message, newest turn text-only" "$payload" history; then
-    DOCTOR_HISTORY_IMAGE="PASS"
-  else
-    DOCTOR_HISTORY_IMAGE="FAIL"
-  fi
+  # The meter comes from doctor_capability_meter, never from the check's exit
+  # status: that status answers "did this check go red", and the meter answers
+  # "what did this run MEASURE". They differ on exactly one path — a probe that
+  # failed for a cause this run could not tell apart from another rule's failure
+  # — and there the honest meter is NOT_RUN. A red verdict line, failed= and
+  # exit=1 still carry the run-level verdict, so nothing is softened.
+  doctor_chat_check HISTORY_IMAGE "chat: image in an EARLIER message, newest turn text-only" "$payload" history
+  DOCTOR_HISTORY_IMAGE=$(doctor_capability_meter)
 
   payload=$(python3 -c 'import json
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                   "stream": True}))') \
     || die "Could not build the stream test request (python3 failed)."
-  if doctor_chat_check STREAM_SYNC "chat: \"stream\": true still answers one JSON object" "$payload" stream; then
-    DOCTOR_STREAM="PASS"
-  else
-    DOCTOR_STREAM="FAIL"
-  fi
+  doctor_chat_check STREAM_SYNC "chat: \"stream\": true still answers one JSON object" "$payload" stream
+  DOCTOR_STREAM=$(doctor_capability_meter)
 
   if $DOCTOR_DEEP; then
     say ""
@@ -968,5 +972,6 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   fi
   bad "Adapter check: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."
   say "  Every rule above, with a copy-paste self-test:  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+  doctor_not_yours_hint
   exit 1
 }

@@ -1037,8 +1037,16 @@ configure_openclaw() {
         docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
           dist/index.js config set --batch-json \
           '[{"path":"gateway.http.endpoints.chatCompletions.enabled","value":true}]'; then
-        run_step "restart the gateway so the flag applies" \
-          docker compose --project-directory "$compose_dir" restart openclaw-gateway || true
+        # Same boot window as the tool-policy restart: `restart` returns in about
+        # a second and the health route answers a few seconds later. Usually the
+        # exposure step buys that time, but a run reusing an existing exposure
+        # walks straight into verification, so wait here too. HTTP-safe is FALSE
+        # — this change IS the HTTP layer, so the epilogue must not promise it
+        # cannot affect it. GW_LOCAL_PORT and GW_HEALTH_PATH are set just above.
+        if run_step "restart the gateway so the flag applies" \
+          docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
+          gw_note_restart_and_wait "chat-endpoint setting" false
+        fi
       fi
     else
       print_and_wait "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \
@@ -1841,6 +1849,9 @@ explain_exposure_paths() {
   say "     trusts by itself; a certificate you signed yourself does not qualify, and"
   say "     there is no way for the app to make an exception (I explain the free ways"
   say "     to get a real one if yours doesn't pass)."
+  say "     A cloudflared quick tunnel is this one, not 3: the *.trycloudflare.com"
+  say "     address 'cloudflared tunnel --url' prints comes with a certificate your"
+  say "     devices already trust, and it needs no domain of your own."
   say "     Apple Watch:       works on its own IF that address works without a VPN."
   say ""
   say "  You can re-run this script any time and pick a different path."
@@ -1878,7 +1889,12 @@ choose_exposure() {
   say "  3) ${BOLD}Cloudflare Tunnel${RESET} — public  ($cf_state)"
   say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
   say ""
-  say "  4) ${BOLD}I already run my own HTTPS for it${RESET}"
+  # The parenthetical names the commonest casual exposure of all, `cloudflared tunnel
+  # --url`. Its address belongs to option 4; unnamed here, a quick-tunnel user reads
+  # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
+  # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
+  # would hide it whenever the tunnel runs from another terminal, host, or PATH.
+  say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
   say "     You give the https:// address; its certificate has to be one your devices already trust."
   say ""
   if $SETUP_FROM_CHECK; then
@@ -3335,6 +3351,139 @@ emit("ops", json.dumps(ops))
 PY
 }
 
+# A gateway needs a moment after a restart before it answers again: on a stock
+# OpenClaw Docker install `docker compose restart` returns in about a second and
+# /healthz first answers about five seconds later. Grading it inside that window
+# fails a gateway that is merely booting, and the honest remedy is to wait — so
+# the waiting lives beside the restart that caused it, not in the grading.
+GW_RESTART_WAIT_SECONDS=60      # wall-clock budget for one restart's boot
+GW_RESTART_WAIT_MAX_PROBES=90   # hard backstop: `date` is wall time, not monotonic, so a
+                                # clock stepped backwards mid-wait must not extend the loop
+
+# Facts about a restart THIS run asked for. Recorded because a user whose gateway
+# was still coming back reads "some checks failed" as "I broke it" and undoes a
+# change that was correct.
+#   GW_RESTART_COMPLETED_EPOCH — empty until a restart this run asked for has
+#     completed; then the epoch second at which it completed. A declined restart,
+#     a restart command that exited non-zero, and a dry run all leave it empty.
+#   GW_RESTART_LOCAL_WAIT_TIMED_OUT — the wait below spent its whole budget and
+#     the gateway never answered. Deliberately a fact, not a verdict: it says the
+#     wait expired, never that a later failure was caused by the restart.
+#   GW_RESTART_WHAT — what the operator just approved, as a noun phrase, so the
+#     two messages below name THEIR OWN change. Three callers restart a gateway
+#     (the chat-endpoint flag, OpenClaw's tool policy, a Hermes config change);
+#     naming the wrong one is worse than naming none, because it reassures the
+#     operator about a change they did not make.
+#   GW_RESTART_WHAT_HTTP_SAFE — may we honestly say the change itself cannot
+#     break the gateway's HTTP? True for a tool policy and for Hermes's
+#     agent-side config, both of which sit nowhere near the HTTP layer. FALSE for
+#     the chat-endpoint flag, which IS that layer — enabling a route should only
+#     ever add one, but this is not the place to promise it.
+GW_RESTART_COMPLETED_EPOCH=""
+GW_RESTART_LOCAL_WAIT_TIMED_OUT=false
+GW_RESTART_WHAT="configuration change"
+GW_RESTART_WHAT_HTTP_SAFE=false
+
+# Wait for a gateway this run restarted to answer its local health endpoint
+# again. Bounded twice over (deadline + probe cap), and it gates NOTHING: a
+# gateway that is genuinely broken still reaches Step 5 and still fails there.
+# All this removes is the grading of a gateway that had not finished booting.
+#
+# The probe is verification's own local_health_ok on purpose: the wait and the
+# check that follows it must accept exactly the same answers. A stricter wait
+# would sit out its whole budget on a gateway the check would have passed; a
+# laxer one hands off early, which is the bug this exists to fix.
+#
+# Two answers a second apart are required. One is not proof — a container that
+# starts, answers once and dies would otherwise be reported ready, and so would
+# an old process still listening on its way down.
+gw_wait_local_health_after_restart() { # -> 0 answering again · 1 budget spent
+  if [ -z "${GW_LOCAL_PORT:-}" ] || [ -z "${GW_HEALTH_PATH:-}" ]; then
+    # Nothing local to watch (no health route, or an address that isn't this
+    # machine's), so there is no honest moment to wait for. Verification is then
+    # the first thing that touches the gateway, exactly as it was before.
+    note "There's no local health endpoint here, so I can't tell when the gateway is back."
+    note "If the checks below fail, give it a minute and re-run me."
+    return 0
+  fi
+  local url="http://127.0.0.1:$GW_LOCAL_PORT$GW_HEALTH_PATH"
+  local now deadline="" probes=0
+  now=$(date +%s 2>/dev/null) || now=""
+  case "$now" in ''|*[!0-9]*) ;; *) deadline=$((now + GW_RESTART_WAIT_SECONDS)) ;; esac
+
+  say "  Waiting for the gateway to answer $GW_HEALTH_PATH again after the restart"
+  say "  (up to ${GW_RESTART_WAIT_SECONDS}s — a restarted gateway takes a few seconds to come back)…"
+  while [ "$probes" -lt "$GW_RESTART_WAIT_MAX_PROBES" ]; do
+    probes=$((probes+1))
+    if local_health_ok "$url"; then
+      sleep 1
+      probes=$((probes+1))
+      if local_health_ok "$url"; then
+        ok "The gateway is answering again."
+        return 0
+      fi
+      # A single answer that didn't hold: keep waiting rather than grade it here.
+    fi
+    if [ -n "$deadline" ]; then
+      now=$(date +%s 2>/dev/null) || now=""
+      case "$now" in ''|*[!0-9]*) break ;; esac
+      [ "$now" -ge "$deadline" ] && break
+    fi
+    sleep 1
+  done
+
+  GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+  warn "The gateway still hasn't answered $GW_HEALTH_PATH about ${GW_RESTART_WAIT_SECONDS}s after the restart finished."
+  note "The $GW_RESTART_WHAT is saved either way — this wait didn't undo it."
+  note "The checks below still run and may fail while the gateway is coming back. Give it a"
+  note "minute and re-run me; if the same check fails again, treat it as a real problem."
+  return 1
+}
+
+# The one restart fact worth repeating at the very end of a failed run: by then
+# the readiness warning above has scrolled away, and the transcript the operator
+# is actually looking at when they decide whether to undo their change is the
+# failure epilogue. Silent unless the dedicated wait genuinely expired — a
+# models/auth/TLS failure after a gateway that came back fine is not timing, and
+# a blanket "maybe it was the restart" would excuse a real breakage forever.
+gw_restart_timing_note() {
+  [ -n "$GW_RESTART_COMPLETED_EPOCH" ] || return 0
+  $GW_RESTART_LOCAL_WAIT_TIMED_OUT || return 0
+  say ""
+  warn "One of those may be timing: the gateway hadn't answered $GW_HEALTH_PATH again within"
+  warn "${GW_RESTART_WAIT_SECONDS}s of the restart this run asked for, so it may still have been coming back."
+  if $GW_RESTART_WHAT_HTTP_SAFE; then
+    note "The $GW_RESTART_WHAT is saved, and it cannot break a gateway's HTTP — the restart it"
+    note "needed is what interrupted this check."
+  else
+    note "The $GW_RESTART_WHAT is saved — the restart it needed is what interrupted this check."
+  fi
+  note "Give it a minute and re-run me; if the same check fails again, the"
+  note "restart is no longer a likely explanation."
+  return 0
+}
+
+# Record that a restart this run asked for has completed, then wait for the
+# gateway. Called on BOTH restart routes (the one we run, and the one the
+# operator confirms by hand) — the boot window is identical either way, and
+# pressing Enter is the only signal available on the second route.
+# Always returns 0: a spent wait is evidence, never a reason to abandon the lane.
+# The tool-policy step is the only caller, which is why the two messages above
+# name the tool-policy change by name — a second caller has to generalise them
+# rather than tell a Hermes user their tool policy is safe.
+gw_note_restart_and_wait() { # gw_note_restart_and_wait [<what> [<http-safe>]]
+  GW_RESTART_WHAT="${1:-configuration change}"
+  GW_RESTART_WHAT_HTTP_SAFE=false
+  [ "${2:-false}" = "true" ] && GW_RESTART_WHAT_HTTP_SAFE=true
+  GW_RESTART_COMPLETED_EPOCH=""
+  GW_RESTART_LOCAL_WAIT_TIMED_OUT=false   # reset per attempt: an earlier timeout
+                                          # must not be read as this restart's
+  $DRY_RUN && return 0                    # nothing was restarted, so nothing to wait for
+  GW_RESTART_COMPLETED_EPOCH=$(date +%s 2>/dev/null) || GW_RESTART_COMPLETED_EPOCH=""
+  gw_wait_local_health_after_restart || true
+  return 0
+}
+
 # Check OpenClaw's tool policy for the file lane; offer the exact fix through
 # the same config-set + restart machinery as the Step-2 endpoint enable.
 # Returns 0 = lane proceeds, 1 = user chose to drop the lane. Declining the FIX
@@ -3378,7 +3527,9 @@ openclaw_tool_policy_step() {
   # status = fix | manual — the policy would break agent file transfer.
   warn "This tool policy would break agent file transfer:"
   say  "    $reason"
-  local applied=false
+  # Two separate facts, never conflated: the policy landed in openclaw.json, and
+  # the running gateway picked it up. Re-reading the config proves only the first.
+  local policy_saved=false restart_done=false
   if [ "$status" = "fix" ]; then
     say ""
     say "  The fix — ONLY these keys change; edit, apply_patch, exec and everything"
@@ -3395,29 +3546,45 @@ openclaw_tool_policy_step() {
         if run_step "allow the agent's file tools in OpenClaw's tool policy" \
           docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
             dist/index.js config set --batch-json "$ops"; then
-          run_step "restart the gateway so the policy applies" \
-            docker compose --project-directory "$compose_dir" restart openclaw-gateway || true
-          applied=true
+          policy_saved=true
+          if run_step "restart the gateway so the policy applies" \
+            docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
+            restart_done=true
+            gw_note_restart_and_wait "tool-policy change" true
+          fi
         fi
       else
         local joined=""; local m
         for m in "${cmds[@]}"; do joined="${joined:+$joined && }$m"; done
+        # One step covers both halves here, so its confirmation is the only signal
+        # available for either — the same boot window follows an operator's own
+        # restart, so the same wait follows it.
         if print_and_wait "Not the standard Docker setup — apply the policy change with your install's CLI, then restart the gateway." \
-          "$joined"; then applied=true; fi
+          "$joined"; then
+          policy_saved=true
+          restart_done=true
+          gw_note_restart_and_wait "tool-policy change" true
+        fi
       fi
     fi
-    if $applied && ! $DRY_RUN; then
+    if $policy_saved && ! $DRY_RUN; then
       # Re-read rather than trust: config set can no-op silently (wrong CLI,
       # wrong file) and verification below never exercises agent tools.
       # awk -F'\t', not sed \t — BSD sed treats \t as a literal 't'.
       local recheck; recheck=$(openclaw_tools_analysis "$cfg" | awk -F '\t' '$1=="status"{print $2; exit}')
       if [ "$recheck" = "ok" ]; then
-        ok "Tool policy re-checked — now file-transfer-ready."
+        ok "Tool policy re-checked — openclaw.json is file-transfer-ready."
+        # The re-read proves the FILE, so a policy the running gateway never
+        # reloaded may not say what the config now says.
+        if ! $restart_done; then
+          warn "The gateway was not restarted, so it is still running with its old policy."
+          note "Restart it when you can; until then the agent still can't open the files Conduck uploads."
+        fi
         return 0
       fi
       warn "The policy still doesn't look file-transfer-ready after the change — re-check"
       warn "tools.deny / tools.allow in openclaw.json by hand."
-    elif $applied; then
+    elif $policy_saved; then
       return 0   # dry-run: planned, nothing to re-check
     fi
   fi
@@ -3567,16 +3734,9 @@ setup_file_lane() {
   say "  shared the same way as the gateway."
   if ! confirm "  Set it up?"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
 
-  # OpenClaw: check the agent-side half FIRST — before any unit or exposure
-  # work, so a user who bails out here leaves nothing behind. (Byte transport
-  # is only half the lane; the tool policy decides whether the agent may
-  # actually read/return the files.)
-  if [ "$GW_KIND" = "openclaw" ] && ! openclaw_tool_policy_step; then
-    note "Leaving the file lane out — fix the tool policy, then re-run me to add it."
-    FS_CRED=""; FS_URL=""
-    return 0
-  fi
-
+  # rclone FIRST, because asking is free: without it no lane can be built at all,
+  # and changing a foreign gateway's tool policy (and restarting it) for a lane
+  # that cannot exist is a change made for nothing.
   if ! have rclone; then
     warn "rclone isn't installed. It's a single binary: https://rclone.org/install/"
     # The upstream installer stays the primary route on purpose: distro rclone
@@ -3589,7 +3749,22 @@ setup_file_lane() {
       rc_pm=$(linux_install_cmd rclone); [ -n "$rc_pm" ] && rc_hint="${rc_pm#*$'\t'}"
     fi
     [ -n "$rc_hint" ] && note "Or, if your package manager carries it:  $rc_hint"
-    warn "Install it and re-run me, or skip the file lane for now."
+    # This is not the end of the run: setup continues and pairs the gateway. Say
+    # so — read as a dead end, the sensible-looking reaction is to abandon a setup
+    # that was about to succeed.
+    note "Nothing else stops here: setup continues without file transfer, and chat (including"
+    note "pasted images) still works. If the checks below pass you get a chat-only setup code."
+    note "Install rclone whenever you like and re-run me to add file transfer."
+    return 0
+  fi
+
+  # OpenClaw: check the agent-side half BEFORE any unit or exposure work, so a
+  # user who bails out here leaves nothing behind. (Byte transport is only half
+  # the lane; the tool policy decides whether the agent may actually read/return
+  # the files.)
+  if [ "$GW_KIND" = "openclaw" ] && ! openclaw_tool_policy_step; then
+    note "Leaving the file lane out — fix the tool policy, then re-run me to add it."
+    FS_CRED=""; FS_URL=""
     return 0
   fi
 
@@ -4664,14 +4839,23 @@ PY
 }
 
 restart_hermes_for_config() {
+  local restarted=1
   if [ "$OS" = "Linux" ] && have systemctl \
      && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
     run_step "restart Hermes so the approved config change applies" \
-      systemctl --user restart hermes-gateway.service
+      systemctl --user restart hermes-gateway.service && restarted=0
   else
     print_and_wait "Restart Hermes however it runs on this machine so the approved config change takes effect." \
-      "systemctl --user restart hermes-gateway.service   # or your own restart method"
+      "systemctl --user restart hermes-gateway.service   # or your own restart method" && restarted=0
   fi
+  # Hermes's API server is not listening the moment the restart command returns,
+  # and BOTH callers walk straight into config and lane decisions about it. Same
+  # defect class as the OpenClaw restarts, so the same bounded wait. HTTP-safe is
+  # TRUE: what the operator approved here is agent-side config, nowhere near the
+  # HTTP layer. On a --check-server handoff the gateway is paired as `custom` and
+  # GW_HEALTH_PATH is empty, so the wait says it cannot tell rather than guessing.
+  [ "$restarted" -eq 0 ] && gw_note_restart_and_wait "Hermes configuration change" true
+  return "$restarted"
 }
 
 # --- API-server recall scope --------------------------------------------------
@@ -5883,6 +6067,12 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # message can never poison the chat (forward it or replace it with the
 # contract's disclosure — never reject; one bad photo must not kill every
 # later turn), and that "stream": true still gets ONE synchronous JSON answer.
+# CHAT_BASIC owns the absent-model rule, and it owns it alone: the history,
+# stream and image probes also omit the field, so on an adapter that REQUIRES a
+# model they would every one of them fail for CHAT_BASIC's reason. Once CHAT_BASIC
+# has confirmed that requirement — by re-sending its identical request with the
+# first advertised id — the later probes carry that id and grade their OWN rule,
+# and the missing-model failure is reported once, where it belongs.
 # --deep adds the semantic image probe: a locally generated PNG showing 4
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
@@ -5904,10 +6094,17 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
 #   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.4 harness=<ver>
-#     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN> history_image=<…>
-#     stream=<…> image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
+#     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
+#     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
+#     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
 #     file_transport=<…> file_access=<…> file_e2e=<…>
 #     checks=<n> failed=<n> exit=<n>
+# Every capability meter is a claim about something the run MEASURED, so NOT_RUN
+# covers both "a prerequisite stopped this tier" and "the probe failed for a
+# cause this run could not tell apart from another rule's failure". A capability
+# the run could not measure is never reported as failing it — the run-level
+# verdict lives in core=/failed=/exit=, and a red verdict line there is what
+# says the adapter is non-conformant.
 # The three file meters share one enum: NOT_REQUESTED (no --files) |
 # NOT_RUN (requested, but a prerequisite stopped this tier) | PASS | FAIL |
 # ERROR (unsafe config, harness failure, or unproven cleanup). Scripts key
@@ -5946,6 +6143,45 @@ DOCTOR_FILE_E2E="NOT_REQUESTED"
 # grades what a rejection did with the body it rejected, so it only has something
 # to grade when the route actually rejected: this is that precondition.
 DOCTOR_AUTH_WRONG_CODE=""
+
+# Does this adapter tolerate a request with NO "model" field? Three probes
+# deliberately omit it (the contract requires tolerating an absent model), so on
+# an adapter that REQUIRES one they would all fail for that single reason — and
+# each would be explained as a fault of its own rule, which is how a working
+# history-image path gets told it poisons conversations. CHAT_BASIC answers the
+# question ONCE and every later chat probe reads the answer here:
+#   unknown        — not decided (CHAT_BASIC hasn't run, or failed some other way)
+#   tolerated      — a model-less turn answered; later model-less probes are honest
+#   required       — CHAT_BASIC failed model-less and the identical request answered
+#                    once DOCTOR_MODEL_LANE_ID was supplied. Later probes carry that
+#                    id, so they grade the rule they exist to grade.
+#   unattributable — CHAT_BASIC failed model-less and this run could not separate
+#                    "requires a model" from a fault of its own; later probes of the
+#                    same shape report NOT graded rather than inventing a cause.
+# ONLY CHAT_BASIC may write these (doctor_chat_check enforces it). Letting a later
+# probe decide would let a capability check outside the core= rollup turn its own
+# red into a measured green, and IMAGE_INPUT can't flip core= — so a whole run
+# could go green on an adapter that violates the absent-model rule.
+DOCTOR_MODEL_LANE="unknown"
+DOCTOR_MODEL_LANE_ID=""
+
+# The way out of a FAIL that isn't the reader's to fix. This grade holds software
+# written FOR Conduck to Conduck-specific rules, and third-party OpenAI-compatible
+# software is EXPECTED to fail it — answering "stream": true with SSE is correct
+# OpenAI behaviour, keyless is a legitimate deployment choice, and neither is a
+# defect in LiteLLM, Open WebUI or Ollama. Without this, the closing line points
+# only at the contract docs, so a user grading someone else's server reads a wall
+# of red as "this cannot be used" and stops — when the app pairs with it fine.
+# Printed on EVERY --check-adapter failure exit, including the early /v1/models
+# abort: the person is equally stranded whichever check stopped the run.
+doctor_not_yours_hint() {
+  say "  Didn't write this server yourself? Then this red says very little. The grade above"
+  say "  holds software built FOR Conduck to Conduck's own rules, and generic servers (Ollama,"
+  say "  LiteLLM, Open WebUI) fail rules that are correct for them — their owners did nothing"
+  say "  wrong. Ask the question you actually have instead:"
+  say "    ${BOLD}bash conduck-connect.sh --check-server${RESET}   — can the app talk to this server?"
+  say "    ${BOLD}bash conduck-connect.sh --setup${RESET}          — pair it; a failed grade here doesn't block that"
+}
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
   # IMAGE_INPUT grades an optional capability's honesty; FILES_*/FILE_* grade
@@ -6590,21 +6826,161 @@ print("ok %d" % len(c))' "$exp" 2>/dev/null)
   return 1
 }
 
+# The statuses that MIGHT mean "this request needs a model field". A status in
+# here proves NOTHING on its own — it only buys the one controlled retry below the
+# right to run, and that retry is the evidence. So this list exists to avoid
+# wasting a five-minute turn, not to classify anything.
+#
+# 413 is deliberately NOT in it, and this list is deliberately NOT the one
+# --check-server uses. Two separate reasons:
+#   413 — the contract assigns it to a request-size / image-too-large limit, and
+#     this check has a real diagnosis for that. Admitting it here would let a
+#     genuine size limit be re-reported as "not graded" and bury the true cause.
+#   --check-server keeps its own, wider list inline. It answers a different
+#     question (can the app talk to this server) at a deliberately laxer bar, and
+#     it already ships that behaviour; sharing one list would silently move a
+#     verdict in a command this slice was not asked to change. Two questions, two
+#     lists, each with its reason written next to it.
+# This is also NOT "the set the app's model-required heuristic accepts": the app
+# gates on those statuses AND then requires model-required prose in the body
+# (RemoteAgentClient), so the status alone was never its rule either.
+doctor_model_required_candidate_status() { # <http-status>
+  case "$1" in 400|404|422) return 0 ;; esac
+  return 1
+}
+
+# 0 iff the payload carries a top-level "model" key (absent and null both count
+# as absent — the contract's rule is about the field the app didn't send).
+doctor_payload_has_model() { # <payload-json>
+  printf '%s' "$1" | python3 -c 'import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("model") is not None else 1)' 2>/dev/null
+}
+
+# Echo the payload with "model" set. Used to carry the advertised id on the
+# probes that come AFTER the absent-model rule has already been graded.
+doctor_payload_with_model() { # <payload-json> <model-id>
+  printf '%s' "$1" | CONDUCK_CHECK_MODEL="$2" python3 -c 'import json, os, sys
+req = json.load(sys.stdin)
+req["model"] = os.environ["CONDUCK_CHECK_MODEL"]
+print(json.dumps(req))' 2>/dev/null
+}
+
+# Did THIS payload only fail for want of a model? Re-sends the identical request
+# with the first advertised id and nothing else changed: rc 0 means the model was
+# the only thing missing — confirmed for this payload, not deduced from prose.
+# Reading the error message instead would be guesswork (every adapter words it
+# differently); one controlled retry is the evidence.
+#
+# The caller's DCC_*/DCE_* evidence is snapshotted and restored, because
+# doctor_chat_eval overwrites those globals: without this the caller's own hints
+# would describe the RETRY and not the model-less failure they are explaining.
+doctor_model_required_probe() { # <payload-json>
+  local payload="$1" retried rc=1
+  local s_code="$DCC_CODE" s_ct="$DCC_CT" s_time="$DCC_TIME" s_body="$DCC_BODY" s_crc="$DCC_CURL_RC"
+  local s_reason="$DCE_REASON" s_hint="$DCE_HINT" s_len="$DCE_LEN" s_token="$DCE_TOKEN"
+  retried=$(doctor_payload_with_model "$payload" "$MODELS_FIRST_ID")
+  if [ -n "$retried" ] && doctor_chat_eval "$retried"; then rc=0; fi
+  DCC_CODE="$s_code"; DCC_CT="$s_ct"; DCC_TIME="$s_time"; DCC_BODY="$s_body"; DCC_CURL_RC="$s_crc"
+  DCE_REASON="$s_reason"; DCE_HINT="$s_hint"; DCE_LEN="$s_len"; DCE_TOKEN="$s_token"
+  return $rc
+}
+
+# Every verdict reached on a probe that had to BORROW a model id says so, on the
+# verdict itself. Without this the transcript and the machine summary both read as
+# though the probe ran under the contract's own model-less conditions, which is
+# the condition it could NOT run under — and a green line that quietly relaxed
+# what it tested is the same defect as a red line with an invented cause. Cheap
+# and unconditional on purpose: the note is skipped only when nothing was
+# borrowed, so no verdict can carry a relaxed condition silently.
+# $2 is the borrowed thing itself (the rewritten payload, or the id) — EMPTY means
+# this probe borrowed nothing and the note must not fire. Gating on
+# DOCTOR_MODEL_LANE alone would print it on CHAT_BASIC's own verdict, the one
+# probe that really did run model-less and that latched the lane a line earlier.
+doctor_carried_model_note() { # doctor_carried_model_note <check-id> <borrowed-or-empty>
+  [ -n "$2" ] || return 0
+  [ "$DOCTOR_MODEL_LANE" = "required" ] || return 0
+  d_say "$1" "(measured with \"model\": \"$(safe_display "$DOCTOR_MODEL_LANE_ID" 60)\" supplied — this adapter"
+  d_say "$1" " rejects the model-less request the contract asks for, which [CHAT_BASIC] grades)"
+  return 0
+}
+
+# 0 iff the failure currently in DCC_*/DCE_* is one this run could NOT attribute:
+# a model-less probe rejected the same way CHAT_BASIC was, on a run that could not
+# separate "this adapter requires a model" from a fault of the rule being graded.
+# Callers add "and this payload really was model-less" themselves.
+doctor_unattributable_modelless() {
+  [ "$DOCTOR_MODEL_LANE" = "unattributable" ] || return 1
+  [ "$DCE_HINT" = "http" ] || return 1
+  doctor_model_required_candidate_status "$DCC_CODE"
+}
+
 # One graded chat check with its verdict line + failure hints. kind picks the
 # failure explanation: plain (the tolerance turn) · history (the
 # anti-poisoning turn) · stream ("stream": true).
+#
+# DCC_VERDICT carries the CAPABILITY verdict for the machine summary, which is
+# not always the verdict line: PASS · FAIL · NOT_RUN when the probe failed for a
+# cause this run could not attribute to the rule the check exists to grade. A
+# capability the run could not measure must never be reported as failing it.
+DCC_VERDICT="NOT_RUN"
+
+# The capability meter for the check doctor_chat_check just graded. Fill a
+# machine-summary meter from THIS, never from doctor_chat_check's exit status:
+# that status answers "did this check go red", which is a different question from
+# "what did this run measure". NOT_RUN is the honest answer when the probe failed
+# for a cause this run could not tell apart from another rule's failure.
+doctor_capability_meter() { printf '%s' "$DCC_VERDICT"; }
 doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kind>
-  local id="$1" label="$2" payload="$3" kind="${4:-plain}"
+  local id="$1" label="$2" payload="$3" kind="${4:-plain}" modelless=false carried=""
+  DCC_VERDICT="NOT_RUN"
+  doctor_payload_has_model "$payload" || modelless=true
+  # Once CHAT_BASIC has established that this adapter requires the field, every
+  # later model-less probe carries the advertised id. Without it they all fail
+  # for CHAT_BASIC's reason and none of them measures anything. This mirrors
+  # --check-server, which carries the advertised id on every probe after it
+  # learns the server requires one.
+  if $modelless && [ "$DOCTOR_MODEL_LANE" = "required" ]; then
+    carried=$(doctor_payload_with_model "$payload" "$DOCTOR_MODEL_LANE_ID")
+    if [ -n "$carried" ]; then payload="$carried"; modelless=false; fi
+  fi
   if doctor_chat_eval "$payload"; then
+    DCC_VERDICT="PASS"
+    [ "$id" = "CHAT_BASIC" ] && DOCTOR_MODEL_LANE="tolerated"
     d_ok "$id" "$label — one choice, non-empty string content (${DCE_LEN:-?} chars, ${DCC_TIME:-?}s)"
+    doctor_carried_model_note "$id" "$carried"
     return 0
   fi
+  DCC_VERDICT="FAIL"
+  # The absent-model question, decided ONCE, by CHAT_BASIC only (see
+  # DOCTOR_MODEL_LANE). A later probe must never latch it.
+  if [ "$id" = "CHAT_BASIC" ] && $modelless && [ "$DCE_HINT" = "http" ] \
+     && doctor_model_required_candidate_status "$DCC_CODE"; then
+    if [ -n "$MODELS_FIRST_ID" ] && doctor_model_required_probe "$payload"; then
+      DOCTOR_MODEL_LANE="required"; DOCTOR_MODEL_LANE_ID="$MODELS_FIRST_ID"
+    else
+      DOCTOR_MODEL_LANE="unattributable"
+    fi
+  fi
   d_bad "$id" "$label — $DCE_REASON"
+  doctor_carried_model_note "$id" "$carried"
+  # A model-less probe that failed the same way CHAT_BASIC did, on a run that
+  # could not attribute that failure: the honest answer is that this check was
+  # not graded — never a story about the rule it happens to be named after.
+  if $modelless && [ "$id" != "CHAT_BASIC" ] && doctor_unattributable_modelless; then
+    DCC_VERDICT="NOT_RUN"
+    d_say "$id" "(this request deliberately carries no \"model\" field, and [CHAT_BASIC] above was"
+    d_say "$id" " rejected the same way, so this run can't tell the two rules apart — it is NOT"
+    d_say "$id" " grading this one. Fix that failure first, then re-run me.)"
+    return 1
+  fi
   case "$DCE_HINT" in
     sse)
       case "$kind" in
-        stream) d_say "$id" "(even when the request says \"stream\": true, answer ONE complete JSON object —"
-                d_say "$id" " Conduck never accepts SSE; it may set the flag, but reads a synchronous reply)" ;;
+        stream) d_say "$id" "(even when the request says \"stream\": true, answer ONE complete JSON object."
+                d_say "$id" " Conduck always sends \"stream\": false and never accepts SSE, so answer one JSON"
+                d_say "$id" " object even if some other client sets the flag)" ;;
         *)      d_say "$id" "(when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)" ;;
       esac ;;
     transfer)
@@ -6641,7 +7017,30 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
           d_say "$id" " front's proxy timeout — agent turns are slow, raise it — or the adapter is wedged"
           d_say "$id" " on this request and its own log will say so.)"
           return 1 ;;
+        413)
+          # The contract spends 413 on a request-size limit, and a server that
+          # answers one has STATED its cause. Telling the reader instead that they
+          # reject historical images, or refuse the stream flag, is the same defect
+          # as any other invented explanation — so the stated cause pre-empts every
+          # per-kind story, exactly as the front-end 5xx statuses do above.
+          d_say "$id" "(a 413 is a request-size limit answering, not a judgement on this request's shape."
+          d_say "$id" " The probe images here are tiny, so the limit is almost always in FRONT of the"
+          d_say "$id" " adapter — raise the reverse proxy's max body size (nginx client_max_body_size,"
+          d_say "$id" " Caddy request_body). Conduck sends real photos, which are far larger than this.)"
+          return 1 ;;
       esac
+      # The one cause that would otherwise be told three different ways, none of
+      # them true: this adapter requires the field the contract makes optional.
+      # A retry confirmed it for this exact payload, so it is said once, plainly,
+      # and never dressed up as a history-poisoning or streaming fault.
+      if [ "$id" = "CHAT_BASIC" ] && [ "$DOCTOR_MODEL_LANE" = "required" ]; then
+        d_say "$id" "(the identical request answered normally as soon as \"model\": \"$(safe_display "$DOCTOR_MODEL_LANE_ID" 60)\" was"
+        d_say "$id" " supplied, so this adapter REQUIRES that field — and that is the ONLY fault this request"
+        d_say "$id" " shows. The contract makes it optional: with no \"model\", pick your own default and answer."
+        d_say "$id" " The remaining chat checks carry that id, so each grades its own rule instead of failing"
+        d_say "$id" " again for this one.)"
+        return 1
+      fi
       case "$kind" in
         history)
           d_say "$id" "(the contract forbids rejecting a request because of an image in an EARLIER message —"
@@ -6790,20 +7189,22 @@ print(json.dumps(req))') \
 
 doctor_image_input_check() {
   local id="IMAGE_INPUT" code payload
-  # Shadowed, not inherited. $CONDUCK_PROBE_MODEL is internal plumbing for
+  # Set explicitly, never inherited. $CONDUCK_PROBE_MODEL is internal plumbing for
   # handing a value to python without argv, and the probe's python reads the
   # ENVIRONMENT — so a variable the operator happens to have exported would
-  # silently put a "model" field in this request. The adapter contract makes
-  # tolerating an ABSENT model a REQUIREMENT, so a model here grades a different
-  # rule than the one this check exists to grade, and the adapter author would
-  # have no way to see why the verdict moved. --check-server sets it explicitly
-  # at its own call site; this one explicitly does not.
-  CONDUCK_PROBE_MODEL="" image_probe_gen
+  # silently put a "model" field in this request and move the verdict for a reason
+  # the adapter author cannot see. It is EMPTY by default, because the contract
+  # makes tolerating an absent model a requirement and CHAT_BASIC is what grades
+  # that rule. It carries the advertised id only once CHAT_BASIC has established
+  # that this adapter requires the field: otherwise this probe fails for CHAT_BASIC's
+  # reason and reports a vision fault the run never measured.
+  CONDUCK_PROBE_MODEL="$DOCTOR_MODEL_LANE_ID" image_probe_gen
   code="$IPG_CODE"; payload="$IPG_PAYLOAD"
   if doctor_chat_eval "$payload" "$code"; then
     if [ "$DCE_TOKEN" = "yes" ]; then
       DOCTOR_IMAGE_INPUT="VERIFIED"
       d_ok "$id" "image input — the reply reads the digits back (VERIFIED, ${DCC_TIME:-?}s)"
+      doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
       return 0
     fi
     DOCTOR_IMAGE_INPUT="UNVERIFIED"
@@ -6811,22 +7212,40 @@ doctor_image_input_check() {
     d_say "$id" "(the engine never saw the image — it was silently dropped somewhere, the one forbidden"
     d_say "$id" " move. Forward images to the engine, or decline honestly with HTTP 400 + an error body"
     d_say "$id" " carrying code \"image_unsupported\" — never answer as if no image was attached.)"
+    doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
+    return 1
+  fi
+  if [ "$DCC_CODE" = "400" ] && printf '%s' "$DCC_BODY" | doctor_is_openai_error \
+     && printf '%s' "$DCC_BODY" | doctor_error_code "image_unsupported"; then
+    DOCTOR_IMAGE_INPUT="DECLINED"
+    d_ok "$id" "image input — declined with HTTP 400 + code \"image_unsupported\" (honest refusal, allowed)"
+    doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
+    return 0
+  fi
+  # Same rule as the chat probes, and it is asked BEFORE the decline is graded: an
+  # adapter that requires a model answers this model-less probe with a 400 and a
+  # perfectly well-formed error body, which the branch below would otherwise read
+  # as a dishonest image decline — a vision verdict on a run that never reached the
+  # engine's eyes at all. Not measured means NOT_RUN.
+  if doctor_unattributable_modelless; then
+    DOCTOR_IMAGE_INPUT="NOT_RUN"
+    d_bad "$id" "image input — $DCE_REASON"
+    d_say "$id" "(this request also carries no \"model\" field, and [CHAT_BASIC] above was rejected the same"
+    d_say "$id" " way, so this run can't tell the two rules apart — it is NOT grading image input. Fix that"
+    d_say "$id" " failure first, then re-run me.)"
     return 1
   fi
   if [ "$DCC_CODE" = "400" ] && printf '%s' "$DCC_BODY" | doctor_is_openai_error; then
-    if printf '%s' "$DCC_BODY" | doctor_error_code "image_unsupported"; then
-      DOCTOR_IMAGE_INPUT="DECLINED"
-      d_ok "$id" "image input — declined with HTTP 400 + code \"image_unsupported\" (honest refusal, allowed)"
-      return 0
-    fi
     DOCTOR_IMAGE_INPUT="FAIL"
     d_bad "$id" "image input — declined with HTTP 400, but without code \"image_unsupported\""
     d_say "$id" "(the decline itself is allowed — but the app keys on the machine code to explain the"
     d_say "$id" " refusal and offer recovery, so add \"code\": \"image_unsupported\" to the error object)"
+    doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
     return 1
   fi
   DOCTOR_IMAGE_INPUT="FAIL"
   d_bad "$id" "image input — $DCE_REASON"
+  doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
   return 1
 }
 # ----------------------------------------------------- check-adapter --files --
@@ -7725,6 +8144,10 @@ run_doctor() {
     bad "Adapter check: FAIL — /v1/models isn't answering correctly, so I stopped here."
     say "  Fix that first (every other check would only fail the same way), then re-run me."
     say "  The contract, with a copy-paste self-test: ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+    # The same way out as the full FAIL below: this envelope rule is stricter than
+    # the app's own Test Connection (Content-Type is graded, an empty "data" is a
+    # failure), so third-party software can stop here and still work with the app.
+    doctor_not_yours_hint
     exit 1
   fi
 
@@ -7762,21 +8185,21 @@ print(json.dumps({"messages": [
         {"type": "image_url", "image_url": {"url": uri}}]},
     {"role": "user", "content": "Reply with exactly: pong"}], "stream": False}))') \
     || die "Could not build the history-image test request (python3 failed)."
-  if doctor_chat_check HISTORY_IMAGE "chat: image in an EARLIER message, newest turn text-only" "$payload" history; then
-    DOCTOR_HISTORY_IMAGE="PASS"
-  else
-    DOCTOR_HISTORY_IMAGE="FAIL"
-  fi
+  # The meter comes from doctor_capability_meter, never from the check's exit
+  # status: that status answers "did this check go red", and the meter answers
+  # "what did this run MEASURE". They differ on exactly one path — a probe that
+  # failed for a cause this run could not tell apart from another rule's failure
+  # — and there the honest meter is NOT_RUN. A red verdict line, failed= and
+  # exit=1 still carry the run-level verdict, so nothing is softened.
+  doctor_chat_check HISTORY_IMAGE "chat: image in an EARLIER message, newest turn text-only" "$payload" history
+  DOCTOR_HISTORY_IMAGE=$(doctor_capability_meter)
 
   payload=$(python3 -c 'import json
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                   "stream": True}))') \
     || die "Could not build the stream test request (python3 failed)."
-  if doctor_chat_check STREAM_SYNC "chat: \"stream\": true still answers one JSON object" "$payload" stream; then
-    DOCTOR_STREAM="PASS"
-  else
-    DOCTOR_STREAM="FAIL"
-  fi
+  doctor_chat_check STREAM_SYNC "chat: \"stream\": true still answers one JSON object" "$payload" stream
+  DOCTOR_STREAM=$(doctor_capability_meter)
 
   if $DOCTOR_DEEP; then
     say ""
@@ -7799,6 +8222,7 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   fi
   bad "Adapter check: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."
   say "  Every rule above, with a copy-paste self-test:  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+  doctor_not_yours_hint
   exit 1
 }
 # -------------------------------------------------------------- --check-server --
@@ -7824,6 +8248,11 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 # Semantic compatibility (client-owned history replay) is INVISIBLE here: a
 # stateful server passes this probe and still double-counts context — that
 # dimension needs its own test.
+# An address whose /v1/models fails re-asks for the ADDRESS and keeps the token
+# already entered (interactive runs only — a scripted one exits 1 on the first
+# failure). The credential is the expensive input to re-type, the address is the
+# cheap one, and the two most common first tries are a typo and a site root whose
+# OpenAI API lives one path segment deeper.
 COMPAT_RAN=false
 COMPAT_CHECKS=0; COMPAT_FAILS=0
 COMPAT_MODELS="NOT_RUN"; COMPAT_CHAT="NOT_RUN"; COMPAT_HISTORY_IMAGE="NOT_RUN"
@@ -8009,6 +8438,104 @@ compat_on_exit() {
   compat_summary "$rc"
 }
 
+# A base address that fails verification RE-ASKS instead of ending the run. The
+# token is already in hand — often a 300-character JWT — and an operator who
+# mistyped the address, or pointed at a site root whose OpenAI API lives under a
+# sub-path, should be able to try the neighbour without pasting the credential
+# again. rc 0 = $GW_URL now holds a new address to grade; rc 1 = nothing left to
+# try (not a terminal, an empty answer, or the input ended), and the caller owns
+# the exit. Same acceptance rule as the first prompt — https anywhere, plain http
+# only toward this machine — so the retry can't relax what the first ask enforced.
+compat_reask_url() {
+  local reply url
+  interactive_terminal || return 1
+  say ""
+  say "  Another address to try? The token you already entered is kept — Enter to stop."
+  while true; do
+    read -r -p "  URL (Enter to stop) > " reply || return 1
+    case "$reply" in '') return 1 ;; esac
+    if url=$(doctor_accept_url "$reply"); then
+      GW_URL="$url"
+      apply_gateway_url_normalization
+      return 0
+    fi
+    if url_has_userinfo "$reply"; then
+      warn "$URL_USERINFO_HINT"; continue
+    fi
+    case "$reply" in
+      [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." ;;
+      *) warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." ;;
+    esac
+  done
+}
+
+# GET /v1/models at the address in $GW_URL, graded exactly the way the app's Test
+# Connection grades it, with the verdict line and its diagnosis. rc 0 = this
+# address is usable and the rest of the run can proceed; rc 1 = it is not, and the
+# caller decides whether to ask for another address or end the run. Sets
+# COMPAT_MODELS either way; every $MODELS_* fact the later probes read is left as
+# this attempt found it.
+compat_models_check() {
+  local rc=0 secs over why=""
+  models_is_json "$GW_URL" "$COMPAT_WANTED_MODEL" || rc=$?
+  secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
+  over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
+  if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
+    COMPAT_MODELS="PASS"
+    c_ok SERVER_MODELS "GET /v1/models — the app's Test Connection passes (${secs}s)"
+    # Content-Type is NOT graded: the app parses the bytes and never reads the
+    # header (this is a deliberate divergence from the adapter contract).
+    if $MODELS_DATA_EMPTY; then
+      c_say SERVER_MODELS "(\"data\" is empty — the app reports \"connected, no models yet\"; chat needs the"
+      c_say SERVER_MODELS " server to answer without a model field)"
+    elif $MODELS_NO_VALID_ID; then
+      c_say SERVER_MODELS "(entries carry no usable \"id\" string — the app can't offer a model picker;"
+      c_say SERVER_MODELS " fine as long as the server answers without a model field)"
+    fi
+    return 0
+  fi
+  COMPAT_MODELS="FAIL"
+  if [ "$rc" = "0" ]; then
+    c_bad SERVER_MODELS "GET /v1/models — answered, but took ${secs}s (the app's Test Connection gives up at 15s)"
+  elif [ "$rc" = "2" ]; then
+    c_bad SERVER_MODELS "GET /v1/models — an HTML page (HTTP ${MODELS_HTTP_CODE:-?}), not JSON"
+    c_say SERVER_MODELS "(something else answered — a login page, a reverse proxy, a wrong base address, or the"
+    c_say SERVER_MODELS " OpenAI-compatible API sitting under a SUB-PATH of this one. Open WebUI is the common"
+    c_say SERVER_MODELS " case: its site root answers with the app's own HTML under HTTP 200 and its API lives"
+    c_say SERVER_MODELS " at <url>/api — so try this same address with /api on the end.)"
+  elif [ "$rc" = "3" ]; then
+    c_bad SERVER_MODELS "GET /v1/models — answers, but not the shape the app requires"
+    c_say SERVER_MODELS "(the app needs a JSON OBJECT whose top-level \"data\" is an ARRAY — a bare array or"
+    c_say SERVER_MODELS " {\"models\": …} fails its Test Connection; some servers have a separate OpenAI-compatible"
+    c_say SERVER_MODELS " path that answers correctly — point the app at THAT base URL)"
+  else
+    if [ "${MODELS_CURL_RC:-0}" != "0" ]; then
+      case "$MODELS_CURL_RC" in
+        6)  why="DNS lookup failed — that hostname doesn't resolve" ;;
+        7)  why="connection refused — nothing is listening there (wrong port? not started?)" ;;
+        28) why="timed out — no answer from the host" ;;
+        35|60) why="TLS problem — the app requires a certificate this machine would trust too" ;;
+        *)  why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
+      esac
+    else
+      case "$MODELS_HTTP_CODE" in
+        401|403) if [ "${GW_AUTH:-}" = "none" ]; then
+                   why="HTTP $MODELS_HTTP_CODE and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+                 else
+                   why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way"
+                 fi ;;
+        3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
+        404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
+        5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
+        2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
+        *)       why="HTTP ${MODELS_HTTP_CODE:-?}" ;;
+      esac
+    fi
+    c_bad SERVER_MODELS "GET /v1/models — $why"
+  fi
+  return 1
+}
+
 run_compat() {
   trap compat_on_exit EXIT
   trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
@@ -8073,69 +8600,23 @@ run_compat() {
   # path and the optional setup handoff can no longer pair what was proven.
   COMPAT_WANTED_MODEL="${CONDUCK_CHECK_SERVER_MODEL:-}"
 
-  head_ "Server check — $GW_URL"
-  COMPAT_RAN=true
-
   # -- models: direct-endpoint acceptance from Test Connection ----------------
-  local rc=0 secs over
-  models_is_json "$GW_URL" "$COMPAT_WANTED_MODEL" || rc=$?
-  secs=$(printf '%s' "${MODELS_TIME:-0}" | awk '{printf "%.1f", $1+0}' 2>/dev/null); [ -n "$secs" ] || secs="?"
-  over=$(printf '%s' "${MODELS_TIME:-0}" | awk '{print ($1+0 > 15) ? 1 : 0}' 2>/dev/null)
-  if [ "$rc" = "0" ] && [ "$over" != "1" ]; then
-    COMPAT_MODELS="PASS"
-    c_ok SERVER_MODELS "GET /v1/models — the app's Test Connection passes (${secs}s)"
-    # Content-Type is NOT graded: the app parses the bytes and never reads the
-    # header (this is a deliberate divergence from the adapter contract).
-    if $MODELS_DATA_EMPTY; then
-      c_say SERVER_MODELS "(\"data\" is empty — the app reports \"connected, no models yet\"; chat needs the"
-      c_say SERVER_MODELS " server to answer without a model field)"
-    elif $MODELS_NO_VALID_ID; then
-      c_say SERVER_MODELS "(entries carry no usable \"id\" string — the app can't offer a model picker;"
-      c_say SERVER_MODELS " fine as long as the server answers without a model field)"
-    fi
-  else
-    COMPAT_MODELS="FAIL"
-    if [ "$rc" = "0" ]; then
-      c_bad SERVER_MODELS "GET /v1/models — answered, but took ${secs}s (the app's Test Connection gives up at 15s)"
-    elif [ "$rc" = "2" ]; then
-      c_bad SERVER_MODELS "GET /v1/models — an HTML page (HTTP ${MODELS_HTTP_CODE:-?}), not JSON"
-      c_say SERVER_MODELS "(something else answered — a login page, a reverse proxy, or a wrong base address)"
-    elif [ "$rc" = "3" ]; then
-      c_bad SERVER_MODELS "GET /v1/models — answers, but not the shape the app requires"
-      c_say SERVER_MODELS "(the app needs a JSON OBJECT whose top-level \"data\" is an ARRAY — a bare array or"
-      c_say SERVER_MODELS " {\"models\": …} fails its Test Connection; some servers have a separate OpenAI-compatible"
-      c_say SERVER_MODELS " path that answers correctly — point the app at THAT base URL)"
-    else
-      local why=""
-      if [ "${MODELS_CURL_RC:-0}" != "0" ]; then
-        case "$MODELS_CURL_RC" in
-          6)  why="DNS lookup failed — that hostname doesn't resolve" ;;
-          7)  why="connection refused — nothing is listening there (wrong port? not started?)" ;;
-          28) why="timed out — no answer from the host" ;;
-          35|60) why="TLS problem — the app requires a certificate this machine would trust too" ;;
-          *)  why="transfer failed (curl exit $MODELS_CURL_RC)" ;;
-        esac
-      else
-        case "$MODELS_HTTP_CODE" in
-          401|403) if [ "${GW_AUTH:-}" = "none" ]; then
-                     why="HTTP $MODELS_HTTP_CODE and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
-                   else
-                     why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way"
-                   fi ;;
-          3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
-          404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
-          5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
-          2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
-          *)       why="HTTP ${MODELS_HTTP_CODE:-?}" ;;
-        esac
-      fi
-      c_bad SERVER_MODELS "GET /v1/models — $why"
-    fi
+  # A failing address re-asks rather than ending the run (compat_reask_url): the
+  # token is already entered, and making the operator paste a long one again to
+  # try the neighbouring address is the tool wasting their time. Each attempt
+  # re-arms the counters, so the summary describes the address that was actually
+  # graded and never carries a previous attempt's red into a later PASS.
+  while true; do
+    head_ "Server check — $GW_URL"
+    COMPAT_RAN=true
+    COMPAT_CHECKS=0; COMPAT_FAILS=0; COMPAT_MODELS="NOT_RUN"
+    compat_models_check && break
+    compat_reask_url && continue
     say ""
     bad "Server check: FAIL — the app's Test Connection fails here, so nothing else can work."
     say "  Fix that first, then re-run me. Testing an adapter you BUILT? Use ${BOLD}--check-adapter${RESET}."
     exit 1
-  fi
+  done
 
   # An explicit model choice is announced BEFORE the first chat turn, so the
   # verdicts below are read against the right target — and so a typo'd id is
@@ -8187,9 +8668,15 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="optional"
     c_ok SERVER_CHAT "chat without a \"model\" field — decoded by the app's rules (${CCE_LEN:-?} chars)"
   elif [ "$b_ok" = "true" ]; then
-    # Only the statuses the app's own model-required heuristics accept
-    # (400/404/413/422) may be read as "needs a model" — a transient 429/5xx
-    # that happened to clear by the second turn must not claim that.
+    # Only the statuses the app's own model-required gate accepts may be read as
+    # "needs a model" — a transient 429/5xx that happened to clear by the second
+    # turn must not claim that. This list stays INLINE and stays wider than the
+    # adapter check's: this command asks whether the APP can talk to the server, so
+    # it mirrors the app's own status gate (413 included, because the app reaches
+    # its model-required path from there too). The adapter check grades contract
+    # conformance instead and excludes 413, which the contract spends on a
+    # request-size limit. Different questions, different bars — one shared list
+    # would quietly move one of the two verdicts.
     case "$a_code" in
       400|404|413|422)
         COMPAT_CHAT="PASS"; COMPAT_MODEL_FIELD="required"
@@ -8306,9 +8793,20 @@ print(json.dumps(req))') \
         c_say SERVER_HISTORY_IMAGE "HTTP 413 on a 1×1 PNG points at a request-size limit in front of the server, not"
         c_say SERVER_HISTORY_IMAGE "at the engine — check the reverse proxy's max body size." ;;
     esac
-    if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-      c_say SERVER_HISTORY_IMAGE "Only '$(safe_display "$COMPAT_MODEL_ID" 60)' was tested — the first of $MODELS_ID_COUNT advertised ids."
-      c_say SERVER_HISTORY_IMAGE "Before judging the server, re-run with CONDUCK_CHECK_SERVER_MODEL=<id> on another."
+    # Whenever THIS run picked the graded path rather than the operator, one model
+    # out of many was a lottery draw. That is as true of the model-less default
+    # route as it is of the first advertised id — and it is the default route a
+    # fan-out gateway with hundreds of ids usually lands on, because a server that
+    # answers a model-less request never becomes first_advertised at all.
+    if [ "$COMPAT_MODEL_SOURCE" != "explicit" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+      if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ]; then
+        c_say SERVER_HISTORY_IMAGE "Only '$(safe_display "$COMPAT_MODEL_ID" 60)' was tested — the first of $MODELS_ID_COUNT advertised ids."
+      else
+        c_say SERVER_HISTORY_IMAGE "This turn named no model, so it graded the default route — one path out of the"
+        c_say SERVER_HISTORY_IMAGE "$MODELS_ID_COUNT model ids this server advertises."
+      fi
+      c_say SERVER_HISTORY_IMAGE "Before judging the server, re-run with CONDUCK_CHECK_SERVER_MODEL=<id> on the one"
+      c_say SERVER_HISTORY_IMAGE "you actually plan to use."
     fi
   fi
 
@@ -8390,8 +8888,14 @@ print(json.dumps(req))') \
   fi
   bad "Server check: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
   say "  The app would hit the same walls on $graded_scope."
-  if [ "$COMPAT_MODEL_SOURCE" = "first_advertised" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-    say "  That is not yet a verdict on the server: CONDUCK_CHECK_SERVER_MODEL=<id> grades another."
+  # Same gate as the history-image note above, and for the same reason: the hint
+  # belongs to every run where the TOOL chose the graded path, not only to the
+  # first-advertised one. A server that accepts a model-less request never reaches
+  # first_advertised, so gating on that source alone hid this line from exactly the
+  # fan-out gateways whose 300-plus untested models make it matter most.
+  if [ "$COMPAT_MODEL_SOURCE" != "explicit" ] && [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+    say "  That is not yet a verdict on the server: it advertises $MODELS_ID_COUNT model ids and this run"
+    say "  graded one path. CONDUCK_CHECK_SERVER_MODEL=<id> grades the model you plan to use."
   fi
   say "  Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
   say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
@@ -8484,6 +8988,11 @@ emit_payload() {
     cleanup_exposures
     warn "Some checks failed above — fix those first, then re-run me."
     warn "I only hand you a setup code that is known to work."
+    # Self-guarding: silent unless a restart this run asked for was followed by a
+    # readiness wait that genuinely expired. By here the Step-4 warning has
+    # scrolled away, and this epilogue is what the operator is reading when they
+    # decide whether to undo a change that was correct.
+    gw_restart_timing_note
     # Custom targets only. Route by provenance: existing OpenAI-compatible
     # software uses the app-compatibility grader; adapters written for Conduck
     # use the stricter contract grader. OpenClaw/Hermes users need neither hint.
@@ -8541,11 +9050,16 @@ emit_payload() {
   esac
   say "  Run this script again any time to check the connection or show the code again."
   # Custom targets only (see the matching gate in emit_payload's failure branch).
+  # The adapter line rides a SUCCESS screen, so it needs the outcome named with it:
+  # this pairing already works, and a user who runs the strict grader on generic
+  # software gets a FAIL that means nothing about the setup they just proved.
   if [ "$GW_KIND" = "custom" ]; then
     local dt="$GW_URL"
     [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
     say "  Existing OpenAI-compatible server? Re-check it with:  ${BOLD}bash conduck-connect.sh --check-server $dt${RESET}"
     say "  Adapter built for Conduck? Grade it with:             ${BOLD}bash conduck-connect.sh --check-adapter $dt${RESET}"
+    note "The adapter grade only fits software built for Conduck: generic servers (Ollama, LiteLLM,"
+    note "Open WebUI) fail rules that are correct for them — that does not undo the pairing above."
   fi
   if $FS_ROLLBACK_INCOMPLETE; then
     say ""

@@ -219,8 +219,16 @@ configure_openclaw() {
         docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
           dist/index.js config set --batch-json \
           '[{"path":"gateway.http.endpoints.chatCompletions.enabled","value":true}]'; then
-        run_step "restart the gateway so the flag applies" \
-          docker compose --project-directory "$compose_dir" restart openclaw-gateway || true
+        # Same boot window as the tool-policy restart: `restart` returns in about
+        # a second and the health route answers a few seconds later. Usually the
+        # exposure step buys that time, but a run reusing an existing exposure
+        # walks straight into verification, so wait here too. HTTP-safe is FALSE
+        # — this change IS the HTTP layer, so the epilogue must not promise it
+        # cannot affect it. GW_LOCAL_PORT and GW_HEALTH_PATH are set just above.
+        if run_step "restart the gateway so the flag applies" \
+          docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
+          gw_note_restart_and_wait "chat-endpoint setting" false
+        fi
       fi
     else
       print_and_wait "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \

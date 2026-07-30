@@ -23,6 +23,12 @@
 # message can never poison the chat (forward it or replace it with the
 # contract's disclosure — never reject; one bad photo must not kill every
 # later turn), and that "stream": true still gets ONE synchronous JSON answer.
+# CHAT_BASIC owns the absent-model rule, and it owns it alone: the history,
+# stream and image probes also omit the field, so on an adapter that REQUIRES a
+# model they would every one of them fail for CHAT_BASIC's reason. Once CHAT_BASIC
+# has confirmed that requirement — by re-sending its identical request with the
+# first advertised id — the later probes carry that id and grade their OWN rule,
+# and the missing-model failure is reported once, where it belongs.
 # --deep adds the semantic image probe: a locally generated PNG showing 4
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
@@ -44,10 +50,17 @@
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
 #   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.4 harness=<ver>
-#     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN> history_image=<…>
-#     stream=<…> image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
+#     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
+#     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
+#     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
 #     file_transport=<…> file_access=<…> file_e2e=<…>
 #     checks=<n> failed=<n> exit=<n>
+# Every capability meter is a claim about something the run MEASURED, so NOT_RUN
+# covers both "a prerequisite stopped this tier" and "the probe failed for a
+# cause this run could not tell apart from another rule's failure". A capability
+# the run could not measure is never reported as failing it — the run-level
+# verdict lives in core=/failed=/exit=, and a red verdict line there is what
+# says the adapter is non-conformant.
 # The three file meters share one enum: NOT_REQUESTED (no --files) |
 # NOT_RUN (requested, but a prerequisite stopped this tier) | PASS | FAIL |
 # ERROR (unsafe config, harness failure, or unproven cleanup). Scripts key
@@ -86,6 +99,45 @@ DOCTOR_FILE_E2E="NOT_REQUESTED"
 # grades what a rejection did with the body it rejected, so it only has something
 # to grade when the route actually rejected: this is that precondition.
 DOCTOR_AUTH_WRONG_CODE=""
+
+# Does this adapter tolerate a request with NO "model" field? Three probes
+# deliberately omit it (the contract requires tolerating an absent model), so on
+# an adapter that REQUIRES one they would all fail for that single reason — and
+# each would be explained as a fault of its own rule, which is how a working
+# history-image path gets told it poisons conversations. CHAT_BASIC answers the
+# question ONCE and every later chat probe reads the answer here:
+#   unknown        — not decided (CHAT_BASIC hasn't run, or failed some other way)
+#   tolerated      — a model-less turn answered; later model-less probes are honest
+#   required       — CHAT_BASIC failed model-less and the identical request answered
+#                    once DOCTOR_MODEL_LANE_ID was supplied. Later probes carry that
+#                    id, so they grade the rule they exist to grade.
+#   unattributable — CHAT_BASIC failed model-less and this run could not separate
+#                    "requires a model" from a fault of its own; later probes of the
+#                    same shape report NOT graded rather than inventing a cause.
+# ONLY CHAT_BASIC may write these (doctor_chat_check enforces it). Letting a later
+# probe decide would let a capability check outside the core= rollup turn its own
+# red into a measured green, and IMAGE_INPUT can't flip core= — so a whole run
+# could go green on an adapter that violates the absent-model rule.
+DOCTOR_MODEL_LANE="unknown"
+DOCTOR_MODEL_LANE_ID=""
+
+# The way out of a FAIL that isn't the reader's to fix. This grade holds software
+# written FOR Conduck to Conduck-specific rules, and third-party OpenAI-compatible
+# software is EXPECTED to fail it — answering "stream": true with SSE is correct
+# OpenAI behaviour, keyless is a legitimate deployment choice, and neither is a
+# defect in LiteLLM, Open WebUI or Ollama. Without this, the closing line points
+# only at the contract docs, so a user grading someone else's server reads a wall
+# of red as "this cannot be used" and stops — when the app pairs with it fine.
+# Printed on EVERY --check-adapter failure exit, including the early /v1/models
+# abort: the person is equally stranded whichever check stopped the run.
+doctor_not_yours_hint() {
+  say "  Didn't write this server yourself? Then this red says very little. The grade above"
+  say "  holds software built FOR Conduck to Conduck's own rules, and generic servers (Ollama,"
+  say "  LiteLLM, Open WebUI) fail rules that are correct for them — their owners did nothing"
+  say "  wrong. Ask the question you actually have instead:"
+  say "    ${BOLD}bash conduck-connect.sh --check-server${RESET}   — can the app talk to this server?"
+  say "    ${BOLD}bash conduck-connect.sh --setup${RESET}          — pair it; a failed grade here doesn't block that"
+}
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
   # IMAGE_INPUT grades an optional capability's honesty; FILES_*/FILE_* grade
@@ -730,21 +782,161 @@ print("ok %d" % len(c))' "$exp" 2>/dev/null)
   return 1
 }
 
+# The statuses that MIGHT mean "this request needs a model field". A status in
+# here proves NOTHING on its own — it only buys the one controlled retry below the
+# right to run, and that retry is the evidence. So this list exists to avoid
+# wasting a five-minute turn, not to classify anything.
+#
+# 413 is deliberately NOT in it, and this list is deliberately NOT the one
+# --check-server uses. Two separate reasons:
+#   413 — the contract assigns it to a request-size / image-too-large limit, and
+#     this check has a real diagnosis for that. Admitting it here would let a
+#     genuine size limit be re-reported as "not graded" and bury the true cause.
+#   --check-server keeps its own, wider list inline. It answers a different
+#     question (can the app talk to this server) at a deliberately laxer bar, and
+#     it already ships that behaviour; sharing one list would silently move a
+#     verdict in a command this slice was not asked to change. Two questions, two
+#     lists, each with its reason written next to it.
+# This is also NOT "the set the app's model-required heuristic accepts": the app
+# gates on those statuses AND then requires model-required prose in the body
+# (RemoteAgentClient), so the status alone was never its rule either.
+doctor_model_required_candidate_status() { # <http-status>
+  case "$1" in 400|404|422) return 0 ;; esac
+  return 1
+}
+
+# 0 iff the payload carries a top-level "model" key (absent and null both count
+# as absent — the contract's rule is about the field the app didn't send).
+doctor_payload_has_model() { # <payload-json>
+  printf '%s' "$1" | python3 -c 'import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+sys.exit(0 if isinstance(d, dict) and d.get("model") is not None else 1)' 2>/dev/null
+}
+
+# Echo the payload with "model" set. Used to carry the advertised id on the
+# probes that come AFTER the absent-model rule has already been graded.
+doctor_payload_with_model() { # <payload-json> <model-id>
+  printf '%s' "$1" | CONDUCK_CHECK_MODEL="$2" python3 -c 'import json, os, sys
+req = json.load(sys.stdin)
+req["model"] = os.environ["CONDUCK_CHECK_MODEL"]
+print(json.dumps(req))' 2>/dev/null
+}
+
+# Did THIS payload only fail for want of a model? Re-sends the identical request
+# with the first advertised id and nothing else changed: rc 0 means the model was
+# the only thing missing — confirmed for this payload, not deduced from prose.
+# Reading the error message instead would be guesswork (every adapter words it
+# differently); one controlled retry is the evidence.
+#
+# The caller's DCC_*/DCE_* evidence is snapshotted and restored, because
+# doctor_chat_eval overwrites those globals: without this the caller's own hints
+# would describe the RETRY and not the model-less failure they are explaining.
+doctor_model_required_probe() { # <payload-json>
+  local payload="$1" retried rc=1
+  local s_code="$DCC_CODE" s_ct="$DCC_CT" s_time="$DCC_TIME" s_body="$DCC_BODY" s_crc="$DCC_CURL_RC"
+  local s_reason="$DCE_REASON" s_hint="$DCE_HINT" s_len="$DCE_LEN" s_token="$DCE_TOKEN"
+  retried=$(doctor_payload_with_model "$payload" "$MODELS_FIRST_ID")
+  if [ -n "$retried" ] && doctor_chat_eval "$retried"; then rc=0; fi
+  DCC_CODE="$s_code"; DCC_CT="$s_ct"; DCC_TIME="$s_time"; DCC_BODY="$s_body"; DCC_CURL_RC="$s_crc"
+  DCE_REASON="$s_reason"; DCE_HINT="$s_hint"; DCE_LEN="$s_len"; DCE_TOKEN="$s_token"
+  return $rc
+}
+
+# Every verdict reached on a probe that had to BORROW a model id says so, on the
+# verdict itself. Without this the transcript and the machine summary both read as
+# though the probe ran under the contract's own model-less conditions, which is
+# the condition it could NOT run under — and a green line that quietly relaxed
+# what it tested is the same defect as a red line with an invented cause. Cheap
+# and unconditional on purpose: the note is skipped only when nothing was
+# borrowed, so no verdict can carry a relaxed condition silently.
+# $2 is the borrowed thing itself (the rewritten payload, or the id) — EMPTY means
+# this probe borrowed nothing and the note must not fire. Gating on
+# DOCTOR_MODEL_LANE alone would print it on CHAT_BASIC's own verdict, the one
+# probe that really did run model-less and that latched the lane a line earlier.
+doctor_carried_model_note() { # doctor_carried_model_note <check-id> <borrowed-or-empty>
+  [ -n "$2" ] || return 0
+  [ "$DOCTOR_MODEL_LANE" = "required" ] || return 0
+  d_say "$1" "(measured with \"model\": \"$(safe_display "$DOCTOR_MODEL_LANE_ID" 60)\" supplied — this adapter"
+  d_say "$1" " rejects the model-less request the contract asks for, which [CHAT_BASIC] grades)"
+  return 0
+}
+
+# 0 iff the failure currently in DCC_*/DCE_* is one this run could NOT attribute:
+# a model-less probe rejected the same way CHAT_BASIC was, on a run that could not
+# separate "this adapter requires a model" from a fault of the rule being graded.
+# Callers add "and this payload really was model-less" themselves.
+doctor_unattributable_modelless() {
+  [ "$DOCTOR_MODEL_LANE" = "unattributable" ] || return 1
+  [ "$DCE_HINT" = "http" ] || return 1
+  doctor_model_required_candidate_status "$DCC_CODE"
+}
+
 # One graded chat check with its verdict line + failure hints. kind picks the
 # failure explanation: plain (the tolerance turn) · history (the
 # anti-poisoning turn) · stream ("stream": true).
+#
+# DCC_VERDICT carries the CAPABILITY verdict for the machine summary, which is
+# not always the verdict line: PASS · FAIL · NOT_RUN when the probe failed for a
+# cause this run could not attribute to the rule the check exists to grade. A
+# capability the run could not measure must never be reported as failing it.
+DCC_VERDICT="NOT_RUN"
+
+# The capability meter for the check doctor_chat_check just graded. Fill a
+# machine-summary meter from THIS, never from doctor_chat_check's exit status:
+# that status answers "did this check go red", which is a different question from
+# "what did this run measure". NOT_RUN is the honest answer when the probe failed
+# for a cause this run could not tell apart from another rule's failure.
+doctor_capability_meter() { printf '%s' "$DCC_VERDICT"; }
 doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kind>
-  local id="$1" label="$2" payload="$3" kind="${4:-plain}"
+  local id="$1" label="$2" payload="$3" kind="${4:-plain}" modelless=false carried=""
+  DCC_VERDICT="NOT_RUN"
+  doctor_payload_has_model "$payload" || modelless=true
+  # Once CHAT_BASIC has established that this adapter requires the field, every
+  # later model-less probe carries the advertised id. Without it they all fail
+  # for CHAT_BASIC's reason and none of them measures anything. This mirrors
+  # --check-server, which carries the advertised id on every probe after it
+  # learns the server requires one.
+  if $modelless && [ "$DOCTOR_MODEL_LANE" = "required" ]; then
+    carried=$(doctor_payload_with_model "$payload" "$DOCTOR_MODEL_LANE_ID")
+    if [ -n "$carried" ]; then payload="$carried"; modelless=false; fi
+  fi
   if doctor_chat_eval "$payload"; then
+    DCC_VERDICT="PASS"
+    [ "$id" = "CHAT_BASIC" ] && DOCTOR_MODEL_LANE="tolerated"
     d_ok "$id" "$label — one choice, non-empty string content (${DCE_LEN:-?} chars, ${DCC_TIME:-?}s)"
+    doctor_carried_model_note "$id" "$carried"
     return 0
   fi
+  DCC_VERDICT="FAIL"
+  # The absent-model question, decided ONCE, by CHAT_BASIC only (see
+  # DOCTOR_MODEL_LANE). A later probe must never latch it.
+  if [ "$id" = "CHAT_BASIC" ] && $modelless && [ "$DCE_HINT" = "http" ] \
+     && doctor_model_required_candidate_status "$DCC_CODE"; then
+    if [ -n "$MODELS_FIRST_ID" ] && doctor_model_required_probe "$payload"; then
+      DOCTOR_MODEL_LANE="required"; DOCTOR_MODEL_LANE_ID="$MODELS_FIRST_ID"
+    else
+      DOCTOR_MODEL_LANE="unattributable"
+    fi
+  fi
   d_bad "$id" "$label — $DCE_REASON"
+  doctor_carried_model_note "$id" "$carried"
+  # A model-less probe that failed the same way CHAT_BASIC did, on a run that
+  # could not attribute that failure: the honest answer is that this check was
+  # not graded — never a story about the rule it happens to be named after.
+  if $modelless && [ "$id" != "CHAT_BASIC" ] && doctor_unattributable_modelless; then
+    DCC_VERDICT="NOT_RUN"
+    d_say "$id" "(this request deliberately carries no \"model\" field, and [CHAT_BASIC] above was"
+    d_say "$id" " rejected the same way, so this run can't tell the two rules apart — it is NOT"
+    d_say "$id" " grading this one. Fix that failure first, then re-run me.)"
+    return 1
+  fi
   case "$DCE_HINT" in
     sse)
       case "$kind" in
-        stream) d_say "$id" "(even when the request says \"stream\": true, answer ONE complete JSON object —"
-                d_say "$id" " Conduck never accepts SSE; it may set the flag, but reads a synchronous reply)" ;;
+        stream) d_say "$id" "(even when the request says \"stream\": true, answer ONE complete JSON object."
+                d_say "$id" " Conduck always sends \"stream\": false and never accepts SSE, so answer one JSON"
+                d_say "$id" " object even if some other client sets the flag)" ;;
         *)      d_say "$id" "(when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)" ;;
       esac ;;
     transfer)
@@ -781,7 +973,30 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
           d_say "$id" " front's proxy timeout — agent turns are slow, raise it — or the adapter is wedged"
           d_say "$id" " on this request and its own log will say so.)"
           return 1 ;;
+        413)
+          # The contract spends 413 on a request-size limit, and a server that
+          # answers one has STATED its cause. Telling the reader instead that they
+          # reject historical images, or refuse the stream flag, is the same defect
+          # as any other invented explanation — so the stated cause pre-empts every
+          # per-kind story, exactly as the front-end 5xx statuses do above.
+          d_say "$id" "(a 413 is a request-size limit answering, not a judgement on this request's shape."
+          d_say "$id" " The probe images here are tiny, so the limit is almost always in FRONT of the"
+          d_say "$id" " adapter — raise the reverse proxy's max body size (nginx client_max_body_size,"
+          d_say "$id" " Caddy request_body). Conduck sends real photos, which are far larger than this.)"
+          return 1 ;;
       esac
+      # The one cause that would otherwise be told three different ways, none of
+      # them true: this adapter requires the field the contract makes optional.
+      # A retry confirmed it for this exact payload, so it is said once, plainly,
+      # and never dressed up as a history-poisoning or streaming fault.
+      if [ "$id" = "CHAT_BASIC" ] && [ "$DOCTOR_MODEL_LANE" = "required" ]; then
+        d_say "$id" "(the identical request answered normally as soon as \"model\": \"$(safe_display "$DOCTOR_MODEL_LANE_ID" 60)\" was"
+        d_say "$id" " supplied, so this adapter REQUIRES that field — and that is the ONLY fault this request"
+        d_say "$id" " shows. The contract makes it optional: with no \"model\", pick your own default and answer."
+        d_say "$id" " The remaining chat checks carry that id, so each grades its own rule instead of failing"
+        d_say "$id" " again for this one.)"
+        return 1
+      fi
       case "$kind" in
         history)
           d_say "$id" "(the contract forbids rejecting a request because of an image in an EARLIER message —"
@@ -930,20 +1145,22 @@ print(json.dumps(req))') \
 
 doctor_image_input_check() {
   local id="IMAGE_INPUT" code payload
-  # Shadowed, not inherited. $CONDUCK_PROBE_MODEL is internal plumbing for
+  # Set explicitly, never inherited. $CONDUCK_PROBE_MODEL is internal plumbing for
   # handing a value to python without argv, and the probe's python reads the
   # ENVIRONMENT — so a variable the operator happens to have exported would
-  # silently put a "model" field in this request. The adapter contract makes
-  # tolerating an ABSENT model a REQUIREMENT, so a model here grades a different
-  # rule than the one this check exists to grade, and the adapter author would
-  # have no way to see why the verdict moved. --check-server sets it explicitly
-  # at its own call site; this one explicitly does not.
-  CONDUCK_PROBE_MODEL="" image_probe_gen
+  # silently put a "model" field in this request and move the verdict for a reason
+  # the adapter author cannot see. It is EMPTY by default, because the contract
+  # makes tolerating an absent model a requirement and CHAT_BASIC is what grades
+  # that rule. It carries the advertised id only once CHAT_BASIC has established
+  # that this adapter requires the field: otherwise this probe fails for CHAT_BASIC's
+  # reason and reports a vision fault the run never measured.
+  CONDUCK_PROBE_MODEL="$DOCTOR_MODEL_LANE_ID" image_probe_gen
   code="$IPG_CODE"; payload="$IPG_PAYLOAD"
   if doctor_chat_eval "$payload" "$code"; then
     if [ "$DCE_TOKEN" = "yes" ]; then
       DOCTOR_IMAGE_INPUT="VERIFIED"
       d_ok "$id" "image input — the reply reads the digits back (VERIFIED, ${DCC_TIME:-?}s)"
+      doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
       return 0
     fi
     DOCTOR_IMAGE_INPUT="UNVERIFIED"
@@ -951,21 +1168,39 @@ doctor_image_input_check() {
     d_say "$id" "(the engine never saw the image — it was silently dropped somewhere, the one forbidden"
     d_say "$id" " move. Forward images to the engine, or decline honestly with HTTP 400 + an error body"
     d_say "$id" " carrying code \"image_unsupported\" — never answer as if no image was attached.)"
+    doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
+    return 1
+  fi
+  if [ "$DCC_CODE" = "400" ] && printf '%s' "$DCC_BODY" | doctor_is_openai_error \
+     && printf '%s' "$DCC_BODY" | doctor_error_code "image_unsupported"; then
+    DOCTOR_IMAGE_INPUT="DECLINED"
+    d_ok "$id" "image input — declined with HTTP 400 + code \"image_unsupported\" (honest refusal, allowed)"
+    doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
+    return 0
+  fi
+  # Same rule as the chat probes, and it is asked BEFORE the decline is graded: an
+  # adapter that requires a model answers this model-less probe with a 400 and a
+  # perfectly well-formed error body, which the branch below would otherwise read
+  # as a dishonest image decline — a vision verdict on a run that never reached the
+  # engine's eyes at all. Not measured means NOT_RUN.
+  if doctor_unattributable_modelless; then
+    DOCTOR_IMAGE_INPUT="NOT_RUN"
+    d_bad "$id" "image input — $DCE_REASON"
+    d_say "$id" "(this request also carries no \"model\" field, and [CHAT_BASIC] above was rejected the same"
+    d_say "$id" " way, so this run can't tell the two rules apart — it is NOT grading image input. Fix that"
+    d_say "$id" " failure first, then re-run me.)"
     return 1
   fi
   if [ "$DCC_CODE" = "400" ] && printf '%s' "$DCC_BODY" | doctor_is_openai_error; then
-    if printf '%s' "$DCC_BODY" | doctor_error_code "image_unsupported"; then
-      DOCTOR_IMAGE_INPUT="DECLINED"
-      d_ok "$id" "image input — declined with HTTP 400 + code \"image_unsupported\" (honest refusal, allowed)"
-      return 0
-    fi
     DOCTOR_IMAGE_INPUT="FAIL"
     d_bad "$id" "image input — declined with HTTP 400, but without code \"image_unsupported\""
     d_say "$id" "(the decline itself is allowed — but the app keys on the machine code to explain the"
     d_say "$id" " refusal and offer recovery, so add \"code\": \"image_unsupported\" to the error object)"
+    doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
     return 1
   fi
   DOCTOR_IMAGE_INPUT="FAIL"
   d_bad "$id" "image input — $DCE_REASON"
+  doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
   return 1
 }

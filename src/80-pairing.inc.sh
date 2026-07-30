@@ -85,6 +85,11 @@ emit_payload() {
     cleanup_exposures
     warn "Some checks failed above — fix those first, then re-run me."
     warn "I only hand you a setup code that is known to work."
+    # Self-guarding: silent unless a restart this run asked for was followed by a
+    # readiness wait that genuinely expired. By here the Step-4 warning has
+    # scrolled away, and this epilogue is what the operator is reading when they
+    # decide whether to undo a change that was correct.
+    gw_restart_timing_note
     # Custom targets only. Route by provenance: existing OpenAI-compatible
     # software uses the app-compatibility grader; adapters written for Conduck
     # use the stricter contract grader. OpenClaw/Hermes users need neither hint.
@@ -142,11 +147,16 @@ emit_payload() {
   esac
   say "  Run this script again any time to check the connection or show the code again."
   # Custom targets only (see the matching gate in emit_payload's failure branch).
+  # The adapter line rides a SUCCESS screen, so it needs the outcome named with it:
+  # this pairing already works, and a user who runs the strict grader on generic
+  # software gets a FAIL that means nothing about the setup they just proved.
   if [ "$GW_KIND" = "custom" ]; then
     local dt="$GW_URL"
     [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
     say "  Existing OpenAI-compatible server? Re-check it with:  ${BOLD}bash conduck-connect.sh --check-server $dt${RESET}"
     say "  Adapter built for Conduck? Grade it with:             ${BOLD}bash conduck-connect.sh --check-adapter $dt${RESET}"
+    note "The adapter grade only fits software built for Conduck: generic servers (Ollama, LiteLLM,"
+    note "Open WebUI) fail rules that are correct for them — that does not undo the pairing above."
   fi
   if $FS_ROLLBACK_INCOMPLETE; then
     say ""

@@ -85,7 +85,12 @@ credentials: the wizard, both checks, and the saved-profile reader all refuse
 one, so a password can never end up inside a routing field or the pairing code.
 
 - Normal setup and `--show-code` verification may send a local health check,
-  `GET /v1/models`, and a real `POST /v1/chat/completions` pong. Before a newly
+  `GET /v1/models`, and a real `POST /v1/chat/completions` pong. After a restart
+  you approve, setup also polls that same loopback health endpoint about once a
+  second for up to a minute, until the gateway answers twice in a row — no new
+  host, port, credential, or method, just the request already described above
+  repeated inside a bounded window, so a gateway that is merely still booting is
+  not graded as broken. Before a newly
   created/reused lane is exposed, setup checks its exact loopback service,
   saved credential, byte-faithful PUT/GET, and rejection of missing/wrong
   credentials. If a file lane is configured, setup/`--show-code` also performs

@@ -2364,7 +2364,433 @@ test_show_code_live_folder() {
   fi
 }
 
+# ===================================== a gateway we restarted, coming back ====
+#
+# The measured bug these cover: on a stock OpenClaw Docker install the tool-policy
+# fix's `docker compose restart` returns at about t+1s and /healthz first answers
+# at about t+6s, so verification graded a gateway that was still booting and every
+# user on the recommended path saw failures that meant nothing was wrong.
+#
+# The waiter's bound is WALL CLOCK, so proving it must not cost a real minute:
+# `date` and `sleep` are shadowed by a fake clock and `local_health_ok` (the real
+# one lives in the verification module) by a scripted answer queue. The waiter
+# calls both as plain commands — never through $( ) or a pipeline — so the queue
+# index and the clock survive from one probe to the next. Facts are PRINTED from
+# inside the subshell: globals assigned there die with it.
+# A file, not a variable: every call runs inside $( ), so anything the helper
+# assigns dies with that subshell.
+GW_WAIT_OUT="$TMP/gw-wait.out"
+run_gw_wait() { # run_gw_wait <entry-fn> <health-script> <clock-step> <dry-run> [port] [pre-timed-out]
+  (
+    FAKE_NOW=1000
+    FAKE_SLEEPS=0
+    HEALTH_PROBES=0
+    HEALTH_SCRIPT="$2"
+    CLOCK_STEP="$3"
+    DRY_RUN="$4"
+    GW_LOCAL_PORT="${5-8080}"
+    GW_HEALTH_PATH="/healthz"
+    GW_RESTART_COMPLETED_EPOCH=""
+    GW_RESTART_LOCAL_WAIT_TIMED_OUT="${6-false}"
+    date() { case "$1" in +%s) printf '%s\n' "$FAKE_NOW" ;; *) command date "$@" ;; esac; }
+    sleep() { FAKE_SLEEPS=$((FAKE_SLEEPS+1)); FAKE_NOW=$((FAKE_NOW + CLOCK_STEP)); }
+    local_health_ok() {
+      HEALTH_PROBES=$((HEALTH_PROBES+1))
+      answer="n"
+      if [ -n "$HEALTH_SCRIPT" ]; then
+        answer="${HEALTH_SCRIPT%% *}"
+        case "$HEALTH_SCRIPT" in
+          *' '*) HEALTH_SCRIPT="${HEALTH_SCRIPT#* }" ;;
+          *)     HEALTH_SCRIPT="" ;;
+        esac
+      fi
+      [ "$answer" = "y" ]
+    }
+    rc=0
+    "$1" > "$GW_WAIT_OUT" 2>&1 || rc=$?
+    printf 'rc=%s probes=%s sleeps=%s timedout=%s epoch=%s\n' \
+      "$rc" "$HEALTH_PROBES" "$FAKE_SLEEPS" "$GW_RESTART_LOCAL_WAIT_TIMED_OUT" \
+      "${GW_RESTART_COMPLETED_EPOCH:-none}"
+  )
+}
+
+test_gateway_restart_wait() {
+  local facts
+
+  # The measured shape: refused, refused, refused, then answering. The waiter
+  # hands off only after the answer holds a second later.
+  facts=$(run_gw_wait gw_wait_local_health_after_restart "n n n y y" 1 false)
+  expect_eq "restart wait: a booting gateway is waited out" \
+    "$facts" "rc=0 probes=5 sleeps=4 timedout=false epoch=none"
+  case "$(cat "$GW_WAIT_OUT")" in *"answering again"*)
+      pass "restart wait: says the gateway came back" ;;
+    *) fail "restart wait: says the gateway came back" "$(cat "$GW_WAIT_OUT")" ;; esac
+
+  # One answer is not proof. A gateway that answers once and stops must NOT be
+  # handed to verification on that answer — probes=5 is the whole point: the
+  # first success was confirmed, failed confirmation, and the wait continued.
+  facts=$(run_gw_wait gw_wait_local_health_after_restart "y n n y y" 1 false)
+  expect_eq "restart wait: a single unheld answer is not readiness" \
+    "$facts" "rc=0 probes=5 sleeps=4 timedout=false epoch=none"
+
+  # An answer that holds on the very first probe still costs exactly one
+  # confirming second, and nothing more.
+  facts=$(run_gw_wait gw_wait_local_health_after_restart "y y" 1 false)
+  expect_eq "restart wait: an already-up gateway costs one confirming second" \
+    "$facts" "rc=0 probes=2 sleeps=1 timedout=false epoch=none"
+
+  # Genuinely broken: the wait ENDS, records the fact, and reports honestly.
+  # probes=61 (not the 90 cap) proves the wall-clock deadline is what stopped it.
+  facts=$(run_gw_wait gw_wait_local_health_after_restart "" 1 false)
+  expect_eq "restart wait: a gateway that never answers ends the wait" \
+    "$facts" "rc=1 probes=61 sleeps=60 timedout=true epoch=none"
+  local timed_out; timed_out=$(cat "$GW_WAIT_OUT")
+  case "$timed_out" in *"re-run me"*) pass "restart wait: timeout hands back the remedy" ;;
+    *) fail "restart wait: timeout hands back the remedy" "$timed_out" ;; esac
+  case "$timed_out" in *"saved"*) pass "restart wait: timeout says the change survived" ;;
+    *) fail "restart wait: timeout says the change survived" "$timed_out" ;; esac
+  case "$timed_out" in *"real problem"*) pass "restart wait: timeout still calls a repeat failure real" ;;
+    *) fail "restart wait: timeout still calls a repeat failure real" "$timed_out" ;; esac
+
+  # `date` is wall time, not monotonic. A clock stepped BACKWARDS mid-wait can
+  # never reach the deadline, so the probe cap is what has to end the loop —
+  # this is the case that proves "bounded" is not merely "bounded in theory".
+  facts=$(run_gw_wait gw_wait_local_health_after_restart "" -1 false)
+  expect_eq "restart wait: a backwards clock cannot extend the wait" \
+    "$facts" "rc=1 probes=90 sleeps=90 timedout=true epoch=none"
+
+  # Nothing local to watch: no invented sleep, and it says why rather than
+  # implying it verified something.
+  facts=$(run_gw_wait gw_wait_local_health_after_restart "y y" 1 false "")
+  expect_eq "restart wait: no local health endpoint probes nothing" \
+    "$facts" "rc=0 probes=0 sleeps=0 timedout=false epoch=none"
+  case "$(cat "$GW_WAIT_OUT")" in *"local health endpoint"*)
+      pass "restart wait: no local health endpoint says so" ;;
+    *) fail "restart wait: no local health endpoint says so" "$(cat "$GW_WAIT_OUT")" ;; esac
+
+  # A run that promises to change nothing restarts nothing, so it waits for
+  # nothing and records nothing.
+  facts=$(run_gw_wait gw_note_restart_and_wait "y y" 1 true)
+  expect_eq "restart wait: dry-run neither waits nor records" \
+    "$facts" "rc=0 probes=0 sleeps=0 timedout=false epoch=none"
+
+  # A fresh restart must not inherit the previous one's timeout.
+  facts=$(run_gw_wait gw_note_restart_and_wait "y y" 1 false 8080 true)
+  expect_eq "restart wait: a new restart clears an older timeout" \
+    "$facts" "rc=0 probes=2 sleeps=1 timedout=false epoch=1000"
+
+  # The wrapper ALWAYS succeeds. Its caller reads a nonzero as "drop the file
+  # lane", so a spent wait must never escape as one.
+  facts=$(run_gw_wait gw_note_restart_and_wait "" 1 false)
+  expect_eq "restart wait: a spent wait never escapes as a failure" \
+    "$facts" "rc=0 probes=61 sleeps=60 timedout=true epoch=1000"
+}
+
+test_restart_timing_note() {
+  local out
+  # Silent unless the dedicated wait genuinely expired: a models/auth/TLS failure
+  # after a gateway that came back fine is not timing, and a blanket "maybe it was
+  # the restart" would excuse a real breakage forever.
+  out=$(
+    GW_RESTART_COMPLETED_EPOCH=""
+    GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+    gw_restart_timing_note 2>&1
+  )
+  expect_eq "restart note: silent when no restart happened" "$out" ""
+  out=$(
+    GW_RESTART_COMPLETED_EPOCH="1000"
+    GW_RESTART_LOCAL_WAIT_TIMED_OUT=false
+    gw_restart_timing_note 2>&1
+  )
+  expect_eq "restart note: silent when the gateway came back" "$out" ""
+
+  out=$(
+    GW_RESTART_COMPLETED_EPOCH="1000"
+    GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+    GW_HEALTH_PATH="/healthz"
+    gw_restart_timing_note 2>&1
+  )
+  case "$out" in *"may be timing"*) pass "restart note: names timing as a possible cause" ;;
+    *) fail "restart note: names timing as a possible cause" "$out" ;; esac
+  case "$out" in *"re-run me"*) pass "restart note: hands back the remedy" ;;
+    *) fail "restart note: hands back the remedy" "$out" ;; esac
+  case "$out" in *"no longer a likely explanation"*)
+      pass "restart note: refuses to excuse a repeat failure" ;;
+    *) fail "restart note: refuses to excuse a repeat failure" "$out" ;; esac
+}
+
+# Three callers restart a gateway, and each must be told about ITS OWN change.
+# Naming the wrong one is worse than naming none: it reassures the operator about
+# a change they never made. These guard exactly that.
+test_restart_note_names_the_right_change() {
+  local out
+  # The tool policy sits nowhere near the HTTP layer, so the reassurance is
+  # honest and load-bearing — it is what stops a correct change being undone.
+  out=$(
+    GW_RESTART_WHAT="tool-policy change"; GW_RESTART_WHAT_HTTP_SAFE=true
+    GW_RESTART_COMPLETED_EPOCH="1000"; GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+    GW_HEALTH_PATH="/healthz"; gw_restart_timing_note 2>&1
+  )
+  case "$out" in *"tool-policy change is saved"*)
+      pass "restart note: tool policy names itself" ;;
+    *) fail "restart note: tool policy names itself" "$out" ;; esac
+  case "$out" in *"cannot break a gateway's HTTP"*)
+      pass "restart note: tool policy keeps its HTTP-safe reassurance" ;;
+    *) fail "restart note: tool policy keeps its HTTP-safe reassurance" "$out" ;; esac
+
+  # The chat-endpoint flag IS the HTTP layer. Enabling a route should only ever
+  # add one, but the epilogue is not the place to promise that — so the
+  # reassurance must be ABSENT here even though the wording is otherwise shared.
+  out=$(
+    GW_RESTART_WHAT="chat-endpoint setting"; GW_RESTART_WHAT_HTTP_SAFE=false
+    GW_RESTART_COMPLETED_EPOCH="1000"; GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+    GW_HEALTH_PATH="/healthz"; gw_restart_timing_note 2>&1
+  )
+  case "$out" in *"chat-endpoint setting is saved"*)
+      pass "restart note: chat endpoint names itself" ;;
+    *) fail "restart note: chat endpoint names itself" "$out" ;; esac
+  case "$out" in *"cannot break a gateway's HTTP"*)
+      fail "restart note: chat endpoint must not claim HTTP safety" "$out" ;;
+    *) pass "restart note: chat endpoint must not claim HTTP safety" ;; esac
+  case "$out" in *"tool-policy"*)
+      fail "restart note: chat endpoint never mentions a tool policy" "$out" ;;
+    *) pass "restart note: chat endpoint never mentions a tool policy" ;; esac
+
+  # The regression that prompted all of this: a Hermes user being told their
+  # tool policy is safe, about a Hermes config change they made instead.
+  out=$(
+    GW_RESTART_WHAT="Hermes configuration change"; GW_RESTART_WHAT_HTTP_SAFE=true
+    GW_RESTART_COMPLETED_EPOCH="1000"; GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+    GW_HEALTH_PATH="/v1/health"; gw_restart_timing_note 2>&1
+  )
+  case "$out" in *"Hermes configuration change is saved"*)
+      pass "restart note: Hermes names its own change" ;;
+    *) fail "restart note: Hermes names its own change" "$out" ;; esac
+  case "$out" in *"tool-policy"*|*"tool policy"*)
+      fail "restart note: Hermes is never told about a tool policy" "$out" ;;
+    *) pass "restart note: Hermes is never told about a tool policy" ;; esac
+
+  # The spent-wait warning names the change too, and shares the same variable —
+  # so it has to move with it rather than keeping a second hardcoded noun.
+  GW_RESTART_WHAT="Hermes configuration change" \
+    run_gw_wait gw_wait_local_health_after_restart "" 1 false >/dev/null
+  out=$(cat "$GW_WAIT_OUT")
+  case "$out" in *"Hermes configuration change is saved either way"*)
+      pass "restart wait: the spent-wait warning names the change too" ;;
+    *) fail "restart wait: the spent-wait warning names the change too" "$out" ;; esac
+
+  # An unparameterised call must degrade to a neutral noun, never to whichever
+  # caller happened to run last.
+  out=$(
+    DRY_RUN=true; gw_note_restart_and_wait
+    GW_RESTART_COMPLETED_EPOCH="1000"; GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+    GW_HEALTH_PATH="/healthz"; gw_restart_timing_note 2>&1
+  )
+  case "$out" in *"configuration change is saved"*)
+      pass "restart note: an unnamed change degrades to a neutral noun" ;;
+    *) fail "restart note: an unnamed change degrades to a neutral noun" "$out" ;; esac
+  case "$out" in *"cannot break a gateway's HTTP"*)
+      fail "restart note: an unnamed change claims no HTTP safety" "$out" ;;
+    *) pass "restart note: an unnamed change claims no HTTP safety" ;; esac
+
+  # The wrapper's arg -> global mapping, which every call site depends on.
+  # DRY_RUN returns before the wait loop, so this stays instant.
+  out=$(
+    DRY_RUN=true
+    gw_note_restart_and_wait "tool-policy change" true >/dev/null 2>&1
+    printf '%s|%s' "$GW_RESTART_WHAT" "$GW_RESTART_WHAT_HTTP_SAFE"
+  )
+  expect_eq "restart wait: names and HTTP-safe flag reach the globals" \
+    "$out" "tool-policy change|true"
+  # A caller that omits the flag must not inherit a previous caller's `true`.
+  out=$(
+    DRY_RUN=true
+    gw_note_restart_and_wait "tool-policy change" true >/dev/null 2>&1
+    gw_note_restart_and_wait "chat-endpoint setting" >/dev/null 2>&1
+    printf '%s|%s' "$GW_RESTART_WHAT" "$GW_RESTART_WHAT_HTTP_SAFE"
+  )
+  expect_eq "restart wait: an omitted HTTP-safe flag never inherits true" \
+    "$out" "chat-endpoint setting|false"
+}
+
+# ============================ tool policy: restart, then wait (40-file-lane) ===
+#
+# The step's own arms, with the waiter stubbed so the two questions stay separate:
+# the waiter's semantics are proved above, and what matters here is that a restart
+# the step performs is followed by a wait, that a spent wait changes no verdict,
+# and that a restart the operator declined is never reported as applied.
+openclaw_fix_config() { # openclaw_fix_config <path> <ready|needs-fix>
+  case "$2" in
+    ready) printf '%s\n' '{"tools": {"profile": "coding", "alsoAllow": ["pdf"]}}' > "$1" ;;
+    *)     printf '%s\n' '{"tools": {"profile": "coding"}}' > "$1" ;;
+  esac
+}
+
+# The policy step's run_step stub, out here because a `case` inside $( ) trips
+# bash's parser. Two knobs, set by each case in its own subshell:
+#   POLICY_CFG         — the config the modelled config-set rewrites. The real
+#                        run_step executes the command it prints and the suite's
+#                        stub does not, so without this the step's re-read could
+#                        never reach its success arm.
+#   POLICY_RESTART_RC  — 1 declines the restart half, the way an operator does.
+POLICY_CFG=""
+POLICY_RESTART_RC=0
+policy_run_step() { # policy_run_step <description> [command…]
+  local desc="$1"
+  case "$desc" in
+    *restart*)
+      if [ "$POLICY_RESTART_RC" != "0" ]; then
+        printf '[run_step declined] %s\n' "$desc"
+        return 1
+      fi
+      ;;
+    *"tool policy"*) openclaw_fix_config "$POLICY_CFG" ready ;;
+  esac
+  printf '[run_step] %s\n' "$desc"
+  return 0
+}
+
+test_tool_policy_restart_handoff() {
+  local saved_home="$HOME" home="$TMP/policy-home" cfg out facts
+  cfg="$home/.openclaw/openclaw.json"
+
+  # A config-set the step believes succeeded, a restart it also runs, and a wait
+  # that spends its whole budget. The lane must survive all three: the step's
+  # caller treats any nonzero as "drop the file lane".
+  facts=$(
+    HOME="$home"; rm -rf "$home"; mkdir -p "$home/.openclaw" "$home/openclaw"
+    : > "$home/openclaw/docker-compose.yml"
+    openclaw_fix_config "$cfg" needs-fix
+    CONFIRM_ANSWER="n"
+    WAIT_CALLS=0
+    GW_RESTART_COMPLETED_EPOCH=""
+    GW_RESTART_LOCAL_WAIT_TIMED_OUT=false
+    POLICY_CFG="$cfg"; POLICY_RESTART_RC=0
+    run_step() { policy_run_step "$@"; }
+    gw_wait_local_health_after_restart() {
+      WAIT_CALLS=$((WAIT_CALLS+1))
+      GW_RESTART_LOCAL_WAIT_TIMED_OUT=true
+      return 1
+    }
+    rc=0
+    openclaw_tool_policy_step > "$TMP/policy.out" 2>&1 || rc=$?
+    printf 'rc=%s waits=%s epoch=%s timedout=%s\n' "$rc" "$WAIT_CALLS" \
+      "${GW_RESTART_COMPLETED_EPOCH:-none}" "$GW_RESTART_LOCAL_WAIT_TIMED_OUT"
+  )
+  case "$facts" in "rc=0 waits=1 epoch="[0-9]*" timedout=true")
+      pass "tool policy: a restart is followed by a wait, and a spent wait keeps the lane" ;;
+    *) fail "tool policy: a restart is followed by a wait, and a spent wait keeps the lane" "$facts" ;; esac
+  out=$(cat "$TMP/policy.out")
+  case "$out" in *"openclaw.json is file-transfer-ready"*)
+      pass "tool policy: the re-read claims the file, not the running gateway" ;;
+    *) fail "tool policy: the re-read claims the file, not the running gateway" "$out" ;; esac
+  case "$out" in *"was not restarted"*)
+      fail "tool policy: a completed restart is not reported as skipped" "$out" ;;
+    *) pass "tool policy: a completed restart is not reported as skipped" ;; esac
+
+  # Restart declined. The policy is on disk, the running gateway is not on it,
+  # and saying otherwise is how a green claim outruns the truth.
+  facts=$(
+    HOME="$home"; rm -rf "$home"; mkdir -p "$home/.openclaw" "$home/openclaw"
+    : > "$home/openclaw/docker-compose.yml"
+    openclaw_fix_config "$cfg" needs-fix
+    CONFIRM_ANSWER="n"
+    WAIT_CALLS=0
+    GW_RESTART_COMPLETED_EPOCH=""
+    POLICY_CFG="$cfg"; POLICY_RESTART_RC=1
+    run_step() { policy_run_step "$@"; }
+    gw_wait_local_health_after_restart() { WAIT_CALLS=$((WAIT_CALLS+1)); return 0; }
+    rc=0
+    openclaw_tool_policy_step > "$TMP/policy.out" 2>&1 || rc=$?
+    printf 'rc=%s waits=%s epoch=%s\n' "$rc" "$WAIT_CALLS" "${GW_RESTART_COMPLETED_EPOCH:-none}"
+  )
+  expect_eq "tool policy: a declined restart waits for nothing and records nothing" \
+    "$facts" "rc=0 waits=0 epoch=none"
+  out=$(cat "$TMP/policy.out")
+  case "$out" in *"still running with its old policy"*)
+      pass "tool policy: a declined restart says the gateway kept the old policy" ;;
+    *) fail "tool policy: a declined restart says the gateway kept the old policy" "$out" ;; esac
+
+  # The by-hand arm asks for the change AND the restart in one step, so its
+  # confirmation is the only signal either happened — and the boot window after
+  # an operator's own restart is identical.
+  facts=$(
+    HOME="$home"; rm -rf "$home"; mkdir -p "$home/.openclaw"
+    openclaw_fix_config "$cfg" needs-fix
+    CONFIRM_ANSWER="y"
+    WAIT_CALLS=0
+    GW_RESTART_COMPLETED_EPOCH=""
+    gw_wait_local_health_after_restart() { WAIT_CALLS=$((WAIT_CALLS+1)); return 0; }
+    rc=0
+    openclaw_tool_policy_step > "$TMP/policy.out" 2>&1 || rc=$?
+    printf 'rc=%s waits=%s epoch=%s\n' "$rc" "$WAIT_CALLS" "${GW_RESTART_COMPLETED_EPOCH:-none}"
+  )
+  case "$facts" in "rc=0 waits=1 epoch="[0-9]*)
+      pass "tool policy: a by-hand restart is waited out too" ;;
+    *) fail "tool policy: a by-hand restart is waited out too" "$facts" ;; esac
+
+  # A run that changes nothing restarts nothing, so there is nothing to wait for.
+  facts=$(
+    HOME="$home"; rm -rf "$home"; mkdir -p "$home/.openclaw" "$home/openclaw"
+    : > "$home/openclaw/docker-compose.yml"
+    openclaw_fix_config "$cfg" needs-fix
+    DRY_RUN=true
+    WAIT_CALLS=0
+    GW_RESTART_COMPLETED_EPOCH=""
+    gw_wait_local_health_after_restart() { WAIT_CALLS=$((WAIT_CALLS+1)); return 0; }
+    rc=0
+    openclaw_tool_policy_step > "$TMP/policy.out" 2>&1 || rc=$?
+    printf 'rc=%s waits=%s epoch=%s\n' "$rc" "$WAIT_CALLS" "${GW_RESTART_COMPLETED_EPOCH:-none}"
+  )
+  expect_eq "tool policy: dry-run neither restarts nor waits" \
+    "$facts" "rc=0 waits=0 epoch=none"
+
+  HOME="$saved_home"
+}
+
+test_missing_rclone_continues() {
+  local saved_home="$HOME" out facts
+  # Without rclone no lane can be built at all, so the policy step must not have
+  # changed a foreign gateway's config or restarted it for a lane that cannot
+  # exist — and the operator must be told the run continues, because reading a
+  # dead end is what makes someone abandon a setup that was about to succeed.
+  facts=$(
+    HOME="$TMP/rclone-home"; rm -rf "$HOME"; mkdir -p "$HOME"
+    GW_KIND="openclaw"
+    OS="Linux"
+    CONFIRM_ANSWER="y"
+    POLICY_CALLS=0
+    have() { [ "$1" != "rclone" ] && command -v "$1" >/dev/null 2>&1; }
+    linux_install_cmd() { printf 'apt\tsudo apt install rclone'; }
+    openclaw_tool_policy_step() { POLICY_CALLS=$((POLICY_CALLS+1)); return 0; }
+    rc=0
+    setup_file_lane > "$TMP/rclone.out" 2>&1 || rc=$?
+    printf 'rc=%s policy=%s\n' "$rc" "$POLICY_CALLS"
+  )
+  expect_eq "missing rclone: no policy change or restart is attempted" "$facts" "rc=0 policy=0"
+  out=$(cat "$TMP/rclone.out")
+  case "$out" in *"setup continues without file transfer"*)
+      pass "missing rclone: says the run continues" ;;
+    *) fail "missing rclone: says the run continues" "$out" ;; esac
+  case "$out" in *"chat-only setup code"*)
+      pass "missing rclone: says a code still comes" ;;
+    *) fail "missing rclone: says a code still comes" "$out" ;; esac
+  case "$out" in *"re-run me to add file transfer"*)
+      pass "missing rclone: says installing it later is enough" ;;
+    *) fail "missing rclone: says installing it later is enough" "$out" ;; esac
+  case "$out" in *"skip the file lane for now"*)
+      fail "missing rclone: the dead-end wording is gone" "$out" ;;
+    *) pass "missing rclone: the dead-end wording is gone" ;; esac
+
+  HOME="$saved_home"
+}
+
 printf 'file-lane readiness regressions — source modules + loopback fixtures\n'
+test_gateway_restart_wait
+test_restart_timing_note
+test_restart_note_names_the_right_change
+test_tool_policy_restart_handoff
+test_missing_rclone_continues
 test_port_allocation
 test_duplicate_per_gateway_port
 test_prebound_port

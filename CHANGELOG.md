@@ -4,6 +4,134 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **Setup restarted the gateway to apply the tool-policy fix, then graded it
+  while it was still booting.** On a stock OpenClaw Docker install `docker
+  compose restart` returns in about a second and the health route first answers
+  about five seconds later, so the verification that followed failed a gateway
+  that was merely coming back — and the honest reading of that transcript is
+  "the change I just approved broke my gateway", which gets a correct change
+  undone. A restart this run asked for is now followed by a bounded wait on the
+  gateway's own loopback health endpoint, on BOTH restart routes: the one the
+  script runs, and the one the operator confirms by hand (the boot window is
+  identical either way, and the confirmation is the only signal the second route
+  has). Two answers a second apart are required, because one proves nothing — a
+  container that starts, answers and dies, and an old process still listening on
+  its way down, each answer once. The wait is bounded twice over, by a
+  60-second budget and by a probe cap, since `date` is wall time and a clock
+  stepped backwards mid-wait must not be able to extend the loop. It gates
+  NOTHING: a gateway that is genuinely broken still reaches verification and
+  still fails there, and the probe is verification's own health check rather
+  than a private copy, so the wait and the check that follows it accept exactly
+  the same answers by construction. All three restart sites now wait: the
+  chat-endpoint flag in Step 2, OpenClaw's tool policy, and a Hermes config
+  change — the last of which had two callers walking straight into config and
+  lane decisions about an API server that was not listening yet. Each names its
+  OWN change in the messages, because reassuring an operator about a change they
+  never made is worse than saying nothing; and only the two that sit away from
+  the HTTP layer claim they cannot affect it. The chat-endpoint flag IS that
+  layer, so it makes no such promise. A Hermes gateway paired through a
+  `--check-server` handoff has no known health route, and the wait says it cannot
+  tell rather than guessing.
+- **A declined or failed restart still printed "now file-transfer-ready".**
+  Re-reading `openclaw.json` proves what is on disk and nothing about what the
+  running gateway loaded, so a user who said no to the restart — or whose
+  restart errored — was told the lane was ready while the live gateway was still
+  denying the agent's file tools. The two facts are now separate: the success
+  line claims the file (`openclaw.json` is file-transfer-ready), and when the
+  gateway was not restarted it says so out loud, with what that costs until it
+  is.
+- **A missing `rclone` read as the end of the run, and then a pairing code
+  arrived anyway.** "Install it and re-run me, or skip the file lane for now"
+  was the last thing said before setup carried on to pair the gateway, so the
+  sensible-looking reaction was to abandon a setup that was about to succeed.
+  It now says what actually happens: the run continues without file transfer,
+  chat including pasted images still works, a chat-only setup code still comes
+  if the checks pass, and installing rclone later plus a re-run adds the lane.
+  The `rclone` check also moved AHEAD of the OpenClaw tool-policy step — asking
+  whether a binary exists costs nothing, and changing a foreign gateway's tool
+  policy and restarting it for a lane that cannot be built is a change made for
+  nothing.
+- **`--check-adapter` blamed three separate rules for one missing `model`
+  field.** The history-image, stream and image probes all deliberately omit
+  `model`, because tolerating an absent one is a contract requirement — so on an
+  adapter that REQUIRES the field, every one of them failed for that single
+  reason and each was then explained as a fault of its own rule. A working
+  anti-poisoning path was told it rejects images in conversation history; a
+  working vision path was told it silently drops them. `CHAT_BASIC` now owns the
+  absent-model rule alone and answers it once, by re-sending its identical
+  request with the first advertised id — evidence for that exact payload, not a
+  guess read out of prose, and cheap because only a fast rejection status buys
+  the retry the right to run. Once the requirement is confirmed the later probes
+  carry that id and grade the rule they exist to grade, the requirement is named
+  once where it belongs, and every verdict reached on a borrowed model discloses
+  it on itself, so a green line cannot quietly relax what it tested. When the
+  confirming retry fails too the cause is unattributable, and the checker says
+  it is not grading those probes instead of inventing a story for them. For
+  script consumers: `history_image=`, `stream=` and `image_input=` can now
+  report the existing `NOT_RUN` value for a probe that ran but measured nothing,
+  as well as for a tier a prerequisite stopped. No field was added, renamed or
+  reordered and no new enum value exists, so `schema=` stays 3; the run-level
+  verdict still lives in `core=`, `failed=` and the exit code.
+- **Two chat-failure explanations described a cause that was not there.** A
+  `413` was folded into whichever per-rule story the probe happened to be — a
+  request-size limit answering a few-hundred-byte probe PNG was reported as a
+  judgement on the request's shape. The stated cause now pre-empts every
+  per-kind story, the same way the front-end 5xx statuses already did, and names
+  where the limit almost always sits (in front of the adapter, not in the
+  engine). The stream hint also left what Conduck sends ambiguous; it now states
+  plainly that Conduck always sends `"stream": false` and never accepts SSE, so
+  an adapter should answer one JSON object even if some other client sets the
+  flag.
+- **A failing adapter grade stranded the reader who had not written the
+  adapter.** This grade holds software built FOR Conduck to Conduck's own rules,
+  and third-party OpenAI-compatible servers are EXPECTED to fail parts of it —
+  answering `"stream": true` with SSE is correct OpenAI behaviour and keyless is
+  a legitimate deployment choice, so neither is a defect in Ollama, LiteLLM or
+  Open WebUI. The closing line pointed only at the contract docs, so a wall of
+  red read as "this cannot be used" when the app pairs with it fine. Every
+  failure exit now names the question the reader actually has, and the two
+  commands that answer it — including the early `/v1/models` abort, where the
+  reader is equally stranded.
+- **The multi-model caveat was unreachable on exactly the servers it exists
+  for.** `--check-server` grades one model path, and the line saying so was
+  gated on a state the run only reaches when the server REJECTS a model-less
+  request. Any server that ANSWERS one — the common case, and precisely what a
+  fan-out gateway advertising hundreds of ids does — landed elsewhere and got no
+  caveat at all, on either the history-image note or the closing FAIL line. The
+  gate is now "this run picked the graded path rather than the operator", which
+  is as true of the model-less default route as of the first advertised id, with
+  wording for both.
+- **A mistyped address ended the server check and threw the token away.** The
+  credential is the expensive input to re-type — often a 300-character JWT — and
+  the address is the cheap one, yet a failing address exited the run and asked
+  for both again. A failed address now re-asks for the ADDRESS and keeps the
+  credential already entered, under the same acceptance rule as the first prompt
+  (https anywhere, plain http only toward this machine) so the retry cannot
+  relax what the first ask enforced. Interactive runs only: a scripted run still
+  exits 1 on the first failure. Each attempt re-arms its counters, so a first
+  attempt's red can never bleed into a later attempt's PASS. The HTML diagnosis
+  also names the real answer now — an OpenAI-compatible API living under a
+  SUB-PATH of the address given, with Open WebUI's `<url>/api` as the concrete
+  case.
+- **The pairing success screen suggested a grade without naming its outcome.**
+  Right after proving a working setup it offered `--check-adapter`, so users who
+  had just paired stock third-party software ran the strict grade, got a FAIL,
+  and concluded the setup they had just proved was broken. The suggestion stays
+  — it is the only screen an adapter author reaches — and now carries its
+  consequence: the grade only fits software built for Conduck, generic servers
+  fail rules that are correct for them, and that does not undo the pairing
+  above.
+- **The exposure menu never named the `*.trycloudflare.com` quick tunnel.**
+  `cloudflared tunnel --url` is by far the commonest casual way one of these
+  gateways gets exposed, and with no row a user could recognise it sent its own
+  users at option 3 — the single path that wants a Cloudflare domain they do not
+  have, and the one whose "cloudflared found" line looked like recognition.
+  Option 4 now names the quick tunnel in the annotation slot the rows already
+  use, unconditionally (gating it on a local `cloudflared` would hide it
+  whenever the tunnel runs from another terminal, host, or `PATH`), and the `?`
+  comparison places it on 4 explicitly. Truthful either way: that address
+  carries a certificate devices already trust and needs no domain of your own,
+  so it passes option 4's trust gate on its own merits.
 - **The body-drain rejection is now a counted conformance check, not just a
   diagnosis.** `AUTH_CHAT_REJECT_BODY` grades what the diagnostic could only
   describe: after an early `401`, the adapter must either drain the request body
