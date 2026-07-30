@@ -3881,7 +3881,40 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" host-environment "*) true ;; *) false 
   fi
 fi
 
+# The rclone integration companion. Everything above this line is hermetic — stdlib
+# fixtures, no external binaries — and that is deliberate: it is what lets this suite
+# run anywhere without provisioning. So this block may NOT make the suite's verdict
+# depend on whether rclone happens to be installed.
+#
+# It is chained anyway because the alternative was worse: this script is the ONLY
+# place the real `rclone serve webdav` dir-cache behaviour is graded, and nothing
+# invoked it, so its cases had never run outside a human typing the path.
+#
+# Three outcomes, and the third is the one that matters. Exit 2 is the script's
+# "rclone is absent" contract, which is NOT a failure and must not fail a hermetic
+# run — but it must not read as coverage either. It is recorded and re-stated after
+# the RESULT line, because a suite that goes quiet about what it did not run is how
+# this became dead coverage in the first place.
+NOT_RUN=""
+if [ -z "$ONLY" ] || case " $ONLY " in *" rclone-integration "*) true ;; *) false ;; esac; then
+  bash "$HERE/run-check-adapter-rclone-integration.sh"; integ_rc=$?
+  case "$integ_rc" in
+    0)
+      PASS=$((PASS+1))
+      printf 'SUITE ✓ rclone-integration\n' ;;
+    2)
+      NOT_RUN="rclone-integration (needs a real rclone binary: brew install rclone)"
+      printf 'SUITE — rclone-integration DID NOT RUN — rclone is not installed\n' ;;
+    *)
+      FAIL=$((FAIL+1))
+      printf 'SUITE ✗ rclone-integration — integration suite failed (exit %s)\n' "$integ_rc" ;;
+  esac
+fi
+
 printf '\nSUITE RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
+# Printed AFTER the result, where it cannot be lost above a wall of passing lines:
+# a green run that skipped a coverage area has to say so on its last line.
+[ -z "$NOT_RUN" ] || printf 'SUITE COVERAGE NOT RUN: %s\n' "$NOT_RUN"
 [ "$FAIL" = "0" ] || exit 1
 [ "$PASS" -gt 0 ] || { echo "no cases ran" >&2; exit 1; }
 exit 0

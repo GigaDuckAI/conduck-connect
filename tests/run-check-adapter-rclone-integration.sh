@@ -4,8 +4,16 @@
 # regression suite (run-checks-suite.sh). It proves the adapter check's --files
 # freshness check against a REAL `rclone serve webdav`, not the stdlib
 # fixture — the one place the actual rclone dir-cache bug can be reproduced
-# end to end. It is deliberately NOT part of the suite (which must stay
-# rclone-free), and a MISSING rclone is a hard exit 2, never a silent skip.
+# end to end.
+#
+# run-checks-suite.sh chains this script at its tail, and reads the three exit
+# codes apart: 0 counts as a passing suite entry, 1 fails the whole suite, and 2
+# — the missing-rclone contract below — is recorded and restated after that
+# suite's RESULT line as coverage that did not run. That keeps the suite's own
+# cases rclone-free, so a machine without rclone still gets a truthful green,
+# while a machine WITH rclone actually grades this. A missing rclone stays a hard
+# exit 2 and never a silent skip: this script fakes no rclone, and the suite
+# never lets an absent one read as coverage.
 #
 # Two cases, same served dir shape as the app, OS-assigned ports, a per-run
 # random credential, HOME isolated so no real pairing profile is consulted:
