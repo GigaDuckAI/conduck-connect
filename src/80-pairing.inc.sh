@@ -3,10 +3,11 @@
 # Write a NON-SECRET pairing profile so a later `--show-code` can re-emit without
 # re-answering the wizard. NEVER holds tokens/credentials — only the routing facts
 # needed to reconstruct + re-verify. 0600, umask 077, built with a real JSON
-# encoder (never hand-quoted). Refreshed on every successful WIZARD emit (incl.
-# --reuse-only) but NEVER under --show-code: that mode never rewrites saved state,
-# and a transient probe failure there can drop a file lane from this one emission —
-# rewriting the profile would make that drop permanent. A failure here only WARNs —
+# encoder (never hand-quoted). Refreshed on every successful WIZARD emit, but NEVER
+# under --show-code: that mode never rewrites saved state, and a transient probe
+# failure there can drop a file lane from this one emission — rewriting the profile
+# would make that drop permanent. An EXISTING profile is protected by the same
+# reasoning against two more runs (see the guards below). A failure here only WARNs —
 # it must not sink a completed pairing.
 write_profile() {
   # --show-code never rewrites saved state; rewriting here could permanently strip a
@@ -15,6 +16,34 @@ write_profile() {
   $DRY_RUN && return 0                       # emit_payload never runs in dry-run, but stay explicit
   [ -n "$GW_ID" ] || return 0                # no stable id → nowhere to key the profile; skip quietly
   local pf; pf="$STATE_DIR/profile-$GW_ID.json"
+  # Three run shapes may not overwrite a profile that ALREADY exists. Writing the FIRST
+  # profile is always safe — there is nothing to destroy — so every guard below is gated
+  # on the file being there, and a first pairing still gets its profile either way.
+  if [ -f "$pf" ]; then
+    # --reuse-only refuses configuration changes, and this file IS saved configuration:
+    # the reuse-only paths that leave a still-running file lane out of THIS code would
+    # otherwise delete the record of that live lane for good.
+    if $REUSE_ONLY; then
+      note "Kept the saved pairing profile exactly as it is — --reuse-only changes nothing, and this file counts."
+      note "Re-run me without --reuse-only to refresh what it records."
+      return 0
+    fi
+    # The rule the other two guards share, held in one place: a run whose checks failed
+    # has proven nothing about this setup, so it may not overwrite a record that a run
+    # which passed wrote. emit_payload's failure branch exits first, so no shipping path
+    # reaches this line — it is the backstop for the next caller that forgets.
+    if $VERIFY_FAILED; then
+      return 0
+    fi
+    # A lane a CHECK dropped is still running, and the operator did not remove it.
+    # Recording "no file lane" here is what makes one transient probe failure a
+    # permanent deletion — the exact outcome --show-code's guard above exists to avoid.
+    if $FS_LANE_DROPPED_BY_CHECK && [ "$(json_type "$pf" "fileServer")" = "object" ]; then
+      note "Left the saved pairing profile untouched, so the file lane it records survives this run's probe failure."
+      note "Nothing from this run is saved to it — re-run me once the file server answers again to refresh it."
+      return 0
+    fi
+  fi
   ensure_state_dir \
     || { warn "Couldn't create $STATE_DIR to save the pairing profile — pairing is still complete."; return 0; }
   local out
@@ -145,6 +174,45 @@ emit_payload() {
   case "$TRANSPORT" in
     tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, or Mac) needs the Tailscale app, logged in to the same tailnet." ;;
   esac
+  # A quick tunnel's hostname is REASSIGNED on every restart of it, a reboot included, and
+  # the replacement reaches no saved profile and no output of this script. What goes stale
+  # is THE CODE, so the reminder belongs where the operator is holding it — the address was
+  # named at the step that accepted it, and by here that step has scrolled away.
+  # The file-lane clause rides the same pair build_pairing_payload_json uses, so it can
+  # never name a lane this code does not carry. 30-exposure's predicate on purpose: a
+  # second copy of a host-matching rule is how the two drift apart.
+  local qt_gw=false qt_fs=false
+  is_quick_tunnel_url "$GW_URL" && qt_gw=true
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] && is_quick_tunnel_url "$FS_URL"; then qt_fs=true; fi
+  if $qt_gw || $qt_fs; then
+    say ""
+    if $qt_gw && $qt_fs; then
+      warn "This code carries Cloudflare QUICK TUNNEL addresses for BOTH the gateway and the file lane."
+    elif $qt_gw; then
+      warn "This code carries a Cloudflare QUICK TUNNEL address for the gateway."
+    else
+      warn "This code carries a Cloudflare QUICK TUNNEL address for the file lane."
+    fi
+    warn "That hostname is reassigned every time the tunnel restarts — a reboot, a crash, or a"
+    warn "Ctrl-C in its terminal. This exact code then points at a hostname that does not exist,"
+    warn "and the address it comes back on appears in no saved profile and in no output of this"
+    warn "script, so there is nothing for the app or for me to look up."
+    $qt_gw || warn "Chat keeps working; attachments stop."
+    say "  ${BOLD}Keep that tunnel running${RESET} for as long as you want this code to work, and re-run me for a"
+    say "  fresh code after every restart of it."
+  fi
+  # The durability caveat rides HERE as well as at the step that built the lane: this
+  # screen is where the operator decides to trust the lane, and by now the Step-4 line has
+  # scrolled away. Gated on the one arrangement it is true for — a systemd USER unit on
+  # Linux, which systemd stops shortly after that user's last session ends.
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] && [ "$OS" = "Linux" ] && [ -n "$FS_UNIT" ] \
+     && ! fs_linger_enabled_linux; then
+    local lu lpriv; lu=$(id -un 2>/dev/null); lpriv=$(priv_prefix)
+    warn "File transfer in this code rides a service that stops when you log out: lingering is off"
+    warn "for '$lu', so the file server stops answering after that user's last logout and does not"
+    warn "come back on reboot. Chat keeps working; attachments stop until that user logs in again."
+    note "Make it survive logout and reboot:  ${lpriv:+$lpriv }loginctl enable-linger $lu"
+  fi
   say "  Run this script again any time to check the connection or show the code again."
   # Custom targets only (see the matching gate in emit_payload's failure branch).
   # The adapter line rides a SUCCESS screen, so it needs the outcome named with it:

@@ -141,6 +141,13 @@ for lifted in configure_hermes hermes_api_server_port hermes_settings_match_url 
   declare -F "$lifted" >/dev/null \
     || { echo "could not lift $lifted out of src/20-gateway.inc.sh" >&2; exit 2; }
 done
+# The quick-tunnel predicate belongs to the exposure module and the file lane
+# calls it rather than carrying a second host-matching rule. Lifted, never
+# re-stated: a stub here would pass while the real matcher drifted underneath it.
+eval "$(sed -n '/^is_quick_tunnel_url()/,/^}/p' "$ROOT/src/30-exposure.inc.sh")"
+declare -F is_quick_tunnel_url >/dev/null \
+  || { echo "could not lift is_quick_tunnel_url out of src/30-exposure.inc.sh" >&2; exit 2; }
+
 # The --check-server handoff latch, at its source default: only a passing server
 # check may set it, and this suite must start every case from "not attributed".
 CHECK_HANDOFF_LOCAL_HERMES=false
@@ -2364,6 +2371,452 @@ test_show_code_live_folder() {
   fi
 }
 
+# ========================================= the served root, resolved + gated ==
+#
+# The measured bug: the wizard accepted a symlink as the shared folder, wrote it
+# into the unit verbatim, certified it "byte-faithful" and offered to publish it.
+# Pointed at $HOME it served ~/.ssh/authorized_keys and this connector's own 0600
+# credential file over WebDAV. The doctor already refuses that root; setup must
+# refuse the same one, and must record the RESOLVED path so the target cannot be
+# swapped under a running server.
+real_path_of() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+test_shared_folder_gate() {
+  reset_fake_home "folder-gate"
+  local real="$HOME/agent-workspace"
+  mkdir -p "$real"
+  expect_false "served root refuses /" fs_resolve_shared_folder "/"
+  expect_false "served root refuses \$HOME itself" fs_resolve_shared_folder "$HOME"
+  expect_false "served root refuses a relative path" fs_resolve_shared_folder "agent-workspace"
+  ln -s "$HOME" "$HOME/home-link"
+  expect_false "served root refuses a symlink to \$HOME" fs_resolve_shared_folder "$HOME/home-link"
+  case "$FS_FOLDER_REFUSAL" in
+    *"home directory"*) pass "served-root refusal carries its reason" ;;
+    *) fail "served-root refusal carries its reason" "got '$FS_FOLDER_REFUSAL'" ;;
+  esac
+  printf 'not a folder\n' > "$HOME/a-file"
+  expect_false "served root refuses a plain file" fs_resolve_shared_folder "$HOME/a-file"
+
+  expect_true "served root accepts the agent's own folder" fs_resolve_shared_folder "$real"
+  ln -s "$real" "$HOME/ws-link"
+  if fs_resolve_shared_folder "$HOME/ws-link" \
+     && [ "$FS_FOLDER_RESOLVED" = "$(real_path_of "$real")" ]; then
+    pass "served root resolves a symlink to its target"
+  else
+    fail "served root resolves a symlink to its target" "got '$FS_FOLDER_RESOLVED'"
+  fi
+}
+
+# One real pass through Step 4 for a NEW lane: the refused answer must be re-asked
+# (never silently accepted), and what lands in the unit + the profile field must be
+# the resolved path.
+new_lane_run() { # new_lane_run <fs_local_service_ready rc> <folder answer…>
+  local ready_rc="$1"; shift
+  local queue="$TMP/new-lane-answers"
+  printf '%s\n' "$@" > "$queue"
+  (
+    HOME="$TMP/new-lane-home"; mkdir -p "$HOME"
+    STATE_DIR="$HOME/state"
+    STATE_DIR_EXPOSURE_REPORTED=false
+    GW_KIND="custom"; GW_ID="custom"; OS="Linux"
+    TRANSPORT="public"; SCOPE="private"
+    DRY_RUN=false; REUSE_ONLY=false
+    FS_CRED=""; FS_URL=""; FS_FOLDER=""; FS_LOCAL_PORT=""; FS_UNIT=""
+    FS_LANE_PREPARED=false; FS_UNIT_CREATED_THIS_RUN=false
+    FS_ROUTE_SELF_MANAGED=false; FS_RESIDUE_REPORTED=false
+    CONFIRM_ANSWER="y"
+    READY_RC="$ready_rc"
+    ASK_QUEUE="$queue"
+    # A file, not a variable: `ask` is called inside $( ), so a queue index kept in
+    # a variable would die with that subshell and re-serve the same answer forever.
+    ask() {
+      local reply=""
+      if [ -s "$ASK_QUEUE" ]; then
+        reply=$(head -n 1 "$ASK_QUEUE")
+        sed '1d' "$ASK_QUEUE" > "$ASK_QUEUE.rest" && mv "$ASK_QUEUE.rest" "$ASK_QUEUE"
+      fi
+      [ -n "$reply" ] || reply="$2"
+      printf '[ask] %s\n' "$1" >&2
+      printf '%s' "$reply"
+    }
+    ask_url() { printf '%s' "${URL_ANSWER:-}"; }
+    have() { case "$1" in rclone|systemctl|loginctl) return 0 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    systemctl() { return 0; }
+    loginctl() { printf 'Linger=yes\n'; }
+    existing_fs_config() { return 1; }
+    allocate_fs_local_port() { FS_LOCAL_PORT=5006; return 0; }
+    fs_local_service_ready() { return "$READY_RC"; }
+    hermes_residual_state_note() { :; }
+    install_conduck_tools_block() { :; }
+    write_fs_unit_linux() {
+      FS_UNIT="$HOME/.config/systemd/user/conduck-files-$GW_ID.service"
+      mkdir -p "$(dirname "$FS_UNIT")"
+      printf 'ExecStart=/usr/bin/rclone serve webdav "%s" --addr 127.0.0.1:%s --user conduck\n' \
+        "$1" "$FS_LOCAL_PORT" > "$FS_UNIT"
+      ensure_state_dir
+      printf '%s\n' "$FS_CRED" > "$(state_cred_file)"
+      printf 'RCLONE_PASS=%s\n' "$FS_CRED" > "$(state_env_file)"
+      return 0
+    }
+    setup_file_lane
+    printf 'FOLDER=%s\n' "$FS_FOLDER"
+  ) 2>&1
+}
+
+test_new_lane_folder_recording() {
+  local home="$TMP/new-lane-home" out
+  rm -rf "$home"; mkdir -p "$home/workspace"
+  ln -s "$home" "$home/loop-to-home"
+  ln -s "$home/workspace" "$home/ws-link"
+  # First answer is a link to $HOME (refused), second is a link to a real folder.
+  out=$(new_lane_run 0 "$home/loop-to-home" "$home/ws-link")
+  case "$out" in *"I can't serve $home/loop-to-home"*)
+      pass "new lane refuses a \$HOME-resolving answer" ;;
+    *) fail "new lane refuses a \$HOME-resolving answer" "$out" ;; esac
+  case "$out" in *"served over WebDAV with read AND write access"*)
+      pass "new lane explains why that root is refused" ;;
+    *) fail "new lane explains why that root is refused" "$out" ;; esac
+  case "$out" in *"FOLDER=$(real_path_of "$home/workspace")"*)
+      pass "new lane records the RESOLVED served root" ;;
+    *) fail "new lane records the RESOLVED served root" "$out" ;; esac
+  if grep -qF "serve webdav \"$(real_path_of "$home/workspace")\"" \
+       "$home/.config/systemd/user/conduck-files-custom.service" 2>/dev/null; then
+    pass "new lane writes the resolved root into the unit"
+  else
+    fail "new lane writes the resolved root into the unit" "unit kept the symlink path"
+  fi
+  # No address given on the "my own HTTPS" transport, so the lane this run built
+  # never ships — the exact case that used to end green in silence.
+  case "$out" in *"Before you close this terminal"*)
+      pass "new lane: a built-but-unshipped lane is reported at the end" ;;
+    *) fail "new lane: a built-but-unshipped lane is reported at the end" "$out" ;; esac
+  case "$out" in *"systemctl --user disable --now conduck-files-custom.service"*)
+      pass "new lane: its teardown commands are handed over" ;;
+    *) fail "new lane: its teardown commands are handed over" "$out" ;; esac
+}
+
+# ================================ a file-lane address that will not survive ===
+#
+# The measured bug: a quick tunnel came back after a reboot on a NEW public
+# hostname while the paired device still called the dead one, and the live address
+# was in no profile and no script output. The gateway URL is warned about at
+# acceptance; the file lane's own URL had the same exposure and said nothing.
+quick_tunnel_warning_out() { # quick_tunnel_warning_out <file-lane url>
+  (
+    FS_URL="$1"
+    fs_warn_quick_tunnel_url
+  ) 2>&1
+}
+
+test_file_lane_quick_tunnel_warning() {
+  local out
+  out=$(quick_tunnel_warning_out "https://files-abc-def.trycloudflare.com")
+  case "$out" in *"QUICK TUNNEL"*)
+      pass "file-lane quick tunnel: the address is called out" ;;
+    *) fail "file-lane quick tunnel: the address is called out" "$out" ;; esac
+  case "$out" in *"attachments stop working"*)
+      pass "file-lane quick tunnel: names the file-lane consequence" ;;
+    *) fail "file-lane quick tunnel: names the file-lane consequence" "$out" ;; esac
+  case "$out" in *"no saved profile"*)
+      pass "file-lane quick tunnel: says the new address is nowhere to be found" ;;
+    *) fail "file-lane quick tunnel: says the new address is nowhere to be found" "$out" ;; esac
+  case "$out" in *"NAMED tunnel"*)
+      pass "file-lane quick tunnel: offers an address that survives a restart" ;;
+    *) fail "file-lane quick tunnel: offers an address that survives a restart" "$out" ;; esac
+
+  # Silence is the whole point everywhere else — including the two shapes a
+  # home-grown matcher gets wrong.
+  local quiet
+  for quiet in "" \
+      "https://files.example.com" \
+      "https://files.example.ts.net:8443" \
+      "https://files.example.com/trycloudflare.com" \
+      "https://nottrycloudflare.com"; do
+    out=$(quick_tunnel_warning_out "$quiet")
+    if [ -z "$out" ]; then
+      pass "file-lane quick tunnel: silent for '${quiet:-(no address)}'"
+    else
+      fail "file-lane quick tunnel: silent for '${quiet:-(no address)}'" "$out"
+    fi
+  done
+
+  # …and it has to be WIRED, not merely correct: one real pass through the
+  # "my own HTTPS" branch with a quick-tunnel answer.
+  local home="$TMP/new-lane-home"
+  rm -rf "$home"; mkdir -p "$home/workspace"
+  out=$(URL_ANSWER="https://files-xyz.trycloudflare.com" new_lane_run 0 "$home/workspace")
+  case "$out" in *"QUICK TUNNEL"*)
+      pass "file-lane quick tunnel: warned where the address is accepted" ;;
+    *) fail "file-lane quick tunnel: warned where the address is accepted" "$out" ;; esac
+}
+
+# ============================== a lane that was built and never shipped =======
+#
+# The measured bug: on the two transports whose HTTPS route the operator creates
+# themselves, a dropped lane rolled back nothing and said nothing — the run ended
+# green while an authenticated WebDAV server over the agent's folder was still
+# running, still enabled at boot, and still behind the route the script told them
+# to create. One tester finished with 10 units, 9 boot-wired, and no removal
+# command anywhere in the tool.
+residue_run() { # residue_run <created-this-run> <route-self-managed> <os> [shipped]
+  (
+    HOME="$TMP/residue-home"; rm -rf "$HOME"; mkdir -p "$HOME"
+    STATE_DIR="$HOME/state dir"; mkdir -p "$STATE_DIR"
+    GW_ID="openclaw"; OS="$3"
+    DRY_RUN="${DRY:-false}"
+    FS_LANE_PREPARED=true
+    FS_UNIT_CREATED_THIS_RUN="$1"
+    FS_ROUTE_SELF_MANAGED="$2"
+    FS_RESIDUE_REPORTED=false
+    FS_LOCAL_PORT="5006"
+    FS_FOLDER="$HOME/.openclaw/workspace"
+    FS_URL=""; FS_CRED=""
+    if [ "${4:-no}" = "shipped" ]; then
+      FS_URL="https://files.example.test:8443"; FS_CRED="secret"
+    fi
+    if [ "$3" = "Linux" ]; then
+      FS_UNIT="$HOME/.config/systemd/user/conduck-files-openclaw.service"
+      printf 'RCLONE_PASS=x\n' > "$STATE_DIR/fileserver-openclaw.env"
+    else
+      FS_UNIT="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-openclaw.plist"
+    fi
+    mkdir -p "$(dirname "$FS_UNIT")"
+    printf 'unit\n' > "$FS_UNIT"
+    printf 'secret\n' > "$STATE_DIR/fileserver-openclaw.cred"
+    fs_lane_residue_note
+    fs_lane_residue_note          # second call must add nothing
+  ) 2>&1
+}
+
+test_lane_residue_report() {
+  local out
+  out=$(residue_run true false Linux)
+  case "$out" in *"this run started a file server"*)
+      pass "residue: a lane this run built is named as such" ;;
+    *) fail "residue: a lane this run built is named as such" "$out" ;; esac
+  case "$out" in *"conduck-files-openclaw.service"*)
+      pass "residue: names the exact unit" ;;
+    *) fail "residue: names the exact unit" "$out" ;; esac
+  case "$out" in *"starts again at boot"*)
+      pass "residue: says it survives a reboot" ;;
+    *) fail "residue: says it survives a reboot" "$out" ;; esac
+  case "$out" in *"systemctl --user disable --now conduck-files-openclaw.service"*)
+      pass "residue: hands over the disable command" ;;
+    *) fail "residue: hands over the disable command" "$out" ;; esac
+  case "$out" in *"reset-failed"*)
+      pass "residue: clears a crash-looped unit's failed state too" ;;
+    *) fail "residue: clears a crash-looped unit's failed state too" "$out" ;; esac
+  case "$out" in *"fileserver-openclaw.cred'"*)
+      pass "residue: removal of a spacey credential path is quoted" ;;
+    *) fail "residue: removal of a spacey credential path is quoted" "$out" ;; esac
+  case "$out" in *"fileserver-openclaw.env"*)
+      pass "residue: names the Linux env file as well" ;;
+    *) fail "residue: names the Linux env file as well" "$out" ;; esac
+  # Printed once: a second call in the same run must add nothing.
+  if [ "$(printf '%s\n' "$out" | grep -c "disable --now")" = "1" ]; then
+    pass "residue: reported exactly once per run"
+  else
+    fail "residue: reported exactly once per run" "$out"
+  fi
+
+  out=$(residue_run true true Linux)
+  case "$out" in *"HTTPS route you set up for it still points at 127.0.0.1:5006"*)
+      pass "residue: names the operator's own HTTPS route" ;;
+    *) fail "residue: names the operator's own HTTPS route" "$out" ;; esac
+
+  out=$(residue_run false false Darwin)
+  case "$out" in *"keeps running"*)
+      pass "residue: a reused lane is not claimed as this run's" ;;
+    *) fail "residue: a reused lane is not claimed as this run's" "$out" ;; esac
+  case "$out" in *"launchctl unload"*)
+      pass "residue: macOS teardown unloads the LaunchAgent" ;;
+    *) fail "residue: macOS teardown unloads the LaunchAgent" "$out" ;; esac
+  case "$out" in *"fileserver-openclaw.env"*)
+      fail "residue: macOS does not name a Linux-only env file" "$out" ;;
+    *) pass "residue: macOS does not name a Linux-only env file" ;; esac
+
+  out=$(residue_run true false Linux shipped)
+  if [ -z "$out" ]; then
+    pass "residue: a lane that ships is not reported as residue"
+  else
+    fail "residue: a lane that ships is not reported as residue" "$out"
+  fi
+
+  out=$( DRY=true residue_run true false Linux )
+  if [ -z "$out" ]; then
+    pass "residue: a dry run reports nothing (nothing was built)"
+  else
+    fail "residue: a dry run reports nothing (nothing was built)" "$out"
+  fi
+}
+
+# ================================ a unit that exists but cannot be started ====
+#
+# The measured bug: the free-port check is a bind probe seconds before rclone's
+# own bind, so a stolen port wedges the unit in `failed` for good — and every
+# later run printed a checkmark for that corpse, refused to expose it in one
+# line, and exited 0 with a green chat-only code naming no unit and no journal.
+inactive_run() { # inactive_run <confirm> <reuse-only> [pre-bind-new-ports]
+  (
+    HOME="$TMP/inactive-home"; rm -rf "$HOME"; mkdir -p "$HOME"
+    STATE_DIR="$HOME/state"; mkdir -p "$STATE_DIR"
+    GW_ID="openclaw"; OS="Linux"
+    DRY_RUN=false; REUSE_ONLY="$2"
+    CONFIRM_ANSWER="$1"
+    FS_PORT_START=5006; FS_PORT_END=5105
+    FS_UNIT="$HOME/.config/systemd/user/conduck-files-openclaw.service"
+    FS_LOCAL_PORT="5006"
+    FS_CRED="inactive-fixture-secret"
+    FS_FOLDER="$HOME/workspace"
+    FS_LANE_PREPARED=true; FS_UNIT_CREATED_THIS_RUN=false
+    FS_ROUTE_SELF_MANAGED=false; FS_RESIDUE_REPORTED=false
+    mkdir -p "$(dirname "$FS_UNIT")" "$FS_FOLDER"
+    printf '%s\n' '[Service]' \
+      "ExecStart=/usr/bin/rclone serve webdav \"$FS_FOLDER\" --addr 127.0.0.1:5006 --user conduck" \
+      > "$FS_UNIT"
+    local fake_bin="$TMP/inactive-bin"
+    mkdir -p "$fake_bin"
+    printf '%s\n' '#!/usr/bin/env sh' 'exit 0' > "$fake_bin/rclone"
+    chmod 755 "$fake_bin/rclone"
+    PATH="$fake_bin:$PATH"
+    # The global test override answers "active" for every unit; the case under test
+    # is the opposite, so the real pair is restored and driven by this systemctl.
+    eval "$FS_UNIT_ACTIVE_IMPL"
+    have() { case "$1" in systemctl|loginctl|rclone) return 0 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    systemctl() {
+      case "$*" in
+        *"is-active"*)    [ -f "$HOME/started" ] ;;
+        *"enable --now"*) : > "$HOME/started"; return 0 ;;
+        *)                return 0 ;;
+      esac
+    }
+    loginctl() { printf 'Linger=yes\n'; }
+    rc=0
+    fs_inactive_unit_report || rc=$?
+    printf 'rc=%s port=%s\n' "$rc" "$FS_LOCAL_PORT"
+  ) 2>&1
+}
+
+test_inactive_unit_report() {
+  local out
+  out=$(inactive_run n false)
+  case "$out" in *"conduck-files-openclaw.service"*)
+      pass "dead unit: the unit is named" ;;
+    *) fail "dead unit: the unit is named" "$out" ;; esac
+  case "$out" in *"journalctl --user -u conduck-files-openclaw.service"*)
+      pass "dead unit: hands over the journal command" ;;
+    *) fail "dead unit: hands over the journal command" "$out" ;; esac
+  case "$out" in *"took port 5006 between my free-port check"*)
+      pass "dead unit: names the stolen-port cause" ;;
+    *) fail "dead unit: names the stolen-port cause" "$out" ;; esac
+  case "$out" in *"rc=1 port=5006"*)
+      pass "dead unit: declining the move leaves the lane out" ;;
+    *) fail "dead unit: declining the move leaves the lane out" "$out" ;; esac
+
+  out=$(inactive_run y true)
+  case "$out" in *"reuse-only: not moving the lane"*)
+      pass "dead unit: --reuse-only changes no port" ;;
+    *) fail "dead unit: --reuse-only changes no port" "$out" ;; esac
+  case "$out" in *"rc=1 port=5006"*)
+      pass "dead unit: --reuse-only keeps the recorded port" ;;
+    *) fail "dead unit: --reuse-only keeps the recorded port" "$out" ;; esac
+
+  out=$(inactive_run y false)
+  case "$out" in *"rc=0 port=5006"*)
+      fail "dead unit: accepting the move re-allocates the port" "$out" ;;
+    *"rc=0 port="*)
+      pass "dead unit: accepting the move re-allocates the port" ;;
+    *) fail "dead unit: accepting the move re-allocates the port" "$out" ;; esac
+  case "$out" in *"and its service is running again"*)
+      pass "dead unit: the move is confirmed only once it runs" ;;
+    *) fail "dead unit: the move is confirmed only once it runs" "$out" ;; esac
+  case "$out" in *"pointed an HTTPS route at 127.0.0.1:5006"*)
+      pass "dead unit: warns that the old port's route is now empty" ;;
+    *) fail "dead unit: warns that the old port's route is now empty" "$out" ;; esac
+
+  # No supervisor to ask is its own answer — never "it is dead".
+  out=$(
+    OS="Linux"; FS_UNIT="$TMP/absent.service"; DRY_RUN=false
+    eval "$FS_UNIT_ACTIVE_IMPL"
+    have() { return 1; }
+    fs_inactive_unit_report 2>&1 || true
+  )
+  case "$out" in *"can't ask this machine whether the file server is running"*)
+      pass "dead unit: an unaskable supervisor is not reported as dead" ;;
+    *) fail "dead unit: an unaskable supervisor is not reported as dead" "$out" ;; esac
+  case "$out" in *"exists but is not active"*)
+      fail "dead unit: no death claim without evidence" "$out" ;;
+    *) pass "dead unit: no death claim without evidence" ;; esac
+}
+
+# =========================== what a failed probe write may claim about disk ====
+# `fs_local_code`/`fs_local_curl` are scripted here rather than served: the cases
+# that matter are a reachable server that refuses or drops the WRITE, and the
+# claim under test is about wording, not transport.
+probe_wording_run() { # probe_wording_run <put-code> <delete-code> <get-code> <folder>
+  (
+    OS="Linux"; DRY_RUN=false
+    FS_LOCAL_PORT="5099"; FS_CRED="probe-secret"; FS_UNIT="$TMP/probe.service"
+    FS_FOLDER="$4"
+    PUT_CODE="$1"; DEL_CODE="$2"; GET_CODE="$3"
+    fs_unit_active() { return 0; }
+    fs_local_code() {
+      local kind="$1" a last="" is_put=false is_del=false
+      shift
+      for a in "$@"; do
+        case "$a" in -T) is_put=true ;; DELETE) is_del=true ;; esac
+        last="$a"
+      done
+      case "$last" in */) printf '200'; return 0 ;; esac
+      $is_put && { printf '%s' "$PUT_CODE"; return 0; }
+      $is_del && { printf '%s' "$DEL_CODE"; return 0; }
+      case "$kind" in none|wrong) printf '401' ;; *) printf '%s' "$GET_CODE" ;; esac
+    }
+    fs_local_curl() { return 1; }
+    fs_local_service_ready 2>&1 || true
+  )
+}
+
+test_probe_write_failure_wording() {
+  local served="$TMP/probe-served" unknown="$TMP/probe-root-not-here" out
+  mkdir -p "$served"
+  # Refused write; DELETE unusable, but an authenticated GET proves the name is
+  # free. (Unrecoverable root, so the local-disk fallback cannot answer either.)
+  out=$(probe_wording_run 403 500 404 "$unknown")
+  case "$out" in *"Nothing was left behind"*)
+      pass "failed probe write: absence is stated, not residue" ;;
+    *) fail "failed probe write: absence is stated, not residue" "$out" ;; esac
+  case "$out" in *"Cleanup was not proven"*)
+      fail "failed probe write: cleanup is not blamed for a write that failed" "$out" ;;
+    *) pass "failed probe write: cleanup is not blamed for a write that failed" ;; esac
+
+  # Write dropped mid-flight with no HTTP answer and nothing usable after it.
+  out=$(probe_wording_run 000 000 000 "$unknown")
+  case "$out" in *"got no answer from the file server"*)
+      pass "dropped probe write: says the write got no answer" ;;
+    *) fail "dropped probe write: says the write got no answer" "$out" ;; esac
+  case "$out" in *"I can't tell whether"*)
+      pass "dropped probe write: admits it cannot tell" ;;
+    *) fail "dropped probe write: admits it cannot tell" "$out" ;; esac
+
+  # A refused write whose name still answers IS residue — say so.
+  out=$(probe_wording_run 403 405 200 "$unknown")
+  case "$out" in *"still answers HTTP 200"*)
+      pass "refused probe write: a name that still answers is reported" ;;
+    *) fail "refused probe write: a name that still answers is reported" "$out" ;; esac
+
+  # Recoverable root, probe never stored: the local check proves the name is free,
+  # so nothing may claim a removal that never happened — and nothing may warn about
+  # residue either.
+  out=$(probe_wording_run 403 405 404 "$served")
+  case "$out" in *"removed the exact local probe directly"*)
+      fail "absent probe: no removal is claimed for a probe never stored" "$out" ;;
+    *) pass "absent probe: no removal is claimed for a probe never stored" ;; esac
+  case "$out" in *"probe"*"may remain"*|*"Cleanup was not proven"*)
+      fail "absent probe: no residue warning for a probe never stored" "$out" ;;
+    *) pass "absent probe: no residue warning for a probe never stored" ;; esac
+}
+
 # ===================================== a gateway we restarted, coming back ====
 #
 # The measured bug these cover: on a stock OpenClaw Docker install the tool-policy
@@ -2812,6 +3265,12 @@ test_agent_sentinel
 test_agent_deadlines_and_cleanup
 test_request_credential_controls
 test_show_code_live_folder
+test_shared_folder_gate
+test_new_lane_folder_recording
+test_file_lane_quick_tunnel_warning
+test_lane_residue_report
+test_inactive_unit_report
+test_probe_write_failure_wording
 
 printf '\nFILE READY RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ] || exit 1

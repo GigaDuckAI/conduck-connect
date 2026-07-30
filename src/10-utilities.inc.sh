@@ -147,34 +147,71 @@ interactive_terminal() {
 # True only when a profile this version can actually use exists. The validator
 # is defined in the --show-code module and shared with its picker/loader, so the
 # menu can never advertise an entry those paths would reject moments later.
+#
+# A profile FILE that exists and does NOT validate is a third state, and it has to
+# be carried out of here rather than folded into "no profile": the two lead to
+# opposite advice. "Run setup once" rewrites profile-<id>.json, so offering it for
+# a file a NEWER conduck-connect wrote is how an older script destroys recoverable
+# state. The count and the validator's own first reason travel back with the
+# answer — the validator is the only place that knows whether the file is corrupt
+# (setup IS the fix) or from the future (updating this script is).
+SAVED_PROFILE_REJECTED=0
+SAVED_PROFILE_REJECT_REASON=""
 saved_profile_exists() {
   local p
+  SAVED_PROFILE_REJECTED=0
+  SAVED_PROFILE_REJECT_REASON=""
   for p in "$STATE_DIR"/profile-*.json; do
     [ -f "$p" ] || continue
-    show_qr_validate_profile "$p" && return 0
+    if show_qr_validate_profile "$p"; then
+      # A usable profile answers the question; the rejections behind it are the
+      # picker's business, not the menu's.
+      SAVED_PROFILE_REJECTED=0
+      SAVED_PROFILE_REJECT_REASON=""
+      return 0
+    fi
+    SAVED_PROFILE_REJECTED=$((SAVED_PROFILE_REJECTED+1))
+    [ -n "$SAVED_PROFILE_REJECT_REASON" ] || SAVED_PROFILE_REJECT_REASON="$PROFILE_VALIDATION_ERROR"
   done
   return 1
 }
 
 choose_main_action() {
+  # Evaluated ONCE: the answer decides three lines below it, and each validation
+  # pass re-parses every profile on disk.
+  local have_saved=false
+  saved_profile_exists && have_saved=true
   say "${BOLD}Welcome to Conduck Connect${RESET}"
-  if saved_profile_exists; then
+  if $have_saved; then
     say "Set up a gateway, check one before pairing, or re-show a saved setup code."
   else
     say "Set up a gateway, or check one before pairing."
+  fi
+  # Option 4 genuinely cannot be offered for a profile this version cannot read,
+  # but going quiet about it is what turns an unreadable profile into a lost one:
+  # the operator reads "no saved code", picks 1, and setup overwrites the file.
+  if ! $have_saved && [ "$SAVED_PROFILE_REJECTED" -gt 0 ]; then
+    say ""
+    if [ "$SAVED_PROFILE_REJECTED" = "1" ]; then
+      warn "There IS a saved setup code on this machine, and this version can't read it — so \"Show a saved setup code\" is not on the list below."
+    else
+      warn "There are $SAVED_PROFILE_REJECTED saved setup codes on this machine, and this version can't read any of them — so \"Show a saved setup code\" is not on the list below."
+    fi
+    note "$SAVED_PROFILE_REJECT_REASON"
+    note "Setting up again REPLACES the saved file, so read that line before choosing 1."
   fi
   say ""
   say "  What would you like to do?"
   say "    1) Set up and pair a gateway"
   say "    2) Check existing OpenAI-compatible software (not built for Conduck)"
   say "    3) Check an adapter built specifically for Conduck"
-  if saved_profile_exists; then
+  if $have_saved; then
     say "    4) Show a saved setup code"
   fi
   say "    q) Exit"
   say ""
   local choice regex='^([1-3]|[qQ])$'
-  saved_profile_exists && regex='^([1-4]|[qQ])$'
+  $have_saved && regex='^([1-4]|[qQ])$'
   choice=$(require_choice "Choose an option" "$regex") || die "$NO_ANSWER"
   case "$choice" in
     1) COMMAND="setup" ;;
@@ -339,11 +376,14 @@ run_step() {  # run_step "description" cmd args...
   fi
 }
 
-file_mode_is_open() { # file_mode_is_open <file> -> 0 when group or other have ANY access
+file_mode_is_open() { # file_mode_is_open <file> [octal mask, default 077] -> 0 when a mask bit is set
   # python3 is a hard preflight requirement on every path that calls this; a
   # missing one answers "not open" and stays quiet rather than warning blindly.
-  python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
-    "$1" 2>/dev/null
+  # The mask is a parameter because "another account can READ this" and "another
+  # account can REPLACE this" are different harms that need different words: 077
+  # is any access at all, 022 is group/other WRITE.
+  python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & int(sys.argv[2], 8) else 1)' \
+    "$1" "${2:-77}" 2>/dev/null
 }
 
 # Rung 1b: a file the USER owns whose MODE is too open for a secret we just helped
@@ -381,21 +421,169 @@ secure_owned_file_mode() { # secure_owned_file_mode <file> <what-is-inside> -> 1
 #
 # `mkdir -p` is a no-op on a directory that ALREADY exists, mode included, so
 # creating it under `umask 077` only ever secures a first run. A $STATE_DIR that
-# an earlier version, a different umask, or the user's own `mkdir` left at 0755
-# keeps that mode for good — the files inside stay 0600, but the listing is
-# world-readable forever and nothing ever says so. A directory we may not have
-# created is not re-chmodded silently (same rule as the agent workspace), so the
-# exposure is REPORTED, once per run, with the exact fix.
+# an earlier version, a different umask, or the user's own `mkdir` left open keeps
+# that mode for good — the files inside stay 0600, but the directory holding them
+# does not, and nothing ever says so. A directory we may not have created is not
+# re-chmodded silently (same rule as the agent workspace), so the exposure is
+# REPORTED, once per run, with the exact fix.
+#
+# Group/other WRITE is graded apart from read, because the read wording badly
+# understates it. 0600 on fileserver-<id>.cred protects what is INSIDE the file;
+# in a writable directory any local account can replace the whole file, and
+# rclone then reads its password out of somebody else's copy at the next start.
+# Same for profile-<id>.json, which is the record --show-code rebuilds a pairing
+# code from.
 STATE_DIR_EXPOSURE_REPORTED=false
 ensure_state_dir() {  # -> 1 when the directory does not exist and could not be created
   ( umask 077; mkdir -p "$STATE_DIR" ) 2>/dev/null || return 1
   $STATE_DIR_EXPOSURE_REPORTED && return 0
   file_mode_is_open "$STATE_DIR" || return 0
   STATE_DIR_EXPOSURE_REPORTED=true
-  warn "$STATE_DIR can be listed by other accounts on this machine (it already existed with that mode)."
-  warn "The credential files inside are 0600, but the folder itself names every gateway you have paired."
+  if file_mode_is_open "$STATE_DIR" 22; then
+    warn "$STATE_DIR is WRITABLE by other accounts on this machine (it already existed with that mode)."
+    warn "Any local account can swap the files in it — including the file-server password rclone reads when it starts, and the saved profile that says where your gateway is."
+    warn "Their 0600 protects what is inside those files, not the folder that holds them."
+  else
+    warn "$STATE_DIR can be listed by other accounts on this machine (it already existed with that mode)."
+    warn "The credential files inside are 0600, but the folder itself names every gateway you have paired."
+  fi
   warn "Fix it when you can:  chmod 700 $STATE_DIR"
   return 0
+}
+
+# ------------------------------------------------------ single-instance setup --
+# Two setup runs at once are not merely racy, they are silently destructive. Both
+# scan the same loopback range and settle on the SAME free port (the bind probe
+# closes its socket immediately, so it reserves nothing), both write
+# conduck-files-$GW_ID and fileserver-$GW_ID.cred/.env, and both finish by writing
+# profile-$GW_ID.json — which is a whole-file overwrite, so a run whose lane lost
+# the port race erases a live file server from the record the winner just saved.
+# Sequential re-runs are idempotent by design; only the overlap breaks.
+#
+# `mkdir` is the gate, not `flock`: macOS ships no flock binary, and mkdir is the
+# one create-or-fail primitive that is atomic on every filesystem a $HOME lands on.
+#
+# Nothing here ever WAITS, so there is no deadlock to have: a run either takes the
+# lock, reclaims provable debris, or stops with what holds it and what to do.
+#
+# The lock's authority is the LIVENESS of the process named inside it, never the
+# existence of the directory. That is what makes a SIGKILL, a reboot, or a power
+# cut recoverable with no human in the loop — the debris names a pid that is gone,
+# and the next run reclaims it. Existence-as-authority would block every future
+# run for good, which is the one failure mode a lock like this must not have.
+SETUP_LOCK_PATH=""       # set only while WE hold it — the release deletes this exact path
+SETUP_LOCK_HELD=false
+
+# What identifies a process beyond its number: its command line. A pid alone is
+# not identity — after a reboot the same number belongs to something else, and a
+# lock that outlived a kill would then read as held forever. `ps -p <pid> -o
+# command=` is the one spelling Linux and macOS agree on. The stored value and the
+# live one both come through THIS helper, so the bound and the control-stripping
+# can never make a living holder look like a stranger.
+setup_lock_proc_sig() { # setup_lock_proc_sig <pid> -> its command line (empty when the process is gone)
+  local s
+  s=$(ps -p "$1" -o command= 2>/dev/null | head -1) || s=""
+  safe_display "$s" 200
+}
+
+# Who holds <lock-dir>, and can this run even tell? Echoes "held<TAB><what to tell
+# the user>" or "stale<TAB><why it is debris>". Reads only.
+setup_lock_holder_state() { # setup_lock_holder_state <lock-dir>
+  local lock="$1" pid="" host="" sig="" live=""
+  if [ -r "$lock/owner" ]; then
+    { IFS= read -r pid; IFS= read -r host; IFS= read -r sig; } < "$lock/owner" 2>/dev/null || true
+  fi
+  case "$pid" in
+    ''|*[!0-9]*)
+      # No owner record at all. Either a run died in the sliver between creating
+      # the directory and writing the record, or a run is inside that sliver right
+      # now — and only age separates those. A minute is orders of magnitude longer
+      # than the two statements it spans, so an older record-less lock is debris
+      # while a younger one is a run that is starting.
+      if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        printf 'stale\t%s' "it names no process (a run was interrupted before it could record one)"
+      else
+        printf 'held\t%s' "another conduck-connect setup is starting on this machine"
+      fi
+      return 0 ;;
+  esac
+  if [ -n "$host" ] && [ "$host" != "$(uname -n 2>/dev/null)" ]; then
+    # A $HOME on a network share is ONE lock for several machines. Process $pid
+    # means nothing here, so this run may not judge it and must not steal it.
+    printf 'held\t%s' "a setup on $host holds it (process $pid), and this machine cannot tell whether that run is still alive"
+    return 0
+  fi
+  # Probe `ps` against our OWN pid first: a stripped container may have no usable
+  # one, and "ps printed nothing" would otherwise read as "the holder is gone".
+  # Unknowable liveness fails CLOSED — never steal a lock on a guess.
+  if [ -z "$(setup_lock_proc_sig $$)" ]; then
+    printf 'held\t%s' "it names process $pid, and this box has no usable 'ps' for me to check whether that run is still alive"
+    return 0
+  fi
+  live=$(setup_lock_proc_sig "$pid")
+  if [ -z "$live" ]; then
+    printf 'stale\t%s' "process $pid is gone"
+  elif [ "$live" != "$sig" ]; then
+    printf 'stale\t%s' "process $pid belongs to another program now"
+  else
+    printf 'held\t%s' "another conduck-connect setup is running here (process $pid)"
+  fi
+}
+
+setup_lock_acquire() {
+  # No state directory means nowhere to put a lock. Don't stop the run over it —
+  # it will fail soon on its own merits, with a better diagnosis than this one.
+  ensure_state_dir || return 0
+  local lock="$STATE_DIR/setup.lock" state kind why attempt=0
+  # Bounded, because the loop's "reclaim debris and try again" arm is the only one
+  # that repeats: an adversary re-creating the lock in that window must not be able
+  # to spin us forever.
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt+1))
+    if mkdir "$lock" 2>/dev/null; then
+      if ( umask 077; printf '%s\n%s\n%s\n' \
+             "$$" "$(uname -n 2>/dev/null)" "$(setup_lock_proc_sig $$)" > "$lock/owner" ) 2>/dev/null; then
+        # Ownership is CONFIRMED from the file, never inferred from mkdir having
+        # succeeded: two runs that both find the same debris can both clear it, and
+        # the second clear would take out the winner's fresh lock. A record naming
+        # somebody else means they got it — loop, find it held, and stop saying so.
+        # This narrows that window rather than closing it: doing better needs a
+        # second lock to serialise the reclaim, and a second lock is one more thing
+        # a SIGKILL can strand, which is the failure this whole design avoids.
+        if [ "$(head -1 "$lock/owner" 2>/dev/null || true)" = "$$" ]; then
+          SETUP_LOCK_PATH="$lock"; SETUP_LOCK_HELD=true
+          return 0
+        fi
+        continue
+      fi
+      # A lock no later run can judge is worse than no lock: it would be reclaimed
+      # by the age rule while this run is still going. Drop it and say so instead.
+      rm -rf "$lock" 2>/dev/null || true
+      warn "Couldn't write $lock/owner, so I can't guard against a second setup running at the same time. Don't start another one until this run finishes."
+      return 0
+    fi
+    state=$(setup_lock_holder_state "$lock")
+    kind="${state%%$'\t'*}"; why="${state#*$'\t'}"
+    if [ "$kind" = "held" ]; then
+      die "I won't start a second setup on this machine: $why. Two at once pick the same loopback port and the same service name, and whichever finishes second overwrites the first one's saved profile. Let that run finish (or stop it), then re-run me. If you are certain nothing else is running, remove the lock and re-run me:  rm -rf $lock"
+    fi
+    note "Clearing a leftover setup lock — $why."
+    rm -rf "$lock" 2>/dev/null || true
+  done
+  die "Couldn't take the setup lock at $lock — something keeps re-creating it. Remove it and re-run me:  rm -rf $lock"
+}
+
+# Released on EVERY exit path: the caller composes this into the EXIT trap, which
+# covers `die` and the plain end of the run, and HUP/INT/TERM are routed through
+# `exit` so they land there too. Idempotent, and it removes ONLY the path this run
+# created — a run that never took the lock must never delete the one another run
+# is holding.
+setup_lock_release() {
+  $SETUP_LOCK_HELD || return 0
+  SETUP_LOCK_HELD=false
+  [ -n "$SETUP_LOCK_PATH" ] || return 0
+  rm -rf "$SETUP_LOCK_PATH" 2>/dev/null || true
+  SETUP_LOCK_PATH=""
 }
 
 # Rung 2: a change to something YOU own — we print the exact command, you run it.

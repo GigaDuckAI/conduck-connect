@@ -11,6 +11,19 @@ FS_EXISTING_UNSAFE=false    # matching unit exists but cannot be parsed/reused w
 FS_PORT_ALLOCATION_REASON=""
 FS_PORT_START=5006
 FS_PORT_END=5105
+# A file lane is a LIVE, boot-persistent, authenticated WebDAV server over the
+# agent's working folder. Every path that builds one and then does not ship it
+# owes the operator that fact, so these four follow the lane through the run:
+FS_LANE_PREPARED=false         # a live file server for THIS gateway is in play this run
+FS_UNIT_CREATED_THIS_RUN=false # …and this run is what wrote and started it
+FS_ROUTE_SELF_MANAGED=false    # the operator was told to point their OWN HTTPS route at
+                               # FS_LOCAL_PORT. Tailscale mappings are excluded on purpose:
+                               # those this connector applies and rolls back itself (FS_APPLIED).
+FS_RESIDUE_REPORTED=false      # the residue/teardown report is printed once per run
+# fs_resolve_shared_folder answers in globals, never on stdout: a command
+# substitution runs it in a subshell and would throw the refusal reason away.
+FS_FOLDER_RESOLVED=""
+FS_FOLDER_REFUSAL=""
 
 state_cred_file() { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$GW_ID"; }
 state_env_file()  { printf '%s/fileserver-%s.env'  "$STATE_DIR" "$GW_ID"; }
@@ -180,6 +193,69 @@ fs_systemd_quote() { # fs_systemd_quote <literal>
   printf '"%s"' "$value"
 }
 
+# Quote a literal for a command line the OPERATOR is meant to copy and paste.
+# Only when it needs quoting, so the common case stays readable: an unquoted path
+# with a space in it is a `rm -f` that removes something else, or nothing.
+fs_shell_arg() { # fs_shell_arg <literal>
+  case "$1" in
+    ""|*[!A-Za-z0-9._/@:+-]*)
+      local value="$1"
+      value="${value//\'/\'\\\'\'}"   # ' → '\'' (close, escape, reopen)
+      printf "'%s'" "$value" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Resolve the shared folder before ANY service definition records it, and refuse
+# the two roots that turn this lane into a remote file browser for the whole
+# account. Mirrors the doctor's gate in 61-check-adapter-files.inc.sh, so setup
+# cannot certify a root the doctor refuses to grade.
+#
+# Resolving is load-bearing beyond the refusal: rclone re-resolves the served
+# path on every request, so a symlink recorded verbatim in the unit serves
+# whatever its target points at TODAY — the target can be swapped, including to
+# $HOME, with no restart, no re-check, and nothing in any later transcript.
+# Recording the resolved path pins the folder to the one that was certified.
+#
+# Answers land in globals: a command substitution would run this in a subshell
+# and throw the refusal reason away.
+fs_resolve_shared_folder() { # fs_resolve_shared_folder <path> -> 0 + FS_FOLDER_RESOLVED · 1 + FS_FOLDER_REFUSAL
+  FS_FOLDER_RESOLVED=""; FS_FOLDER_REFUSAL=""
+  local out
+  out=$(python3 - "$1" <<'PY' 2>/dev/null
+import os, sys
+p = sys.argv[1]
+if not p or not os.path.isabs(p) or any(c in p for c in "\r\n"):
+    print("BAD\tit is not a plain absolute path"); sys.exit(0)
+rp = os.path.realpath(p)
+home = os.path.realpath(os.path.expanduser("~"))
+if rp == os.sep:
+    print("BAD\tit resolves to /, the root of this whole filesystem"); sys.exit(0)
+if rp == home:
+    print("BAD\tit resolves to your home directory itself"); sys.exit(0)
+if os.path.isfile(rp):
+    print("BAD\tit resolves to a file, not a folder"); sys.exit(0)
+print("OK\t" + rp)
+PY
+) || out=""
+  case "$out" in
+    OK$'\t'*)  FS_FOLDER_RESOLVED="${out#OK$'\t'}"; return 0 ;;
+    BAD$'\t'*) FS_FOLDER_REFUSAL="${out#BAD$'\t'}"; return 1 ;;
+    *) FS_FOLDER_REFUSAL="I could not resolve that path on this machine"; return 1 ;;
+  esac
+}
+
+# The same explanation wherever a folder is refused: the operator's next move is
+# to name a narrower folder, and that only happens if they know WHY this one is
+# refused rather than merely that it is.
+fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
+  warn "I can't serve $1 — ${FS_FOLDER_REFUSAL:-I could not resolve that path on this machine}."
+  note "The shared folder is served over WebDAV with read AND write access to everything inside it."
+  note "It has to be the agent's working folder, never your whole account: served from / or your home"
+  note "directory, anything holding the file password can read your keys — and this connector's own"
+  note "credential files — and write into them."
+}
+
 fs_systemd_envfile_path() { # fs_systemd_envfile_path <absolute literal path>
   # EnvironmentFile= is not ExecStart=: systemd passes the entire right-hand
   # side to its path/specifier parser and does NOT unquote it. Adding shell-like
@@ -338,9 +414,16 @@ ensure_existing_fs_envfile_linux() {
   [ "$status" = "ready" ] && return 0
 
   warn "This connector-owned unit uses the old quoted EnvironmentFile form."
-  note "systemd treats those quotes as part of the path, ignores the password file,"
-  note "and starts rclone unauthenticated. I can replace only that one directive"
-  note "with the same absolute path unquoted, then reload and restart this unit."
+  # Wording verified against rclone 1.74: `--user conduck` with no password does
+  # NOT serve openly. It demands an EMPTY password, so the saved credential gets
+  # 401 like every other one. Calling that "unauthenticated" sends the operator
+  # hunting for an intrusion, when the real symptom is attachments that can never
+  # authenticate.
+  note "systemd treats those quotes as part of the path, so rclone never reads the password"
+  note "file and demands an EMPTY password instead: it answers 401 to the saved credential —"
+  note "and to every other password — while the user 'conduck' with a blank password gets in."
+  note "I can replace only that one directive with the same absolute path unquoted,"
+  note "then reload and restart this unit."
   if $DRY_RUN; then
     plan_add "REPAIR legacy quoted EnvironmentFile in $FS_UNIT; daemon-reload + restart"
     note "(dry-run: a real run asks before repairing that connector-owned unit)"
@@ -689,27 +772,228 @@ PY
   fi
 }
 
-# A unit file existing is not readiness: it may be disabled, crash-looping, or
-# shadowed by another process on the same port. Confirm the supervisor owns a
-# live process before any HTTPS exposure is created.
-fs_unit_active() {
-  [ -n "$FS_UNIT" ] || return 1
-  if [ "$OS" = "Linux" ]; then
-    have systemctl || return 1
-    systemctl --user is-active --quiet "$(basename "$FS_UNIT")"
-  else
-    have launchctl || return 1
-    local label
-    label=$(python3 - "$FS_UNIT" <<'PY' 2>/dev/null
+fs_unit_label() { # fs_unit_label -> the launchd Label in $FS_UNIT (empty when unreadable)
+  [ -n "$FS_UNIT" ] || return 0
+  python3 - "$FS_UNIT" <<'PY' 2>/dev/null
 import plistlib, sys
 try:
     print(plistlib.load(open(sys.argv[1], "rb")).get("Label", ""))
 except Exception:
     pass
 PY
-)
-    [ -n "$label" ] && launchctl list "$label" >/dev/null 2>&1
+}
+
+# A unit file existing is not readiness: it may be disabled, crash-looping, or
+# shadowed by another process on the same port. `unknown` is its own answer, never
+# folded into `inactive`: with no systemctl/launchctl we cannot ask, and reporting
+# a healthy service as dead sends the operator debugging something that is fine.
+fs_unit_state() { # fs_unit_state -> active | inactive | unknown
+  [ -n "$FS_UNIT" ] || { printf 'unknown'; return 0; }
+  if [ "$OS" = "Linux" ]; then
+    have systemctl || { printf 'unknown'; return 0; }
+    if systemctl --user is-active --quiet "$(basename "$FS_UNIT")"; then
+      printf 'active'
+    else
+      printf 'inactive'
+    fi
+  else
+    have launchctl || { printf 'unknown'; return 0; }
+    local label
+    label=$(fs_unit_label)
+    [ -n "$label" ] || { printf 'unknown'; return 0; }
+    if launchctl list "$label" >/dev/null 2>&1; then
+      printf 'active'
+    else
+      printf 'inactive'
+    fi
   fi
+}
+
+# Confirm the supervisor owns a live process before any HTTPS exposure is created.
+# Fails closed on `unknown`: an exposure is created from this answer.
+fs_unit_active() { [ "$(fs_unit_state)" = "active" ]; }
+
+# The exact commands that remove ONE connector-owned file server. Shared by every
+# caller so they cannot drift, and printed rather than run: this tool has no
+# removal command, so copy-pasteable text IS the mechanism.
+fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file…]
+  local unit="$1" name f; shift
+  if [ -n "$unit" ]; then
+    name=$(basename "$unit")
+    if [ "$OS" = "Linux" ]; then
+      printf '    %ssystemctl --user disable --now %s%s\n' "$BOLD" "$(fs_shell_arg "$name")" "$RESET"
+      # A unit that crash-looped into systemd's start-rate limit stays `failed`
+      # even once its file is gone, and only reset-failed clears that entry.
+      printf '    %ssystemctl --user reset-failed %s%s\n' "$BOLD" "$(fs_shell_arg "$name")" "$RESET"
+      printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$unit")" "$RESET"
+      printf '    %ssystemctl --user daemon-reload%s\n' "$BOLD" "$RESET"
+    else
+      printf '    %slaunchctl unload %s%s\n' "$BOLD" "$(fs_shell_arg "$unit")" "$RESET"
+      printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$unit")" "$RESET"
+    fi
+  fi
+  for f in "$@"; do
+    printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$f")" "$RESET"
+  done
+}
+
+# A lane that is BUILT but never shipped leaves a live, authenticated WebDAV
+# server over the agent's working folder, a credential on disk, and — on the
+# transports whose HTTPS route the operator creates by hand — a route still
+# pointing at it. Only Tailscale mappings get rolled back (they are the only
+# exposure this connector applies itself), so on the other transports the run
+# otherwise ends green and never mentions the server, the credential, or the
+# route again. Same shape whether a Step-5 probe failed or the run was
+# interrupted between the unit and the pairing code.
+#
+# It removes nothing: the usual repair is "fix what failed and re-run me", and
+# that re-run reuses this exact unit and credential. So name what exists and hand
+# the removal commands to the operator who does want it gone.
+#
+# Silent when the lane IS shipping, in a dry run, and after its first call, which
+# makes it safe to call from every drop path — including an exit trap.
+fs_lane_residue_note() {
+  $FS_LANE_PREPARED || return 0
+  $FS_RESIDUE_REPORTED && return 0
+  $DRY_RUN && return 0
+  [ -z "$FS_URL" ] || [ -z "$FS_CRED" ] || return 0   # a shipped lane is not residue
+  local unit="" f
+  local files=()
+  [ -n "$FS_UNIT" ] && [ -f "$FS_UNIT" ] && unit="$FS_UNIT"
+  for f in "$(state_cred_file)" "$(state_env_file)"; do
+    [ -f "$f" ] && files+=("$f")
+  done
+  # Nothing on disk means nothing to report — an early refusal that got as far as
+  # naming a folder but never wrote a unit or a credential leaves no server.
+  [ -n "$unit" ] || [ ${#files[@]} -gt 0 ] || return 0
+  FS_RESIDUE_REPORTED=true
+
+  say ""
+  if $FS_UNIT_CREATED_THIS_RUN; then
+    warn "Before you close this terminal: this run started a file server, and the setup code above"
+    warn "does NOT carry it."
+  else
+    warn "Before you close this terminal: this gateway's file server keeps running, and the setup"
+    warn "code above does NOT carry it."
+  fi
+  if [ -n "$unit" ]; then
+    note "service:    $unit"
+    if [ "$OS" = "Linux" ]; then
+      note "            (a systemd user service, enabled — it starts again at boot)"
+    else
+      note "            (a LaunchAgent with KeepAlive — it starts again at login)"
+    fi
+  fi
+  local served="$FS_FOLDER"
+  [ -n "$served" ] || served="the folder in its service definition"
+  note "serving:    $served  →  http://127.0.0.1:${FS_LOCAL_PORT:-?}"
+  for f in ${files[@]+"${files[@]}"}; do
+    note "credential: $f"
+  done
+  if $FS_ROUTE_SELF_MANAGED; then
+    warn "The HTTPS route you set up for it still points at 127.0.0.1:${FS_LOCAL_PORT:-?}. That route lives in"
+    warn "your own web server or tunnel config, so I can't remove it for you — for as long as it is up,"
+    warn "this file server answers wherever that address answers, guarded only by its password."
+  fi
+  say ""
+  say "  To remove the file server (chat and the code above are unaffected):"
+  fs_print_teardown "$unit" ${files[@]+"${files[@]}"}
+  note "The shared folder itself is left alone — on OpenClaw and Hermes it doubles as the agent's"
+  note "own working directory."
+  note "Leaving it running is fine too: fix what failed, re-run me, and this same lane ships again"
+  note "with the same credential."
+  return 0
+}
+
+# "The unit exists but is not active" has one dominant cause, and it is this
+# connector's own race: the free-port check is a bind probe seconds before
+# rclone's own bind, so any process on the host can take that port in the gap.
+# rclone then exits, systemd retries it into its start-rate limit, and the unit
+# sits `failed` for good — while every later run re-finds it, refuses to expose
+# it, and ends green. The operator's symptom is "attachments just never work".
+# So: name the unit, hand over the command that says WHY, and offer the one fix
+# that resolves it — move the lane to another free port.
+# Returns 0 ONLY when the lane is live again (on a new port) and safe to continue.
+fs_inactive_unit_report() {
+  local state unit_name old_unit old_port uid
+  state=$(fs_unit_state)
+  unit_name=$(basename "${FS_UNIT:-unknown}")
+  if [ "$state" = "unknown" ]; then
+    warn "I can't ask this machine whether the file server is running (no systemctl/launchctl here),"
+    warn "so I won't expose it."
+    [ -n "$FS_UNIT" ] && note "service: $FS_UNIT"
+    return 1
+  fi
+  warn "The file-server service exists but is not active — refusing to expose it."
+  note "service:  ${FS_UNIT:-unknown}"
+  note "serving:  ${FS_FOLDER:-unknown folder}  →  http://127.0.0.1:${FS_LOCAL_PORT:-?}"
+  say ""
+  say "  What it says about itself:"
+  if [ "$OS" = "Linux" ]; then
+    printf '    %ssystemctl --user status %s%s\n' "$BOLD" "$(fs_shell_arg "$unit_name")" "$RESET"
+    printf '    %sjournalctl --user -u %s -n 50 --no-pager%s\n' "$BOLD" "$(fs_shell_arg "$unit_name")" "$RESET"
+  else
+    uid=$(id -u 2>/dev/null || true)
+    printf '    %slaunchctl print gui/%s/%s%s\n' "$BOLD" "${uid:-<your-uid>}" "$(fs_shell_arg "$(fs_unit_label)")" "$RESET"
+  fi
+  note "The usual cause: another process took port ${FS_LOCAL_PORT:-?} between my free-port check and rclone's"
+  note "own bind, so rclone couldn't listen. After a few retries the service manager stops trying,"
+  note "and the port stays taken — which is why re-running me alone never fixes it."
+  $DRY_RUN && return 1
+  if [ -z "$FS_FOLDER" ] || [ -z "$FS_CRED" ]; then
+    note "I can't rebuild it here — its served folder or credential isn't recoverable. Remove the unit"
+    note "and re-run me to build the lane again."
+    return 1
+  fi
+  if $REUSE_ONLY; then
+    note "(reuse-only: not moving the lane to another port — re-run without --reuse-only to do that.)"
+    return 1
+  fi
+  if ! confirm "  Move this file lane to a different free port and start it there?"; then
+    note "Leaving the file lane out of this setup code; chat is unaffected."
+    return 1
+  fi
+  mutate_guard "rewrite the file-server unit on a different loopback port" || return 1
+  old_unit="$FS_UNIT"; old_port="$FS_LOCAL_PORT"
+  if ! allocate_fs_local_port; then
+    warn "${FS_PORT_ALLOCATION_REASON:-No free loopback port for the file lane right now.}"
+    FS_LOCAL_PORT="$old_port"
+    return 1
+  fi
+  # systemd's start-rate limiter is what makes the wedge permanent: until the
+  # counter is reset the unit refuses to start at all, and daemon-reload does not
+  # reset it — so a rewritten ExecStart on a free port would still not run.
+  if [ "$OS" = "Linux" ] && have systemctl; then
+    systemctl --user reset-failed "$unit_name" >/dev/null 2>&1 || true
+  fi
+  FS_UNIT_CREATED_THIS_RUN=true   # from here on this run owns writing and starting it
+  local wrote=true live_port
+  if [ "$OS" = "Linux" ]; then
+    write_fs_unit_linux "$FS_FOLDER" || wrote=false
+  else
+    write_fs_unit_mac "$FS_FOLDER" || wrote=false
+  fi
+  if ! $wrote || ! fs_unit_active; then
+    # Whatever is on disk is the authority on which port this lane now names — the
+    # residue report that follows must name the port the unit really carries, not
+    # the one this attempt hoped for.
+    live_port=$(fs_unit_port "$FS_UNIT" 2>/dev/null || true)
+    if [ -n "$live_port" ]; then FS_LOCAL_PORT="$live_port"; else FS_LOCAL_PORT="$old_port"; fi
+    warn "The file server still isn't running — leaving the file lane out of this setup code."
+    return 1
+  fi
+  ok "File lane moved to port $FS_LOCAL_PORT and its service is running again."
+  # A unit under one of the pre-per-gateway names is NOT the file the writer just
+  # wrote, so the wedged one is still on this machine, still enabled, still failing.
+  if [ -n "$old_unit" ] && [ "$old_unit" != "$FS_UNIT" ] && [ -f "$old_unit" ]; then
+    warn "The old unit is still on this machine and still fails to start:"
+    note "  $old_unit"
+    say "  Remove it:"
+    fs_print_teardown "$old_unit"
+  fi
+  note "Anything that already pointed an HTTPS route at 127.0.0.1:$old_port now points at nothing —"
+  note "the lane answers on $FS_LOCAL_PORT from here on."
+  return 0
 }
 
 fs_local_curl() { # fs_local_curl <real|wrong|none> <curl args…>
@@ -741,10 +1025,10 @@ fs_local_code() { # fs_local_code <real|wrong|none> <curl args…>
 # credential, rejects missing/wrong credentials, and serves byte-identical
 # writes. This happens on loopback BEFORE creating a tunnel/Serve mapping.
 fs_local_service_ready() {
-  fs_unit_active || {
-    warn "The file-server service exists but is not active — refusing to expose it."
-    return 1
-  }
+  # A dead unit is a diagnosis, not a one-line refusal: fs_inactive_unit_report
+  # names it, shows how to read its own log, and can re-home the lane to a free
+  # port. Only a 0 from there means the service is live again and worth probing.
+  fs_unit_active || fs_inactive_unit_report || return 1
   local base="http://127.0.0.1:$FS_LOCAL_PORT" i=0 code=""
   while [ "$i" -lt 20 ]; do
     code=$(fs_local_code real "$base/")
@@ -756,8 +1040,8 @@ fs_local_service_ready() {
     return 1 ;;
   esac
 
-  local tag probe tmp outtmp missing wrong del gone get_code
-  local bytes_ok=false cleanup_ok=false removed_local=false
+  local tag probe tmp outtmp missing wrong del gone get_code local_verdict=""
+  local bytes_ok=false cleanup_ok=false removed_local=false put_ok=false
   tag=$(python3 -c 'import secrets; print(secrets.token_hex(4))' 2>/dev/null) || return 1
   probe="conduck-connect-local-probe-$tag.txt"
   tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-local-probe.XXXXXX" 2>/dev/null) || return 1
@@ -770,6 +1054,7 @@ fs_local_service_ready() {
   get_code="000"
   case "$code" in
     2??)
+      put_ok=true
       get_code=$(fs_local_curl real -o "$outtmp" -w '%{http_code}' "$base/$probe" 2>/dev/null || true)
       case "$get_code" in 2??) cmp -s "$tmp" "$outtmp" && bytes_ok=true ;; esac
       ;;
@@ -786,7 +1071,12 @@ fs_local_service_ready() {
   # root is known, remove only the randomized regular file locally and prove
   # the same 404 through WebDAV.
   case "$del:$gone" in 2??:404|404:404) cleanup_ok=true ;; esac
-  if ! $cleanup_ok && [ -n "$FS_FOLDER" ] && python3 - "$FS_FOLDER" "$probe" <<'PY' >/dev/null 2>&1
+  if ! $cleanup_ok && [ -n "$FS_FOLDER" ]; then
+    # `removed` and `absent` are deliberately different answers. Both prove the
+    # exact name is not on disk, but only one of them is a removal — and claiming
+    # to have removed a probe that was never stored is a false statement about
+    # this run's own footprint.
+    local_verdict=$(python3 - "$FS_FOLDER" "$probe" <<'PY' 2>/dev/null
 import os, re, stat, sys
 root, name = os.path.realpath(sys.argv[1]), sys.argv[2]
 if not re.fullmatch(r"conduck-connect-local-probe-[0-9a-f]{8}\.txt", name):
@@ -799,7 +1089,7 @@ try:
     try:
         before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
     except FileNotFoundError:
-        sys.exit(0)
+        print("absent"); sys.exit(0)
     # Never resolve or unlink through a replacement symlink. Open and re-stat
     # the exact directory entry so a swap also fails before unlinkat.
     if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
@@ -817,18 +1107,33 @@ try:
     finally:
         os.close(file_fd)
     os.unlink(name, dir_fd=root_fd)
+    print("removed")
 finally:
     os.close(root_fd)
 PY
-  then
-    removed_local=true
-    gone=$(fs_local_code real "$base/$probe")
-    [ "$gone" = "404" ] && cleanup_ok=true
+) || local_verdict=""
+    case "$local_verdict" in removed) removed_local=true ;; esac
+    if [ -n "$local_verdict" ]; then
+      gone=$(fs_local_code real "$base/$probe")
+      [ "$gone" = "404" ] && cleanup_ok=true
+    fi
   fi
-  if ! $cleanup_ok; then
+  if $cleanup_ok; then
+    $removed_local && warn "WebDAV DELETE was not reliable (HTTP $del); removed the exact local probe directly and proved HTTP 404."
+  elif $put_ok; then
     warn "Cleanup was not proven for the exact local probe $probe (DELETE HTTP $del; follow-up GET HTTP $gone)."
-  elif $removed_local; then
-    warn "WebDAV DELETE was not reliable (HTTP $del); removed the exact local probe directly and proved HTTP 404."
+  else
+    # The write never answered 2xx, so this run most likely never created the probe
+    # at all. Reporting unproven CLEANUP here sends the operator looking through the
+    # agent's folder for a file that was never written; report what the follow-up
+    # GET actually proves about that exact name instead.
+    local why="the file server refused the probe write (HTTP $code)"
+    [ "$code" = "000" ] && why="the probe write got no answer from the file server"
+    case "$gone" in
+      404) warn "Nothing was left behind: $why, and an authenticated GET proves $probe is absent." ;;
+      2??) warn "$probe still answers HTTP $gone although $why — remove it from ${FS_FOLDER:-the served folder} by hand." ;;
+      *)   warn "I can't tell whether $probe is in ${FS_FOLDER:-the served folder}: $why, and the follow-up GET answered HTTP $gone." ;;
+    esac
   fi
 
   if ! $bytes_ok; then
@@ -852,12 +1157,60 @@ PY
 # to ALIGN the lane to the gateway, OMIT it, or INCLUDE it as-is (advanced).
 # $SCOPE = the gateway's scope (public|private); the lane's is derived from its verb.
 
+# The lane's own HTTPS mapping when it PREDATES this run. Rollback covers only
+# what this run applied, and a mapping the operator made is theirs to keep — but
+# leaving the lane out of the setup code does not stop that address from reaching
+# an authenticated file server, so it gets named either way.
+fs_note_existing_mapping() { # fs_note_existing_mapping <https-port> <verb>
+  [ -n "$1" ] || return 0
+  warn "Its existing Tailscale mapping is still live: port $1 → 127.0.0.1:${FS_LOCAL_PORT:-?}."
+  warn "I didn't create that mapping, so I don't remove it. To take it down yourself:"
+  if [ "${2:-}" = "funnel" ]; then
+    printf '    %stailscale funnel --https=%s off%s   # stops the PUBLIC half\n' "$BOLD" "$1" "$RESET"
+    printf '    %stailscale serve --https=%s off%s   # …and the mapping itself\n' "$BOLD" "$1" "$RESET"
+  else
+    printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$1" "$RESET"
+  fi
+}
+
+# A quick tunnel's hostname is REASSIGNED every time `cloudflared tunnel --url`
+# restarts, including at every reboot. The gateway address gets its own warning
+# where it is accepted; the FILE lane needs one too, because its consequence is
+# worse: this address lives ONLY inside the setup code, so after a restart the
+# paired device keeps calling a hostname that no longer resolves — attachments
+# fail with nothing to search for — while the same folder, behind the same
+# password, comes back at a NEW public hostname that appears in no saved profile
+# and in no output of this script. Nothing here can fix that (it is how the
+# tunnel is designed), so the honest moment to say it is when the address is
+# accepted, while the operator can still choose one that survives a restart.
+fs_warn_quick_tunnel_url() {
+  [ -n "$FS_URL" ] || return 0
+  # 30-exposure's predicate on purpose (host-only, lowercased): a second copy of
+  # a host-matching rule is how the two drift apart.
+  is_quick_tunnel_url "$FS_URL" || return 0
+  say ""
+  warn "That file-lane address is a Cloudflare QUICK TUNNEL, and its hostname changes every time"
+  warn "the tunnel restarts — a reboot, a crash, or a Ctrl-C in the terminal running it."
+  warn "It is carried only inside the setup code from this run, so when it changes the app keeps"
+  warn "calling a hostname that no longer exists: attachments stop working, and nothing here can"
+  warn "learn the new address."
+  warn "Your shared folder does come back — at a new public address, with the same password — and"
+  warn "that address is in no saved profile and in no output of this script."
+  say "  ${BOLD}Keep that tunnel running${RESET} for as long as you want attachments to work, and re-run this"
+  say "  script for a fresh code after every restart of it."
+  say "  For an address that survives a restart, give the file lane the same kind of permanent"
+  say "  hostname as the gateway: a Cloudflare NAMED tunnel on a domain you manage, or Tailscale."
+  say ""
+}
+
 # Promote a private file lane to PUBLIC (Funnel) so it matches a public gateway.
 # Publication event → a SECOND explicit confirm on top of the menu choice.
 fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
   if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?"; then
     FS_CRED=""; note "Leaving the file lane out — keeping your files off the public internet."
+    fs_note_existing_mapping "$ehttps" "$everb"
+    fs_lane_residue_note
     return 0
   fi
   case "$ehttps" in
@@ -866,7 +1219,10 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
       # command wins, so funnel cleanly supersedes the serve handler — no `serve off`).
       if tailscale_expose "$ehttps" "$FS_LOCAL_PORT" true file; then
         FS_URL="https://$host:$ehttps"; FS_REACH="public"; ok "File lane is now public at $FS_URL."
-      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fi
+      # A failed exposure leaves the server itself running and enabled at boot — the same
+      # residue the declined branch below reports. The report is latched, so a later path
+      # that also reports it prints once.
+      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fs_lane_residue_note; fi
       ;;
     *)
       # Lane is on a non-Funnel port (e.g. 8444/9443) → need a free Funnel port.
@@ -878,7 +1234,11 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
           FS_URL="https://$host:$ehttps"; FS_REACH="private"
           warn "Keeping the file lane private at $FS_URL."
           warn "Heads-up: the gateway is PUBLIC but this file lane stays Tailscale-only, so attachments work only on your Tailscale-connected devices — an Apple Watch used away from your iPhone won't reach them. Chat still works everywhere."
-        else FS_CRED=""; note "Leaving the file lane out."; fi
+        else
+          FS_CRED=""; note "Leaving the file lane out."
+          fs_note_existing_mapping "$ehttps" "$everb"
+          fs_lane_residue_note
+        fi
         return 0
       fi
       # Got a Funnel port → expose it, then drop the old private mapping (rollback-recorded).
@@ -886,7 +1246,7 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
         local newport="$PICKED_PORT"
         ts_unmap "$ehttps" "$everb"
         FS_URL="https://$host:$newport"; FS_REACH="public"; ok "File lane is now public at $FS_URL."
-      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fi
+      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fs_lane_residue_note; fi
       ;;
   esac
 }
@@ -898,7 +1258,7 @@ fs_demote_private() { # fs_demote_private <existing-https-port> <existing-verb> 
   local ehttps="$1" everb="$2" host="$3"
   if tailscale_expose "$ehttps" "$FS_LOCAL_PORT" false file; then
     FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "File lane is now private at $FS_URL — only your Tailscale devices can reach it."
-  else warn "Could not make the file lane private — leaving it out (won't ship a public lane as private)."; drop_file_lane; fi
+  else warn "Could not make the file lane private — leaving it out (won't ship a public lane as private)."; drop_file_lane; fs_lane_residue_note; fi
 }
 
 # The plain-words help behind the mismatch menus' `?`. Branches on the gateway's
@@ -938,7 +1298,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
       c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
       case "$c" in
-        1) FS_CRED=""; note "Leaving the file lane out." ;;
+        1) FS_CRED=""; note "Leaving the file lane out."
+           fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
         2) FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
       esac
       return 0
@@ -951,7 +1312,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
-      2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway." ;;
+      2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway."
+         fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
       3) FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
     esac
   else
@@ -963,7 +1325,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
       c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
       case "$c" in
-        1) FS_CRED=""; note "Leaving the file lane out." ;;
+        1) FS_CRED=""; note "Leaving the file lane out."
+           fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
         2) FS_URL="https://$host:$ehttps"; FS_REACH="public"; warn "Including a public file lane at $FS_URL." ;;
       esac
       return 0
@@ -976,7 +1339,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
-      2) FS_CRED=""; note "Leaving the file lane out." ;;
+      2) FS_CRED=""; note "Leaving the file lane out."
+         fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
       3) FS_URL="https://$host:$ehttps"; FS_REACH="public"; warn "Including a public file lane at $FS_URL." ;;
     esac
   fi
@@ -1590,11 +1954,45 @@ setup_file_lane() {
   # by any process also reserves a port.
   local workspace="" new_fs=false
   if existing_fs_config; then
-    ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered."
+    # A live server for this gateway is in play from here on, so every bail-out
+    # below owes the operator the residue report.
+    FS_LANE_PREPARED=true
+    # A unit file is not a running service. Claiming "found your file server" for a
+    # unit that sits `failed` is the checkmark that makes a wedged lane invisible
+    # for every later run.
+    case "$(fs_unit_state)" in
+      active)
+        ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered." ;;
+      inactive)
+        warn "Found this gateway's file-server unit (folder + port $FS_LOCAL_PORT, credential recovered),"
+        warn "but its service is NOT running." ;;
+      *)
+        ok "Found this gateway's file-server unit: folder + port $FS_LOCAL_PORT, credential recovered."
+        note "(I can't ask this machine whether its service is running.)" ;;
+    esac
     workspace="$FS_FOLDER"
+    # The served root is re-certified and re-published on every run, so a root the
+    # doctor refuses to grade must not pass here either — this is the one gate
+    # between a mis-pointed unit and a pairing code that publishes it.
+    if ! fs_resolve_shared_folder "$FS_FOLDER"; then
+      fs_folder_refusal_warn "$FS_FOLDER"
+      warn "That is what this unit serves, so I won't expose it or put it in a setup code."
+      note "Point the unit at the agent's working folder (or remove it, below) and re-run me."
+      FS_CRED=""; FS_URL=""
+      fs_lane_residue_note
+      return 0
+    fi
+    if [ "$FS_FOLDER_RESOLVED" != "$FS_FOLDER" ]; then
+      warn "That unit serves $FS_FOLDER, which is a link to $FS_FOLDER_RESOLVED."
+      warn "rclone re-resolves it on every request, so whatever the link points at is what gets"
+      warn "served — it can be re-pointed under the running server with no restart and no re-check."
+      note "Recreate the lane against the real path when you can: remove the unit (commands are"
+      note "printed whenever a lane is left out) and re-run me."
+    fi
     if [ "$OS" = "Linux" ] \
        && ! ensure_existing_fs_envfile_linux; then
       FS_CRED=""; FS_URL=""
+      fs_lane_residue_note
       return 0
     fi
     if $FS_CRED_LEGACY_ARGV; then
@@ -1644,8 +2042,26 @@ setup_file_lane() {
       while true; do
         local w; w=$(ask "  Absolute path to the agent's working folder" "$workspace")
         case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
-        workspace="$w"; break
+        if ! fs_resolve_shared_folder "$w"; then
+          fs_folder_refusal_warn "$w"
+          continue
+        fi
+        [ "$FS_FOLDER_RESOLVED" != "$w" ] \
+          && note "$w resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path, so a later change to the link can't move the served folder under a running server."
+        workspace="$FS_FOLDER_RESOLVED"; break
       done
+    else
+      # The default is resolved on exactly the same terms: `~/.openclaw/workspace`
+      # is a path like any other, and it can be a link to $HOME too.
+      if ! fs_resolve_shared_folder "$workspace"; then
+        fs_folder_refusal_warn "$workspace"
+        warn "Leaving the optional file lane out; chat is unaffected."
+        FS_CRED=""; FS_URL=""; FS_FOLDER=""
+        return 0
+      fi
+      [ "$FS_FOLDER_RESOLVED" != "$workspace" ] \
+        && note "$workspace resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path."
+      workspace="$FS_FOLDER_RESOLVED"
     fi
     FS_FOLDER="$workspace"   # new lane knows its own folder — recorded in the profile
     new_fs=true
@@ -1669,15 +2085,15 @@ setup_file_lane() {
   if [ "$GW_KIND" = "hermes" ]; then
     if [ -z "$workspace" ]; then
       warn "The existing Hermes file-server unit does not reveal its served folder — leaving the lane out."
-      FS_CRED=""; FS_URL=""; return 0
+      FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0
     fi
     if ! hermes_file_readiness_step "$workspace"; then
       hermes_residual_state_note
-      FS_CRED=""; FS_URL=""; return 0
+      FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0
     fi
     if ! install_conduck_hermes_block "$workspace"; then
       hermes_residual_state_note
-      FS_CRED=""; FS_URL=""; return 0
+      FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0
     fi
   fi
 
@@ -1716,17 +2132,22 @@ setup_file_lane() {
       fi
       FS_CRED=$(openssl rand -hex 16)
       ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
+      # From the next line on there is a credential on disk and, moments later, a
+      # boot-enabled server over the agent's folder. Recorded BEFORE the writer
+      # runs, because a writer that fails halfway leaves exactly that behind.
+      FS_LANE_PREPARED=true
+      FS_UNIT_CREATED_THIS_RUN=true
       if [ "$OS" = "Linux" ]; then
         write_fs_unit_linux "$workspace" || {
           warn "File-server unit did not start — leaving the lane out."
           hermes_residual_state_note
-          FS_CRED=""; return 0
+          FS_CRED=""; fs_lane_residue_note; return 0
         }
       else
         write_fs_unit_mac "$workspace" || {
           warn "File-server unit did not start — leaving the lane out."
           hermes_residual_state_note
-          FS_CRED=""; return 0
+          FS_CRED=""; fs_lane_residue_note; return 0
         }
       fi
     fi
@@ -1752,6 +2173,7 @@ setup_file_lane() {
     warn "The file server is not safe to expose yet — leaving it out of the QR."
     hermes_residual_state_note
     FS_CRED=""; FS_URL=""
+    fs_lane_residue_note
     return 0
   fi
 
@@ -1780,6 +2202,7 @@ setup_file_lane() {
       elif $REUSE_ONLY; then
         note "(reuse-only: the file lane has no HTTPS exposure yet and I won't create one — leaving it out)"
         FS_CRED=""
+        fs_lane_residue_note
       elif pick_public_port "$TRANSPORT" "$FS_LOCAL_PORT" "file"; then
         # Not yet exposed — allocate on the gateway's transport (scope matches by construction).
         FS_HTTPS_PORT="$PICKED_PORT"
@@ -1789,10 +2212,12 @@ setup_file_lane() {
         else
           warn "File-lane exposure not confirmed — leaving it out of the QR."
           drop_file_lane
+          fs_lane_residue_note
         fi
       else
         warn "No free HTTPS port for the file lane on this transport — skipping the file lane."
         FS_CRED=""   # no permitted port free; file lane skipped
+        fs_lane_residue_note
       fi
       ;;
     cloudflare)
@@ -1802,15 +2227,21 @@ setup_file_lane() {
       say "      - hostname: ${BOLD}files.YOURDOMAIN${RESET}"
       say "        service: http://127.0.0.1:$FS_LOCAL_PORT"
       say ""
+      # An HTTPS route the OPERATOR creates is one this connector can never unmap
+      # for them, so a lane dropped later has to name it. Recorded the moment they
+      # confirm they made it (or say they already have one).
       if $REUSE_ONLY; then
         note "(reuse-only: assuming your file-lane ingress rule already exists)"
         local h; h=$(ask_url "The file-lane web address (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
-        [ -n "$h" ] && FS_URL="$h" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
+        if [ -n "$h" ]; then FS_URL="$h"; FS_ROUTE_SELF_MANAGED=true; fs_warn_quick_tunnel_url
+        else note "No address — leaving the file lane out of the QR."; FS_CRED=""; fs_lane_residue_note; fi
       elif print_and_wait "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
         "cloudflared tunnel route dns <your-tunnel> files.YOURDOMAIN"; then
+        FS_ROUTE_SELF_MANAGED=true
         local h2; h2=$(ask_url "The file-lane web address you configured (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
-        [ -n "$h2" ] && FS_URL="$h2" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
-      else FS_CRED=""; fi
+        if [ -n "$h2" ]; then FS_URL="$h2"; fs_warn_quick_tunnel_url
+        else note "No address — leaving the file lane out of the QR."; FS_CRED=""; fs_lane_residue_note; fi
+      else FS_CRED=""; fs_lane_residue_note; fi
       ;;
     public)
       say ""
@@ -1821,7 +2252,13 @@ setup_file_lane() {
       local h; h=$(ask_url "The https:// web address that reaches it (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
       if [ -n "$h" ]; then
         FS_URL="$h"
-      else note "Skipped the file lane (Conduck still works — inline-only attachments)."; FS_CRED=""; fi
+        FS_ROUTE_SELF_MANAGED=true   # their own web server holds it; only they can take it back down
+        fs_warn_quick_tunnel_url     # "my own HTTPS" reaches a quick tunnel just as easily
+      else
+        note "Skipped the file lane (Conduck still works — inline-only attachments)."
+        FS_CRED=""
+        fs_lane_residue_note
+      fi
       ;;
   esac
 }

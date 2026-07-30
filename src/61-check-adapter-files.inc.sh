@@ -30,6 +30,9 @@ DF_DEV_INO=""      # "<dev>:<ino>" pinned at resolve time — every direct disk 
 DF_RUN=""          # per-run namespace nonce; every artifact name carries it
 DF_ARTS=()         # "tier<TAB>kind<TAB>relkey" — registered BEFORE creation; tier T|A, kind file|dir
 DF_AGENT_RAN=false
+DF_WROTE=false     # true once a mutating operation could have created something. DF_ARTS
+                   # proves only INTENT (registration precedes creation, by design), so
+                   # anything that sends the operator looking keys off THIS flag.
 df_register() { DF_ARTS+=("$1"$'\t'"$2"$'\t'"$3"); }
 
 # The file lane's own curl: same egress isolation as the chat probes (`-q`
@@ -56,6 +59,19 @@ doctor_fs_code() { # doctor_fs_code <real|wrong|none> [curl args…] <url> -> ec
   local code
   code=$(doctor_curl_fs "$1" -o /dev/null -w '%{http_code}' "${@:2}" 2>/dev/null) || true
   case "$code" in [0-9][0-9][0-9]) printf '%s' "$code" ;; *) printf '000' ;; esac
+}
+# The ONE door for every mutating WebDAV verb (PUT, MKCOL) — same contract as
+# doctor_fs_code, plus the DF_WROTE bookkeeping. An ANSWERED request may have
+# created something even when it rejected the write, and even somewhere this
+# host cannot see (a server serving a DIFFERENT directory than the one on
+# record is exactly what FILES_WRITE_THROUGH exists to catch), so any status
+# counts. A 000 means no server answered at all: nothing can have been created,
+# and a later DELETE to the same silent lane cannot remove anything either.
+doctor_fs_write() { # doctor_fs_write <real|wrong|none> [curl args…] <url> -> echoes 3-digit code
+  local code
+  code=$(doctor_fs_code "$@")
+  [ "$code" = "000" ] || DF_WROTE=true
+  printf '%s' "$code"
 }
 
 doctor_files_dir_ok() { # the pinned-identity gate before EVERY direct disk operation
@@ -249,7 +265,7 @@ doctor_files_transport() {
   # write-through: PUT over WebDAV must land byte-identical in the folder.
   df_register T file "$wkey"
   printf '%s\n' "$wt_nonce" > "$tmp"
-  code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$wkey")
+  code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$wkey")
   local wt_ok=false
   case "$code" in
     2??)
@@ -292,14 +308,14 @@ doctor_files_transport() {
   fi
   df_register T file "$ukey1"
   printf 'conduck-check unauth probe\n' > "$uprobe"
-  code=$(doctor_fs_code none -T "$uprobe" "$DF_URL/$ukey1")
+  code=$(doctor_fs_write none -T "$uprobe" "$DF_URL/$ukey1")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without credentials is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO credentials was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   df_register T file "$ukey2"
-  code=$(doctor_fs_code wrong -T "$uprobe" "$DF_URL/$ukey2")
+  code=$(doctor_fs_write wrong -T "$uprobe" "$DF_URL/$ukey2")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
@@ -318,6 +334,9 @@ doctor_files_transport() {
       # Revalidate the pinned folder identity IMMEDIATELY before the direct
       # write — the resolve-time check is several network round-trips old.
       if doctor_files_dir_ok; then
+        # O_CREAT lands the name before the write can fail, so the create COUNTS
+        # from here on whether or not it reports OK.
+        DF_WROTE=true
         out=$(python3 - "$DF_DIR" "$fkey" <<'PY' 2>/dev/null
 import os, secrets, sys
 p = os.path.join(sys.argv[1], sys.argv[2])
@@ -395,16 +414,26 @@ PY
   # keys on a conclusive rejection. Only an indeterminate answer is trouble.
   df_register T file "$nkey/n.txt"
   df_register T dir "$nkey"
-  code=$(doctor_fs_code real -X MKCOL "$DF_URL/$nkey/")
+  code=$(doctor_fs_write real -X MKCOL "$DF_URL/$nkey/")
   case "$code" in
     201)
       printf 'conduck-check nested probe\n' > "$tmp"
-      code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$nkey/n.txt")
+      code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$nkey/n.txt")
       body=$(doctor_curl_fs real "$DF_URL/$nkey/n.txt" 2>/dev/null) || body=""
-      if [ "${code#2}" != "$code" ] && [ "$body" = "conduck-check nested probe" ]; then
+      # Three outcomes, three different repairs: the PUT inside the new folder
+      # being refused, the file reading back empty, and it reading back wrong.
+      # A single message carrying only the PUT's status prints "(HTTP 201)" next
+      # to a failure, which reads as if the 201 is the problem — so the status
+      # stays where it IS the finding, and the read-back failures name the read
+      # instead.
+      if [ "${code#2}" = "$code" ]; then
+        d_bad FILES_NESTED "MKCOL created the folder, but a PUT inside it answered HTTP $code"; tfail=$((tfail+1))
+      elif [ "$body" = "conduck-check nested probe" ]; then
         d_ok FILES_NESTED "nested folders SUPPORTED (MKCOL + PUT + GET round-trip)"
+      elif [ -z "$body" ]; then
+        d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but reading the file back returned no bytes"; tfail=$((tfail+1))
       else
-        d_bad FILES_NESTED "MKCOL succeeded but a file inside would not round-trip (HTTP $code)"; tfail=$((tfail+1))
+        d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but the file reads back with different content"; tfail=$((tfail+1))
       fi ;;
     403|405|409|501)
       d_ok FILES_NESTED "nested folders REJECTED by the server (HTTP $code) — fine: the app falls back to flat keys" ;;
@@ -448,18 +477,24 @@ doctor_files_agent() {
   # fallback, and the doctor follows it.
   df_register A dir "conduck-check-$DF_RUN"
   used_key="$ikey"
-  code=$(doctor_fs_code real -X MKCOL "$DF_URL/conduck-check-$DF_RUN/")
+  code=$(doctor_fs_write real -X MKCOL "$DF_URL/conduck-check-$DF_RUN/")
   if [ "$code" = "201" ]; then
     df_register A file "$ikey"
-    code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$ikey")
+    code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$ikey")
   else
     used_key="conduck-check-$DF_RUN-${ih}__input-$DF_RUN.txt"
     df_register A file "$used_key"
-    code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$used_key")
+    code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$used_key")
   fi
   if [ "${code#2}" = "$code" ]; then
     # WebDAV upload failed — place the input directly on disk so the agent
     # tier can still produce evidence (independence from a broken transport).
+    # Carry the upload's status into every message below: HTTP 403 (a read-only
+    # folder or a rejected credential), a 5xx (out of space, a server fault) and
+    # no answer at all (nothing listening) are three different repairs, and this
+    # status is the only thing that separates them.
+    local uwhy="HTTP $code"
+    [ "$code" = "000" ] && uwhy="no answer"
     # Revalidate the pin immediately before this direct write, same as the
     # freshness create: the entry check is several probes old by now.
     doctor_files_dir_ok || {
@@ -467,6 +502,9 @@ doctor_files_agent() {
       rm -f "$tmp" 2>/dev/null
       return 0
     }
+    # Same O_CREAT rule as the freshness write: the name can exist even when the
+    # write below reports a failure.
+    DF_WROTE=true
     out=$(python3 - "$DF_DIR" "$used_key" "$tmp" <<'PY' 2>/dev/null
 import os, sys
 p = os.path.join(sys.argv[1], sys.argv[2])
@@ -480,11 +518,11 @@ print("OK")
 PY
 )
     if [ "$out" != "OK" ]; then
-      note "  [FILE_COPY_BYTES] skipped — could not place the input sentinel at all (transport already red above)."
+      note "  [FILE_COPY_BYTES] skipped — the input sentinel's WebDAV upload failed ($uwhy) and the direct disk write failed too (transport already red above)."
       rm -f "$tmp" 2>/dev/null
       return 0
     fi
-    note "  (input sentinel placed directly on disk — the WebDAV upload path failed, see tier 1.)"
+    note "  (input sentinel placed directly on disk — the WebDAV upload path failed ($uwhy), see tier 1.)"
   fi
 
   # The output name must not pre-exist — and the WebDAV 404 doubles as cache
@@ -754,6 +792,12 @@ except Exception:
 doctor_files_cleanup_backstop() {
   [ "${#DF_ARTS[@]}" -gt 0 ] 2>/dev/null || return 0
   [ -n "$DF_URL" ] || return 0
+  # Registration precedes creation, so a populated DF_ARTS proves only that the
+  # run INTENDED those names. DF_WROTE still false means nothing ever answered a
+  # mutating request and no direct disk create ran: there is nothing to remove,
+  # and sending the operator to search their agent's working folder for a file
+  # that cannot exist is a false alarm (a silent lane answers no DELETE either).
+  $DF_WROTE || return 0
   local entry kind rel
   for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)

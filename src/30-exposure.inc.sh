@@ -12,6 +12,43 @@ declare -a FS_APPLIED=()      # same, but for the OPTIONAL file lane — rolled 
 FS_HTTPS_PORT=""              # chosen at exposure time (transport-aware)
 FS_ROLLBACK_INCOMPLETE=false  # a file-lane exposure we applied could not be proven removed
 
+# Every undo record ALSO lives on disk, one file per exposure, written BEFORE the
+# mutation it undoes. APPLIED/FS_APPLIED die with the process, and the two ways an
+# interrupted run really ends are the two they cannot survive: SIGKILL or an OOM
+# kill (no trap runs at all) and a dropped SSH session (the trap runs, but prints
+# into a terminal that is gone). Either way the exposure stays live — possibly a
+# PUBLIC Funnel in front of a tool-capable agent — while the only record of who
+# opened it dies with the shell, so no later run can find it. $STATE_DIR is the
+# sanctioned home for this class of data and is created only by ensure_state_dir.
+EXPOSURE_RECORD_VERSION=1
+EXPOSURE_RUN_TAG=""            # per-run, so a whole-run purge only drops THIS run's files
+EXPOSURE_RECORD_SEQ=0          # zero-padded into the name, so restore order is recoverable
+EXPOSURE_RECORD_WARNED=false   # an unusable record is named once, and kept
+
+# THE rule for prior state, shared by every path that undoes an exposure: what WE
+# applied is removed, and the prior mapping is restored only when it was PRIVATE.
+# A prior PUBLIC Funnel is never re-created for the operator — a block they accept
+# under the word "cleanup" must not be able to re-publish their agent to the open
+# internet, least of all two prompts after they answered "yes, turn the public URL
+# off" and verification then failed. The command is printed instead, labelled
+# PUBLIC, so re-publishing stays a deliberate act.
+prior_is_public() { # prior_is_public <prior-state>
+  case "$1" in funnel$'\t'*) return 0 ;; esac
+  return 1
+}
+
+# Does any of these records carry a prior PUBLIC mapping? Decides whether a
+# cleanup prompt has to say out loud what it will NOT do.
+entries_have_public_prior() { # entries_have_public_prior <entry>…
+  local entry rest
+  for entry in "$@"; do
+    [ -n "$entry" ] || continue
+    rest="${entry#*$'\t'}"
+    prior_is_public "${rest#*$'\t'}" && return 0
+  done
+  return 1
+}
+
 # The one undo recipe, used by every path that has to tell the user how to put a
 # port back: a funnel WE created needs its OWN `off` (`serve off` clears the web
 # handler but NOT the AllowFunnel flag, so public exposure would survive).
@@ -26,11 +63,53 @@ print_undo_hints() { # print_undo_hints <"port\tapplied-verb\tprior">…
     fi
     if [ "$prior" = "EMPTY" ]; then
       printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$port" "$RESET"
+    elif prior_is_public "$prior"; then
+      # Clear the port, then print the re-publish separately and under its own
+      # heading. Printing it inline with the others would put "make this public
+      # again" inside a block the operator is being asked to accept wholesale.
+      pproxy="${prior#*$'\t'}"
+      printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$port" "$RESET"
+      say "    ${DIM}Port $port carried a PUBLIC Tailscale Funnel before this run. Putting that back"
+      say "    would return this machine to the open internet, so it is not part of the undo"
+      say "    above. Only if you want port $port PUBLIC again:${RESET}"
+      printf '    %stailscale funnel --bg --https=%s %s%s   # makes port %s PUBLIC again\n' "$BOLD" "$port" "$pproxy" "$RESET" "$port"
     else
       pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
-      printf '    %stailscale %s --bg --https=%s %s%s   # restore previous mapping\n' "$BOLD" "$pverb" "$port" "$pproxy" "$RESET"
+      printf '    %stailscale %s --bg --https=%s %s%s   # restore your previous private mapping\n' "$BOLD" "$pverb" "$port" "$pproxy" "$RESET"
     fi
   done
+}
+
+# Undo ONE record, by the rule above. Best-effort per command (`|| true`): the
+# CALLER proves the outcome from a status re-read, because a refused command and a
+# refused-but-already-correct state are indistinguishable from an exit code.
+undo_exposure_entry() { # undo_exposure_entry <"port\tapplied-verb\tprior">
+  local entry="$1" port rest averb prior pverb pproxy
+  port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
+  averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
+  if [ "$averb" = "funnel" ]; then tailscale funnel --https="$port" off 2>/dev/null || true; fi
+  if [ "$prior" = "EMPTY" ] || prior_is_public "$prior"; then
+    # Both cases end with the port CLEARED: nothing was there before, or what was
+    # there was public and is not ours to re-publish. `funnel off` first, because
+    # a prior public port carries the AllowFunnel flag that `serve off` leaves set.
+    prior_is_public "$prior" && { tailscale funnel --https="$port" off 2>/dev/null || true; }
+    tailscale serve --https="$port" off 2>/dev/null || true
+  else
+    pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
+    tailscale "$pverb" --bg --https="$port" "$pproxy" 2>/dev/null || true
+  fi
+}
+
+# What a PROVEN undo looks like for one record — the value ts_target_for_port must
+# return afterwards. A public prior targets an EMPTY port, not the prior itself:
+# undo_exposure_entry clears it rather than re-publishing, so "back to prior" would
+# report the SAFER outcome as an incomplete rollback and nag about a closed port.
+undo_target_for_entry() { # undo_target_for_entry <entry> -> expected target, "" for a cleared port
+  local rest prior
+  rest="${1#*$'\t'}"; prior="${rest#*$'\t'}"
+  [ "$prior" = "EMPTY" ] && return 0
+  prior_is_public "$prior" && return 0
+  printf '%s' "$prior"
 }
 
 tailscale_dns_name() {
@@ -167,6 +246,126 @@ snapshot_port() { # snapshot_port <port> <verb> [role] — record prior state + 
   else APPLIED+=("$p"$'\t'"$verb"$'\t'"${t:-EMPTY}"); fi
 }
 
+# ------------------------------------------------- the on-disk undo record -----
+# One line per record, tab-separated, `prior` LAST because it is the one field
+# that legitimately contains a tab ("verb<TAB>proxy"):
+#   <format-version>  <role>  <port>  <applied-verb>  <applied-proxy>  <prior>
+# Nothing else in this script reads these files.
+
+# Every value read back out is interpolated into a `tailscale` command, so each is
+# checked against the ONLY shape this script ever writes rather than trusted: a
+# file under $STATE_DIR is editable by its owner and outlives version changes.
+exposure_proxy_ok() { # exposure_proxy_ok <proxy>
+  case "$1" in
+    http://127.0.0.1:) return 1 ;;
+    http://127.0.0.1:*) case "${1#http://127.0.0.1:}" in *[!0-9]*) return 1 ;; esac; return 0 ;;
+  esac
+  return 1
+}
+
+# Read one record into REC_* (globals, because bash 3.2 has no `declare -n`).
+# Returns 1 for anything this version cannot use, WITHOUT deleting the file: an
+# unreadable record may still name a live public exposure, so it is kept for a
+# version that understands it, and never fed to a command.
+REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
+read_exposure_record() { # read_exposure_record <file> -> 0 and sets REC_*, else 1
+  REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
+  local ver role port averb aproxy prior
+  IFS=$'\t' read -r ver role port averb aproxy prior < "$1" 2>/dev/null || return 1
+  [ "${ver:-}" = "$EXPOSURE_RECORD_VERSION" ] || return 1
+  case "${role:-}" in gateway|file) ;; *) return 1 ;; esac
+  case "${port:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${averb:-}" in serve|funnel) ;; *) return 1 ;; esac
+  exposure_proxy_ok "${aproxy:-}" || return 1
+  case "${prior:-}" in
+    EMPTY) ;;
+    serve$'\t'*|funnel$'\t'*) exposure_proxy_ok "${prior#*$'\t'}" || return 1 ;;
+    *) return 1 ;;
+  esac
+  REC_ROLE="$role"; REC_PORT="$port"; REC_AVERB="$averb"; REC_APROXY="$aproxy"; REC_PRIOR="$prior"
+}
+
+# Is the exposure a record describes STILL the one live on that port? The whole
+# meaning of a record is "this script opened this, and has not told you about it",
+# so both the verb and the backend have to match — a leftover private Serve is not
+# the public Funnel we recorded, and a port some other tool has taken over is not
+# ours to close. Reads current TS_PORTS; the caller refreshes them.
+exposure_record_is_live() { # exposure_record_is_live -> 0 when REC_* still matches TS_PORTS
+  [ "$(ts_target_for_port "$REC_PORT")" = "$REC_AVERB"$'\t'"$REC_APROXY" ]
+}
+
+# The disk twin of snapshot_port, written BEFORE the mutation. Best effort BY
+# DESIGN: a record we cannot write must never stop an exposure the operator just
+# agreed to — the cost of failing is that the NEXT run does not know, which is
+# exactly where we already are today.
+persist_exposure_record() { # persist_exposure_record <port> <applied-verb> <applied-proxy> <role> [prior]
+  local port="$1" averb="$2" aproxy="$3" role="$4" prior="${5:-}"
+  $DRY_RUN && return 0                    # nothing mutates, so there is nothing to undo
+  [ -n "${STATE_DIR:-}" ] || return 0
+  ensure_state_dir || return 0
+  [ -n "$EXPOSURE_RUN_TAG" ] || EXPOSURE_RUN_TAG="$$-$(date +%s 2>/dev/null || printf '0')"
+  EXPOSURE_RECORD_SEQ=$((EXPOSURE_RECORD_SEQ+1))
+  # `prior` is passed only when re-tagging an ADOPTED record, whose prior state
+  # belongs to the run that opened the port; reading it live here would record the
+  # exposure itself as its own prior state and make the undo a no-op.
+  [ -n "$prior" ] || prior=$(ts_target_for_port "$port")
+  local f; f=$(printf '%s/exposure-%s-%03d.pending' "$STATE_DIR" "$EXPOSURE_RUN_TAG" "$EXPOSURE_RECORD_SEQ")
+  # 0600 like everything else in here: the line names a gateway's port and backend.
+  ( umask 077
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$EXPOSURE_RECORD_VERSION" "$role" "$port" "$averb" "$aproxy" "${prior:-EMPTY}" >"$f"
+  ) 2>/dev/null || return 0
+}
+
+# Take over an earlier run's record for a mapping THIS run reuses as-is. Reusing an
+# exposure makes it this run's: on success the code names it, so the record has to
+# go with this run's other records, and on failure the undo still has to know the
+# prior state the ORIGINAL run captured. Leaving the old file alone instead would
+# have the next run offer to close a working, already-reported pairing.
+adopt_exposure_records_for_port() { # adopt_exposure_records_for_port <port> <verb> <proxy> <role>
+  local port="$1" verb="$2" proxy="$3" role="$4" f prior
+  $DRY_RUN && return 0
+  [ -n "${STATE_DIR:-}" ] || return 0
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] || continue
+    read_exposure_record "$f" || continue
+    [ "$REC_PORT" = "$port" ] && [ "$REC_AVERB" = "$verb" ] && [ "$REC_APROXY" = "$proxy" ] || continue
+    prior="$REC_PRIOR"
+    rm -f "$f" 2>/dev/null || continue
+    persist_exposure_record "$port" "$verb" "$proxy" "$role" "$prior"
+  done
+}
+
+# Drop records that have nothing left to offer. Tag-agnostic for the proven case,
+# because a record is garbage the moment its exposure is gone no matter which run
+# wrote it — and a later run that offers to close an already-closed port teaches
+# the operator to skip past this whole class of warning.
+# FAIL CLOSED: an unreadable Tailscale state is not proof of removal, so nothing
+# is dropped then.
+# `all` drops THIS run's records unconditionally, used once a setup code is
+# emitted: the exposure is live BECAUSE the operator asked for it, and the run has
+# just said so on screen, so it is no longer an unreported one.
+prune_exposure_records() { # prune_exposure_records [all]
+  local force="${1:-}" f
+  $DRY_RUN && return 0
+  [ -n "${STATE_DIR:-}" ] || return 0
+  if [ "$force" = "all" ]; then
+    [ -n "$EXPOSURE_RUN_TAG" ] || return 0
+    for f in "$STATE_DIR"/exposure-"$EXPOSURE_RUN_TAG"-*.pending; do
+      [ -f "$f" ] && { rm -f "$f" 2>/dev/null || true; }
+    done
+    return 0
+  fi
+  ts_targets
+  $TS_STATE_KNOWN || return 0
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] || continue
+    read_exposure_record "$f" || continue
+    exposure_record_is_live && continue
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+
 # Offer the higher-rights retry of a Tailscale command that just failed, and hand
 # it over for the user to run. Three states, because an empty `priv_prefix` means
 # two OPPOSITE things:
@@ -209,6 +408,10 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     verb_now="${t%%$'\t'*}"; proxy_now="${t#*$'\t'}"
     if [ "$proxy_now" = "http://127.0.0.1:$localport" ] && [ "$verb_now" = "$verb" ]; then
       ok "Already exposed: https port $httpsport → 127.0.0.1:$localport ($verb). Reusing."
+      # Reuse changes nothing, so there is nothing new to record — but an earlier
+      # interrupted run may be the reason this mapping exists, and this run now
+      # owns it.
+      adopt_exposure_records_for_port "$httpsport" "$verb" "http://127.0.0.1:$localport" "$role"
       return 0
     fi
   fi
@@ -228,8 +431,11 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
   mutate_guard "expose port $httpsport via tailscale $verb" || return 1
   if confirm "  Run '$cmd' now?"; then
     # Snapshot only once the user has AGREED — a declined confirm must leave no
-    # rollback record for a port we never touched.
+    # rollback record for a port we never touched. Memory AND disk, both BEFORE
+    # the first mutating command below (the demote already changes the port), so
+    # the record exists even if this process never reaches another line.
     snapshot_port "$httpsport" "$verb" "$role"
+    persist_exposure_record "$httpsport" "$verb" "http://127.0.0.1:$localport" "$role"
     if $demote; then tailscale funnel --https="$httpsport" off 2>/dev/null || true; fi
     $cmd || {
       warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
@@ -266,27 +472,29 @@ cleanup_exposures() {
   [ ${#all[@]} -gt 0 ] || return 0
   say ""
   warn "Some exposure changes were applied but verification did not pass."
-  warn "Here is how to put each affected port back the way it was:"
+  warn "Here is how to undo what this run changed on each affected port:"
   print_undo_hints "${all[@]}"
   say ""
+  # Say plainly what a "yes" will NOT do. Without this the operator reads the
+  # PUBLIC re-publish line as part of the block they are accepting.
+  if entries_have_public_prior "${all[@]}"; then
+    warn "The PUBLIC line above is NOT included — I never re-publish a port on your behalf."
+  fi
   if ! $REUSE_ONLY && confirm "  Run these cleanup commands now?"; then
     # Reverse order: the LAST mapping applied is undone first, so when two records
     # touch one port the earliest-recorded prior state is the one that survives.
-    local i entry port rest averb prior pverb pproxy
+    local i
     for (( i=${#all[@]}-1; i>=0; i-- )); do
-      entry="${all[$i]}"
-      port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
-      averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
-      if [ "$averb" = "funnel" ]; then tailscale funnel --https="$port" off 2>/dev/null || true; fi
-      if [ "$prior" = "EMPTY" ]; then tailscale serve --https="$port" off 2>/dev/null || true
-      else
-        pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
-        tailscale "$pverb" --bg --https="$port" "$pproxy" 2>/dev/null || true
-      fi
+      undo_exposure_entry "${all[$i]}"
     done
     ok "Cleanup attempted — verify with 'tailscale serve status' and 'tailscale funnel status'."
   fi
   APPLIED=(); FS_APPLIED=()   # handled — don't let the EXIT backstop repeat it
+  # The disk records are NOT cleared with them: the prompt above may have been
+  # declined, skipped by --reuse-only, or refused by Tailscale, and only a status
+  # re-read can tell. prune_exposure_records keeps exactly the ones still live, so
+  # a later run offers to close whatever this one did not.
+  prune_exposure_records
 }
 
 # Remove a Tailscale mapping we are SUPERSEDING — used only by the different-port
@@ -303,6 +511,11 @@ ts_unmap() { # ts_unmap <port> <verb>
     return 0
   fi
   mutate_guard "remove the old $verb mapping on port $port" || return 1
+  # In-memory only, deliberately: this REMOVES an exposure, so there is nothing
+  # live for a later run to find and close. The disk record exists to catch an
+  # exposure we OPENED and never reported; a record here would only offer to
+  # re-create a mapping — and re-creating one unbidden is what prior_is_public
+  # exists to prevent.
   snapshot_port "$port" "$verb" file        # record (in FS_APPLIED) so cleanup can restore it
   tailscale "$verb" --https="$port" off || {
     warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
@@ -327,28 +540,26 @@ ts_unmap() { # ts_unmap <port> <verb>
 rollback_fs_exposures() {
   [ ${#FS_APPLIED[@]} -gt 0 ] || return 0
   if $DRY_RUN; then FS_APPLIED=(); return 0; fi
-  local entry port rest averb prior pverb pproxy
+  local entry port rest prior
   for entry in "${FS_APPLIED[@]}"; do
-    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
-    averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
-    if [ "$averb" = "funnel" ]; then tailscale funnel --https="$port" off 2>/dev/null || true; fi
-    if [ "$prior" = "EMPTY" ]; then tailscale serve --https="$port" off 2>/dev/null || true
-    else pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"; tailscale "$pverb" --bg --https="$port" "$pproxy" 2>/dev/null || true; fi
+    undo_exposure_entry "$entry"
   done
-  # FAIL CLOSED: claim success only when a status re-parse PROVES each port is
-  # back to its prior state. Otherwise keep the record (the EXIT backstop and
-  # cleanup_exposures still act on it) and say so — never "all clear" on faith.
+  # FAIL CLOSED: claim success only when a status re-parse PROVES each port reached
+  # the state undo_target_for_entry names. Otherwise keep the record (the EXIT
+  # backstop and cleanup_exposures still act on it) and say so — never "all clear"
+  # on faith.
   ts_targets
   local leftover=() t want
   for entry in "${FS_APPLIED[@]}"; do
-    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"; prior="${rest#*$'\t'}"
-    want=""; [ "$prior" != "EMPTY" ] && want="$prior"
+    port="${entry%%$'\t'*}"
+    want=$(undo_target_for_entry "$entry")
     t=$(ts_target_for_port "$port")
     if ! $TS_STATE_KNOWN || [ "${t:-}" != "$want" ]; then leftover+=("$entry"); fi
   done
   if [ ${#leftover[@]} -eq 0 ]; then
     note "Rolled back the file-lane exposure — confirmed no public file server is left behind."
     FS_APPLIED=()
+    prune_exposure_records   # proven gone: the disk records for these ports go too
   else
     # Keep the record AND remember the failure: emit_payload must not close a run
     # with a green QR while a file server we exposed is still reachable.
@@ -385,7 +596,10 @@ on_exit() {
   # A successful run normally has nothing to undo. The exception: a file-lane
   # rollback that could NOT be proven — that exposure may still be live, so the
   # undo hints must survive even a green QR.
-  if $EMITTED && ! $FS_ROLLBACK_INCOMPLETE; then return 0; fi
+  if $EMITTED && ! $FS_ROLLBACK_INCOMPLETE; then
+    prune_exposure_records all   # a clean run leaves nothing behind on disk either
+    return 0
+  fi
   say ""
   if $EMITTED; then
     warn "A file-lane exposure this run applied could NOT be confirmed removed. It may still be reachable. To undo it:"
@@ -393,6 +607,10 @@ on_exit() {
     warn "Exited before emitting a setup code, but exposure changes were applied. To undo them:"
   fi
   print_undo_hints "${all[@]}"
+  # Printing is not evidence anybody read it, let alone acted: this same block is
+  # what a dropped SSH session writes into a terminal that no longer exists. The
+  # disk records stay, so the next run can offer to close whatever is still live.
+  note "The next run of this script offers to close any of these that is still live."
 }
 trap on_exit EXIT
 # macOS Bash 3.2 does not reliably run EXIT for an unhandled signal. Route
@@ -450,6 +668,144 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
       warn "Port $rport is STILL exposed — run: $off_cmd"
     fi
   done
+  # A funnel swept here can be the very one an interrupted earlier run recorded on
+  # disk, so retire that record now rather than let the NEXT run offer to close a
+  # port this one already closed.
+  prune_exposure_records
+}
+
+# The other half of the on-disk undo record: read what earlier runs left, and offer
+# to close whatever is still live. Runs at the START of a setup run, before any new
+# port is chosen, because the leftover may be a PUBLIC Funnel in front of a
+# tool-capable agent and that outranks the setup the operator came here for.
+# Records whose exposure is already gone are retired in SILENCE — a block that
+# announces closed ports is a block operators learn to skip.
+# prior_is_public governs here too: a prior private mapping is put back, a prior
+# public one is only ever printed.
+reconcile_orphaned_exposures() {
+  [ -n "${STATE_DIR:-}" ] || return 0
+  local f pending_seen=false
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] && pending_seen=true
+  done
+  $pending_seen || return 0
+  # Without the CLI nothing here can be checked OR closed, and the records cannot
+  # be believed either: `tailscale` missing from THIS shell's PATH is not proof its
+  # mappings are gone. Name the situation and keep every file for a run that can
+  # read the real state.
+  if ! have tailscale; then
+    say ""
+    warn "An earlier run of this script recorded a Tailscale exposure it opened, but the"
+    warn "'tailscale' command isn't on this shell's PATH, so I can't check whether it is"
+    warn "still live. Run me from a shell that has it, or check 'tailscale funnel status'."
+    return 0
+  fi
+  ts_targets
+  if ! $TS_STATE_KNOWN; then
+    say ""
+    warn "An earlier run of this script recorded a Tailscale exposure it opened, and I could"
+    warn "not read 'tailscale serve status --json' to see whether it is still live."
+    warn "Check 'tailscale serve status' and 'tailscale funnel status'."
+    return 0
+  fi
+  # Two passes so the operator sees the full scope before answering: collect the
+  # still-live records as undo entries (the shape print_undo_hints and
+  # undo_exposure_entry both take), retiring the rest as we go.
+  local live=() files=() backends=() roles=() entry public=false host=""
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] || continue
+    if ! read_exposure_record "$f"; then
+      if ! $EXPOSURE_RECORD_WARNED; then
+        EXPOSURE_RECORD_WARNED=true
+        warn "$STATE_DIR holds an exposure record this version cannot read. Leaving it alone (it may"
+        warn "name a live exposure) — check 'tailscale serve status' and 'tailscale funnel status'."
+      fi
+      continue
+    fi
+    if ! exposure_record_is_live; then rm -f "$f" 2>/dev/null || true; continue; fi
+    live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
+    files+=("$f")
+    backends+=("${REC_APROXY#http://127.0.0.1:}")   # the local port it fronts, for the report
+    # What sits behind it decides how alarming this is: an agent gateway answers
+    # prompts and runs tools, a file lane hands out files.
+    if [ "$REC_ROLE" = "file" ]; then roles+=("your shared folder"); else roles+=("your gateway"); fi
+    [ "$REC_AVERB" = "funnel" ] && public=true
+  done
+  [ ${#live[@]} -gt 0 ] || return 0
+
+  host=$(tailscale_dns_name)
+  say ""
+  warn "An earlier run of this script opened an exposure and never finished — nothing told"
+  warn "you how to close it, because that run was cut off. It is still live:"
+  local i port rest averb backend
+  for (( i=0; i<${#live[@]}; i++ )); do
+    entry="${live[$i]}"
+    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
+    averb="${rest%%$'\t'*}"
+    backend="port $port → 127.0.0.1:${backends[$i]} (${roles[$i]})"
+    if [ "$averb" = "funnel" ]; then
+      say "    ${BOLD}$backend — PUBLIC${RESET} (Tailscale Funnel): reachable from the internet${host:+ at https://$host:$port}"
+    else
+      say "    $backend — private (Tailscale Serve): your tailnet only"
+    fi
+  done
+  say ""
+  $public && warn "A public one means anyone who has the URL can knock on your gateway right now."
+  say "  Closing it changes nothing about the gateway itself — only the address in front of it."
+  say ""
+  print_undo_hints "${live[@]}"
+  say ""
+  if $DRY_RUN; then
+    plan_add "OFFER  close the leftover exposure(s) recorded by an interrupted earlier run"
+    note "(dry-run: would offer to close the above)"
+    return 0
+  fi
+  # NOT mutate_guard: --reuse-only means report-don't-change, and dying here would
+  # let one interrupted run block every later reuse-only run from even starting.
+  if $REUSE_ONLY; then
+    warn "(--reuse-only: leaving it as-is — run the commands above, or re-run without --reuse-only.)"
+    return 0
+  fi
+  if ! confirm "  Close it now?"; then
+    warn "Leaving it live. The commands above close it whenever you want."
+    return 0
+  fi
+  for (( i=${#live[@]}-1; i>=0; i-- )); do
+    undo_exposure_entry "${live[$i]}"
+  done
+  # FAIL CLOSED, per record: prove the outcome from a status re-read, retire only
+  # what is proven, and name what is left rather than claiming a clean sweep.
+  ts_targets
+  local leftover=() t want
+  for (( i=0; i<${#live[@]}; i++ )); do
+    entry="${live[$i]}"
+    port="${entry%%$'\t'*}"
+    want=$(undo_target_for_entry "$entry")
+    t=$(ts_target_for_port "$port")
+    if ! $TS_STATE_KNOWN || [ "${t:-}" != "$want" ]; then
+      leftover+=("$entry")
+    else
+      rm -f "${files[$i]}" 2>/dev/null || true
+      # Two different outcomes, so say which one happened: a cleared port and a
+      # port handed back to a private mapping it carried before are not the same
+      # thing, and "no longer exposed" would be false for the second.
+      if [ -n "$want" ]; then
+        ok "Port $port is back to the private mapping it carried before that run."
+      else
+        ok "Port $port is no longer exposed."
+      fi
+    fi
+  done
+  if [ ${#leftover[@]} -gt 0 ]; then
+    warn "Could not confirm every leftover exposure was closed — often missing operator or root"
+    warn "rights. Check 'tailscale serve status' / 'tailscale funnel status'. To close by hand:"
+    print_undo_hints "${leftover[@]}"
+    # The printed commands have to be runnable AS PRINTED. On a box where Tailscale
+    # wants operator rights, a bare command answers with a permission error the
+    # operator reads as a different fault than the one they have.
+    local rp; rp=$(priv_prefix)
+    [ -n "$rp" ] && note "If Tailscale refuses those, prefix each with '$rp'."
+  fi
 }
 
 # The plain-words comparison behind the exposure menu's `?`. ADDITIVE only: it
@@ -759,6 +1115,36 @@ if nb > datetime.datetime.utcnow():
     print("notyet")' 2>/dev/null
 }
 
+# Is this address a `cloudflared tunnel --url` quick tunnel? Matched on the host
+# only, lowercased, so a path or a port cannot smuggle the suffix past the test.
+is_quick_tunnel_url() { # is_quick_tunnel_url <url>
+  local a; a="${1#*://}"; a="${a%%/*}"; a="${a%%:*}"
+  a=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+  case "$a" in *.trycloudflare.com) return 0 ;; esac
+  return 1
+}
+
+# A quick tunnel's hostname is REASSIGNED every time `cloudflared tunnel --url`
+# restarts — including at every reboot. Nothing on this machine and nothing in the
+# app learns the new one: the paired device keeps calling a hostname that no longer
+# resolves, and the live address exists in no saved profile and no output of this
+# script. That is how the tunnel is designed, so there is nothing to fix and the
+# only honest move is to say it at the moment the address is accepted, while the
+# operator can still choose a path whose address survives a restart.
+warn_quick_tunnel_url() {
+  is_quick_tunnel_url "$GW_URL" || return 0
+  say ""
+  warn "That is a Cloudflare QUICK TUNNEL address, and its hostname changes every time the"
+  warn "tunnel restarts — a reboot, a crash, or a Ctrl-C in the terminal running it."
+  warn "When it changes, the setup code from this run points at a hostname that no longer"
+  warn "exists: the app just stops connecting, and nothing here can learn the new address."
+  say "  ${BOLD}Keep that tunnel running${RESET} for as long as you want Conduck to reach this gateway, and"
+  say "  re-run this script for a fresh code after every restart of it."
+  say "  For an address that survives a restart: a Cloudflare NAMED tunnel on a domain you"
+  say "  manage (option 3), or Tailscale (options 1 and 2), whose hostname is permanent."
+  say ""
+}
+
 # The "I run my own HTTPS" gate. The certificate must be one THIS machine already
 # trusts, because that is the same bar the app applies on the phone: Apple's App
 # Transport Security refuses an untrusted chain before the app is consulted, and a
@@ -766,6 +1152,7 @@ if nb > datetime.datetime.utcnow():
 # has, it never grants it. So there is no accept-anyway arm to offer; an untrusted
 # certificate ends the run, with the reason named and the free remedies listed.
 classify_own_https() {  # GW_URL + SCOPE already set
+  warn_quick_tunnel_url   # before the certificate gate: it is true whatever the cert says
   if $DRY_RUN; then
     TRANSPORT="public"   # provisional routing; a real run runs the trust gate
     plan_add "CHECK the certificate at $GW_URL — setup continues only if this machine trusts it"

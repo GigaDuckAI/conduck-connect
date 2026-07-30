@@ -41,15 +41,28 @@ url_host_lc() { # url_host_lc <https-url>
 # Dies directly (not via $()) so a "no profile" die halts the whole script.
 PROFILE_FILE=""
 show_qr_pick_profile() {
-  local pf; local cand=()
+  local pf; local cand=() rejected=0 reason=""
   for pf in "$STATE_DIR"/profile-*.json; do
     [ -e "$pf" ] || continue          # no matches → the literal glob; skip it
     # Use the exact validator the loader uses. Corrupt/partial files are neither
     # listed nor selectable, so a menu option can never lead straight to a
     # validation dead end.
-    show_qr_validate_profile "$pf" && cand+=("$pf")
+    if show_qr_validate_profile "$pf"; then
+      cand+=("$pf")
+    else
+      # Keep the FIRST rejection's reason. "Nothing usable" and "nothing at all"
+      # need opposite advice: re-running setup rewrites profile-<id>.json, so
+      # prescribing it for a file this version merely cannot PARSE (one a newer
+      # conduck-connect wrote) destroys the very state the operator came to reuse.
+      rejected=$((rejected+1))
+      [ -n "$reason" ] || reason="$PROFILE_VALIDATION_ERROR"
+    fi
   done
-  [ ${#cand[@]} -gt 0 ] || die "No usable saved pairing profile on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
+  if [ ${#cand[@]} -eq 0 ]; then
+    [ "$rejected" = "1" ] && die "There IS a saved pairing profile on this machine, and this version ($VERSION) can't use it. $reason"
+    [ "$rejected" = "0" ] || die "There are $rejected saved pairing profiles on this machine, and this version ($VERSION) can't use any of them. The first one says: $reason"
+    die "No usable saved pairing profile on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
+  fi
   local k
   if [ ${#cand[@]} -eq 1 ]; then PROFILE_FILE="${cand[0]}"; return 0; fi
   say ""
@@ -471,6 +484,15 @@ show_qr_recall_scope() {
 run_show_qr() {
   head_ "Re-show your pairing code — skips setup and changes no configuration"
   show_qr_pick_profile
+  # This path reads $STATE_DIR exactly the way the wizard does — it parses the
+  # saved profile and re-derives the gateway token and the file-lane credential
+  # from it — so it owes the same exposure report the wizard gives. It runs AFTER
+  # the picker, where a profile file has just proven the directory exists: the
+  # `mkdir -p` inside is then a provable no-op, so a command whose promise is
+  # "changes no configuration" still creates nothing. It runs BEFORE any secret is
+  # recovered, so an operator learns the folder is open before the run reads a
+  # password out of it.
+  ensure_state_dir
   show_qr_load_profile
   show_qr_recover_gateway_secret
   show_qr_recover_file_lane

@@ -4,6 +4,153 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The only record of how to close an exposure lived in memory, so an
+  interrupted run left one open with nothing on disk that named it.** `APPLIED`
+  and `FS_APPLIED` are bash arrays and the undo recipe was only ever *printed*:
+  on a SIGKILL or an OOM kill nothing printed at all, and on a dropped SSH
+  session the exit trap ran and wrote into a terminal that no longer existed —
+  practically identical outcomes, with a public Tailscale Funnel in front of a
+  tool-capable agent gateway potentially still live. Each undo record is now
+  written to `$STATE_DIR` (already 0700 for exactly this class of data) BEFORE
+  the mutation that needs undoing, and a later run reports each leftover that is
+  still live — naming its port, its backend, and whether it is PUBLIC — and
+  offers to close it. Records are dropped only on proof: when the port no longer
+  carries the verb and proxy we applied, or wholesale once a run emits a code.
+  Declining the cleanup prompt now KEEPS the records, because printing hints is
+  not evidence anyone read them, which is the dropped-SSH case exactly. Every
+  field is re-validated on read, since the file is owner-editable and its values
+  reach a `tailscale` command line. Reconcile runs after the setup lock, so two
+  runs cannot both offer to close the same port, and before any new port is
+  chosen.
+- **A prompt titled "cleanup" would re-publish the gateway to the internet.**
+  Under "here is how to put each affected port back the way it was", a port whose
+  prior mapping was a Funnel got `tailscale funnel --bg …` — an unlabelled
+  instruction to re-expose the machine — and accepting the block RAN it, possibly
+  two prompts after the operator answered yes to turning the public URL off. One
+  rule now governs every undo path: what this run applied is removed, and a prior
+  mapping is restored only when it was private. A public prior leaves the port
+  CLEARED, and the command that would re-publish it is printed OUTSIDE the
+  accepted block, under its own heading, labelled as making the port public,
+  alongside "I never re-publish a port on your behalf". The command survives as
+  information because the operator may want that state back; it is no longer an
+  action the script can take for them.
+- **A `*.trycloudflare.com` address was accepted, and later emitted in a pairing
+  code, with no word that it does not survive a restart.** Those hostnames are
+  reassigned every time the tunnel restarts, so a reboot silently moves the
+  address: the paired device points at a hostname that no longer exists, and the
+  live one appears in no saved profile and in no output of this script, so
+  neither the app nor this tool can look it up. The staleness is now named where
+  the address is accepted AND again beside the emitted code, which is the
+  artifact that goes stale, for the gateway URL and the file-lane URL
+  independently.
+- **A dropped file lane rolled back nothing and said nothing on two of three
+  transports.** Rollback is Tailscale-only by construction, so on "my own HTTPS"
+  and on Cloudflare a lane that failed its probe was quietly omitted from the
+  code while the run ended GREEN — leaving an authenticated WebDAV server over
+  the agent's working folder running, enabled at boot, with the HTTPS route the
+  script told the operator to create still pointing at it. Any lane that is
+  created but not shipped now reports itself before the terminal closes: the
+  unit, that it restarts at boot, its credential files, and the exact
+  copy-pasteable teardown commands (including `reset-failed`, without which a
+  crash-looped unit stays `failed` after its file is gone). The report is latched
+  to once per run. It now also fires on the three branches where making the lane
+  public or private FAILS, which previously dropped the lane silently while the
+  adjacent operator-declined branch reported correctly.
+- **The shared folder was never resolved, so it could be the whole home
+  directory — or quietly become it later.** The wizard accepted a symlink, wrote
+  it into the service definition verbatim, certified it "byte-faithful", and
+  offered to publish it, and the link's target could then be re-aimed under the
+  running server with no restart and no re-check. Pointed at `$HOME`, the lane
+  served `~/.ssh/authorized_keys` and this connector's own credential files over
+  WebDAV. The folder is now resolved before any service definition records it,
+  and `/`, the home directory itself, a non-absolute path and a plain file are
+  all refused with the reason and what to do instead — matching what
+  `--check-adapter --files` already refuses. The RESOLVED path is what gets
+  served and recorded, so re-aiming a link afterwards cannot move the served
+  folder, and the operator is told when resolution changed the path.
+- **A stolen port wedged the lane permanently while every later run printed a
+  checkmark for a dead service.** The port check is a bind probe seconds before
+  rclone's own bind, so anything on the host can take it in the gap; the unit
+  then crash-loops into systemd's start-rate limit and sits `failed` for good.
+  Later runs printed "Found your existing file server", refused to expose it, and
+  exited 0 with a green chat-only code, naming no unit and no way to look at it —
+  leaving the operator with "attachments just never work" and nothing to search
+  for. An inactive unit is now named, with the `systemctl --user status` and
+  `journalctl --user -u <unit>` commands to inspect it.
+- **Two setups running at once picked the same port, wrote the same unit and
+  credential, and the loser erased the winner's live file lane from the saved
+  profile.** Sequential re-runs were already properly idempotent; only the
+  concurrent case broke, and nothing guarded it. Setup now takes a single-instance
+  lock at the one choke point both entries pass through. Authority is the holder's
+  LIVENESS, not the lock's existence — identity is the pid plus its command line,
+  since after a reboot the same pid belongs to another program — so a lock
+  stranded by a kill, a reboot or a power cut is reclaimed by the next run instead
+  of blocking every future one. Unknowable liveness fails closed and never steals:
+  no usable `ps`, or a `$HOME` shared with another machine, both refuse to judge.
+  A dry run is exempt, since it changes nothing and must not be able to block a
+  real setup.
+- **A failed run, and `--reuse-only`, destroyed the saved record of a live file
+  lane.** `--reuse-only`'s contract is that it refuses configuration changes, and
+  the saved profile is configuration; a run whose checks failed had likewise
+  proven nothing about the setup it was about to record. Either could turn one
+  transient probe failure into the permanent deletion of a working lane, which is
+  the outcome `--show-code`'s existing guard exists to prevent. Three guards now
+  protect an EXISTING profile — reuse-only, a failed verification, and a lane
+  dropped by a check rather than by the operator — each explaining what it kept
+  and how to refresh it. Writing a FIRST profile is unguarded: there is nothing
+  to destroy.
+- **A moved address was reported as "the server errored".** On the Cloudflare and
+  public transports the HTTP-code map filed 530 in the 5xx bucket, when 530 means
+  precisely that nothing serves that hostname — its tunnel is gone — and the
+  gateway never saw the request. Those two transports now get a real drift line:
+  the gateway is probed on loopback, and answering locally while the address does
+  not reach it IS the drift, so "reconcile the address" is separated from "start
+  the gateway" instead of blaming the server for both. It fires only on failures
+  where the request demonstrably never arrived; a rejected token or a login page
+  proves it did, and calling those a moved address would send the operator after
+  a fix that changes nothing.
+- **A gateway-only code was offered when the gateway itself was what failed, and
+  the file server was named as the thing to fix.** Once any gateway check fails
+  no code is emitted at all, so the offer promised something the run would then
+  refuse, over a fault the file lane cannot cause. Both paths now say the gateway
+  failed too and to fix that first.
+- **An unreadable saved profile was reported as "no saved profile — run setup
+  once", and following that advice overwrote it.** The validator's real errors
+  were discarded, so a profile a newer version wrote looked identical to no
+  profile at all. Both entry points now surface the reason: the welcome menu says
+  a saved code exists that this version cannot read, why, and that setting up
+  again REPLACES the file; `--show-code` distinguishes "there is one and this
+  version cannot use it" from "there is none". Option 4 is still offered only for
+  a profile the loader will accept, so the menu cannot advertise an entry that
+  dead-ends moments later.
+- **A world-WRITABLE state directory was reported as a listing problem.**
+  "Readable by other accounts" badly understates it: 0600 protects what is inside
+  `fileserver-<id>.cred`, but in a writable directory any local account can
+  replace the whole file, and rclone then reads its password out of somebody
+  else's copy at the next start — likewise `profile-<id>.json`, which is what
+  `--show-code` rebuilds a pairing code from. Write is now graded apart from read
+  and worded for what it actually permits. `--show-code` checks the mode too: it
+  parses the profile and re-derives both secrets, so it carries the same
+  exposure, and the check runs before any secret is read.
+- **`--check-adapter --files` sent the operator hunting for a probe file that
+  could not exist, and made three different failures look identical.** The
+  cleanup warning keyed off names registered BEFORE creation, so it fired even
+  when nothing had ever answered a mutating request; it now keys off whether a
+  write was genuinely attempted, counting a REJECTED write as possibly-created
+  (an answering server may have written into a directory this host cannot see)
+  and treating no answer at all as the only case where nothing can exist. Write
+  failures now carry the HTTP status they already held, separating a read-only
+  folder from a full disk from a server fault. The nested-folder verdict no longer
+  prints "(HTTP 201)" beside a failure: a refused write, an empty read-back and a
+  changed read-back are three findings, and the status appears only where it is
+  the finding.
+- **The logout caveat appeared only at the step that built the lane, which had
+  scrolled away by the time the operator decided to trust it.** A `systemd --user`
+  file server stops shortly after that user's last session ends and does not come
+  back on reboot unless lingering is on. That is now re-stated beside the emitted
+  code, gated on the one arrangement it is true for, with the `loginctl
+  enable-linger` command.
+
 - **Setup restarted the gateway to apply the tool-policy fix, then graded it
   while it was still booting.** On a stock OpenClaw Docker install `docker
   compose restart` returns in about a second and the health route first answers

@@ -277,34 +277,71 @@ interactive_terminal() {
 # True only when a profile this version can actually use exists. The validator
 # is defined in the --show-code module and shared with its picker/loader, so the
 # menu can never advertise an entry those paths would reject moments later.
+#
+# A profile FILE that exists and does NOT validate is a third state, and it has to
+# be carried out of here rather than folded into "no profile": the two lead to
+# opposite advice. "Run setup once" rewrites profile-<id>.json, so offering it for
+# a file a NEWER conduck-connect wrote is how an older script destroys recoverable
+# state. The count and the validator's own first reason travel back with the
+# answer — the validator is the only place that knows whether the file is corrupt
+# (setup IS the fix) or from the future (updating this script is).
+SAVED_PROFILE_REJECTED=0
+SAVED_PROFILE_REJECT_REASON=""
 saved_profile_exists() {
   local p
+  SAVED_PROFILE_REJECTED=0
+  SAVED_PROFILE_REJECT_REASON=""
   for p in "$STATE_DIR"/profile-*.json; do
     [ -f "$p" ] || continue
-    show_qr_validate_profile "$p" && return 0
+    if show_qr_validate_profile "$p"; then
+      # A usable profile answers the question; the rejections behind it are the
+      # picker's business, not the menu's.
+      SAVED_PROFILE_REJECTED=0
+      SAVED_PROFILE_REJECT_REASON=""
+      return 0
+    fi
+    SAVED_PROFILE_REJECTED=$((SAVED_PROFILE_REJECTED+1))
+    [ -n "$SAVED_PROFILE_REJECT_REASON" ] || SAVED_PROFILE_REJECT_REASON="$PROFILE_VALIDATION_ERROR"
   done
   return 1
 }
 
 choose_main_action() {
+  # Evaluated ONCE: the answer decides three lines below it, and each validation
+  # pass re-parses every profile on disk.
+  local have_saved=false
+  saved_profile_exists && have_saved=true
   say "${BOLD}Welcome to Conduck Connect${RESET}"
-  if saved_profile_exists; then
+  if $have_saved; then
     say "Set up a gateway, check one before pairing, or re-show a saved setup code."
   else
     say "Set up a gateway, or check one before pairing."
+  fi
+  # Option 4 genuinely cannot be offered for a profile this version cannot read,
+  # but going quiet about it is what turns an unreadable profile into a lost one:
+  # the operator reads "no saved code", picks 1, and setup overwrites the file.
+  if ! $have_saved && [ "$SAVED_PROFILE_REJECTED" -gt 0 ]; then
+    say ""
+    if [ "$SAVED_PROFILE_REJECTED" = "1" ]; then
+      warn "There IS a saved setup code on this machine, and this version can't read it — so \"Show a saved setup code\" is not on the list below."
+    else
+      warn "There are $SAVED_PROFILE_REJECTED saved setup codes on this machine, and this version can't read any of them — so \"Show a saved setup code\" is not on the list below."
+    fi
+    note "$SAVED_PROFILE_REJECT_REASON"
+    note "Setting up again REPLACES the saved file, so read that line before choosing 1."
   fi
   say ""
   say "  What would you like to do?"
   say "    1) Set up and pair a gateway"
   say "    2) Check existing OpenAI-compatible software (not built for Conduck)"
   say "    3) Check an adapter built specifically for Conduck"
-  if saved_profile_exists; then
+  if $have_saved; then
     say "    4) Show a saved setup code"
   fi
   say "    q) Exit"
   say ""
   local choice regex='^([1-3]|[qQ])$'
-  saved_profile_exists && regex='^([1-4]|[qQ])$'
+  $have_saved && regex='^([1-4]|[qQ])$'
   choice=$(require_choice "Choose an option" "$regex") || die "$NO_ANSWER"
   case "$choice" in
     1) COMMAND="setup" ;;
@@ -469,11 +506,14 @@ run_step() {  # run_step "description" cmd args...
   fi
 }
 
-file_mode_is_open() { # file_mode_is_open <file> -> 0 when group or other have ANY access
+file_mode_is_open() { # file_mode_is_open <file> [octal mask, default 077] -> 0 when a mask bit is set
   # python3 is a hard preflight requirement on every path that calls this; a
   # missing one answers "not open" and stays quiet rather than warning blindly.
-  python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & 0o077 else 1)' \
-    "$1" 2>/dev/null
+  # The mask is a parameter because "another account can READ this" and "another
+  # account can REPLACE this" are different harms that need different words: 077
+  # is any access at all, 022 is group/other WRITE.
+  python3 -c 'import os,sys; sys.exit(0 if os.stat(sys.argv[1]).st_mode & int(sys.argv[2], 8) else 1)' \
+    "$1" "${2:-77}" 2>/dev/null
 }
 
 # Rung 1b: a file the USER owns whose MODE is too open for a secret we just helped
@@ -511,21 +551,169 @@ secure_owned_file_mode() { # secure_owned_file_mode <file> <what-is-inside> -> 1
 #
 # `mkdir -p` is a no-op on a directory that ALREADY exists, mode included, so
 # creating it under `umask 077` only ever secures a first run. A $STATE_DIR that
-# an earlier version, a different umask, or the user's own `mkdir` left at 0755
-# keeps that mode for good — the files inside stay 0600, but the listing is
-# world-readable forever and nothing ever says so. A directory we may not have
-# created is not re-chmodded silently (same rule as the agent workspace), so the
-# exposure is REPORTED, once per run, with the exact fix.
+# an earlier version, a different umask, or the user's own `mkdir` left open keeps
+# that mode for good — the files inside stay 0600, but the directory holding them
+# does not, and nothing ever says so. A directory we may not have created is not
+# re-chmodded silently (same rule as the agent workspace), so the exposure is
+# REPORTED, once per run, with the exact fix.
+#
+# Group/other WRITE is graded apart from read, because the read wording badly
+# understates it. 0600 on fileserver-<id>.cred protects what is INSIDE the file;
+# in a writable directory any local account can replace the whole file, and
+# rclone then reads its password out of somebody else's copy at the next start.
+# Same for profile-<id>.json, which is the record --show-code rebuilds a pairing
+# code from.
 STATE_DIR_EXPOSURE_REPORTED=false
 ensure_state_dir() {  # -> 1 when the directory does not exist and could not be created
   ( umask 077; mkdir -p "$STATE_DIR" ) 2>/dev/null || return 1
   $STATE_DIR_EXPOSURE_REPORTED && return 0
   file_mode_is_open "$STATE_DIR" || return 0
   STATE_DIR_EXPOSURE_REPORTED=true
-  warn "$STATE_DIR can be listed by other accounts on this machine (it already existed with that mode)."
-  warn "The credential files inside are 0600, but the folder itself names every gateway you have paired."
+  if file_mode_is_open "$STATE_DIR" 22; then
+    warn "$STATE_DIR is WRITABLE by other accounts on this machine (it already existed with that mode)."
+    warn "Any local account can swap the files in it — including the file-server password rclone reads when it starts, and the saved profile that says where your gateway is."
+    warn "Their 0600 protects what is inside those files, not the folder that holds them."
+  else
+    warn "$STATE_DIR can be listed by other accounts on this machine (it already existed with that mode)."
+    warn "The credential files inside are 0600, but the folder itself names every gateway you have paired."
+  fi
   warn "Fix it when you can:  chmod 700 $STATE_DIR"
   return 0
+}
+
+# ------------------------------------------------------ single-instance setup --
+# Two setup runs at once are not merely racy, they are silently destructive. Both
+# scan the same loopback range and settle on the SAME free port (the bind probe
+# closes its socket immediately, so it reserves nothing), both write
+# conduck-files-$GW_ID and fileserver-$GW_ID.cred/.env, and both finish by writing
+# profile-$GW_ID.json — which is a whole-file overwrite, so a run whose lane lost
+# the port race erases a live file server from the record the winner just saved.
+# Sequential re-runs are idempotent by design; only the overlap breaks.
+#
+# `mkdir` is the gate, not `flock`: macOS ships no flock binary, and mkdir is the
+# one create-or-fail primitive that is atomic on every filesystem a $HOME lands on.
+#
+# Nothing here ever WAITS, so there is no deadlock to have: a run either takes the
+# lock, reclaims provable debris, or stops with what holds it and what to do.
+#
+# The lock's authority is the LIVENESS of the process named inside it, never the
+# existence of the directory. That is what makes a SIGKILL, a reboot, or a power
+# cut recoverable with no human in the loop — the debris names a pid that is gone,
+# and the next run reclaims it. Existence-as-authority would block every future
+# run for good, which is the one failure mode a lock like this must not have.
+SETUP_LOCK_PATH=""       # set only while WE hold it — the release deletes this exact path
+SETUP_LOCK_HELD=false
+
+# What identifies a process beyond its number: its command line. A pid alone is
+# not identity — after a reboot the same number belongs to something else, and a
+# lock that outlived a kill would then read as held forever. `ps -p <pid> -o
+# command=` is the one spelling Linux and macOS agree on. The stored value and the
+# live one both come through THIS helper, so the bound and the control-stripping
+# can never make a living holder look like a stranger.
+setup_lock_proc_sig() { # setup_lock_proc_sig <pid> -> its command line (empty when the process is gone)
+  local s
+  s=$(ps -p "$1" -o command= 2>/dev/null | head -1) || s=""
+  safe_display "$s" 200
+}
+
+# Who holds <lock-dir>, and can this run even tell? Echoes "held<TAB><what to tell
+# the user>" or "stale<TAB><why it is debris>". Reads only.
+setup_lock_holder_state() { # setup_lock_holder_state <lock-dir>
+  local lock="$1" pid="" host="" sig="" live=""
+  if [ -r "$lock/owner" ]; then
+    { IFS= read -r pid; IFS= read -r host; IFS= read -r sig; } < "$lock/owner" 2>/dev/null || true
+  fi
+  case "$pid" in
+    ''|*[!0-9]*)
+      # No owner record at all. Either a run died in the sliver between creating
+      # the directory and writing the record, or a run is inside that sliver right
+      # now — and only age separates those. A minute is orders of magnitude longer
+      # than the two statements it spans, so an older record-less lock is debris
+      # while a younger one is a run that is starting.
+      if [ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        printf 'stale\t%s' "it names no process (a run was interrupted before it could record one)"
+      else
+        printf 'held\t%s' "another conduck-connect setup is starting on this machine"
+      fi
+      return 0 ;;
+  esac
+  if [ -n "$host" ] && [ "$host" != "$(uname -n 2>/dev/null)" ]; then
+    # A $HOME on a network share is ONE lock for several machines. Process $pid
+    # means nothing here, so this run may not judge it and must not steal it.
+    printf 'held\t%s' "a setup on $host holds it (process $pid), and this machine cannot tell whether that run is still alive"
+    return 0
+  fi
+  # Probe `ps` against our OWN pid first: a stripped container may have no usable
+  # one, and "ps printed nothing" would otherwise read as "the holder is gone".
+  # Unknowable liveness fails CLOSED — never steal a lock on a guess.
+  if [ -z "$(setup_lock_proc_sig $$)" ]; then
+    printf 'held\t%s' "it names process $pid, and this box has no usable 'ps' for me to check whether that run is still alive"
+    return 0
+  fi
+  live=$(setup_lock_proc_sig "$pid")
+  if [ -z "$live" ]; then
+    printf 'stale\t%s' "process $pid is gone"
+  elif [ "$live" != "$sig" ]; then
+    printf 'stale\t%s' "process $pid belongs to another program now"
+  else
+    printf 'held\t%s' "another conduck-connect setup is running here (process $pid)"
+  fi
+}
+
+setup_lock_acquire() {
+  # No state directory means nowhere to put a lock. Don't stop the run over it —
+  # it will fail soon on its own merits, with a better diagnosis than this one.
+  ensure_state_dir || return 0
+  local lock="$STATE_DIR/setup.lock" state kind why attempt=0
+  # Bounded, because the loop's "reclaim debris and try again" arm is the only one
+  # that repeats: an adversary re-creating the lock in that window must not be able
+  # to spin us forever.
+  while [ "$attempt" -lt 3 ]; do
+    attempt=$((attempt+1))
+    if mkdir "$lock" 2>/dev/null; then
+      if ( umask 077; printf '%s\n%s\n%s\n' \
+             "$$" "$(uname -n 2>/dev/null)" "$(setup_lock_proc_sig $$)" > "$lock/owner" ) 2>/dev/null; then
+        # Ownership is CONFIRMED from the file, never inferred from mkdir having
+        # succeeded: two runs that both find the same debris can both clear it, and
+        # the second clear would take out the winner's fresh lock. A record naming
+        # somebody else means they got it — loop, find it held, and stop saying so.
+        # This narrows that window rather than closing it: doing better needs a
+        # second lock to serialise the reclaim, and a second lock is one more thing
+        # a SIGKILL can strand, which is the failure this whole design avoids.
+        if [ "$(head -1 "$lock/owner" 2>/dev/null || true)" = "$$" ]; then
+          SETUP_LOCK_PATH="$lock"; SETUP_LOCK_HELD=true
+          return 0
+        fi
+        continue
+      fi
+      # A lock no later run can judge is worse than no lock: it would be reclaimed
+      # by the age rule while this run is still going. Drop it and say so instead.
+      rm -rf "$lock" 2>/dev/null || true
+      warn "Couldn't write $lock/owner, so I can't guard against a second setup running at the same time. Don't start another one until this run finishes."
+      return 0
+    fi
+    state=$(setup_lock_holder_state "$lock")
+    kind="${state%%$'\t'*}"; why="${state#*$'\t'}"
+    if [ "$kind" = "held" ]; then
+      die "I won't start a second setup on this machine: $why. Two at once pick the same loopback port and the same service name, and whichever finishes second overwrites the first one's saved profile. Let that run finish (or stop it), then re-run me. If you are certain nothing else is running, remove the lock and re-run me:  rm -rf $lock"
+    fi
+    note "Clearing a leftover setup lock — $why."
+    rm -rf "$lock" 2>/dev/null || true
+  done
+  die "Couldn't take the setup lock at $lock — something keeps re-creating it. Remove it and re-run me:  rm -rf $lock"
+}
+
+# Released on EVERY exit path: the caller composes this into the EXIT trap, which
+# covers `die` and the plain end of the run, and HUP/INT/TERM are routed through
+# `exit` so they land there too. Idempotent, and it removes ONLY the path this run
+# created — a run that never took the lock must never delete the one another run
+# is holding.
+setup_lock_release() {
+  $SETUP_LOCK_HELD || return 0
+  SETUP_LOCK_HELD=false
+  [ -n "$SETUP_LOCK_PATH" ] || return 0
+  rm -rf "$SETUP_LOCK_PATH" 2>/dev/null || true
+  SETUP_LOCK_PATH=""
 }
 
 # Rung 2: a change to something YOU own — we print the exact command, you run it.
@@ -1372,6 +1560,43 @@ declare -a FS_APPLIED=()      # same, but for the OPTIONAL file lane — rolled 
 FS_HTTPS_PORT=""              # chosen at exposure time (transport-aware)
 FS_ROLLBACK_INCOMPLETE=false  # a file-lane exposure we applied could not be proven removed
 
+# Every undo record ALSO lives on disk, one file per exposure, written BEFORE the
+# mutation it undoes. APPLIED/FS_APPLIED die with the process, and the two ways an
+# interrupted run really ends are the two they cannot survive: SIGKILL or an OOM
+# kill (no trap runs at all) and a dropped SSH session (the trap runs, but prints
+# into a terminal that is gone). Either way the exposure stays live — possibly a
+# PUBLIC Funnel in front of a tool-capable agent — while the only record of who
+# opened it dies with the shell, so no later run can find it. $STATE_DIR is the
+# sanctioned home for this class of data and is created only by ensure_state_dir.
+EXPOSURE_RECORD_VERSION=1
+EXPOSURE_RUN_TAG=""            # per-run, so a whole-run purge only drops THIS run's files
+EXPOSURE_RECORD_SEQ=0          # zero-padded into the name, so restore order is recoverable
+EXPOSURE_RECORD_WARNED=false   # an unusable record is named once, and kept
+
+# THE rule for prior state, shared by every path that undoes an exposure: what WE
+# applied is removed, and the prior mapping is restored only when it was PRIVATE.
+# A prior PUBLIC Funnel is never re-created for the operator — a block they accept
+# under the word "cleanup" must not be able to re-publish their agent to the open
+# internet, least of all two prompts after they answered "yes, turn the public URL
+# off" and verification then failed. The command is printed instead, labelled
+# PUBLIC, so re-publishing stays a deliberate act.
+prior_is_public() { # prior_is_public <prior-state>
+  case "$1" in funnel$'\t'*) return 0 ;; esac
+  return 1
+}
+
+# Does any of these records carry a prior PUBLIC mapping? Decides whether a
+# cleanup prompt has to say out loud what it will NOT do.
+entries_have_public_prior() { # entries_have_public_prior <entry>…
+  local entry rest
+  for entry in "$@"; do
+    [ -n "$entry" ] || continue
+    rest="${entry#*$'\t'}"
+    prior_is_public "${rest#*$'\t'}" && return 0
+  done
+  return 1
+}
+
 # The one undo recipe, used by every path that has to tell the user how to put a
 # port back: a funnel WE created needs its OWN `off` (`serve off` clears the web
 # handler but NOT the AllowFunnel flag, so public exposure would survive).
@@ -1386,11 +1611,53 @@ print_undo_hints() { # print_undo_hints <"port\tapplied-verb\tprior">…
     fi
     if [ "$prior" = "EMPTY" ]; then
       printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$port" "$RESET"
+    elif prior_is_public "$prior"; then
+      # Clear the port, then print the re-publish separately and under its own
+      # heading. Printing it inline with the others would put "make this public
+      # again" inside a block the operator is being asked to accept wholesale.
+      pproxy="${prior#*$'\t'}"
+      printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$port" "$RESET"
+      say "    ${DIM}Port $port carried a PUBLIC Tailscale Funnel before this run. Putting that back"
+      say "    would return this machine to the open internet, so it is not part of the undo"
+      say "    above. Only if you want port $port PUBLIC again:${RESET}"
+      printf '    %stailscale funnel --bg --https=%s %s%s   # makes port %s PUBLIC again\n' "$BOLD" "$port" "$pproxy" "$RESET" "$port"
     else
       pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
-      printf '    %stailscale %s --bg --https=%s %s%s   # restore previous mapping\n' "$BOLD" "$pverb" "$port" "$pproxy" "$RESET"
+      printf '    %stailscale %s --bg --https=%s %s%s   # restore your previous private mapping\n' "$BOLD" "$pverb" "$port" "$pproxy" "$RESET"
     fi
   done
+}
+
+# Undo ONE record, by the rule above. Best-effort per command (`|| true`): the
+# CALLER proves the outcome from a status re-read, because a refused command and a
+# refused-but-already-correct state are indistinguishable from an exit code.
+undo_exposure_entry() { # undo_exposure_entry <"port\tapplied-verb\tprior">
+  local entry="$1" port rest averb prior pverb pproxy
+  port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
+  averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
+  if [ "$averb" = "funnel" ]; then tailscale funnel --https="$port" off 2>/dev/null || true; fi
+  if [ "$prior" = "EMPTY" ] || prior_is_public "$prior"; then
+    # Both cases end with the port CLEARED: nothing was there before, or what was
+    # there was public and is not ours to re-publish. `funnel off` first, because
+    # a prior public port carries the AllowFunnel flag that `serve off` leaves set.
+    prior_is_public "$prior" && { tailscale funnel --https="$port" off 2>/dev/null || true; }
+    tailscale serve --https="$port" off 2>/dev/null || true
+  else
+    pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
+    tailscale "$pverb" --bg --https="$port" "$pproxy" 2>/dev/null || true
+  fi
+}
+
+# What a PROVEN undo looks like for one record — the value ts_target_for_port must
+# return afterwards. A public prior targets an EMPTY port, not the prior itself:
+# undo_exposure_entry clears it rather than re-publishing, so "back to prior" would
+# report the SAFER outcome as an incomplete rollback and nag about a closed port.
+undo_target_for_entry() { # undo_target_for_entry <entry> -> expected target, "" for a cleared port
+  local rest prior
+  rest="${1#*$'\t'}"; prior="${rest#*$'\t'}"
+  [ "$prior" = "EMPTY" ] && return 0
+  prior_is_public "$prior" && return 0
+  printf '%s' "$prior"
 }
 
 tailscale_dns_name() {
@@ -1527,6 +1794,126 @@ snapshot_port() { # snapshot_port <port> <verb> [role] — record prior state + 
   else APPLIED+=("$p"$'\t'"$verb"$'\t'"${t:-EMPTY}"); fi
 }
 
+# ------------------------------------------------- the on-disk undo record -----
+# One line per record, tab-separated, `prior` LAST because it is the one field
+# that legitimately contains a tab ("verb<TAB>proxy"):
+#   <format-version>  <role>  <port>  <applied-verb>  <applied-proxy>  <prior>
+# Nothing else in this script reads these files.
+
+# Every value read back out is interpolated into a `tailscale` command, so each is
+# checked against the ONLY shape this script ever writes rather than trusted: a
+# file under $STATE_DIR is editable by its owner and outlives version changes.
+exposure_proxy_ok() { # exposure_proxy_ok <proxy>
+  case "$1" in
+    http://127.0.0.1:) return 1 ;;
+    http://127.0.0.1:*) case "${1#http://127.0.0.1:}" in *[!0-9]*) return 1 ;; esac; return 0 ;;
+  esac
+  return 1
+}
+
+# Read one record into REC_* (globals, because bash 3.2 has no `declare -n`).
+# Returns 1 for anything this version cannot use, WITHOUT deleting the file: an
+# unreadable record may still name a live public exposure, so it is kept for a
+# version that understands it, and never fed to a command.
+REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
+read_exposure_record() { # read_exposure_record <file> -> 0 and sets REC_*, else 1
+  REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
+  local ver role port averb aproxy prior
+  IFS=$'\t' read -r ver role port averb aproxy prior < "$1" 2>/dev/null || return 1
+  [ "${ver:-}" = "$EXPOSURE_RECORD_VERSION" ] || return 1
+  case "${role:-}" in gateway|file) ;; *) return 1 ;; esac
+  case "${port:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${averb:-}" in serve|funnel) ;; *) return 1 ;; esac
+  exposure_proxy_ok "${aproxy:-}" || return 1
+  case "${prior:-}" in
+    EMPTY) ;;
+    serve$'\t'*|funnel$'\t'*) exposure_proxy_ok "${prior#*$'\t'}" || return 1 ;;
+    *) return 1 ;;
+  esac
+  REC_ROLE="$role"; REC_PORT="$port"; REC_AVERB="$averb"; REC_APROXY="$aproxy"; REC_PRIOR="$prior"
+}
+
+# Is the exposure a record describes STILL the one live on that port? The whole
+# meaning of a record is "this script opened this, and has not told you about it",
+# so both the verb and the backend have to match — a leftover private Serve is not
+# the public Funnel we recorded, and a port some other tool has taken over is not
+# ours to close. Reads current TS_PORTS; the caller refreshes them.
+exposure_record_is_live() { # exposure_record_is_live -> 0 when REC_* still matches TS_PORTS
+  [ "$(ts_target_for_port "$REC_PORT")" = "$REC_AVERB"$'\t'"$REC_APROXY" ]
+}
+
+# The disk twin of snapshot_port, written BEFORE the mutation. Best effort BY
+# DESIGN: a record we cannot write must never stop an exposure the operator just
+# agreed to — the cost of failing is that the NEXT run does not know, which is
+# exactly where we already are today.
+persist_exposure_record() { # persist_exposure_record <port> <applied-verb> <applied-proxy> <role> [prior]
+  local port="$1" averb="$2" aproxy="$3" role="$4" prior="${5:-}"
+  $DRY_RUN && return 0                    # nothing mutates, so there is nothing to undo
+  [ -n "${STATE_DIR:-}" ] || return 0
+  ensure_state_dir || return 0
+  [ -n "$EXPOSURE_RUN_TAG" ] || EXPOSURE_RUN_TAG="$$-$(date +%s 2>/dev/null || printf '0')"
+  EXPOSURE_RECORD_SEQ=$((EXPOSURE_RECORD_SEQ+1))
+  # `prior` is passed only when re-tagging an ADOPTED record, whose prior state
+  # belongs to the run that opened the port; reading it live here would record the
+  # exposure itself as its own prior state and make the undo a no-op.
+  [ -n "$prior" ] || prior=$(ts_target_for_port "$port")
+  local f; f=$(printf '%s/exposure-%s-%03d.pending' "$STATE_DIR" "$EXPOSURE_RUN_TAG" "$EXPOSURE_RECORD_SEQ")
+  # 0600 like everything else in here: the line names a gateway's port and backend.
+  ( umask 077
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$EXPOSURE_RECORD_VERSION" "$role" "$port" "$averb" "$aproxy" "${prior:-EMPTY}" >"$f"
+  ) 2>/dev/null || return 0
+}
+
+# Take over an earlier run's record for a mapping THIS run reuses as-is. Reusing an
+# exposure makes it this run's: on success the code names it, so the record has to
+# go with this run's other records, and on failure the undo still has to know the
+# prior state the ORIGINAL run captured. Leaving the old file alone instead would
+# have the next run offer to close a working, already-reported pairing.
+adopt_exposure_records_for_port() { # adopt_exposure_records_for_port <port> <verb> <proxy> <role>
+  local port="$1" verb="$2" proxy="$3" role="$4" f prior
+  $DRY_RUN && return 0
+  [ -n "${STATE_DIR:-}" ] || return 0
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] || continue
+    read_exposure_record "$f" || continue
+    [ "$REC_PORT" = "$port" ] && [ "$REC_AVERB" = "$verb" ] && [ "$REC_APROXY" = "$proxy" ] || continue
+    prior="$REC_PRIOR"
+    rm -f "$f" 2>/dev/null || continue
+    persist_exposure_record "$port" "$verb" "$proxy" "$role" "$prior"
+  done
+}
+
+# Drop records that have nothing left to offer. Tag-agnostic for the proven case,
+# because a record is garbage the moment its exposure is gone no matter which run
+# wrote it — and a later run that offers to close an already-closed port teaches
+# the operator to skip past this whole class of warning.
+# FAIL CLOSED: an unreadable Tailscale state is not proof of removal, so nothing
+# is dropped then.
+# `all` drops THIS run's records unconditionally, used once a setup code is
+# emitted: the exposure is live BECAUSE the operator asked for it, and the run has
+# just said so on screen, so it is no longer an unreported one.
+prune_exposure_records() { # prune_exposure_records [all]
+  local force="${1:-}" f
+  $DRY_RUN && return 0
+  [ -n "${STATE_DIR:-}" ] || return 0
+  if [ "$force" = "all" ]; then
+    [ -n "$EXPOSURE_RUN_TAG" ] || return 0
+    for f in "$STATE_DIR"/exposure-"$EXPOSURE_RUN_TAG"-*.pending; do
+      [ -f "$f" ] && { rm -f "$f" 2>/dev/null || true; }
+    done
+    return 0
+  fi
+  ts_targets
+  $TS_STATE_KNOWN || return 0
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] || continue
+    read_exposure_record "$f" || continue
+    exposure_record_is_live && continue
+    rm -f "$f" 2>/dev/null || true
+  done
+}
+
 # Offer the higher-rights retry of a Tailscale command that just failed, and hand
 # it over for the user to run. Three states, because an empty `priv_prefix` means
 # two OPPOSITE things:
@@ -1569,6 +1956,10 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     verb_now="${t%%$'\t'*}"; proxy_now="${t#*$'\t'}"
     if [ "$proxy_now" = "http://127.0.0.1:$localport" ] && [ "$verb_now" = "$verb" ]; then
       ok "Already exposed: https port $httpsport → 127.0.0.1:$localport ($verb). Reusing."
+      # Reuse changes nothing, so there is nothing new to record — but an earlier
+      # interrupted run may be the reason this mapping exists, and this run now
+      # owns it.
+      adopt_exposure_records_for_port "$httpsport" "$verb" "http://127.0.0.1:$localport" "$role"
       return 0
     fi
   fi
@@ -1588,8 +1979,11 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
   mutate_guard "expose port $httpsport via tailscale $verb" || return 1
   if confirm "  Run '$cmd' now?"; then
     # Snapshot only once the user has AGREED — a declined confirm must leave no
-    # rollback record for a port we never touched.
+    # rollback record for a port we never touched. Memory AND disk, both BEFORE
+    # the first mutating command below (the demote already changes the port), so
+    # the record exists even if this process never reaches another line.
     snapshot_port "$httpsport" "$verb" "$role"
+    persist_exposure_record "$httpsport" "$verb" "http://127.0.0.1:$localport" "$role"
     if $demote; then tailscale funnel --https="$httpsport" off 2>/dev/null || true; fi
     $cmd || {
       warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
@@ -1626,27 +2020,29 @@ cleanup_exposures() {
   [ ${#all[@]} -gt 0 ] || return 0
   say ""
   warn "Some exposure changes were applied but verification did not pass."
-  warn "Here is how to put each affected port back the way it was:"
+  warn "Here is how to undo what this run changed on each affected port:"
   print_undo_hints "${all[@]}"
   say ""
+  # Say plainly what a "yes" will NOT do. Without this the operator reads the
+  # PUBLIC re-publish line as part of the block they are accepting.
+  if entries_have_public_prior "${all[@]}"; then
+    warn "The PUBLIC line above is NOT included — I never re-publish a port on your behalf."
+  fi
   if ! $REUSE_ONLY && confirm "  Run these cleanup commands now?"; then
     # Reverse order: the LAST mapping applied is undone first, so when two records
     # touch one port the earliest-recorded prior state is the one that survives.
-    local i entry port rest averb prior pverb pproxy
+    local i
     for (( i=${#all[@]}-1; i>=0; i-- )); do
-      entry="${all[$i]}"
-      port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
-      averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
-      if [ "$averb" = "funnel" ]; then tailscale funnel --https="$port" off 2>/dev/null || true; fi
-      if [ "$prior" = "EMPTY" ]; then tailscale serve --https="$port" off 2>/dev/null || true
-      else
-        pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"
-        tailscale "$pverb" --bg --https="$port" "$pproxy" 2>/dev/null || true
-      fi
+      undo_exposure_entry "${all[$i]}"
     done
     ok "Cleanup attempted — verify with 'tailscale serve status' and 'tailscale funnel status'."
   fi
   APPLIED=(); FS_APPLIED=()   # handled — don't let the EXIT backstop repeat it
+  # The disk records are NOT cleared with them: the prompt above may have been
+  # declined, skipped by --reuse-only, or refused by Tailscale, and only a status
+  # re-read can tell. prune_exposure_records keeps exactly the ones still live, so
+  # a later run offers to close whatever this one did not.
+  prune_exposure_records
 }
 
 # Remove a Tailscale mapping we are SUPERSEDING — used only by the different-port
@@ -1663,6 +2059,11 @@ ts_unmap() { # ts_unmap <port> <verb>
     return 0
   fi
   mutate_guard "remove the old $verb mapping on port $port" || return 1
+  # In-memory only, deliberately: this REMOVES an exposure, so there is nothing
+  # live for a later run to find and close. The disk record exists to catch an
+  # exposure we OPENED and never reported; a record here would only offer to
+  # re-create a mapping — and re-creating one unbidden is what prior_is_public
+  # exists to prevent.
   snapshot_port "$port" "$verb" file        # record (in FS_APPLIED) so cleanup can restore it
   tailscale "$verb" --https="$port" off || {
     warn "Tailscale refused that — often missing operator or root rights, or Funnel/HTTPS not yet enabled for your tailnet (if so, Tailscale prints instructions above)."
@@ -1687,28 +2088,26 @@ ts_unmap() { # ts_unmap <port> <verb>
 rollback_fs_exposures() {
   [ ${#FS_APPLIED[@]} -gt 0 ] || return 0
   if $DRY_RUN; then FS_APPLIED=(); return 0; fi
-  local entry port rest averb prior pverb pproxy
+  local entry port rest prior
   for entry in "${FS_APPLIED[@]}"; do
-    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
-    averb="${rest%%$'\t'*}"; prior="${rest#*$'\t'}"
-    if [ "$averb" = "funnel" ]; then tailscale funnel --https="$port" off 2>/dev/null || true; fi
-    if [ "$prior" = "EMPTY" ]; then tailscale serve --https="$port" off 2>/dev/null || true
-    else pverb="${prior%%$'\t'*}"; pproxy="${prior#*$'\t'}"; tailscale "$pverb" --bg --https="$port" "$pproxy" 2>/dev/null || true; fi
+    undo_exposure_entry "$entry"
   done
-  # FAIL CLOSED: claim success only when a status re-parse PROVES each port is
-  # back to its prior state. Otherwise keep the record (the EXIT backstop and
-  # cleanup_exposures still act on it) and say so — never "all clear" on faith.
+  # FAIL CLOSED: claim success only when a status re-parse PROVES each port reached
+  # the state undo_target_for_entry names. Otherwise keep the record (the EXIT
+  # backstop and cleanup_exposures still act on it) and say so — never "all clear"
+  # on faith.
   ts_targets
   local leftover=() t want
   for entry in "${FS_APPLIED[@]}"; do
-    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"; prior="${rest#*$'\t'}"
-    want=""; [ "$prior" != "EMPTY" ] && want="$prior"
+    port="${entry%%$'\t'*}"
+    want=$(undo_target_for_entry "$entry")
     t=$(ts_target_for_port "$port")
     if ! $TS_STATE_KNOWN || [ "${t:-}" != "$want" ]; then leftover+=("$entry"); fi
   done
   if [ ${#leftover[@]} -eq 0 ]; then
     note "Rolled back the file-lane exposure — confirmed no public file server is left behind."
     FS_APPLIED=()
+    prune_exposure_records   # proven gone: the disk records for these ports go too
   else
     # Keep the record AND remember the failure: emit_payload must not close a run
     # with a green QR while a file server we exposed is still reachable.
@@ -1745,7 +2144,10 @@ on_exit() {
   # A successful run normally has nothing to undo. The exception: a file-lane
   # rollback that could NOT be proven — that exposure may still be live, so the
   # undo hints must survive even a green QR.
-  if $EMITTED && ! $FS_ROLLBACK_INCOMPLETE; then return 0; fi
+  if $EMITTED && ! $FS_ROLLBACK_INCOMPLETE; then
+    prune_exposure_records all   # a clean run leaves nothing behind on disk either
+    return 0
+  fi
   say ""
   if $EMITTED; then
     warn "A file-lane exposure this run applied could NOT be confirmed removed. It may still be reachable. To undo it:"
@@ -1753,6 +2155,10 @@ on_exit() {
     warn "Exited before emitting a setup code, but exposure changes were applied. To undo them:"
   fi
   print_undo_hints "${all[@]}"
+  # Printing is not evidence anybody read it, let alone acted: this same block is
+  # what a dropped SSH session writes into a terminal that no longer exists. The
+  # disk records stay, so the next run can offer to close whatever is still live.
+  note "The next run of this script offers to close any of these that is still live."
 }
 trap on_exit EXIT
 # macOS Bash 3.2 does not reliably run EXIT for an unhandled signal. Route
@@ -1810,6 +2216,144 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
       warn "Port $rport is STILL exposed — run: $off_cmd"
     fi
   done
+  # A funnel swept here can be the very one an interrupted earlier run recorded on
+  # disk, so retire that record now rather than let the NEXT run offer to close a
+  # port this one already closed.
+  prune_exposure_records
+}
+
+# The other half of the on-disk undo record: read what earlier runs left, and offer
+# to close whatever is still live. Runs at the START of a setup run, before any new
+# port is chosen, because the leftover may be a PUBLIC Funnel in front of a
+# tool-capable agent and that outranks the setup the operator came here for.
+# Records whose exposure is already gone are retired in SILENCE — a block that
+# announces closed ports is a block operators learn to skip.
+# prior_is_public governs here too: a prior private mapping is put back, a prior
+# public one is only ever printed.
+reconcile_orphaned_exposures() {
+  [ -n "${STATE_DIR:-}" ] || return 0
+  local f pending_seen=false
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] && pending_seen=true
+  done
+  $pending_seen || return 0
+  # Without the CLI nothing here can be checked OR closed, and the records cannot
+  # be believed either: `tailscale` missing from THIS shell's PATH is not proof its
+  # mappings are gone. Name the situation and keep every file for a run that can
+  # read the real state.
+  if ! have tailscale; then
+    say ""
+    warn "An earlier run of this script recorded a Tailscale exposure it opened, but the"
+    warn "'tailscale' command isn't on this shell's PATH, so I can't check whether it is"
+    warn "still live. Run me from a shell that has it, or check 'tailscale funnel status'."
+    return 0
+  fi
+  ts_targets
+  if ! $TS_STATE_KNOWN; then
+    say ""
+    warn "An earlier run of this script recorded a Tailscale exposure it opened, and I could"
+    warn "not read 'tailscale serve status --json' to see whether it is still live."
+    warn "Check 'tailscale serve status' and 'tailscale funnel status'."
+    return 0
+  fi
+  # Two passes so the operator sees the full scope before answering: collect the
+  # still-live records as undo entries (the shape print_undo_hints and
+  # undo_exposure_entry both take), retiring the rest as we go.
+  local live=() files=() backends=() roles=() entry public=false host=""
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] || continue
+    if ! read_exposure_record "$f"; then
+      if ! $EXPOSURE_RECORD_WARNED; then
+        EXPOSURE_RECORD_WARNED=true
+        warn "$STATE_DIR holds an exposure record this version cannot read. Leaving it alone (it may"
+        warn "name a live exposure) — check 'tailscale serve status' and 'tailscale funnel status'."
+      fi
+      continue
+    fi
+    if ! exposure_record_is_live; then rm -f "$f" 2>/dev/null || true; continue; fi
+    live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
+    files+=("$f")
+    backends+=("${REC_APROXY#http://127.0.0.1:}")   # the local port it fronts, for the report
+    # What sits behind it decides how alarming this is: an agent gateway answers
+    # prompts and runs tools, a file lane hands out files.
+    if [ "$REC_ROLE" = "file" ]; then roles+=("your shared folder"); else roles+=("your gateway"); fi
+    [ "$REC_AVERB" = "funnel" ] && public=true
+  done
+  [ ${#live[@]} -gt 0 ] || return 0
+
+  host=$(tailscale_dns_name)
+  say ""
+  warn "An earlier run of this script opened an exposure and never finished — nothing told"
+  warn "you how to close it, because that run was cut off. It is still live:"
+  local i port rest averb backend
+  for (( i=0; i<${#live[@]}; i++ )); do
+    entry="${live[$i]}"
+    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"
+    averb="${rest%%$'\t'*}"
+    backend="port $port → 127.0.0.1:${backends[$i]} (${roles[$i]})"
+    if [ "$averb" = "funnel" ]; then
+      say "    ${BOLD}$backend — PUBLIC${RESET} (Tailscale Funnel): reachable from the internet${host:+ at https://$host:$port}"
+    else
+      say "    $backend — private (Tailscale Serve): your tailnet only"
+    fi
+  done
+  say ""
+  $public && warn "A public one means anyone who has the URL can knock on your gateway right now."
+  say "  Closing it changes nothing about the gateway itself — only the address in front of it."
+  say ""
+  print_undo_hints "${live[@]}"
+  say ""
+  if $DRY_RUN; then
+    plan_add "OFFER  close the leftover exposure(s) recorded by an interrupted earlier run"
+    note "(dry-run: would offer to close the above)"
+    return 0
+  fi
+  # NOT mutate_guard: --reuse-only means report-don't-change, and dying here would
+  # let one interrupted run block every later reuse-only run from even starting.
+  if $REUSE_ONLY; then
+    warn "(--reuse-only: leaving it as-is — run the commands above, or re-run without --reuse-only.)"
+    return 0
+  fi
+  if ! confirm "  Close it now?"; then
+    warn "Leaving it live. The commands above close it whenever you want."
+    return 0
+  fi
+  for (( i=${#live[@]}-1; i>=0; i-- )); do
+    undo_exposure_entry "${live[$i]}"
+  done
+  # FAIL CLOSED, per record: prove the outcome from a status re-read, retire only
+  # what is proven, and name what is left rather than claiming a clean sweep.
+  ts_targets
+  local leftover=() t want
+  for (( i=0; i<${#live[@]}; i++ )); do
+    entry="${live[$i]}"
+    port="${entry%%$'\t'*}"
+    want=$(undo_target_for_entry "$entry")
+    t=$(ts_target_for_port "$port")
+    if ! $TS_STATE_KNOWN || [ "${t:-}" != "$want" ]; then
+      leftover+=("$entry")
+    else
+      rm -f "${files[$i]}" 2>/dev/null || true
+      # Two different outcomes, so say which one happened: a cleared port and a
+      # port handed back to a private mapping it carried before are not the same
+      # thing, and "no longer exposed" would be false for the second.
+      if [ -n "$want" ]; then
+        ok "Port $port is back to the private mapping it carried before that run."
+      else
+        ok "Port $port is no longer exposed."
+      fi
+    fi
+  done
+  if [ ${#leftover[@]} -gt 0 ]; then
+    warn "Could not confirm every leftover exposure was closed — often missing operator or root"
+    warn "rights. Check 'tailscale serve status' / 'tailscale funnel status'. To close by hand:"
+    print_undo_hints "${leftover[@]}"
+    # The printed commands have to be runnable AS PRINTED. On a box where Tailscale
+    # wants operator rights, a bare command answers with a permission error the
+    # operator reads as a different fault than the one they have.
+    local rp; rp=$(priv_prefix)
+    [ -n "$rp" ] && note "If Tailscale refuses those, prefix each with '$rp'."
+  fi
 }
 
 # The plain-words comparison behind the exposure menu's `?`. ADDITIVE only: it
@@ -2119,6 +2663,36 @@ if nb > datetime.datetime.utcnow():
     print("notyet")' 2>/dev/null
 }
 
+# Is this address a `cloudflared tunnel --url` quick tunnel? Matched on the host
+# only, lowercased, so a path or a port cannot smuggle the suffix past the test.
+is_quick_tunnel_url() { # is_quick_tunnel_url <url>
+  local a; a="${1#*://}"; a="${a%%/*}"; a="${a%%:*}"
+  a=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
+  case "$a" in *.trycloudflare.com) return 0 ;; esac
+  return 1
+}
+
+# A quick tunnel's hostname is REASSIGNED every time `cloudflared tunnel --url`
+# restarts — including at every reboot. Nothing on this machine and nothing in the
+# app learns the new one: the paired device keeps calling a hostname that no longer
+# resolves, and the live address exists in no saved profile and no output of this
+# script. That is how the tunnel is designed, so there is nothing to fix and the
+# only honest move is to say it at the moment the address is accepted, while the
+# operator can still choose a path whose address survives a restart.
+warn_quick_tunnel_url() {
+  is_quick_tunnel_url "$GW_URL" || return 0
+  say ""
+  warn "That is a Cloudflare QUICK TUNNEL address, and its hostname changes every time the"
+  warn "tunnel restarts — a reboot, a crash, or a Ctrl-C in the terminal running it."
+  warn "When it changes, the setup code from this run points at a hostname that no longer"
+  warn "exists: the app just stops connecting, and nothing here can learn the new address."
+  say "  ${BOLD}Keep that tunnel running${RESET} for as long as you want Conduck to reach this gateway, and"
+  say "  re-run this script for a fresh code after every restart of it."
+  say "  For an address that survives a restart: a Cloudflare NAMED tunnel on a domain you"
+  say "  manage (option 3), or Tailscale (options 1 and 2), whose hostname is permanent."
+  say ""
+}
+
 # The "I run my own HTTPS" gate. The certificate must be one THIS machine already
 # trusts, because that is the same bar the app applies on the phone: Apple's App
 # Transport Security refuses an untrusted chain before the app is consulted, and a
@@ -2126,6 +2700,7 @@ if nb > datetime.datetime.utcnow():
 # has, it never grants it. So there is no accept-anyway arm to offer; an untrusted
 # certificate ends the run, with the reason named and the free remedies listed.
 classify_own_https() {  # GW_URL + SCOPE already set
+  warn_quick_tunnel_url   # before the certificate gate: it is true whatever the cert says
   if $DRY_RUN; then
     TRANSPORT="public"   # provisional routing; a real run runs the trust gate
     plan_add "CHECK the certificate at $GW_URL — setup continues only if this machine trusts it"
@@ -2195,6 +2770,19 @@ FS_EXISTING_UNSAFE=false    # matching unit exists but cannot be parsed/reused w
 FS_PORT_ALLOCATION_REASON=""
 FS_PORT_START=5006
 FS_PORT_END=5105
+# A file lane is a LIVE, boot-persistent, authenticated WebDAV server over the
+# agent's working folder. Every path that builds one and then does not ship it
+# owes the operator that fact, so these four follow the lane through the run:
+FS_LANE_PREPARED=false         # a live file server for THIS gateway is in play this run
+FS_UNIT_CREATED_THIS_RUN=false # …and this run is what wrote and started it
+FS_ROUTE_SELF_MANAGED=false    # the operator was told to point their OWN HTTPS route at
+                               # FS_LOCAL_PORT. Tailscale mappings are excluded on purpose:
+                               # those this connector applies and rolls back itself (FS_APPLIED).
+FS_RESIDUE_REPORTED=false      # the residue/teardown report is printed once per run
+# fs_resolve_shared_folder answers in globals, never on stdout: a command
+# substitution runs it in a subshell and would throw the refusal reason away.
+FS_FOLDER_RESOLVED=""
+FS_FOLDER_REFUSAL=""
 
 state_cred_file() { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$GW_ID"; }
 state_env_file()  { printf '%s/fileserver-%s.env'  "$STATE_DIR" "$GW_ID"; }
@@ -2364,6 +2952,69 @@ fs_systemd_quote() { # fs_systemd_quote <literal>
   printf '"%s"' "$value"
 }
 
+# Quote a literal for a command line the OPERATOR is meant to copy and paste.
+# Only when it needs quoting, so the common case stays readable: an unquoted path
+# with a space in it is a `rm -f` that removes something else, or nothing.
+fs_shell_arg() { # fs_shell_arg <literal>
+  case "$1" in
+    ""|*[!A-Za-z0-9._/@:+-]*)
+      local value="$1"
+      value="${value//\'/\'\\\'\'}"   # ' → '\'' (close, escape, reopen)
+      printf "'%s'" "$value" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# Resolve the shared folder before ANY service definition records it, and refuse
+# the two roots that turn this lane into a remote file browser for the whole
+# account. Mirrors the doctor's gate in 61-check-adapter-files.inc.sh, so setup
+# cannot certify a root the doctor refuses to grade.
+#
+# Resolving is load-bearing beyond the refusal: rclone re-resolves the served
+# path on every request, so a symlink recorded verbatim in the unit serves
+# whatever its target points at TODAY — the target can be swapped, including to
+# $HOME, with no restart, no re-check, and nothing in any later transcript.
+# Recording the resolved path pins the folder to the one that was certified.
+#
+# Answers land in globals: a command substitution would run this in a subshell
+# and throw the refusal reason away.
+fs_resolve_shared_folder() { # fs_resolve_shared_folder <path> -> 0 + FS_FOLDER_RESOLVED · 1 + FS_FOLDER_REFUSAL
+  FS_FOLDER_RESOLVED=""; FS_FOLDER_REFUSAL=""
+  local out
+  out=$(python3 - "$1" <<'PY' 2>/dev/null
+import os, sys
+p = sys.argv[1]
+if not p or not os.path.isabs(p) or any(c in p for c in "\r\n"):
+    print("BAD\tit is not a plain absolute path"); sys.exit(0)
+rp = os.path.realpath(p)
+home = os.path.realpath(os.path.expanduser("~"))
+if rp == os.sep:
+    print("BAD\tit resolves to /, the root of this whole filesystem"); sys.exit(0)
+if rp == home:
+    print("BAD\tit resolves to your home directory itself"); sys.exit(0)
+if os.path.isfile(rp):
+    print("BAD\tit resolves to a file, not a folder"); sys.exit(0)
+print("OK\t" + rp)
+PY
+) || out=""
+  case "$out" in
+    OK$'\t'*)  FS_FOLDER_RESOLVED="${out#OK$'\t'}"; return 0 ;;
+    BAD$'\t'*) FS_FOLDER_REFUSAL="${out#BAD$'\t'}"; return 1 ;;
+    *) FS_FOLDER_REFUSAL="I could not resolve that path on this machine"; return 1 ;;
+  esac
+}
+
+# The same explanation wherever a folder is refused: the operator's next move is
+# to name a narrower folder, and that only happens if they know WHY this one is
+# refused rather than merely that it is.
+fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
+  warn "I can't serve $1 — ${FS_FOLDER_REFUSAL:-I could not resolve that path on this machine}."
+  note "The shared folder is served over WebDAV with read AND write access to everything inside it."
+  note "It has to be the agent's working folder, never your whole account: served from / or your home"
+  note "directory, anything holding the file password can read your keys — and this connector's own"
+  note "credential files — and write into them."
+}
+
 fs_systemd_envfile_path() { # fs_systemd_envfile_path <absolute literal path>
   # EnvironmentFile= is not ExecStart=: systemd passes the entire right-hand
   # side to its path/specifier parser and does NOT unquote it. Adding shell-like
@@ -2522,9 +3173,16 @@ ensure_existing_fs_envfile_linux() {
   [ "$status" = "ready" ] && return 0
 
   warn "This connector-owned unit uses the old quoted EnvironmentFile form."
-  note "systemd treats those quotes as part of the path, ignores the password file,"
-  note "and starts rclone unauthenticated. I can replace only that one directive"
-  note "with the same absolute path unquoted, then reload and restart this unit."
+  # Wording verified against rclone 1.74: `--user conduck` with no password does
+  # NOT serve openly. It demands an EMPTY password, so the saved credential gets
+  # 401 like every other one. Calling that "unauthenticated" sends the operator
+  # hunting for an intrusion, when the real symptom is attachments that can never
+  # authenticate.
+  note "systemd treats those quotes as part of the path, so rclone never reads the password"
+  note "file and demands an EMPTY password instead: it answers 401 to the saved credential —"
+  note "and to every other password — while the user 'conduck' with a blank password gets in."
+  note "I can replace only that one directive with the same absolute path unquoted,"
+  note "then reload and restart this unit."
   if $DRY_RUN; then
     plan_add "REPAIR legacy quoted EnvironmentFile in $FS_UNIT; daemon-reload + restart"
     note "(dry-run: a real run asks before repairing that connector-owned unit)"
@@ -2873,27 +3531,228 @@ PY
   fi
 }
 
-# A unit file existing is not readiness: it may be disabled, crash-looping, or
-# shadowed by another process on the same port. Confirm the supervisor owns a
-# live process before any HTTPS exposure is created.
-fs_unit_active() {
-  [ -n "$FS_UNIT" ] || return 1
-  if [ "$OS" = "Linux" ]; then
-    have systemctl || return 1
-    systemctl --user is-active --quiet "$(basename "$FS_UNIT")"
-  else
-    have launchctl || return 1
-    local label
-    label=$(python3 - "$FS_UNIT" <<'PY' 2>/dev/null
+fs_unit_label() { # fs_unit_label -> the launchd Label in $FS_UNIT (empty when unreadable)
+  [ -n "$FS_UNIT" ] || return 0
+  python3 - "$FS_UNIT" <<'PY' 2>/dev/null
 import plistlib, sys
 try:
     print(plistlib.load(open(sys.argv[1], "rb")).get("Label", ""))
 except Exception:
     pass
 PY
-)
-    [ -n "$label" ] && launchctl list "$label" >/dev/null 2>&1
+}
+
+# A unit file existing is not readiness: it may be disabled, crash-looping, or
+# shadowed by another process on the same port. `unknown` is its own answer, never
+# folded into `inactive`: with no systemctl/launchctl we cannot ask, and reporting
+# a healthy service as dead sends the operator debugging something that is fine.
+fs_unit_state() { # fs_unit_state -> active | inactive | unknown
+  [ -n "$FS_UNIT" ] || { printf 'unknown'; return 0; }
+  if [ "$OS" = "Linux" ]; then
+    have systemctl || { printf 'unknown'; return 0; }
+    if systemctl --user is-active --quiet "$(basename "$FS_UNIT")"; then
+      printf 'active'
+    else
+      printf 'inactive'
+    fi
+  else
+    have launchctl || { printf 'unknown'; return 0; }
+    local label
+    label=$(fs_unit_label)
+    [ -n "$label" ] || { printf 'unknown'; return 0; }
+    if launchctl list "$label" >/dev/null 2>&1; then
+      printf 'active'
+    else
+      printf 'inactive'
+    fi
   fi
+}
+
+# Confirm the supervisor owns a live process before any HTTPS exposure is created.
+# Fails closed on `unknown`: an exposure is created from this answer.
+fs_unit_active() { [ "$(fs_unit_state)" = "active" ]; }
+
+# The exact commands that remove ONE connector-owned file server. Shared by every
+# caller so they cannot drift, and printed rather than run: this tool has no
+# removal command, so copy-pasteable text IS the mechanism.
+fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file…]
+  local unit="$1" name f; shift
+  if [ -n "$unit" ]; then
+    name=$(basename "$unit")
+    if [ "$OS" = "Linux" ]; then
+      printf '    %ssystemctl --user disable --now %s%s\n' "$BOLD" "$(fs_shell_arg "$name")" "$RESET"
+      # A unit that crash-looped into systemd's start-rate limit stays `failed`
+      # even once its file is gone, and only reset-failed clears that entry.
+      printf '    %ssystemctl --user reset-failed %s%s\n' "$BOLD" "$(fs_shell_arg "$name")" "$RESET"
+      printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$unit")" "$RESET"
+      printf '    %ssystemctl --user daemon-reload%s\n' "$BOLD" "$RESET"
+    else
+      printf '    %slaunchctl unload %s%s\n' "$BOLD" "$(fs_shell_arg "$unit")" "$RESET"
+      printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$unit")" "$RESET"
+    fi
+  fi
+  for f in "$@"; do
+    printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$f")" "$RESET"
+  done
+}
+
+# A lane that is BUILT but never shipped leaves a live, authenticated WebDAV
+# server over the agent's working folder, a credential on disk, and — on the
+# transports whose HTTPS route the operator creates by hand — a route still
+# pointing at it. Only Tailscale mappings get rolled back (they are the only
+# exposure this connector applies itself), so on the other transports the run
+# otherwise ends green and never mentions the server, the credential, or the
+# route again. Same shape whether a Step-5 probe failed or the run was
+# interrupted between the unit and the pairing code.
+#
+# It removes nothing: the usual repair is "fix what failed and re-run me", and
+# that re-run reuses this exact unit and credential. So name what exists and hand
+# the removal commands to the operator who does want it gone.
+#
+# Silent when the lane IS shipping, in a dry run, and after its first call, which
+# makes it safe to call from every drop path — including an exit trap.
+fs_lane_residue_note() {
+  $FS_LANE_PREPARED || return 0
+  $FS_RESIDUE_REPORTED && return 0
+  $DRY_RUN && return 0
+  [ -z "$FS_URL" ] || [ -z "$FS_CRED" ] || return 0   # a shipped lane is not residue
+  local unit="" f
+  local files=()
+  [ -n "$FS_UNIT" ] && [ -f "$FS_UNIT" ] && unit="$FS_UNIT"
+  for f in "$(state_cred_file)" "$(state_env_file)"; do
+    [ -f "$f" ] && files+=("$f")
+  done
+  # Nothing on disk means nothing to report — an early refusal that got as far as
+  # naming a folder but never wrote a unit or a credential leaves no server.
+  [ -n "$unit" ] || [ ${#files[@]} -gt 0 ] || return 0
+  FS_RESIDUE_REPORTED=true
+
+  say ""
+  if $FS_UNIT_CREATED_THIS_RUN; then
+    warn "Before you close this terminal: this run started a file server, and the setup code above"
+    warn "does NOT carry it."
+  else
+    warn "Before you close this terminal: this gateway's file server keeps running, and the setup"
+    warn "code above does NOT carry it."
+  fi
+  if [ -n "$unit" ]; then
+    note "service:    $unit"
+    if [ "$OS" = "Linux" ]; then
+      note "            (a systemd user service, enabled — it starts again at boot)"
+    else
+      note "            (a LaunchAgent with KeepAlive — it starts again at login)"
+    fi
+  fi
+  local served="$FS_FOLDER"
+  [ -n "$served" ] || served="the folder in its service definition"
+  note "serving:    $served  →  http://127.0.0.1:${FS_LOCAL_PORT:-?}"
+  for f in ${files[@]+"${files[@]}"}; do
+    note "credential: $f"
+  done
+  if $FS_ROUTE_SELF_MANAGED; then
+    warn "The HTTPS route you set up for it still points at 127.0.0.1:${FS_LOCAL_PORT:-?}. That route lives in"
+    warn "your own web server or tunnel config, so I can't remove it for you — for as long as it is up,"
+    warn "this file server answers wherever that address answers, guarded only by its password."
+  fi
+  say ""
+  say "  To remove the file server (chat and the code above are unaffected):"
+  fs_print_teardown "$unit" ${files[@]+"${files[@]}"}
+  note "The shared folder itself is left alone — on OpenClaw and Hermes it doubles as the agent's"
+  note "own working directory."
+  note "Leaving it running is fine too: fix what failed, re-run me, and this same lane ships again"
+  note "with the same credential."
+  return 0
+}
+
+# "The unit exists but is not active" has one dominant cause, and it is this
+# connector's own race: the free-port check is a bind probe seconds before
+# rclone's own bind, so any process on the host can take that port in the gap.
+# rclone then exits, systemd retries it into its start-rate limit, and the unit
+# sits `failed` for good — while every later run re-finds it, refuses to expose
+# it, and ends green. The operator's symptom is "attachments just never work".
+# So: name the unit, hand over the command that says WHY, and offer the one fix
+# that resolves it — move the lane to another free port.
+# Returns 0 ONLY when the lane is live again (on a new port) and safe to continue.
+fs_inactive_unit_report() {
+  local state unit_name old_unit old_port uid
+  state=$(fs_unit_state)
+  unit_name=$(basename "${FS_UNIT:-unknown}")
+  if [ "$state" = "unknown" ]; then
+    warn "I can't ask this machine whether the file server is running (no systemctl/launchctl here),"
+    warn "so I won't expose it."
+    [ -n "$FS_UNIT" ] && note "service: $FS_UNIT"
+    return 1
+  fi
+  warn "The file-server service exists but is not active — refusing to expose it."
+  note "service:  ${FS_UNIT:-unknown}"
+  note "serving:  ${FS_FOLDER:-unknown folder}  →  http://127.0.0.1:${FS_LOCAL_PORT:-?}"
+  say ""
+  say "  What it says about itself:"
+  if [ "$OS" = "Linux" ]; then
+    printf '    %ssystemctl --user status %s%s\n' "$BOLD" "$(fs_shell_arg "$unit_name")" "$RESET"
+    printf '    %sjournalctl --user -u %s -n 50 --no-pager%s\n' "$BOLD" "$(fs_shell_arg "$unit_name")" "$RESET"
+  else
+    uid=$(id -u 2>/dev/null || true)
+    printf '    %slaunchctl print gui/%s/%s%s\n' "$BOLD" "${uid:-<your-uid>}" "$(fs_shell_arg "$(fs_unit_label)")" "$RESET"
+  fi
+  note "The usual cause: another process took port ${FS_LOCAL_PORT:-?} between my free-port check and rclone's"
+  note "own bind, so rclone couldn't listen. After a few retries the service manager stops trying,"
+  note "and the port stays taken — which is why re-running me alone never fixes it."
+  $DRY_RUN && return 1
+  if [ -z "$FS_FOLDER" ] || [ -z "$FS_CRED" ]; then
+    note "I can't rebuild it here — its served folder or credential isn't recoverable. Remove the unit"
+    note "and re-run me to build the lane again."
+    return 1
+  fi
+  if $REUSE_ONLY; then
+    note "(reuse-only: not moving the lane to another port — re-run without --reuse-only to do that.)"
+    return 1
+  fi
+  if ! confirm "  Move this file lane to a different free port and start it there?"; then
+    note "Leaving the file lane out of this setup code; chat is unaffected."
+    return 1
+  fi
+  mutate_guard "rewrite the file-server unit on a different loopback port" || return 1
+  old_unit="$FS_UNIT"; old_port="$FS_LOCAL_PORT"
+  if ! allocate_fs_local_port; then
+    warn "${FS_PORT_ALLOCATION_REASON:-No free loopback port for the file lane right now.}"
+    FS_LOCAL_PORT="$old_port"
+    return 1
+  fi
+  # systemd's start-rate limiter is what makes the wedge permanent: until the
+  # counter is reset the unit refuses to start at all, and daemon-reload does not
+  # reset it — so a rewritten ExecStart on a free port would still not run.
+  if [ "$OS" = "Linux" ] && have systemctl; then
+    systemctl --user reset-failed "$unit_name" >/dev/null 2>&1 || true
+  fi
+  FS_UNIT_CREATED_THIS_RUN=true   # from here on this run owns writing and starting it
+  local wrote=true live_port
+  if [ "$OS" = "Linux" ]; then
+    write_fs_unit_linux "$FS_FOLDER" || wrote=false
+  else
+    write_fs_unit_mac "$FS_FOLDER" || wrote=false
+  fi
+  if ! $wrote || ! fs_unit_active; then
+    # Whatever is on disk is the authority on which port this lane now names — the
+    # residue report that follows must name the port the unit really carries, not
+    # the one this attempt hoped for.
+    live_port=$(fs_unit_port "$FS_UNIT" 2>/dev/null || true)
+    if [ -n "$live_port" ]; then FS_LOCAL_PORT="$live_port"; else FS_LOCAL_PORT="$old_port"; fi
+    warn "The file server still isn't running — leaving the file lane out of this setup code."
+    return 1
+  fi
+  ok "File lane moved to port $FS_LOCAL_PORT and its service is running again."
+  # A unit under one of the pre-per-gateway names is NOT the file the writer just
+  # wrote, so the wedged one is still on this machine, still enabled, still failing.
+  if [ -n "$old_unit" ] && [ "$old_unit" != "$FS_UNIT" ] && [ -f "$old_unit" ]; then
+    warn "The old unit is still on this machine and still fails to start:"
+    note "  $old_unit"
+    say "  Remove it:"
+    fs_print_teardown "$old_unit"
+  fi
+  note "Anything that already pointed an HTTPS route at 127.0.0.1:$old_port now points at nothing —"
+  note "the lane answers on $FS_LOCAL_PORT from here on."
+  return 0
 }
 
 fs_local_curl() { # fs_local_curl <real|wrong|none> <curl args…>
@@ -2925,10 +3784,10 @@ fs_local_code() { # fs_local_code <real|wrong|none> <curl args…>
 # credential, rejects missing/wrong credentials, and serves byte-identical
 # writes. This happens on loopback BEFORE creating a tunnel/Serve mapping.
 fs_local_service_ready() {
-  fs_unit_active || {
-    warn "The file-server service exists but is not active — refusing to expose it."
-    return 1
-  }
+  # A dead unit is a diagnosis, not a one-line refusal: fs_inactive_unit_report
+  # names it, shows how to read its own log, and can re-home the lane to a free
+  # port. Only a 0 from there means the service is live again and worth probing.
+  fs_unit_active || fs_inactive_unit_report || return 1
   local base="http://127.0.0.1:$FS_LOCAL_PORT" i=0 code=""
   while [ "$i" -lt 20 ]; do
     code=$(fs_local_code real "$base/")
@@ -2940,8 +3799,8 @@ fs_local_service_ready() {
     return 1 ;;
   esac
 
-  local tag probe tmp outtmp missing wrong del gone get_code
-  local bytes_ok=false cleanup_ok=false removed_local=false
+  local tag probe tmp outtmp missing wrong del gone get_code local_verdict=""
+  local bytes_ok=false cleanup_ok=false removed_local=false put_ok=false
   tag=$(python3 -c 'import secrets; print(secrets.token_hex(4))' 2>/dev/null) || return 1
   probe="conduck-connect-local-probe-$tag.txt"
   tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-local-probe.XXXXXX" 2>/dev/null) || return 1
@@ -2954,6 +3813,7 @@ fs_local_service_ready() {
   get_code="000"
   case "$code" in
     2??)
+      put_ok=true
       get_code=$(fs_local_curl real -o "$outtmp" -w '%{http_code}' "$base/$probe" 2>/dev/null || true)
       case "$get_code" in 2??) cmp -s "$tmp" "$outtmp" && bytes_ok=true ;; esac
       ;;
@@ -2970,7 +3830,12 @@ fs_local_service_ready() {
   # root is known, remove only the randomized regular file locally and prove
   # the same 404 through WebDAV.
   case "$del:$gone" in 2??:404|404:404) cleanup_ok=true ;; esac
-  if ! $cleanup_ok && [ -n "$FS_FOLDER" ] && python3 - "$FS_FOLDER" "$probe" <<'PY' >/dev/null 2>&1
+  if ! $cleanup_ok && [ -n "$FS_FOLDER" ]; then
+    # `removed` and `absent` are deliberately different answers. Both prove the
+    # exact name is not on disk, but only one of them is a removal — and claiming
+    # to have removed a probe that was never stored is a false statement about
+    # this run's own footprint.
+    local_verdict=$(python3 - "$FS_FOLDER" "$probe" <<'PY' 2>/dev/null
 import os, re, stat, sys
 root, name = os.path.realpath(sys.argv[1]), sys.argv[2]
 if not re.fullmatch(r"conduck-connect-local-probe-[0-9a-f]{8}\.txt", name):
@@ -2983,7 +3848,7 @@ try:
     try:
         before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
     except FileNotFoundError:
-        sys.exit(0)
+        print("absent"); sys.exit(0)
     # Never resolve or unlink through a replacement symlink. Open and re-stat
     # the exact directory entry so a swap also fails before unlinkat.
     if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
@@ -3001,18 +3866,33 @@ try:
     finally:
         os.close(file_fd)
     os.unlink(name, dir_fd=root_fd)
+    print("removed")
 finally:
     os.close(root_fd)
 PY
-  then
-    removed_local=true
-    gone=$(fs_local_code real "$base/$probe")
-    [ "$gone" = "404" ] && cleanup_ok=true
+) || local_verdict=""
+    case "$local_verdict" in removed) removed_local=true ;; esac
+    if [ -n "$local_verdict" ]; then
+      gone=$(fs_local_code real "$base/$probe")
+      [ "$gone" = "404" ] && cleanup_ok=true
+    fi
   fi
-  if ! $cleanup_ok; then
+  if $cleanup_ok; then
+    $removed_local && warn "WebDAV DELETE was not reliable (HTTP $del); removed the exact local probe directly and proved HTTP 404."
+  elif $put_ok; then
     warn "Cleanup was not proven for the exact local probe $probe (DELETE HTTP $del; follow-up GET HTTP $gone)."
-  elif $removed_local; then
-    warn "WebDAV DELETE was not reliable (HTTP $del); removed the exact local probe directly and proved HTTP 404."
+  else
+    # The write never answered 2xx, so this run most likely never created the probe
+    # at all. Reporting unproven CLEANUP here sends the operator looking through the
+    # agent's folder for a file that was never written; report what the follow-up
+    # GET actually proves about that exact name instead.
+    local why="the file server refused the probe write (HTTP $code)"
+    [ "$code" = "000" ] && why="the probe write got no answer from the file server"
+    case "$gone" in
+      404) warn "Nothing was left behind: $why, and an authenticated GET proves $probe is absent." ;;
+      2??) warn "$probe still answers HTTP $gone although $why — remove it from ${FS_FOLDER:-the served folder} by hand." ;;
+      *)   warn "I can't tell whether $probe is in ${FS_FOLDER:-the served folder}: $why, and the follow-up GET answered HTTP $gone." ;;
+    esac
   fi
 
   if ! $bytes_ok; then
@@ -3036,12 +3916,60 @@ PY
 # to ALIGN the lane to the gateway, OMIT it, or INCLUDE it as-is (advanced).
 # $SCOPE = the gateway's scope (public|private); the lane's is derived from its verb.
 
+# The lane's own HTTPS mapping when it PREDATES this run. Rollback covers only
+# what this run applied, and a mapping the operator made is theirs to keep — but
+# leaving the lane out of the setup code does not stop that address from reaching
+# an authenticated file server, so it gets named either way.
+fs_note_existing_mapping() { # fs_note_existing_mapping <https-port> <verb>
+  [ -n "$1" ] || return 0
+  warn "Its existing Tailscale mapping is still live: port $1 → 127.0.0.1:${FS_LOCAL_PORT:-?}."
+  warn "I didn't create that mapping, so I don't remove it. To take it down yourself:"
+  if [ "${2:-}" = "funnel" ]; then
+    printf '    %stailscale funnel --https=%s off%s   # stops the PUBLIC half\n' "$BOLD" "$1" "$RESET"
+    printf '    %stailscale serve --https=%s off%s   # …and the mapping itself\n' "$BOLD" "$1" "$RESET"
+  else
+    printf '    %stailscale serve --https=%s off%s\n' "$BOLD" "$1" "$RESET"
+  fi
+}
+
+# A quick tunnel's hostname is REASSIGNED every time `cloudflared tunnel --url`
+# restarts, including at every reboot. The gateway address gets its own warning
+# where it is accepted; the FILE lane needs one too, because its consequence is
+# worse: this address lives ONLY inside the setup code, so after a restart the
+# paired device keeps calling a hostname that no longer resolves — attachments
+# fail with nothing to search for — while the same folder, behind the same
+# password, comes back at a NEW public hostname that appears in no saved profile
+# and in no output of this script. Nothing here can fix that (it is how the
+# tunnel is designed), so the honest moment to say it is when the address is
+# accepted, while the operator can still choose one that survives a restart.
+fs_warn_quick_tunnel_url() {
+  [ -n "$FS_URL" ] || return 0
+  # 30-exposure's predicate on purpose (host-only, lowercased): a second copy of
+  # a host-matching rule is how the two drift apart.
+  is_quick_tunnel_url "$FS_URL" || return 0
+  say ""
+  warn "That file-lane address is a Cloudflare QUICK TUNNEL, and its hostname changes every time"
+  warn "the tunnel restarts — a reboot, a crash, or a Ctrl-C in the terminal running it."
+  warn "It is carried only inside the setup code from this run, so when it changes the app keeps"
+  warn "calling a hostname that no longer exists: attachments stop working, and nothing here can"
+  warn "learn the new address."
+  warn "Your shared folder does come back — at a new public address, with the same password — and"
+  warn "that address is in no saved profile and in no output of this script."
+  say "  ${BOLD}Keep that tunnel running${RESET} for as long as you want attachments to work, and re-run this"
+  say "  script for a fresh code after every restart of it."
+  say "  For an address that survives a restart, give the file lane the same kind of permanent"
+  say "  hostname as the gateway: a Cloudflare NAMED tunnel on a domain you manage, or Tailscale."
+  say ""
+}
+
 # Promote a private file lane to PUBLIC (Funnel) so it matches a public gateway.
 # Publication event → a SECOND explicit confirm on top of the menu choice.
 fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
   if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?"; then
     FS_CRED=""; note "Leaving the file lane out — keeping your files off the public internet."
+    fs_note_existing_mapping "$ehttps" "$everb"
+    fs_lane_residue_note
     return 0
   fi
   case "$ehttps" in
@@ -3050,7 +3978,10 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
       # command wins, so funnel cleanly supersedes the serve handler — no `serve off`).
       if tailscale_expose "$ehttps" "$FS_LOCAL_PORT" true file; then
         FS_URL="https://$host:$ehttps"; FS_REACH="public"; ok "File lane is now public at $FS_URL."
-      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fi
+      # A failed exposure leaves the server itself running and enabled at boot — the same
+      # residue the declined branch below reports. The report is latched, so a later path
+      # that also reports it prints once.
+      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fs_lane_residue_note; fi
       ;;
     *)
       # Lane is on a non-Funnel port (e.g. 8444/9443) → need a free Funnel port.
@@ -3062,7 +3993,11 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
           FS_URL="https://$host:$ehttps"; FS_REACH="private"
           warn "Keeping the file lane private at $FS_URL."
           warn "Heads-up: the gateway is PUBLIC but this file lane stays Tailscale-only, so attachments work only on your Tailscale-connected devices — an Apple Watch used away from your iPhone won't reach them. Chat still works everywhere."
-        else FS_CRED=""; note "Leaving the file lane out."; fi
+        else
+          FS_CRED=""; note "Leaving the file lane out."
+          fs_note_existing_mapping "$ehttps" "$everb"
+          fs_lane_residue_note
+        fi
         return 0
       fi
       # Got a Funnel port → expose it, then drop the old private mapping (rollback-recorded).
@@ -3070,7 +4005,7 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
         local newport="$PICKED_PORT"
         ts_unmap "$ehttps" "$everb"
         FS_URL="https://$host:$newport"; FS_REACH="public"; ok "File lane is now public at $FS_URL."
-      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fi
+      else warn "Could not make the file lane public — leaving it out."; drop_file_lane; fs_lane_residue_note; fi
       ;;
   esac
 }
@@ -3082,7 +4017,7 @@ fs_demote_private() { # fs_demote_private <existing-https-port> <existing-verb> 
   local ehttps="$1" everb="$2" host="$3"
   if tailscale_expose "$ehttps" "$FS_LOCAL_PORT" false file; then
     FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "File lane is now private at $FS_URL — only your Tailscale devices can reach it."
-  else warn "Could not make the file lane private — leaving it out (won't ship a public lane as private)."; drop_file_lane; fi
+  else warn "Could not make the file lane private — leaving it out (won't ship a public lane as private)."; drop_file_lane; fs_lane_residue_note; fi
 }
 
 # The plain-words help behind the mismatch menus' `?`. Branches on the gateway's
@@ -3122,7 +4057,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
       c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
       case "$c" in
-        1) FS_CRED=""; note "Leaving the file lane out." ;;
+        1) FS_CRED=""; note "Leaving the file lane out."
+           fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
         2) FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
       esac
       return 0
@@ -3135,7 +4071,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
-      2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway." ;;
+      2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway."
+         fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
       3) FS_URL="https://$host:$ehttps"; FS_REACH="private"; ok "Included the file lane at $FS_URL (reachable only on your Tailscale network)." ;;
     esac
   else
@@ -3147,7 +4084,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
       c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
       case "$c" in
-        1) FS_CRED=""; note "Leaving the file lane out." ;;
+        1) FS_CRED=""; note "Leaving the file lane out."
+           fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
         2) FS_URL="https://$host:$ehttps"; FS_REACH="public"; warn "Including a public file lane at $FS_URL." ;;
       esac
       return 0
@@ -3160,7 +4098,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
-      2) FS_CRED=""; note "Leaving the file lane out." ;;
+      2) FS_CRED=""; note "Leaving the file lane out."
+         fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
       3) FS_URL="https://$host:$ehttps"; FS_REACH="public"; warn "Including a public file lane at $FS_URL." ;;
     esac
   fi
@@ -3774,11 +4713,45 @@ setup_file_lane() {
   # by any process also reserves a port.
   local workspace="" new_fs=false
   if existing_fs_config; then
-    ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered."
+    # A live server for this gateway is in play from here on, so every bail-out
+    # below owes the operator the residue report.
+    FS_LANE_PREPARED=true
+    # A unit file is not a running service. Claiming "found your file server" for a
+    # unit that sits `failed` is the checkmark that makes a wedged lane invisible
+    # for every later run.
+    case "$(fs_unit_state)" in
+      active)
+        ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered." ;;
+      inactive)
+        warn "Found this gateway's file-server unit (folder + port $FS_LOCAL_PORT, credential recovered),"
+        warn "but its service is NOT running." ;;
+      *)
+        ok "Found this gateway's file-server unit: folder + port $FS_LOCAL_PORT, credential recovered."
+        note "(I can't ask this machine whether its service is running.)" ;;
+    esac
     workspace="$FS_FOLDER"
+    # The served root is re-certified and re-published on every run, so a root the
+    # doctor refuses to grade must not pass here either — this is the one gate
+    # between a mis-pointed unit and a pairing code that publishes it.
+    if ! fs_resolve_shared_folder "$FS_FOLDER"; then
+      fs_folder_refusal_warn "$FS_FOLDER"
+      warn "That is what this unit serves, so I won't expose it or put it in a setup code."
+      note "Point the unit at the agent's working folder (or remove it, below) and re-run me."
+      FS_CRED=""; FS_URL=""
+      fs_lane_residue_note
+      return 0
+    fi
+    if [ "$FS_FOLDER_RESOLVED" != "$FS_FOLDER" ]; then
+      warn "That unit serves $FS_FOLDER, which is a link to $FS_FOLDER_RESOLVED."
+      warn "rclone re-resolves it on every request, so whatever the link points at is what gets"
+      warn "served — it can be re-pointed under the running server with no restart and no re-check."
+      note "Recreate the lane against the real path when you can: remove the unit (commands are"
+      note "printed whenever a lane is left out) and re-run me."
+    fi
     if [ "$OS" = "Linux" ] \
        && ! ensure_existing_fs_envfile_linux; then
       FS_CRED=""; FS_URL=""
+      fs_lane_residue_note
       return 0
     fi
     if $FS_CRED_LEGACY_ARGV; then
@@ -3828,8 +4801,26 @@ setup_file_lane() {
       while true; do
         local w; w=$(ask "  Absolute path to the agent's working folder" "$workspace")
         case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
-        workspace="$w"; break
+        if ! fs_resolve_shared_folder "$w"; then
+          fs_folder_refusal_warn "$w"
+          continue
+        fi
+        [ "$FS_FOLDER_RESOLVED" != "$w" ] \
+          && note "$w resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path, so a later change to the link can't move the served folder under a running server."
+        workspace="$FS_FOLDER_RESOLVED"; break
       done
+    else
+      # The default is resolved on exactly the same terms: `~/.openclaw/workspace`
+      # is a path like any other, and it can be a link to $HOME too.
+      if ! fs_resolve_shared_folder "$workspace"; then
+        fs_folder_refusal_warn "$workspace"
+        warn "Leaving the optional file lane out; chat is unaffected."
+        FS_CRED=""; FS_URL=""; FS_FOLDER=""
+        return 0
+      fi
+      [ "$FS_FOLDER_RESOLVED" != "$workspace" ] \
+        && note "$workspace resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path."
+      workspace="$FS_FOLDER_RESOLVED"
     fi
     FS_FOLDER="$workspace"   # new lane knows its own folder — recorded in the profile
     new_fs=true
@@ -3853,15 +4844,15 @@ setup_file_lane() {
   if [ "$GW_KIND" = "hermes" ]; then
     if [ -z "$workspace" ]; then
       warn "The existing Hermes file-server unit does not reveal its served folder — leaving the lane out."
-      FS_CRED=""; FS_URL=""; return 0
+      FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0
     fi
     if ! hermes_file_readiness_step "$workspace"; then
       hermes_residual_state_note
-      FS_CRED=""; FS_URL=""; return 0
+      FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0
     fi
     if ! install_conduck_hermes_block "$workspace"; then
       hermes_residual_state_note
-      FS_CRED=""; FS_URL=""; return 0
+      FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0
     fi
   fi
 
@@ -3900,17 +4891,22 @@ setup_file_lane() {
       fi
       FS_CRED=$(openssl rand -hex 16)
       ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
+      # From the next line on there is a credential on disk and, moments later, a
+      # boot-enabled server over the agent's folder. Recorded BEFORE the writer
+      # runs, because a writer that fails halfway leaves exactly that behind.
+      FS_LANE_PREPARED=true
+      FS_UNIT_CREATED_THIS_RUN=true
       if [ "$OS" = "Linux" ]; then
         write_fs_unit_linux "$workspace" || {
           warn "File-server unit did not start — leaving the lane out."
           hermes_residual_state_note
-          FS_CRED=""; return 0
+          FS_CRED=""; fs_lane_residue_note; return 0
         }
       else
         write_fs_unit_mac "$workspace" || {
           warn "File-server unit did not start — leaving the lane out."
           hermes_residual_state_note
-          FS_CRED=""; return 0
+          FS_CRED=""; fs_lane_residue_note; return 0
         }
       fi
     fi
@@ -3936,6 +4932,7 @@ setup_file_lane() {
     warn "The file server is not safe to expose yet — leaving it out of the QR."
     hermes_residual_state_note
     FS_CRED=""; FS_URL=""
+    fs_lane_residue_note
     return 0
   fi
 
@@ -3964,6 +4961,7 @@ setup_file_lane() {
       elif $REUSE_ONLY; then
         note "(reuse-only: the file lane has no HTTPS exposure yet and I won't create one — leaving it out)"
         FS_CRED=""
+        fs_lane_residue_note
       elif pick_public_port "$TRANSPORT" "$FS_LOCAL_PORT" "file"; then
         # Not yet exposed — allocate on the gateway's transport (scope matches by construction).
         FS_HTTPS_PORT="$PICKED_PORT"
@@ -3973,10 +4971,12 @@ setup_file_lane() {
         else
           warn "File-lane exposure not confirmed — leaving it out of the QR."
           drop_file_lane
+          fs_lane_residue_note
         fi
       else
         warn "No free HTTPS port for the file lane on this transport — skipping the file lane."
         FS_CRED=""   # no permitted port free; file lane skipped
+        fs_lane_residue_note
       fi
       ;;
     cloudflare)
@@ -3986,15 +4986,21 @@ setup_file_lane() {
       say "      - hostname: ${BOLD}files.YOURDOMAIN${RESET}"
       say "        service: http://127.0.0.1:$FS_LOCAL_PORT"
       say ""
+      # An HTTPS route the OPERATOR creates is one this connector can never unmap
+      # for them, so a lane dropped later has to name it. Recorded the moment they
+      # confirm they made it (or say they already have one).
       if $REUSE_ONLY; then
         note "(reuse-only: assuming your file-lane ingress rule already exists)"
         local h; h=$(ask_url "The file-lane web address (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
-        [ -n "$h" ] && FS_URL="$h" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
+        if [ -n "$h" ]; then FS_URL="$h"; FS_ROUTE_SELF_MANAGED=true; fs_warn_quick_tunnel_url
+        else note "No address — leaving the file lane out of the QR."; FS_CRED=""; fs_lane_residue_note; fi
       elif print_and_wait "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
         "cloudflared tunnel route dns <your-tunnel> files.YOURDOMAIN"; then
+        FS_ROUTE_SELF_MANAGED=true
         local h2; h2=$(ask_url "The file-lane web address you configured (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
-        [ -n "$h2" ] && FS_URL="$h2" || { note "No address — leaving the file lane out of the QR."; FS_CRED=""; }
-      else FS_CRED=""; fi
+        if [ -n "$h2" ]; then FS_URL="$h2"; fs_warn_quick_tunnel_url
+        else note "No address — leaving the file lane out of the QR."; FS_CRED=""; fs_lane_residue_note; fi
+      else FS_CRED=""; fs_lane_residue_note; fi
       ;;
     public)
       say ""
@@ -4005,7 +5011,13 @@ setup_file_lane() {
       local h; h=$(ask_url "The https:// web address that reaches it (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
       if [ -n "$h" ]; then
         FS_URL="$h"
-      else note "Skipped the file lane (Conduck still works — inline-only attachments)."; FS_CRED=""; fi
+        FS_ROUTE_SELF_MANAGED=true   # their own web server holds it; only they can take it back down
+        fs_warn_quick_tunnel_url     # "my own HTTPS" reaches a quick tunnel just as easily
+      else
+        note "Skipped the file lane (Conduck still works — inline-only attachments)."
+        FS_CRED=""
+        fs_lane_residue_note
+      fi
       ;;
   esac
 }
@@ -5687,6 +6699,12 @@ except Exception: pass' 2>/dev/null)
 
 VERIFY_FAILED=false
 
+# A file lane that a CHECK dropped, not one the operator declined. The service keeps
+# running and a saved profile still records it, so write_profile reads this to leave a
+# good profile alone rather than turning one transient probe failure into a permanent
+# deletion of a working lane.
+FS_LANE_DROPPED_BY_CHECK=false
+
 check() { # check "label" <command...>  (command's exit code decides)
   local label="$1"; shift
   if "$@" >/dev/null 2>&1; then ok "$label"; else bad "$label"; VERIFY_FAILED=true; return 1; fi
@@ -5867,6 +6885,56 @@ local_health_ok() { # local_health_ok <url> -> 0 when the server answered with <
   case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
 }
 
+# Name a MOVED ADDRESS as its own cause, on the two transports whose live exposure this
+# script cannot introspect. The HTTP-code map alone reads as a server fault, and here that
+# is usually the wrong culprit: Cloudflare answers 530 for a hostname with no tunnel
+# behind it, and the `*.trycloudflare.com` address `cloudflared tunnel --url` prints is a
+# DIFFERENT one after every tunnel restart — so a saved URL stops reaching this machine
+# while the gateway itself never moved. Tailscale needs none of this: its live mapping is
+# asserted directly, before verification runs.
+# The comparison made here is the one that is available: probe the gateway on loopback.
+# Answering locally while the address does not reach it IS the drift, and it separates
+# "reconcile the address" from "start the gateway" instead of blaming the server for both.
+gw_url_drift_note() { # reads TRANSPORT / GW_LOCAL_PORT / MODELS_CURL_RC / MODELS_HTTP_CODE
+  case "$TRANSPORT" in cloudflare|public) ;; *) return 0 ;; esac
+  # Only failures where the request never reached the gateway. A rejected token, an HTML
+  # login page and a wrong envelope all prove it DID arrive, and calling those a moved
+  # address sends the operator after a fix that changes nothing.
+  if [ "$MODELS_CURL_RC" != "0" ]; then
+    case "$MODELS_CURL_RC" in
+      6|7) ;;               # the hostname is gone; or nothing listens at that address
+      *)   return 0 ;;
+    esac
+  else
+    case "$MODELS_HTTP_CODE" in
+      # 530: nothing serves that hostname. 502/503/504: an HTTPS front answered, so the
+      # address is wired to something — and what it forwards to is what did not answer.
+      # Both mean the gateway never saw the request, which is what the probe below tests.
+      530|502|503|504) ;;
+      *) return 0 ;;
+    esac
+  fi
+  if [ -z "$GW_LOCAL_PORT" ]; then
+    note "No local port is recorded for this gateway, so I can't tell a moved address from a stopped gateway."
+    note "Check the gateway is running, then check that address still reaches this machine."
+  elif local_health_ok "http://127.0.0.1:$GW_LOCAL_PORT${GW_HEALTH_PATH:-/v1/models}"; then
+    warn "Your gateway IS answering on this machine (127.0.0.1:$GW_LOCAL_PORT)."
+    warn "That address no longer reaches it, so the address moved — the gateway did not."
+  else
+    note "The gateway doesn't answer on 127.0.0.1:$GW_LOCAL_PORT either, so start it first — and if it is"
+    note "already up, then that address no longer reaches this machine."
+  fi
+  case "$TRANSPORT" in
+    cloudflare) note "Check the tunnel runs, its ingress rule still points at 127.0.0.1:${GW_LOCAL_PORT:-<your gateway port>}, and the DNS route for that hostname still exists." ;;
+    public)     note "A *.trycloudflare.com quick tunnel prints a NEW address every time it restarts, so a saved one stops reaching this machine." ;;
+  esac
+  if $SHOW_QR; then
+    note "Re-run setup to reconcile the saved address with the live one:  bash conduck-connect.sh --setup"
+  else
+    note "Read the address that is live now, then re-run me so the code carries that one."
+  fi
+}
+
 agent_file_lane_gate() {
   local agent_name fix_hint
   case "$GW_KIND" in
@@ -5886,8 +6954,18 @@ agent_file_lane_gate() {
   fi
 
   bad "$agent_name agent file lane failed: $AGENT_FILE_PROBE_REASON"
+  # A gateway-only code is a real offer only while the GATEWAY itself passed. Once any
+  # gateway check has failed, emit_payload hands out no code at all — so asking here
+  # would promise one and then exit 1 anyway, over a fault this file lane cannot fix.
+  if $SHOW_QR && $VERIFY_FAILED; then
+    note "The gateway checks above failed too, so no code is emitted either way — fix the gateway first, then re-run --show-code."
+    FS_LANE_DROPPED_BY_CHECK=true
+    drop_file_lane
+    return 1
+  fi
   if $SHOW_QR; then
     if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+      FS_LANE_DROPPED_BY_CHECK=true
       drop_file_lane
       return 1
     fi
@@ -5896,6 +6974,7 @@ agent_file_lane_gate() {
   note "The WebDAV transport worked, but $agent_name itself did not complete the file turn."
   note "Leaving file transfer out of this setup code; fix $fix_hint, then re-run setup."
   hermes_residual_state_note
+  FS_LANE_DROPPED_BY_CHECK=true
   drop_file_lane
   return 1
 }
@@ -5957,12 +7036,17 @@ verify_all() {
         401|403) why="HTTP $MODELS_HTTP_CODE — token rejected (or an access layer in front wants a login)" ;;
         3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward credentials across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
+        # 530 BEFORE the 5xx bucket, which would file it as a server fault. It is the
+        # answer of an HTTPS front that has nothing to forward to: Cloudflare returns it
+        # for a hostname whose tunnel is gone. The server behind it never saw the request.
+        530)     why="HTTP 530 — the address answered, but nothing is serving that hostname (its tunnel is gone, or it moved)" ;;
         5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
         2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON" ;;
         *)       why="HTTP $MODELS_HTTP_CODE" ;;
       esac
     fi
     bad "$GW_URL/v1/models failed: $why"
+    gw_url_drift_note
     VERIFY_FAILED=true
   fi
 
@@ -6010,14 +7094,25 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
       else
         bad "file transport cleanup was not proven (DELETE HTTP ${delete_code:-000}; follow-up GET HTTP ${gone_code:-000})"
         warn "The exact probe $probe may remain. Leaving file transfer out of this setup code."
+        FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane
       fi
     elif $SHOW_QR; then
       # --show-code never rewrites the saved profile (write_profile guards on $SHOW_QR),
       # so dropping the lane here only affects THIS emission — the saved lane is untouched.
       bad "the saved profile's file lane failed live verification — a transient outage or a real breakage."
-      if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+      # A gateway-only code is a real offer only while the GATEWAY itself passed. Once any
+      # gateway check has failed, emit_payload hands out no code at all, so asking would
+      # promise one and then exit 1 — and naming the file server as the thing to fix points
+      # at the wrong machine when the gateway is what died.
+      if $VERIFY_FAILED; then
+        note "The gateway checks above failed too, so no code is emitted either way — fix the gateway first, then re-run --show-code."
         curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
+        FS_LANE_DROPPED_BY_CHECK=true
+        drop_file_lane
+      elif confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+        curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
+        FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane
       else
         # Best-effort probe cleanup before dying: the PUT may have landed even though
@@ -6031,6 +7126,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
     else
       bad "file lane probe failed — leaving it out of the QR (re-run me after fixing)"
       curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
+      FS_LANE_DROPPED_BY_CHECK=true
       drop_file_lane
     fi
     rm -f "$tmp"
@@ -7280,6 +8376,9 @@ DF_DEV_INO=""      # "<dev>:<ino>" pinned at resolve time — every direct disk 
 DF_RUN=""          # per-run namespace nonce; every artifact name carries it
 DF_ARTS=()         # "tier<TAB>kind<TAB>relkey" — registered BEFORE creation; tier T|A, kind file|dir
 DF_AGENT_RAN=false
+DF_WROTE=false     # true once a mutating operation could have created something. DF_ARTS
+                   # proves only INTENT (registration precedes creation, by design), so
+                   # anything that sends the operator looking keys off THIS flag.
 df_register() { DF_ARTS+=("$1"$'\t'"$2"$'\t'"$3"); }
 
 # The file lane's own curl: same egress isolation as the chat probes (`-q`
@@ -7306,6 +8405,19 @@ doctor_fs_code() { # doctor_fs_code <real|wrong|none> [curl args…] <url> -> ec
   local code
   code=$(doctor_curl_fs "$1" -o /dev/null -w '%{http_code}' "${@:2}" 2>/dev/null) || true
   case "$code" in [0-9][0-9][0-9]) printf '%s' "$code" ;; *) printf '000' ;; esac
+}
+# The ONE door for every mutating WebDAV verb (PUT, MKCOL) — same contract as
+# doctor_fs_code, plus the DF_WROTE bookkeeping. An ANSWERED request may have
+# created something even when it rejected the write, and even somewhere this
+# host cannot see (a server serving a DIFFERENT directory than the one on
+# record is exactly what FILES_WRITE_THROUGH exists to catch), so any status
+# counts. A 000 means no server answered at all: nothing can have been created,
+# and a later DELETE to the same silent lane cannot remove anything either.
+doctor_fs_write() { # doctor_fs_write <real|wrong|none> [curl args…] <url> -> echoes 3-digit code
+  local code
+  code=$(doctor_fs_code "$@")
+  [ "$code" = "000" ] || DF_WROTE=true
+  printf '%s' "$code"
 }
 
 doctor_files_dir_ok() { # the pinned-identity gate before EVERY direct disk operation
@@ -7499,7 +8611,7 @@ doctor_files_transport() {
   # write-through: PUT over WebDAV must land byte-identical in the folder.
   df_register T file "$wkey"
   printf '%s\n' "$wt_nonce" > "$tmp"
-  code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$wkey")
+  code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$wkey")
   local wt_ok=false
   case "$code" in
     2??)
@@ -7542,14 +8654,14 @@ doctor_files_transport() {
   fi
   df_register T file "$ukey1"
   printf 'conduck-check unauth probe\n' > "$uprobe"
-  code=$(doctor_fs_code none -T "$uprobe" "$DF_URL/$ukey1")
+  code=$(doctor_fs_write none -T "$uprobe" "$DF_URL/$ukey1")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without credentials is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO credentials was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   df_register T file "$ukey2"
-  code=$(doctor_fs_code wrong -T "$uprobe" "$DF_URL/$ukey2")
+  code=$(doctor_fs_write wrong -T "$uprobe" "$DF_URL/$ukey2")
   case "$code" in
     401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential is refused (HTTP $code)" ;;
     2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
@@ -7568,6 +8680,9 @@ doctor_files_transport() {
       # Revalidate the pinned folder identity IMMEDIATELY before the direct
       # write — the resolve-time check is several network round-trips old.
       if doctor_files_dir_ok; then
+        # O_CREAT lands the name before the write can fail, so the create COUNTS
+        # from here on whether or not it reports OK.
+        DF_WROTE=true
         out=$(python3 - "$DF_DIR" "$fkey" <<'PY' 2>/dev/null
 import os, secrets, sys
 p = os.path.join(sys.argv[1], sys.argv[2])
@@ -7645,16 +8760,26 @@ PY
   # keys on a conclusive rejection. Only an indeterminate answer is trouble.
   df_register T file "$nkey/n.txt"
   df_register T dir "$nkey"
-  code=$(doctor_fs_code real -X MKCOL "$DF_URL/$nkey/")
+  code=$(doctor_fs_write real -X MKCOL "$DF_URL/$nkey/")
   case "$code" in
     201)
       printf 'conduck-check nested probe\n' > "$tmp"
-      code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$nkey/n.txt")
+      code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$nkey/n.txt")
       body=$(doctor_curl_fs real "$DF_URL/$nkey/n.txt" 2>/dev/null) || body=""
-      if [ "${code#2}" != "$code" ] && [ "$body" = "conduck-check nested probe" ]; then
+      # Three outcomes, three different repairs: the PUT inside the new folder
+      # being refused, the file reading back empty, and it reading back wrong.
+      # A single message carrying only the PUT's status prints "(HTTP 201)" next
+      # to a failure, which reads as if the 201 is the problem — so the status
+      # stays where it IS the finding, and the read-back failures name the read
+      # instead.
+      if [ "${code#2}" = "$code" ]; then
+        d_bad FILES_NESTED "MKCOL created the folder, but a PUT inside it answered HTTP $code"; tfail=$((tfail+1))
+      elif [ "$body" = "conduck-check nested probe" ]; then
         d_ok FILES_NESTED "nested folders SUPPORTED (MKCOL + PUT + GET round-trip)"
+      elif [ -z "$body" ]; then
+        d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but reading the file back returned no bytes"; tfail=$((tfail+1))
       else
-        d_bad FILES_NESTED "MKCOL succeeded but a file inside would not round-trip (HTTP $code)"; tfail=$((tfail+1))
+        d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but the file reads back with different content"; tfail=$((tfail+1))
       fi ;;
     403|405|409|501)
       d_ok FILES_NESTED "nested folders REJECTED by the server (HTTP $code) — fine: the app falls back to flat keys" ;;
@@ -7698,18 +8823,24 @@ doctor_files_agent() {
   # fallback, and the doctor follows it.
   df_register A dir "conduck-check-$DF_RUN"
   used_key="$ikey"
-  code=$(doctor_fs_code real -X MKCOL "$DF_URL/conduck-check-$DF_RUN/")
+  code=$(doctor_fs_write real -X MKCOL "$DF_URL/conduck-check-$DF_RUN/")
   if [ "$code" = "201" ]; then
     df_register A file "$ikey"
-    code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$ikey")
+    code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$ikey")
   else
     used_key="conduck-check-$DF_RUN-${ih}__input-$DF_RUN.txt"
     df_register A file "$used_key"
-    code=$(doctor_fs_code real -T "$tmp" "$DF_URL/$used_key")
+    code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$used_key")
   fi
   if [ "${code#2}" = "$code" ]; then
     # WebDAV upload failed — place the input directly on disk so the agent
     # tier can still produce evidence (independence from a broken transport).
+    # Carry the upload's status into every message below: HTTP 403 (a read-only
+    # folder or a rejected credential), a 5xx (out of space, a server fault) and
+    # no answer at all (nothing listening) are three different repairs, and this
+    # status is the only thing that separates them.
+    local uwhy="HTTP $code"
+    [ "$code" = "000" ] && uwhy="no answer"
     # Revalidate the pin immediately before this direct write, same as the
     # freshness create: the entry check is several probes old by now.
     doctor_files_dir_ok || {
@@ -7717,6 +8848,9 @@ doctor_files_agent() {
       rm -f "$tmp" 2>/dev/null
       return 0
     }
+    # Same O_CREAT rule as the freshness write: the name can exist even when the
+    # write below reports a failure.
+    DF_WROTE=true
     out=$(python3 - "$DF_DIR" "$used_key" "$tmp" <<'PY' 2>/dev/null
 import os, sys
 p = os.path.join(sys.argv[1], sys.argv[2])
@@ -7730,11 +8864,11 @@ print("OK")
 PY
 )
     if [ "$out" != "OK" ]; then
-      note "  [FILE_COPY_BYTES] skipped — could not place the input sentinel at all (transport already red above)."
+      note "  [FILE_COPY_BYTES] skipped — the input sentinel's WebDAV upload failed ($uwhy) and the direct disk write failed too (transport already red above)."
       rm -f "$tmp" 2>/dev/null
       return 0
     fi
-    note "  (input sentinel placed directly on disk — the WebDAV upload path failed, see tier 1.)"
+    note "  (input sentinel placed directly on disk — the WebDAV upload path failed ($uwhy), see tier 1.)"
   fi
 
   # The output name must not pre-exist — and the WebDAV 404 doubles as cache
@@ -8004,6 +9138,12 @@ except Exception:
 doctor_files_cleanup_backstop() {
   [ "${#DF_ARTS[@]}" -gt 0 ] 2>/dev/null || return 0
   [ -n "$DF_URL" ] || return 0
+  # Registration precedes creation, so a populated DF_ARTS proves only that the
+  # run INTENDED those names. DF_WROTE still false means nothing ever answered a
+  # mutating request and no direct disk create ran: there is nothing to remove,
+  # and sending the operator to search their agent's working folder for a file
+  # that cannot exist is a false alarm (a silent lane answers no DELETE either).
+  $DF_WROTE || return 0
   local entry kind rel
   for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)
@@ -8906,10 +10046,11 @@ print(json.dumps(req))') \
 # Write a NON-SECRET pairing profile so a later `--show-code` can re-emit without
 # re-answering the wizard. NEVER holds tokens/credentials — only the routing facts
 # needed to reconstruct + re-verify. 0600, umask 077, built with a real JSON
-# encoder (never hand-quoted). Refreshed on every successful WIZARD emit (incl.
-# --reuse-only) but NEVER under --show-code: that mode never rewrites saved state,
-# and a transient probe failure there can drop a file lane from this one emission —
-# rewriting the profile would make that drop permanent. A failure here only WARNs —
+# encoder (never hand-quoted). Refreshed on every successful WIZARD emit, but NEVER
+# under --show-code: that mode never rewrites saved state, and a transient probe
+# failure there can drop a file lane from this one emission — rewriting the profile
+# would make that drop permanent. An EXISTING profile is protected by the same
+# reasoning against two more runs (see the guards below). A failure here only WARNs —
 # it must not sink a completed pairing.
 write_profile() {
   # --show-code never rewrites saved state; rewriting here could permanently strip a
@@ -8918,6 +10059,34 @@ write_profile() {
   $DRY_RUN && return 0                       # emit_payload never runs in dry-run, but stay explicit
   [ -n "$GW_ID" ] || return 0                # no stable id → nowhere to key the profile; skip quietly
   local pf; pf="$STATE_DIR/profile-$GW_ID.json"
+  # Three run shapes may not overwrite a profile that ALREADY exists. Writing the FIRST
+  # profile is always safe — there is nothing to destroy — so every guard below is gated
+  # on the file being there, and a first pairing still gets its profile either way.
+  if [ -f "$pf" ]; then
+    # --reuse-only refuses configuration changes, and this file IS saved configuration:
+    # the reuse-only paths that leave a still-running file lane out of THIS code would
+    # otherwise delete the record of that live lane for good.
+    if $REUSE_ONLY; then
+      note "Kept the saved pairing profile exactly as it is — --reuse-only changes nothing, and this file counts."
+      note "Re-run me without --reuse-only to refresh what it records."
+      return 0
+    fi
+    # The rule the other two guards share, held in one place: a run whose checks failed
+    # has proven nothing about this setup, so it may not overwrite a record that a run
+    # which passed wrote. emit_payload's failure branch exits first, so no shipping path
+    # reaches this line — it is the backstop for the next caller that forgets.
+    if $VERIFY_FAILED; then
+      return 0
+    fi
+    # A lane a CHECK dropped is still running, and the operator did not remove it.
+    # Recording "no file lane" here is what makes one transient probe failure a
+    # permanent deletion — the exact outcome --show-code's guard above exists to avoid.
+    if $FS_LANE_DROPPED_BY_CHECK && [ "$(json_type "$pf" "fileServer")" = "object" ]; then
+      note "Left the saved pairing profile untouched, so the file lane it records survives this run's probe failure."
+      note "Nothing from this run is saved to it — re-run me once the file server answers again to refresh it."
+      return 0
+    fi
+  fi
   ensure_state_dir \
     || { warn "Couldn't create $STATE_DIR to save the pairing profile — pairing is still complete."; return 0; }
   local out
@@ -9048,6 +10217,45 @@ emit_payload() {
   case "$TRANSPORT" in
     tailscale) note "Reminder: this gateway is tailnet-only — the device running Conduck (iPhone, iPad, or Mac) needs the Tailscale app, logged in to the same tailnet." ;;
   esac
+  # A quick tunnel's hostname is REASSIGNED on every restart of it, a reboot included, and
+  # the replacement reaches no saved profile and no output of this script. What goes stale
+  # is THE CODE, so the reminder belongs where the operator is holding it — the address was
+  # named at the step that accepted it, and by here that step has scrolled away.
+  # The file-lane clause rides the same pair build_pairing_payload_json uses, so it can
+  # never name a lane this code does not carry. 30-exposure's predicate on purpose: a
+  # second copy of a host-matching rule is how the two drift apart.
+  local qt_gw=false qt_fs=false
+  is_quick_tunnel_url "$GW_URL" && qt_gw=true
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] && is_quick_tunnel_url "$FS_URL"; then qt_fs=true; fi
+  if $qt_gw || $qt_fs; then
+    say ""
+    if $qt_gw && $qt_fs; then
+      warn "This code carries Cloudflare QUICK TUNNEL addresses for BOTH the gateway and the file lane."
+    elif $qt_gw; then
+      warn "This code carries a Cloudflare QUICK TUNNEL address for the gateway."
+    else
+      warn "This code carries a Cloudflare QUICK TUNNEL address for the file lane."
+    fi
+    warn "That hostname is reassigned every time the tunnel restarts — a reboot, a crash, or a"
+    warn "Ctrl-C in its terminal. This exact code then points at a hostname that does not exist,"
+    warn "and the address it comes back on appears in no saved profile and in no output of this"
+    warn "script, so there is nothing for the app or for me to look up."
+    $qt_gw || warn "Chat keeps working; attachments stop."
+    say "  ${BOLD}Keep that tunnel running${RESET} for as long as you want this code to work, and re-run me for a"
+    say "  fresh code after every restart of it."
+  fi
+  # The durability caveat rides HERE as well as at the step that built the lane: this
+  # screen is where the operator decides to trust the lane, and by now the Step-4 line has
+  # scrolled away. Gated on the one arrangement it is true for — a systemd USER unit on
+  # Linux, which systemd stops shortly after that user's last session ends.
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] && [ "$OS" = "Linux" ] && [ -n "$FS_UNIT" ] \
+     && ! fs_linger_enabled_linux; then
+    local lu lpriv; lu=$(id -un 2>/dev/null); lpriv=$(priv_prefix)
+    warn "File transfer in this code rides a service that stops when you log out: lingering is off"
+    warn "for '$lu', so the file server stops answering after that user's last logout and does not"
+    warn "come back on reboot. Chat keeps working; attachments stop until that user logs in again."
+    note "Make it survive logout and reboot:  ${lpriv:+$lpriv }loginctl enable-linger $lu"
+  fi
   say "  Run this script again any time to check the connection or show the code again."
   # Custom targets only (see the matching gate in emit_payload's failure branch).
   # The adapter line rides a SUCCESS screen, so it needs the outcome named with it:
@@ -10157,15 +11365,28 @@ url_host_lc() { # url_host_lc <https-url>
 # Dies directly (not via $()) so a "no profile" die halts the whole script.
 PROFILE_FILE=""
 show_qr_pick_profile() {
-  local pf; local cand=()
+  local pf; local cand=() rejected=0 reason=""
   for pf in "$STATE_DIR"/profile-*.json; do
     [ -e "$pf" ] || continue          # no matches → the literal glob; skip it
     # Use the exact validator the loader uses. Corrupt/partial files are neither
     # listed nor selectable, so a menu option can never lead straight to a
     # validation dead end.
-    show_qr_validate_profile "$pf" && cand+=("$pf")
+    if show_qr_validate_profile "$pf"; then
+      cand+=("$pf")
+    else
+      # Keep the FIRST rejection's reason. "Nothing usable" and "nothing at all"
+      # need opposite advice: re-running setup rewrites profile-<id>.json, so
+      # prescribing it for a file this version merely cannot PARSE (one a newer
+      # conduck-connect wrote) destroys the very state the operator came to reuse.
+      rejected=$((rejected+1))
+      [ -n "$reason" ] || reason="$PROFILE_VALIDATION_ERROR"
+    fi
   done
-  [ ${#cand[@]} -gt 0 ] || die "No usable saved pairing profile on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
+  if [ ${#cand[@]} -eq 0 ]; then
+    [ "$rejected" = "1" ] && die "There IS a saved pairing profile on this machine, and this version ($VERSION) can't use it. $reason"
+    [ "$rejected" = "0" ] || die "There are $rejected saved pairing profiles on this machine, and this version ($VERSION) can't use any of them. The first one says: $reason"
+    die "No usable saved pairing profile on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
+  fi
   local k
   if [ ${#cand[@]} -eq 1 ]; then PROFILE_FILE="${cand[0]}"; return 0; fi
   say ""
@@ -10587,6 +11808,15 @@ show_qr_recall_scope() {
 run_show_qr() {
   head_ "Re-show your pairing code — skips setup and changes no configuration"
   show_qr_pick_profile
+  # This path reads $STATE_DIR exactly the way the wizard does — it parses the
+  # saved profile and re-derives the gateway token and the file-lane credential
+  # from it — so it owes the same exposure report the wizard gives. It runs AFTER
+  # the picker, where a profile file has just proven the directory exists: the
+  # `mkdir -p` inside is then a provable no-op, so a command whose promise is
+  # "changes no configuration" still creates nothing. It runs BEFORE any secret is
+  # recovered, so an operator learns the folder is open before the run reads a
+  # password out of it.
+  ensure_state_dir
   show_qr_load_profile
   show_qr_recover_gateway_secret
   show_qr_recover_file_lane
@@ -10690,6 +11920,32 @@ run_setup() {
   fi
   say "Every change asks first, and you see the exact command before it happens. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
   note "Some commands I offer to run for you (you say yes or no to each); the rest you copy-paste and run yourself while I wait."
+
+  # The single-instance gate, taken HERE because this is the one choke point both
+  # entries pass through: the --setup dispatch below, and the check → setup handoff
+  # in finish_successful_check. Everything past this line picks loopback ports and
+  # writes units, credential files and profile-$GW_ID.json — all of them collision
+  # points for two overlapping runs (see setup_lock_acquire for what each one costs).
+  #
+  # A dry run is deliberately exempt: it changes nothing and write_profile returns
+  # early under it, so it neither needs the guard nor may hold one — blocking a real
+  # setup because somebody is reading a plan would be a worse bug than this fixes.
+  if ! $DRY_RUN; then
+    setup_lock_acquire
+    # Compose, never replace: on_exit is the exposure-undo backstop, and nothing
+    # re-arms EXIT past this point (finish_successful_check re-arms it BEFORE it
+    # reaches here). HUP/INT/TERM route through `exit`, so a signal lands here too.
+    # Even a future path that did drop this trap leaves the lock recoverable — its
+    # authority is the holder's liveness, not the directory's existence.
+    trap 'setup_lock_release; on_exit' EXIT
+  fi
+
+  # Before any new port is chosen: an interrupted earlier run may have left a live
+  # exposure recorded on disk, and a leftover PUBLIC funnel outranks this setup.
+  # Ordered deliberately — AFTER setup_lock_acquire, so two overlapping runs cannot
+  # both offer to close the same port, and BEFORE choose_exposure, so the operator
+  # decides about old exposures while none of this run's are applied yet.
+  reconcile_orphaned_exposures
 
   if $SETUP_FROM_CHECK; then
     choose_exposure

@@ -2,6 +2,12 @@
 
 VERIFY_FAILED=false
 
+# A file lane that a CHECK dropped, not one the operator declined. The service keeps
+# running and a saved profile still records it, so write_profile reads this to leave a
+# good profile alone rather than turning one transient probe failure into a permanent
+# deletion of a working lane.
+FS_LANE_DROPPED_BY_CHECK=false
+
 check() { # check "label" <command...>  (command's exit code decides)
   local label="$1"; shift
   if "$@" >/dev/null 2>&1; then ok "$label"; else bad "$label"; VERIFY_FAILED=true; return 1; fi
@@ -182,6 +188,56 @@ local_health_ok() { # local_health_ok <url> -> 0 when the server answered with <
   case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
 }
 
+# Name a MOVED ADDRESS as its own cause, on the two transports whose live exposure this
+# script cannot introspect. The HTTP-code map alone reads as a server fault, and here that
+# is usually the wrong culprit: Cloudflare answers 530 for a hostname with no tunnel
+# behind it, and the `*.trycloudflare.com` address `cloudflared tunnel --url` prints is a
+# DIFFERENT one after every tunnel restart — so a saved URL stops reaching this machine
+# while the gateway itself never moved. Tailscale needs none of this: its live mapping is
+# asserted directly, before verification runs.
+# The comparison made here is the one that is available: probe the gateway on loopback.
+# Answering locally while the address does not reach it IS the drift, and it separates
+# "reconcile the address" from "start the gateway" instead of blaming the server for both.
+gw_url_drift_note() { # reads TRANSPORT / GW_LOCAL_PORT / MODELS_CURL_RC / MODELS_HTTP_CODE
+  case "$TRANSPORT" in cloudflare|public) ;; *) return 0 ;; esac
+  # Only failures where the request never reached the gateway. A rejected token, an HTML
+  # login page and a wrong envelope all prove it DID arrive, and calling those a moved
+  # address sends the operator after a fix that changes nothing.
+  if [ "$MODELS_CURL_RC" != "0" ]; then
+    case "$MODELS_CURL_RC" in
+      6|7) ;;               # the hostname is gone; or nothing listens at that address
+      *)   return 0 ;;
+    esac
+  else
+    case "$MODELS_HTTP_CODE" in
+      # 530: nothing serves that hostname. 502/503/504: an HTTPS front answered, so the
+      # address is wired to something — and what it forwards to is what did not answer.
+      # Both mean the gateway never saw the request, which is what the probe below tests.
+      530|502|503|504) ;;
+      *) return 0 ;;
+    esac
+  fi
+  if [ -z "$GW_LOCAL_PORT" ]; then
+    note "No local port is recorded for this gateway, so I can't tell a moved address from a stopped gateway."
+    note "Check the gateway is running, then check that address still reaches this machine."
+  elif local_health_ok "http://127.0.0.1:$GW_LOCAL_PORT${GW_HEALTH_PATH:-/v1/models}"; then
+    warn "Your gateway IS answering on this machine (127.0.0.1:$GW_LOCAL_PORT)."
+    warn "That address no longer reaches it, so the address moved — the gateway did not."
+  else
+    note "The gateway doesn't answer on 127.0.0.1:$GW_LOCAL_PORT either, so start it first — and if it is"
+    note "already up, then that address no longer reaches this machine."
+  fi
+  case "$TRANSPORT" in
+    cloudflare) note "Check the tunnel runs, its ingress rule still points at 127.0.0.1:${GW_LOCAL_PORT:-<your gateway port>}, and the DNS route for that hostname still exists." ;;
+    public)     note "A *.trycloudflare.com quick tunnel prints a NEW address every time it restarts, so a saved one stops reaching this machine." ;;
+  esac
+  if $SHOW_QR; then
+    note "Re-run setup to reconcile the saved address with the live one:  bash conduck-connect.sh --setup"
+  else
+    note "Read the address that is live now, then re-run me so the code carries that one."
+  fi
+}
+
 agent_file_lane_gate() {
   local agent_name fix_hint
   case "$GW_KIND" in
@@ -201,8 +257,18 @@ agent_file_lane_gate() {
   fi
 
   bad "$agent_name agent file lane failed: $AGENT_FILE_PROBE_REASON"
+  # A gateway-only code is a real offer only while the GATEWAY itself passed. Once any
+  # gateway check has failed, emit_payload hands out no code at all — so asking here
+  # would promise one and then exit 1 anyway, over a fault this file lane cannot fix.
+  if $SHOW_QR && $VERIFY_FAILED; then
+    note "The gateway checks above failed too, so no code is emitted either way — fix the gateway first, then re-run --show-code."
+    FS_LANE_DROPPED_BY_CHECK=true
+    drop_file_lane
+    return 1
+  fi
   if $SHOW_QR; then
     if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+      FS_LANE_DROPPED_BY_CHECK=true
       drop_file_lane
       return 1
     fi
@@ -211,6 +277,7 @@ agent_file_lane_gate() {
   note "The WebDAV transport worked, but $agent_name itself did not complete the file turn."
   note "Leaving file transfer out of this setup code; fix $fix_hint, then re-run setup."
   hermes_residual_state_note
+  FS_LANE_DROPPED_BY_CHECK=true
   drop_file_lane
   return 1
 }
@@ -272,12 +339,17 @@ verify_all() {
         401|403) why="HTTP $MODELS_HTTP_CODE — token rejected (or an access layer in front wants a login)" ;;
         3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward credentials across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
+        # 530 BEFORE the 5xx bucket, which would file it as a server fault. It is the
+        # answer of an HTTPS front that has nothing to forward to: Cloudflare returns it
+        # for a hostname whose tunnel is gone. The server behind it never saw the request.
+        530)     why="HTTP 530 — the address answered, but nothing is serving that hostname (its tunnel is gone, or it moved)" ;;
         5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
         2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON" ;;
         *)       why="HTTP $MODELS_HTTP_CODE" ;;
       esac
     fi
     bad "$GW_URL/v1/models failed: $why"
+    gw_url_drift_note
     VERIFY_FAILED=true
   fi
 
@@ -325,14 +397,25 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
       else
         bad "file transport cleanup was not proven (DELETE HTTP ${delete_code:-000}; follow-up GET HTTP ${gone_code:-000})"
         warn "The exact probe $probe may remain. Leaving file transfer out of this setup code."
+        FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane
       fi
     elif $SHOW_QR; then
       # --show-code never rewrites the saved profile (write_profile guards on $SHOW_QR),
       # so dropping the lane here only affects THIS emission — the saved lane is untouched.
       bad "the saved profile's file lane failed live verification — a transient outage or a real breakage."
-      if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+      # A gateway-only code is a real offer only while the GATEWAY itself passed. Once any
+      # gateway check has failed, emit_payload hands out no code at all, so asking would
+      # promise one and then exit 1 — and naming the file server as the thing to fix points
+      # at the wrong machine when the gateway is what died.
+      if $VERIFY_FAILED; then
+        note "The gateway checks above failed too, so no code is emitted either way — fix the gateway first, then re-run --show-code."
         curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
+        FS_LANE_DROPPED_BY_CHECK=true
+        drop_file_lane
+      elif confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+        curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
+        FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane
       else
         # Best-effort probe cleanup before dying: the PUT may have landed even though
@@ -346,6 +429,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
     else
       bad "file lane probe failed — leaving it out of the QR (re-run me after fixing)"
       curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
+      FS_LANE_DROPPED_BY_CHECK=true
       drop_file_lane
     fi
     rm -f "$tmp"

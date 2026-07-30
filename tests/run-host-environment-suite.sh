@@ -41,7 +41,9 @@ ROOT="$HERE/.."
 UT="$ROOT/src/10-utilities.inc.sh"
 EX="$ROOT/src/30-exposure.inc.sh"
 FL="$ROOT/src/40-file-lane.inc.sh"
-for f in "$UT" "$EX" "$FL"; do
+SQ="$ROOT/src/91-show-code.inc.sh"
+MN="$ROOT/src/99-main.inc.sh"
+for f in "$UT" "$EX" "$FL" "$SQ" "$MN"; do
   [ -f "$f" ] || { printf 'missing %s\n' "$f" >&2; exit 2; }
 done
 
@@ -60,10 +62,27 @@ lift() { # lift <file> <function-name>…
   done
 }
 
-lift "$UT" priv_prefix linux_install_cmd preflight run_step mutate_guard
+lift "$UT" priv_prefix linux_install_cmd preflight run_step mutate_guard \
+           safe_display file_mode_is_open ensure_state_dir \
+           setup_lock_proc_sig setup_lock_holder_state setup_lock_acquire setup_lock_release \
+           saved_profile_exists choose_main_action json_query
 lift "$EX" ts_priv_retry tailscale_expose ts_unmap sweep_stale_public_funnels \
            ts_target_for_port snapshot_port
 lift "$FL" setup_file_lane fs_linger_enabled_linux fs_report_linger_linux
+# The one-liner setters/accessors sit BETWEEN column-0 `}` lines, so the sed lift
+# takes the whole run in one bite. Named here for what they bring, not for elegance:
+# `show_qr_profile_invalid` carries show_qr_validate_profile with it, and json_get
+# carries json_type + env_get. The bodies are the shipped ones either way.
+lift "$SQ" show_qr_profile_invalid show_qr_is_https_host show_qr_is_port show_qr_pick_profile
+lift "$UT" json_get
+declare -F show_qr_validate_profile >/dev/null \
+  || { printf 'show_qr_validate_profile did not come along with show_qr_profile_invalid\n' >&2; exit 2; }
+declare -F json_type >/dev/null \
+  || { printf 'json_type did not come along with json_get\n' >&2; exit 2; }
+
+VERSION="0.13.0-test"      # the validator names it in its schema-mismatch reason
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/conduck-hostenv.XXXXXX") || exit 2
+trap 'rm -rf "$TMPD"' EXIT
 
 PASS=0
 FAIL=0
@@ -714,6 +733,454 @@ test_sweep_retry() {
     "$out" "RETRY: tailscale funnel --https=10000 off; tailscale serve --https=10000 off"
 }
 
+# ============================================ single-instance setup lock (10-utils) ==
+# Two overlapping setup runs settle on the SAME loopback port (the bind probe closes
+# its socket immediately, so it reserves nothing), write the same unit and credential
+# names, and both rewrite profile-<id>.json — a whole-file overwrite, so the run that
+# finishes second erases the other's live file server from the saved record. There is
+# no `flock` on macOS, so the gate is `mkdir`, and the lock's authority is the
+# LIVENESS of the process it names. That last part is what these cases guard: an
+# existence-only lock survives a SIGKILL or a reboot and then blocks every future run
+# forever, which is a worse bug than the race it closes.
+lock_acquire_out() { # lock_acquire_out <state-dir> [release] [ps-broken] [steal-race]
+  local sd="$1" release="${2:-no}" psbroken="${3:-no}" stealrace="${4:-no}"
+  (
+    STATE_DIR="$sd"; STATE_DIR_EXPOSURE_REPORTED=false
+    YELLOW=""; RESET=""; DIM=""
+    SETUP_LOCK_PATH=""; SETUP_LOCK_HELD=false
+    warn() { printf 'warn: %s\n' "$*"; }
+    note() { printf 'note: %s\n' "$*"; }
+    die()  { printf 'die: %s\n' "$*"; exit 9; }
+    # A box with no usable `ps` must fail CLOSED — never steal a lock on a guess.
+    [ "$psbroken" = yes ] && ps() { return 1; }
+    # The one arm a real race cannot be scheduled on demand: the record naming
+    # somebody else the instant after we wrote our own. Only the owner read-back is
+    # shadowed (matched on the path), so the liveness probe's own `head` is untouched.
+    [ "$stealrace" = yes ] && head() {
+      case "$*" in *owner*) printf '999999\n' ;; *) command head "$@" ;; esac
+    }
+    local rc=0
+    setup_lock_acquire || rc=$?
+    printf 'rc=%s held=%s path=%s\n' "$rc" "$SETUP_LOCK_HELD" "$SETUP_LOCK_PATH"
+    if [ "$release" = release ]; then
+      setup_lock_release
+      printf 'after-release held=%s\n' "$SETUP_LOCK_HELD"
+    fi
+  ) 2>&1
+}
+
+# Plant a lock that already exists, exactly as debris or a live holder would leave it.
+plant_lock() { # plant_lock <state-dir> <pid|-> <host|-> <sig|-> [old]
+  local sd="$1" pid="$2" host="$3" sig="$4" age="${5:-new}"
+  mkdir -p "$sd/setup.lock"
+  if [ "$pid" != "-" ]; then
+    [ "$host" = "-" ] && host=$(uname -n)
+    [ "$sig" = "-" ] && sig=$(setup_lock_proc_sig "$pid")
+    printf '%s\n%s\n%s\n' "$pid" "$host" "$sig" > "$sd/setup.lock/owner"
+  fi
+  # An interrupted run leaves a record-less directory. Only its AGE separates that
+  # from a run that is inside the sliver between mkdir and the record write.
+  [ "$age" = old ] && touch -t 202001010101 "$sd/setup.lock"
+  return 0
+}
+
+# A pid that is definitely gone: started, reaped, never reused inside one test run.
+dead_pid() {
+  local p
+  ( exit 0 ) & p=$!
+  wait "$p" 2>/dev/null || true
+  printf '%s' "$p"
+}
+
+test_setup_lock_first_run() {
+  local sd="$TMPD/lock-fresh/conduck" out owner_pid
+  rm -rf "$TMPD/lock-fresh"
+  out=$(lock_acquire_out "$sd")
+  expect_has "setup lock: a first run takes it" "$out" "rc=0 held=true path=$sd/setup.lock"
+  expect_lacks "setup lock: a first run says nothing about locks" "$out" "warn:"
+  owner_pid=$(head -1 "$sd/setup.lock/owner" 2>/dev/null || true)
+  # The record is what makes the lock judgeable later; without it no future run
+  # could tell a live holder from debris.
+  expect_eq "setup lock: the record names the holding process" "$owner_pid" "$$"
+  expect_eq "setup lock: the record names this machine" \
+    "$(sed -n 2p "$sd/setup.lock/owner" 2>/dev/null || true)" "$(uname -n)"
+  expect_eq "setup lock: the record is not world-readable" \
+    "$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' \
+        "$sd/setup.lock/owner")" "0o600"
+}
+
+test_setup_lock_refuses_live_holder() {
+  local sd="$TMPD/lock-live/conduck" out sleeper
+  rm -rf "$TMPD/lock-live"; mkdir -p "$sd"
+  sleep 30 & sleeper=$!
+  plant_lock "$sd" "$sleeper" - -
+  out=$(lock_acquire_out "$sd")
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  expect_has "setup lock: a live holder stops the second run" "$out" "die:"
+  expect_has "setup lock: the block names what holds it" \
+    "$out" "another conduck-connect setup is running here (process $sleeper)"
+  expect_has "setup lock: the block says what the collision costs" \
+    "$out" "overwrites the first one's saved profile"
+  expect_has "setup lock: the block hands over the manual escape" \
+    "$out" "rm -rf $sd/setup.lock"
+  # Refusing must not disturb the run that is actually working.
+  if [ -f "$sd/setup.lock/owner" ]; then pass "setup lock: a refused run leaves the live lock alone"
+  else fail "setup lock: a refused run leaves the live lock alone" "the lock was removed"; fi
+}
+
+test_setup_lock_reclaims_debris() {
+  local sd out gone
+  # A SIGKILL / power cut leaves a lock naming a process that no longer exists.
+  # This is the case that must NEVER need a human.
+  sd="$TMPD/lock-dead/conduck"; rm -rf "$TMPD/lock-dead"; mkdir -p "$sd"
+  gone=$(dead_pid)
+  plant_lock "$sd" "$gone" - "bash conduck-connect.sh --setup"
+  out=$(lock_acquire_out "$sd")
+  expect_has "setup lock: a lock naming a dead process is reclaimed" "$out" "rc=0 held=true"
+  expect_has "setup lock: the reclaim says why it was debris" \
+    "$out" "Clearing a leftover setup lock — process $gone is gone."
+  expect_eq "setup lock: the reclaimed lock records the new holder" \
+    "$(head -1 "$sd/setup.lock/owner" 2>/dev/null || true)" "$$"
+
+  # Reboot + pid reuse: the number is alive again, but it is somebody else. A
+  # pid-only check would read this as held and block every future run.
+  local sleeper
+  sd="$TMPD/lock-recycled/conduck"; rm -rf "$TMPD/lock-recycled"; mkdir -p "$sd"
+  sleep 30 & sleeper=$!
+  plant_lock "$sd" "$sleeper" - "bash conduck-connect.sh --setup"
+  out=$(lock_acquire_out "$sd")
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  expect_has "setup lock: a recycled pid is reclaimed, not obeyed" "$out" "rc=0 held=true"
+  expect_has "setup lock: the reclaim names pid reuse as the reason" \
+    "$out" "process $sleeper belongs to another program now"
+
+  # Killed in the sliver between mkdir and the record write: no record at all, and
+  # old enough that no starting run could still be inside that sliver.
+  sd="$TMPD/lock-orphan/conduck"; rm -rf "$TMPD/lock-orphan"; mkdir -p "$sd"
+  plant_lock "$sd" - - - old
+  out=$(lock_acquire_out "$sd")
+  expect_has "setup lock: an aged record-less lock is reclaimed" "$out" "rc=0 held=true"
+  expect_has "setup lock: the reclaim says the lock named no process" \
+    "$out" "it names no process"
+}
+
+test_setup_lock_fails_closed() {
+  local sd out gone
+  # A record-less lock that is BRAND NEW is a run inside the mkdir→record sliver.
+  # Stealing it would put two setups on the machine, which is the whole defect.
+  sd="$TMPD/lock-starting/conduck"; rm -rf "$TMPD/lock-starting"; mkdir -p "$sd"
+  plant_lock "$sd" - - -
+  out=$(lock_acquire_out "$sd")
+  expect_has "setup lock: a just-created record-less lock is NOT stolen" "$out" "die:"
+  expect_has "setup lock: a starting run is named as such" \
+    "$out" "another conduck-connect setup is starting on this machine"
+
+  # $HOME on a network share is ONE lock for several machines. A pid from another
+  # box means nothing here, so this run may not judge it either way.
+  sd="$TMPD/lock-foreign/conduck"; rm -rf "$TMPD/lock-foreign"; mkdir -p "$sd"
+  gone=$(dead_pid)
+  plant_lock "$sd" "$gone" "not-this-box.invalid" "bash conduck-connect.sh --setup"
+  out=$(lock_acquire_out "$sd")
+  expect_has "setup lock: a lock from another machine is not stolen" "$out" "die:"
+  expect_has "setup lock: the block names the other machine" \
+    "$out" "a setup on not-this-box.invalid holds it (process $gone)"
+  expect_has "setup lock: the block admits it cannot judge that run" \
+    "$out" "cannot tell whether that run is still alive"
+  if [ -f "$sd/setup.lock/owner" ]; then pass "setup lock: the foreign lock survives"
+  else fail "setup lock: the foreign lock survives" "the lock was removed"; fi
+
+  # No usable `ps` (a stripped container): liveness is unknowable, so the dead pid
+  # above must NOT be treated as dead. Guessing here would break the invariant.
+  sd="$TMPD/lock-nops/conduck"; rm -rf "$TMPD/lock-nops"; mkdir -p "$sd"
+  gone=$(dead_pid)
+  plant_lock "$sd" "$gone" - "bash conduck-connect.sh --setup"
+  out=$(lock_acquire_out "$sd" no yes)
+  expect_has "setup lock: no usable ps fails closed" "$out" "die:"
+  expect_has "setup lock: no usable ps says why it cannot judge" \
+    "$out" "no usable 'ps'"
+  expect_has "setup lock: no usable ps still hands over the escape" \
+    "$out" "rm -rf $sd/setup.lock"
+
+  # Two runs can both clear the same debris, and the second clear would take out
+  # the winner's fresh lock. Ownership is therefore read back from the record: when
+  # it names somebody else, this run must NOT hold the lock.
+  sd="$TMPD/lock-steal-race/conduck"; rm -rf "$TMPD/lock-steal-race"
+  out=$(lock_acquire_out "$sd" no no yes)
+  expect_has "setup lock: a record naming somebody else is not treated as ours" "$out" "die:"
+  expect_lacks "setup lock: a lost reclaim race never reports a held lock" "$out" "held=true"
+}
+
+test_setup_lock_release() {
+  local sd out sleeper
+  sd="$TMPD/lock-release/conduck"; rm -rf "$TMPD/lock-release"
+  out=$(lock_acquire_out "$sd" release)
+  expect_has "setup lock: release clears the held flag" "$out" "after-release held=false"
+  if [ -e "$sd/setup.lock" ]; then
+    fail "setup lock: release removes the lock" "$sd/setup.lock survived"
+  else
+    pass "setup lock: release removes the lock"
+  fi
+
+  # The release runs from an EXIT trap, so it fires on runs that never took the
+  # lock too — including a run that was REFUSED. It must not delete the lock the
+  # other run is holding.
+  sd="$TMPD/lock-release-foreign/conduck"; rm -rf "$TMPD/lock-release-foreign"; mkdir -p "$sd"
+  sleep 30 & sleeper=$!
+  plant_lock "$sd" "$sleeper" - -
+  (
+    STATE_DIR="$sd"; SETUP_LOCK_PATH=""; SETUP_LOCK_HELD=false
+    setup_lock_release
+  )
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  if [ -f "$sd/setup.lock/owner" ]; then
+    pass "setup lock: a run that never held it deletes nothing"
+  else
+    fail "setup lock: a run that never held it deletes nothing" "someone else's lock was removed"
+  fi
+}
+
+# Wiring: the lock is worthless if the dispatch does not reach it, and worse than
+# nothing if arming its release drops the exposure-undo backstop it shares EXIT with.
+test_setup_lock_wiring() {
+  local body guarded first_acquire first_exposure first_lane
+  body=$(sed -n '/^run_setup()/,/^}/p' "$MN")
+  expect_has "setup lock wiring: run_setup takes the lock" "$body" "setup_lock_acquire"
+  guarded=$(printf '%s\n' "$body" | grep -A2 'if ! \$DRY_RUN; then' || true)
+  expect_has "setup lock wiring: a dry run neither takes nor holds the lock" \
+    "$guarded" "setup_lock_acquire"
+  # Composed, not replaced: on_exit prints how to undo exposures a failed run applied.
+  expect_has "setup lock wiring: the EXIT trap keeps the exposure backstop" \
+    "$body" "trap 'setup_lock_release; on_exit' EXIT"
+  # …and it has to be taken before anything picks a port or writes a unit.
+  first_acquire=$(printf '%s\n' "$body" | grep -n '^ *setup_lock_acquire$' | head -1 | cut -d: -f1)
+  first_exposure=$(printf '%s\n' "$body" | grep -n 'choose_exposure' | head -1 | cut -d: -f1)
+  first_lane=$(printf '%s\n' "$body" | grep -n 'setup_file_lane' | head -1 | cut -d: -f1)
+  if [ -n "$first_acquire" ] && [ -n "$first_exposure" ] && [ -n "$first_lane" ] \
+     && [ "$first_acquire" -lt "$first_exposure" ] && [ "$first_acquire" -lt "$first_lane" ]; then
+    pass "setup lock wiring: the lock precedes exposure and the file lane"
+  else
+    fail "setup lock wiring: the lock precedes exposure and the file lane" \
+      "acquire@${first_acquire:-none} exposure@${first_exposure:-none} lane@${first_lane:-none}"
+  fi
+}
+
+# ====================================== unreadable saved profiles (10-utils, 91) ==
+# A profile FILE that exists and does not validate is NOT the same thing as no
+# profile, and confusing the two is destructive: setup rewrites profile-<id>.json,
+# so "there is nothing saved, run setup once" is how an older script destroys a
+# profile a NEWER conduck-connect wrote. The validator's own reason is the only
+# thing that knows which of the two it is looking at.
+write_profile_fixture() { # write_profile_fixture <state-dir> <name> <schemaVersion>
+  mkdir -p "$1"
+  cat > "$1/profile-$2.json" <<JSON
+{
+ "schemaVersion": $3,
+ "gateway": {
+  "id": "$2",
+  "kind": "custom",
+  "name": "Fixture $2",
+  "auth": "bearer",
+  "transport": "tailscale",
+  "reach": "private",
+  "url": "https://box.example.ts.net",
+  "localPort": "4711"
+ },
+ "fileServer": null
+}
+JSON
+}
+
+menu_out() { # menu_out <state-dir>
+  (
+    STATE_DIR="$1"
+    BOLD=""; RESET=""; DIM=""; YELLOW=""; GREEN=""; RED=""
+    COMMAND=""; NO_ANSWER="no answer"
+    SAVED_PROFILE_REJECTED=0; SAVED_PROFILE_REJECT_REASON=""
+    say()  { printf '%s\n' "$*"; }
+    warn() { printf 'warn: %s\n' "$*"; }
+    note() { printf 'note: %s\n' "$*"; }
+    die()  { printf 'die: %s\n' "$*"; exit 9; }
+    # Echo the accept regex: it is what actually decides whether option 4 exists,
+    # so asserting on it beats matching menu prose.
+    require_choice() { printf 'regex=%s\n' "$2" >&2; printf 'q'; }
+    choose_main_action
+    printf 'command=%s\n' "$COMMAND"
+  ) 2>&1
+}
+
+test_menu_saved_profile_usable() {
+  local sd="$TMPD/menu-ok/conduck" out
+  rm -rf "$TMPD/menu-ok"
+  write_profile_fixture "$sd" "custom-ok" 1
+  out=$(menu_out "$sd")
+  expect_has "menu: a usable profile offers option 4" "$out" "4) Show a saved setup code"
+  expect_has "menu: a usable profile widens the accept regex" "$out" 'regex=^([1-4]|[qQ])$'
+  expect_lacks "menu: a usable profile raises no rejection warning" "$out" "warn:"
+}
+
+test_menu_no_profile_at_all() {
+  local sd="$TMPD/menu-empty/conduck" out
+  rm -rf "$TMPD/menu-empty"; mkdir -p "$sd"
+  out=$(menu_out "$sd")
+  expect_lacks "menu: an empty state dir offers no option 4" "$out" "4) Show a saved setup code"
+  expect_has "menu: an empty state dir keeps the narrow regex" "$out" 'regex=^([1-3]|[qQ])$'
+  # Nothing saved is not a problem to report — only an unusable file is.
+  expect_lacks "menu: an empty state dir invents no unreadable profile" "$out" "warn:"
+}
+
+test_menu_unreadable_profile() {
+  local sd="$TMPD/menu-future/conduck" out
+  rm -rf "$TMPD/menu-future"
+  write_profile_fixture "$sd" "custom-future" 2
+  out=$(menu_out "$sd")
+  # Option 4 genuinely cannot be offered — but going quiet is what loses the file.
+  expect_lacks "menu: an unreadable profile still cannot be shown" "$out" "4) Show a saved setup code"
+  expect_has "menu: an unreadable profile is announced, not hidden" \
+    "$out" "There IS a saved setup code on this machine, and this version can't read it"
+  expect_has "menu: the validator's real reason reaches the operator" \
+    "$out" "uses schema version '2'"
+  expect_has "menu: a from-the-future profile advises updating THIS script" \
+    "$out" "Update this script, then try again"
+  expect_has "menu: the operator is warned that setup replaces the file" \
+    "$out" "Setting up again REPLACES the saved file"
+
+  # A usable profile answers the question; rejections behind it are the picker's business.
+  write_profile_fixture "$sd" "custom-ok" 1
+  out=$(menu_out "$sd")
+  expect_has "menu: one usable profile beside an unreadable one still offers option 4" \
+    "$out" "4) Show a saved setup code"
+  expect_lacks "menu: a usable profile suppresses the rejection warning" "$out" "warn:"
+
+  # Plural wording carries the count, so the operator knows how much is at stake.
+  rm -rf "$TMPD/menu-future2"; sd="$TMPD/menu-future2/conduck"
+  write_profile_fixture "$sd" "custom-a" 2
+  write_profile_fixture "$sd" "custom-b" 3
+  out=$(menu_out "$sd")
+  expect_has "menu: several unreadable profiles are counted" \
+    "$out" "There are 2 saved setup codes on this machine"
+}
+
+pick_out() { # pick_out <state-dir>
+  (
+    STATE_DIR="$1"; BOLD=""; RESET=""; DIM=""; PROFILE_FILE=""
+    say()  { printf '%s\n' "$*"; }
+    warn() { printf 'warn: %s\n' "$*"; }
+    note() { printf 'note: %s\n' "$*"; }
+    die()  { printf 'die: %s\n' "$*"; exit 9; }
+    require_choice() { printf '1'; }
+    show_qr_pick_profile
+    printf 'picked=%s\n' "$PROFILE_FILE"
+  ) 2>&1
+}
+
+test_show_code_picker_reason() {
+  local sd out
+  # --show-code is exactly where an operator lands after the menu hides option 4,
+  # so it carries the same duty: name the real reason instead of prescribing the
+  # one action that destroys the file.
+  sd="$TMPD/pick-future/conduck"; rm -rf "$TMPD/pick-future"
+  write_profile_fixture "$sd" "custom-future" 2
+  out=$(pick_out "$sd")
+  expect_has "--show-code: an unreadable profile is reported as unusable, not absent" \
+    "$out" "There IS a saved pairing profile on this machine, and this version ($VERSION) can't use it"
+  expect_has "--show-code: the validator's real reason is carried through" \
+    "$out" "uses schema version '2'"
+  expect_lacks "--show-code: an existing profile is never called missing" \
+    "$out" "No usable saved pairing profile on this machine yet"
+
+  # Several unusable profiles name the count and quote the first reason, so the
+  # operator knows how much recoverable state is on the machine.
+  sd="$TMPD/pick-future2/conduck"; rm -rf "$TMPD/pick-future2"
+  write_profile_fixture "$sd" "custom-a" 2
+  write_profile_fixture "$sd" "custom-b" 3
+  out=$(pick_out "$sd")
+  expect_has "--show-code: several unusable profiles are counted" \
+    "$out" "There are 2 saved pairing profiles on this machine"
+  expect_has "--show-code: the first reason is quoted as such" "$out" "The first one says:"
+
+  # Genuinely nothing saved keeps the original onboarding message.
+  sd="$TMPD/pick-empty/conduck"; rm -rf "$TMPD/pick-empty"; mkdir -p "$sd"
+  out=$(pick_out "$sd")
+  expect_has "--show-code: an empty state dir still says to run setup once" \
+    "$out" "No usable saved pairing profile on this machine yet"
+
+  sd="$TMPD/pick-ok/conduck"; rm -rf "$TMPD/pick-ok"
+  write_profile_fixture "$sd" "custom-ok" 1
+  out=$(pick_out "$sd")
+  expect_has "--show-code: a single usable profile is selected without a question" \
+    "$out" "picked=$sd/profile-custom-ok.json"
+}
+
+# ================================== $STATE_DIR exposure wording (10-utils) ==
+# $STATE_DIR holds fileserver-<id>.cred/.env and profile-<id>.json. Group/other
+# READ leaks the listing — which gateways this user paired. Group/other WRITE is a
+# different harm entirely: the 0600 on those files protects their contents, not
+# their place in the folder, so any local account can replace the file rclone reads
+# its password from. One wording for both understates the second.
+state_dir_out() { # state_dir_out <octal-mode>
+  local dir="$TMPD/state-$1/conduck"
+  rm -rf "$TMPD/state-$1"; mkdir -p "$dir"; chmod "$1" "$dir"
+  (
+    STATE_DIR="$dir"; STATE_DIR_EXPOSURE_REPORTED=false; YELLOW=""; RESET=""
+    warn() { printf 'warn: %s\n' "$*"; }
+    local rc=0
+    ensure_state_dir || rc=$?
+    printf 'rc=%s\n' "$rc"
+  ) 2>&1
+}
+
+test_state_dir_exposure_wording() {
+  local out dir
+  expect_eq "state dir: a 0700 directory says nothing" "$(state_dir_out 700)" "rc=0"
+
+  dir="$TMPD/state-755/conduck"
+  out=$(state_dir_out 755)
+  expect_has "state dir: a readable directory names the listing leak" \
+    "$out" "can be listed by other accounts"
+  expect_has "state dir: a readable directory names the exact fix" "$out" "chmod 700 $dir"
+  expect_lacks "state dir: a readable-only directory is not called writable" "$out" "is WRITABLE"
+  expect_has "state dir: reporting an exposure is not a failure for the caller" "$out" "rc=0"
+
+  dir="$TMPD/state-777/conduck"
+  out=$(state_dir_out 777)
+  expect_has "state dir: a writable directory leads with WRITABLE" \
+    "$out" "is WRITABLE by other accounts on this machine"
+  expect_has "state dir: a writable directory names the credential swap" \
+    "$out" "the file-server password rclone reads when it starts"
+  expect_has "state dir: a writable directory says 0600 does not cover the folder" \
+    "$out" "not the folder that holds them"
+  expect_lacks "state dir: a writable directory is not downgraded to a listing problem" \
+    "$out" "can be listed by other accounts"
+  expect_has "state dir: a writable directory names the exact fix" "$out" "chmod 700 $dir"
+  expect_eq "state dir: the fix is printed once, not per warning line" \
+    "$(printf '%s\n' "$out" | grep -c "chmod 700 $dir")" "1"
+}
+
+# Wiring: --show-code reads $STATE_DIR and re-derives the gateway token and the
+# file-lane credential out of it, so it owes the same exposure report the wizard
+# gives — and owes it BEFORE it reads a password out of that folder.
+test_show_code_state_dir_wiring() {
+  local body pick check secret
+  body=$(sed -n '/^run_show_qr()/,/^}/p' "$SQ")
+  expect_has "--show-code wiring: the state dir mode is checked" "$body" "ensure_state_dir"
+  pick=$(printf '%s\n' "$body" | grep -n 'show_qr_pick_profile' | head -1 | cut -d: -f1)
+  check=$(printf '%s\n' "$body" | grep -n '^ *ensure_state_dir$' | head -1 | cut -d: -f1)
+  secret=$(printf '%s\n' "$body" | grep -n 'show_qr_recover_gateway_secret' | head -1 | cut -d: -f1)
+  # After the picker (a profile file proves the directory exists, so `mkdir -p` is a
+  # provable no-op and a "changes nothing" command creates nothing) and before any
+  # secret is recovered.
+  if [ -n "$pick" ] && [ -n "$check" ] && [ -n "$secret" ] \
+     && [ "$pick" -lt "$check" ] && [ "$check" -lt "$secret" ]; then
+    pass "--show-code wiring: the check sits after the picker and before secret recovery"
+  else
+    fail "--show-code wiring: the check sits after the picker and before secret recovery" \
+      "pick@${pick:-none} check@${check:-none} secret@${secret:-none}"
+  fi
+}
+
 printf 'host-environment regressions — lifted source functions, simulated hosts\n'
 test_priv_prefix
 test_install_cmd_per_manager
@@ -729,6 +1196,18 @@ test_ts_priv_retry
 test_expose_retry
 test_unmap_retry
 test_sweep_retry
+test_setup_lock_first_run
+test_setup_lock_refuses_live_holder
+test_setup_lock_reclaims_debris
+test_setup_lock_fails_closed
+test_setup_lock_release
+test_setup_lock_wiring
+test_menu_saved_profile_usable
+test_menu_no_profile_at_all
+test_menu_unreadable_profile
+test_show_code_picker_reason
+test_state_dir_exposure_wording
+test_show_code_state_dir_wiring
 
 printf '\nHOST ENV RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ] || exit 1

@@ -94,6 +94,32 @@ run_setup() {
   say "Every change asks first, and you see the exact command before it happens. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
   note "Some commands I offer to run for you (you say yes or no to each); the rest you copy-paste and run yourself while I wait."
 
+  # The single-instance gate, taken HERE because this is the one choke point both
+  # entries pass through: the --setup dispatch below, and the check → setup handoff
+  # in finish_successful_check. Everything past this line picks loopback ports and
+  # writes units, credential files and profile-$GW_ID.json — all of them collision
+  # points for two overlapping runs (see setup_lock_acquire for what each one costs).
+  #
+  # A dry run is deliberately exempt: it changes nothing and write_profile returns
+  # early under it, so it neither needs the guard nor may hold one — blocking a real
+  # setup because somebody is reading a plan would be a worse bug than this fixes.
+  if ! $DRY_RUN; then
+    setup_lock_acquire
+    # Compose, never replace: on_exit is the exposure-undo backstop, and nothing
+    # re-arms EXIT past this point (finish_successful_check re-arms it BEFORE it
+    # reaches here). HUP/INT/TERM route through `exit`, so a signal lands here too.
+    # Even a future path that did drop this trap leaves the lock recoverable — its
+    # authority is the holder's liveness, not the directory's existence.
+    trap 'setup_lock_release; on_exit' EXIT
+  fi
+
+  # Before any new port is chosen: an interrupted earlier run may have left a live
+  # exposure recorded on disk, and a leftover PUBLIC funnel outranks this setup.
+  # Ordered deliberately — AFTER setup_lock_acquire, so two overlapping runs cannot
+  # both offer to close the same port, and BEFORE choose_exposure, so the operator
+  # decides about old exposures while none of this run's are applied yet.
+  reconcile_orphaned_exposures
+
   if $SETUP_FROM_CHECK; then
     choose_exposure
     local exposure_rc=$?

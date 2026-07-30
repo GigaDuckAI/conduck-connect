@@ -1565,6 +1565,9 @@ warn() { :; }
 note() { :; }
 SHOW_QR=false
 DRY_RUN=false
+REUSE_ONLY=false
+VERIFY_FAILED=false
+FS_LANE_DROPPED_BY_CHECK=false
 STATE_DIR_EXPOSURE_REPORTED=false
 STATE_DIR="$STATE"
 GW_ID="custom-secret-probe"
@@ -1694,6 +1697,118 @@ walk(json.load(open(os.environ["PROF"])))
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# Drive the PRODUCTION write_profile against a state directory that may ALREADY hold a
+# profile, over the run shapes that decide whether it may overwrite one. The gateway
+# facts are fixed; only the run shape and the file-lane pair vary.
+# Args: <function-source> <state-dir> <reuse-only> <verify-failed> <lane-dropped> <fs-url> <fs-cred>
+run_write_profile_shaped() {
+  FUNCS="$1" STATE="$2" RO="$3" VF="$4" DROPPED="$5" FSU="$6" FSC="$7" bash -c '
+eval "$FUNCS"
+warn() { printf "WARN %s\n" "$*"; }
+note() { printf "NOTE %s\n" "$*"; }
+SHOW_QR=false
+DRY_RUN=false
+REUSE_ONLY=$RO
+VERIFY_FAILED=$VF
+FS_LANE_DROPPED_BY_CHECK=$DROPPED
+STATE_DIR_EXPOSURE_REPORTED=false
+STATE_DIR="$STATE"
+GW_ID="custom-shaped"
+GW_KIND="custom"
+GW_NAME="Shaped probe"
+GW_AUTH="bearer"
+GW_TOKEN="probe-token"
+GW_URL="https://gw.example.test"
+GW_LOCAL_PORT="8080"
+GW_MODEL=""
+TRANSPORT="public"
+SCOPE="public"
+FS_URL="$FSU"
+FS_CRED="$FSC"
+FS_LOCAL_PORT="5006"
+FS_FOLDER="/home/probe/conduck-files"
+FS_REACH="public"
+write_profile
+'
+}
+
+# The saved profile is the ONLY record of a paired file lane — the credential is
+# re-derived from the host, but nothing else remembers that the lane exists. So a run
+# that promised to change nothing (--reuse-only) or that lost the lane to a failed
+# probe rather than to a decision must not rewrite it: the service keeps running while
+# the record of it is deleted for good, and --show-code then offers a chat-only code
+# forever. --show-code's own guard already makes exactly this argument.
+#
+# Every arm compares the file BYTE-FOR-BYTE against the saved original, because
+# "kept the lane" and "rewrote the same bytes" are different promises. The last two
+# arms are the non-vacuity half: the write still happens when there is nothing to
+# destroy, and it still drops the lane when no guard is claiming to protect it.
+run_profile_overwrite_guard_case() {
+  local name="profile-refusing-runs-keep-the-saved-lane" writer
+  local root="$TMP/profile-guard" prof before after arm
+  local saved='{"schemaVersion":1,"gateway":{"id":"custom-shaped","kind":"custom","name":"Shaped probe","auth":"bearer","transport":"public","reach":"public","url":"https://old.example.test","localPort":"8080"},"fileServer":{"url":"https://files.example.test:8443","localPort":"5006","reach":"public","folder":"/home/probe/conduck-files"}}'
+
+  writer=$(extract_funcs write_profile ensure_state_dir file_mode_is_open json_type json_query)
+  if [ -z "$writer" ] || ! printf '%s\n' "$writer" | grep -qF 'write_profile()'; then
+    fail_case "$name" "could not extract write_profile from the release artifact"; return
+  fi
+  printf 'pairing-profile overwrite guard\n' > "$TMP/doctor.out"
+
+  # Every arm runs with NO file lane in hand (fs-url/fs-cred empty), which is the shape
+  # that would write "fileServer": null over a recorded lane.
+  # arm|reuse-only|verify-failed|lane-dropped|seed-profile|expect
+  # expect: keep = the saved bytes survive · write = this run's facts are saved
+  local arms='reuse-only|true|false|false|seed|keep
+checks-failed|false|true|false|seed|keep
+lane-dropped-by-check|false|false|true|seed|keep
+lane-dropped-first-pairing|false|false|true|none|write
+lane-absent-by-choice|false|false|false|seed|write'
+  local ro vf dropped seed expect
+  while IFS='|' read -r arm ro vf dropped seed expect; do
+    [ -n "$arm" ] || continue
+    rm -rf "$root"; mkdir -p "$root"
+    prof="$root/profile-custom-shaped.json"
+    if [ "$seed" = "seed" ]; then
+      printf '%s\n' "$saved" > "$prof"
+      before=$(cksum < "$prof")
+    fi
+    if ! run_write_profile_shaped "$writer" "$root" "$ro" "$vf" "$dropped" "" "" \
+         >> "$TMP/doctor.out" 2>&1; then
+      fail_case "$name" "[$arm] write_profile failed to run in isolation"; return
+    fi
+    if [ "$expect" = "keep" ]; then
+      if [ ! -f "$prof" ]; then
+        fail_case "$name" "[$arm] the saved profile was deleted outright"; return
+      fi
+      after=$(cksum < "$prof")
+      if [ "$after" != "$before" ]; then
+        printf -- '--- profile after [%s] ---\n' "$arm" >> "$TMP/doctor.out"
+        cat "$prof" >> "$TMP/doctor.out"
+        fail_case "$name" "[$arm] a run that must not rewrite the saved profile rewrote it"; return
+      fi
+    else
+      if [ ! -f "$prof" ]; then
+        fail_case "$name" "[$arm] no profile was written — the guards are swallowing a legitimate save"; return
+      fi
+      if ! PROF="$prof" python3 -c '
+import json, os, sys
+p = json.load(open(os.environ["PROF"]))
+if p.get("gateway", {}).get("url") != "https://gw.example.test": sys.exit(1)
+if p.get("fileServer") is not None: sys.exit(1)
+'; then
+        printf -- '--- profile after [%s] ---\n' "$arm" >> "$TMP/doctor.out"
+        cat "$prof" >> "$TMP/doctor.out"
+        fail_case "$name" "[$arm] the run that IS allowed to save did not write this run's facts"; return
+      fi
+    fi
+  done <<ARMS
+$arms
+ARMS
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 # Drive the PRODUCTION emit_payload in isolation so the warning it prints can be
 # graded in both shapes it has. The file-lane pair and the gateway kind are the
 # ONLY inputs that vary: an empty pair is a run with no file lane, exactly as
@@ -1701,9 +1816,16 @@ walk(json.load(open(os.environ["PROF"])))
 # offers the two follow-up check commands at all. Output helpers are stubbed to
 # plain text (no colour), with warn() tagged so the assertions can isolate the
 # warning block from the rest of Step 6.
-# Args: <function-source> <file-server-url> <file-server-credential> [gateway-kind].
+# The host-shape trio (OS / unit / linger) defaults to the shape that has no durability
+# caveat to make — macOS, no unit — so the cases that predate it stay on that path.
+# The gateway URL defaults to a permanent-looking hostname, so a case that says nothing
+# about addresses stays on the path with no rotation reminder.
+# Args: <function-source> <file-server-url> <file-server-credential> [gateway-kind]
+#       [os] [file-server-unit] [linger:on|off] [gateway-url].
 run_emit_payload_isolated() {
-  FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" GW_KIND_IN="${4:-custom}" bash -c '
+  FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" GW_KIND_IN="${4:-custom}" \
+  OS_IN="${5:-Darwin}" FS_UNIT_IN="${6:-}" LINGER_IN="${7:-on}" \
+  GW_URL_IN="${8:-https://gw.example.test}" bash -c '
 eval "$FUNCS"
 say()   { printf "%s\n" "$*"; }
 warn()  { printf "WARNLINE %s\n" "$*"; }
@@ -1713,6 +1835,11 @@ die()   { printf "Error: %s\n" "$*" >&2; exit 1; }
 render_qr()        { return 1; }   # no QR here; the paste string still prints
 write_profile()    { :; }          # this case grades emitted text, not saved state
 cleanup_exposures() { :; }
+# loginctl cannot be driven from a test, so the ANSWER is injected — the production
+# call site, and the fact that it is asked at all, is what these cases grade.
+fs_linger_enabled_linux() { [ "$LINGER_IN" = "on" ]; }
+OS="$OS_IN"
+FS_UNIT="$FS_UNIT_IN"
 BOLD=""; RESET=""
 VERIFY_FAILED=false
 FS_ROLLBACK_INCOMPLETE=false
@@ -1720,7 +1847,7 @@ EMITTED=false
 PAYLOAD_VERSION=1
 GW_KIND="$GW_KIND_IN"
 GW_NAME="Warning probe"
-GW_URL="https://gw.example.test"
+GW_URL="$GW_URL_IN"
 GW_AUTH="bearer"
 GW_TOKEN="probe-token"
 GW_MODEL=""
@@ -1751,7 +1878,7 @@ run_pairing_warning_case() {
   local name="pairing-warning-states-what-the-code-is"
   local emit out_files out_bare block_files block_bare
 
-  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap)
+  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
   if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
     fail_case "$name" "could not extract emit_payload from the release artifact"; return
   fi
@@ -1854,7 +1981,7 @@ run_pairing_check_suggestion_case() {
   local name="pairing-adapter-suggestion-names-its-outcome"
   local emit out_custom out_openclaw flat_custom flat_openclaw
 
-  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap)
+  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
   if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
     fail_case "$name" "could not extract emit_payload from the release artifact"; return
   fi
@@ -1899,6 +2026,363 @@ run_pairing_check_suggestion_case() {
   flat_openclaw=$(printf '%s\n' "$out_openclaw" | tr '\n' ' ')
   if warning_states "$flat_openclaw" '[-][-]check-adapter|adapter grade'; then
     fail_case "$name" "an OpenClaw pairing was shown adapter-grade text meant for custom servers"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A systemd USER file server stops shortly after that user's last logout unless
+# lingering is on — and this is a 24/7 gateway product, so a lane that verifies green
+# inside the SSH session that built it is not yet a lane that survives that session.
+# The step that built the lane says so, but by the pairing screen that line has
+# scrolled away, and THIS screen is where the operator decides to trust the lane with
+# their attachments. So it is restated here, gated on the one arrangement it is true
+# for: Linux, a connector-owned unit, lingering actually off.
+run_pairing_linger_caveat_case() {
+  local name="pairing-code-restates-the-logout-caveat"
+  local emit out flat arm
+  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap priv_prefix have is_quick_tunnel_url)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
+    fail_case "$name" "could not extract emit_payload from the release artifact"; return
+  fi
+  # A rename of the durability helper must break HERE, not silently stop the caveat:
+  # the runner stubs the answer, so only this check proves the real function is asked.
+  if ! printf '%s\n' "$emit" | grep -qF 'fs_linger_enabled_linux'; then
+    fail_case "$name" "emit_payload no longer asks the file-lane module about lingering"; return
+  fi
+  if ! grep -q '^fs_linger_enabled_linux()' "$SCRIPT"; then
+    fail_case "$name" "the durability helper emit_payload calls is not defined in the artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # arm|os|unit|linger|fs-lane|expect-caveat
+  local arms='linux-unit-linger-off|Linux|/home/u/.config/systemd/user/conduck-files-x.service|off|yes|yes
+linux-unit-linger-on|Linux|/home/u/.config/systemd/user/conduck-files-x.service|on|yes|no
+linux-no-lane|Linux|/home/u/.config/systemd/user/conduck-files-x.service|off|no|no
+macos-unit-linger-off|Darwin|/Users/u/Library/LaunchAgents/ai.gigaduck.conduck-files-x.plist|off|yes|no
+linux-no-unit|Linux||off|yes|no'
+  local os unit linger lane want
+  while IFS='|' read -r arm os unit linger lane want; do
+    [ -n "$arm" ] || continue
+    local fsu="" fsc=""
+    if [ "$lane" = "yes" ]; then fsu="https://files.example.test:8443"; fsc="probe-file-credential"; fi
+    out=$(run_emit_payload_isolated "$emit" "$fsu" "$fsc" custom "$os" "$unit" "$linger") \
+      || { printf '%s\n' "$out" >> "$TMP/doctor.out"
+           fail_case "$name" "[$arm] emit_payload failed to run"; return; }
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    # Non-vacuous: the screen really was emitted, so an absent caveat means absent.
+    if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
+      fail_case "$name" "[$arm] emit_payload printed no pairing code"; return
+    fi
+    flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+    if [ "$want" = "yes" ]; then
+      # FACT 1 — the lane stops at logout, and does not return by itself on reboot.
+      if ! warning_states "$flat" 'log ?out|logs out|logging out' ||
+         ! warning_states "$flat" 'reboot|restart the machine'; then
+        fail_case "$name" "[$arm] the code was handed over without saying the file lane stops at logout"; return
+      fi
+      # FACT 2 — chat is unaffected; it is attachments that stop. A caveat that reads
+      # as "your setup is broken" would send the operator to redo a correct pairing.
+      if ! warning_states "$flat" 'chat (keeps|still)' ||
+         ! warning_states "$flat" 'attachment'; then
+        fail_case "$name" "[$arm] the caveat did not scope the loss to attachments"; return
+      fi
+      # FACT 3 — the exact command that fixes it, on the screen where it is read.
+      if ! warning_states "$flat" 'loginctl enable-linger'; then
+        fail_case "$name" "[$arm] the caveat named the problem but not the one-line fix"; return
+      fi
+    else
+      if warning_states "$flat" 'enable-linger|lingering is off'; then
+        fail_case "$name" "[$arm] a setup with no logout problem was warned about one"; return
+      fi
+    fi
+  done <<ARMS
+$arms
+ARMS
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A `cloudflared tunnel --url` hostname is reassigned on every restart of that tunnel,
+# reboots included. The address is named at the step that accepts it, but the artifact that
+# goes stale is THE CODE: after a reboot the tunnel returns on a new public hostname, the
+# paired device keeps calling the dead one, and the live address is in no saved profile and
+# no output of this script — so there is nothing for the operator to search for. The
+# reminder therefore has to sit on the screen where they are holding the code.
+#
+# The near-miss arm is the load-bearing one: it proves this rides 30-exposure's host-suffix
+# predicate rather than a second, substring-matching copy of the rule.
+run_pairing_quick_tunnel_reminder_case() {
+  local name="pairing-code-warns-a-rotating-quick-tunnel"
+  local emit out flat arm
+  local qt='https://random-words-1234.trycloudflare.com'
+  local qtf='https://files-9876.trycloudflare.com'
+  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
+    fail_case "$name" "could not extract emit_payload from the release artifact"; return
+  fi
+  # The shared predicate, not a local re-implementation — the whole point of the near-miss arm.
+  if ! printf '%s\n' "$emit" | grep -qF 'is_quick_tunnel_url()'; then
+    fail_case "$name" "emit_payload does not use the shared quick-tunnel predicate"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # arm|gateway-url|fs-url|fs-cred|expect: none · gateway · lane · both
+  local arms="stable-both|https://gw.example.test|https://files.example.test:8443|probe-cred|none
+quick-gateway|$qt|||gateway
+quick-gateway-and-lane|$qt|$qtf|probe-cred|both
+quick-lane-only|https://gw.example.test|$qtf|probe-cred|lane
+quick-lane-not-in-code|https://gw.example.test|$qtf||none
+near-miss-host|https://not-really.trycloudflare.com.example.test|||none"
+  local gw fsu fsc want
+  while IFS='|' read -r arm gw fsu fsc want; do
+    [ -n "$arm" ] || continue
+    out=$(run_emit_payload_isolated "$emit" "$fsu" "$fsc" custom Darwin "" on "$gw") \
+      || { printf '%s\n' "$out" >> "$TMP/doctor.out"
+           fail_case "$name" "[$arm] emit_payload failed to run"; return; }
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
+      fail_case "$name" "[$arm] emit_payload printed no pairing code"; return
+    fi
+    flat=$(printf '%s\n' "$out" | grep '^WARNLINE ' | tr '\n' ' ')
+    if [ "$want" = "none" ]; then
+      if warning_states "$flat" 'quick tunnel'; then
+        fail_case "$name" "[$arm] an address that does not rotate was flagged as a quick tunnel"; return
+      fi
+      continue
+    fi
+    # FACT 1 — the hostname changes when the tunnel restarts, and a reboot is a restart.
+    if ! warning_states "$flat" 'quick tunnel' ||
+       ! warning_states "$flat" 'reassigned|changes every time|changes on every|new (public )?hostname' ||
+       ! warning_states "$flat" 'reboot'; then
+      fail_case "$name" "[$arm] the screen did not say the address changes on a tunnel restart"; return
+    fi
+    # FACT 2 — THIS code is what breaks, and the replacement address is not recoverable
+    # from anything the tool wrote. Without this the operator hunts for a saved copy.
+    if ! warning_states "$flat" 'this (exact )?code|the code from this run' ||
+       ! warning_states "$flat" 'no saved profile|not saved|nothing (for|to) (the app|look|search)'; then
+      fail_case "$name" "[$arm] the screen did not say this code dies with the hostname"; return
+    fi
+    # FACT 3 — WHICH address rotates. "Both" and "the file lane only" are different
+    # consequences (chat dies vs attachments die), so the wording has to distinguish them.
+    case "$want" in
+      gateway)
+        if warning_states "$flat" 'file lane'; then
+          fail_case "$name" "[$arm] a stable file lane was named as the rotating address"; return
+        fi ;;
+      lane)
+        if ! warning_states "$flat" 'file lane'; then
+          fail_case "$name" "[$arm] the rotating file-lane address was not named"; return
+        fi
+        if ! warning_states "$flat" 'chat (keeps|still)'; then
+          fail_case "$name" "[$arm] a lane-only rotation did not say chat survives it"; return
+        fi ;;
+      both)
+        if ! warning_states "$flat" 'both'; then
+          fail_case "$name" "[$arm] two rotating addresses were reported as one"; return
+        fi
+        if warning_states "$flat" 'chat (keeps|still)'; then
+          fail_case "$name" "[$arm] a rotating GATEWAY address was paired with 'chat keeps working'"; return
+        fi ;;
+    esac
+  done <<ARMS
+$arms
+ARMS
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Drive the PRODUCTION verify_all in isolation. Every request it makes is stubbed, so
+# what is graded is the DIAGNOSIS: which cause the failure epilogue names, and which
+# question it asks next. The gateway probe's outcome is injected exactly as
+# models_is_json reports it (return code + MODELS_* diagnostics), which is the same
+# contract verify_all reads on a live run.
+# Args: <function-source> <transport> <models-rc> <http-code> <curl-rc> <loopback>
+#       <local-port> <chat> <fs-url> <fs-cred> <show-qr>
+#   loopback: up|down — what a 127.0.0.1 health probe answers
+#   chat:     ok|fail — whether the live round-trip decodes
+#   fs-url/fs-cred: a pair makes the file-lane block run; its probe always FAILS here
+run_verify_all_isolated() {
+  FUNCS="$1" TRANSPORT_IN="$2" MRC="$3" MCODE="$4" MCURL="$5" LOOP="$6" \
+  LPORT="$7" CHAT="$8" FSU="$9" FSC="${10}" SQ="${11}" bash -c '
+eval "$FUNCS"
+say()   { printf "%s\n" "$*"; }
+ok()    { printf "OK %s\n" "$*"; }
+bad()   { printf "BAD %s\n" "$*"; }
+warn()  { printf "WARN %s\n" "$*"; }
+note()  { printf "NOTE %s\n" "$*"; }
+head_() { printf "%s\n" "$*"; }
+die()   { printf "DIE %s\n" "$*"; exit 9; }
+confirm() { printf "CONFIRM %s\n" "$*"; return 1; }   # asked at all is what is graded
+models_is_json() {
+  MODELS_CURL_RC="$MCURL"; MODELS_HTTP_CODE="$MCODE"
+  MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false
+  return "$MRC"
+}
+local_health_ok() { [ "$LOOP" = "up" ]; }
+app_chat_eval()   { CCE_LEN=4; CCE_REASON="stubbed failure"; [ "$CHAT" = "ok" ]; }
+curl_fs()         { return 22; }                       # the file-lane probe never succeeds
+drop_file_lane()  { FS_URL=""; FS_CRED=""; printf "DROPPED-LANE\n"; }
+agent_file_lane_gate() { :; }
+check() { local l="$1"; shift; if "$@"; then ok "$l"; else bad "$l"; VERIFY_FAILED=true; return 1; fi; }
+VERIFY_FAILED=false
+FS_LANE_DROPPED_BY_CHECK=false
+MODELS_CURL_RC=0; MODELS_HTTP_CODE=""; MODELS_DATA_EMPTY=false; MODELS_NO_VALID_ID=false
+SHOW_QR=$SQ
+TRANSPORT="$TRANSPORT_IN"
+GW_KIND="custom"
+GW_URL="https://moved.example.test"
+GW_LOCAL_PORT="$LPORT"
+GW_HEALTH_PATH=""
+GW_MODEL=""
+FS_URL="$FSU"
+FS_CRED="$FSC"
+verify_all
+printf "VERIFY_FAILED=%s LANE_DROPPED=%s\n" "$VERIFY_FAILED" "$FS_LANE_DROPPED_BY_CHECK"
+'
+}
+
+# A saved address that stops reaching this machine is the commonest real failure on the
+# two transports with no local exposure to introspect, and the HTTP-code map alone files
+# it as a server fault: Cloudflare answers 530 for a hostname whose tunnel is gone, and
+# a quick tunnel hands out a new hostname on every restart. "The server errored" sends
+# that operator to the gateway (or to Cloudflare) for a fix that is a re-run of setup.
+#
+# Facts, not paragraphs. Each arm pins what the epilogue must and must not claim; the
+# 500 and 401 arms are the non-vacuity half — a note that fires on every failure would
+# diagnose nothing, and one that fires on Tailscale would contradict the drift gate that
+# already refused above it.
+run_moved_address_diagnosis_case() {
+  local name="moved-address-is-not-a-server-error" funcs out flat arm
+  funcs=$(extract_funcs verify_all gw_url_drift_note)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_url_drift_note()'; then
+    fail_case "$name" "could not extract verify_all + gw_url_drift_note from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # arm|transport|http-code|loopback|local-port|expect-moved|expect-server-errored
+  local arms='cloudflare-530-up|cloudflare|530|up|8080|yes|no
+public-530-up|public|530|up|8080|yes|no
+public-530-down|public|530|down|8080|maybe|no
+public-530-no-port|public|530|up||maybe|no
+tailscale-530|tailscale|530|up|8080|no|no
+public-500|public|500|up|8080|no|yes
+public-401|public|401|up|8080|no|no'
+  local transport code loop port want_moved want_errored
+  while IFS='|' read -r arm transport code loop port want_moved want_errored; do
+    [ -n "$arm" ] || continue
+    out=$(run_verify_all_isolated "$funcs" "$transport" 1 "$code" 0 "$loop" "$port" ok "" "" false) \
+      || { printf '%s\n' "$out" >> "$TMP/doctor.out"
+           fail_case "$name" "[$arm] verify_all failed to run in isolation"; return; }
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+
+    # The wrong diagnosis, in the exact words that sent users at the app or at Cloudflare.
+    if [ "$want_errored" = "no" ] && warning_states "$flat" 'the server errored'; then
+      fail_case "$name" "[$arm] the epilogue still blamed the server"; return
+    fi
+    if [ "$want_errored" = "yes" ] && ! warning_states "$flat" 'the server errored'; then
+      fail_case "$name" "[$arm] a real 5xx no longer reads as a server fault"; return
+    fi
+    # FACT — the address, not the machine, is what stopped matching. Any phrasing that
+    # says the address no longer reaches here counts; extend the alternation on reword.
+    case "$want_moved" in
+      yes)
+        if ! warning_states "$flat" 'no longer reach|does not reach|doesn.t reach|address moved'; then
+          fail_case "$name" "[$arm] nothing told the operator the address stopped reaching this machine"; return
+        fi
+        if ! warning_states "$flat" '127\.0\.0\.1:8080'; then
+          fail_case "$name" "[$arm] the loopback comparison that proves the gateway is fine was not shown"; return
+        fi
+        if ! warning_states "$flat" 're-run|reconcile|address that is live'; then
+          fail_case "$name" "[$arm] the epilogue named the cause but not the way out"; return
+        fi ;;
+      # Loopback silent (or no port to probe): the two causes cannot be separated, so the
+      # epilogue owes BOTH — never a confident single verdict it has not earned.
+      maybe)
+        if ! warning_states "$flat" 'no longer reach|does not reach|doesn.t reach|moved address|still reaches'; then
+          fail_case "$name" "[$arm] the address was never named as a possible cause"; return
+        fi
+        if ! warning_states "$flat" 'gateway is running|start it first|stopped gateway'; then
+          fail_case "$name" "[$arm] an unprovable loopback state was reported as a certain verdict"; return
+        fi ;;
+      no)
+        if warning_states "$flat" 'no longer reach|address moved|quick tunnel'; then
+          fail_case "$name" "[$arm] a failure the address cannot explain was diagnosed as drift"; return
+        fi ;;
+    esac
+  done <<ARMS
+$arms
+ARMS
+
+  # Also pin the two rows the map itself owes this diagnosis: 530 must not be swallowed
+  # by the 5xx bucket, and a hostname that stops resolving is the same drift.
+  out=$(run_verify_all_isolated "$funcs" "public" 1 "" 6 up 8080 ok "" "" false)
+  printf -- '--- public-dns-gone ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if ! warning_states "$(printf '%s\n' "$out" | tr '\n' ' ')" 'no longer reach|does not reach|doesn.t reach'; then
+    fail_case "$name" "a hostname that no longer resolves was not diagnosed as a moved address"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Once a GATEWAY check has failed, emit_payload emits no code at all. So the file-lane
+# branch must not offer a gateway-only code (a promise the same run then breaks with
+# exit 1), and must not sign off with "fix the file server" when the gateway is what
+# died — the file server is then the one machine that cannot be the cause.
+# The passing-gateway arm is the control: it proves the OFFER still exists, so the arm
+# above is graded on the gateway verdict and not on a question that was simply deleted.
+run_file_lane_failure_names_the_gateway_case() {
+  local name="file-fault-does-not-mask-a-dead-gateway" funcs out flat
+  funcs=$(extract_funcs verify_all gw_url_drift_note)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'verify_all()'; then
+    fail_case "$name" "could not extract verify_all from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # --show-code, gateway DEAD (chat fails), file-lane probe also fails. The exit status is
+  # deliberately not graded here: the stubbed die() exits nonzero, and dying at all on this
+  # path is one of the behaviours under test — so the OUTPUT is what answers, not the code.
+  out=$(run_verify_all_isolated "$funcs" public 0 200 0 up 8080 fail \
+        "https://files.example.test:8443" "probe-cred" true)
+  printf -- '--- dead gateway + failed file lane ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+
+  # Non-vacuous: the run really did fail the gateway AND reach the file-lane branch.
+  # Both lines print on either side of the fix, so this can't mask the assertions below.
+  if ! warning_states "$flat" 'live round-trip failed' ||
+     ! warning_states "$flat" 'file lane failed live verification'; then
+    fail_case "$name" "the arm did not reach the file-lane branch with a failed gateway"; return
+  fi
+  if warning_states "$flat" 'CONFIRM Show a gateway-only code'; then
+    fail_case "$name" "a gateway-only code was offered for a run that can emit no code"; return
+  fi
+  if warning_states "$flat" 'Fix the file server'; then
+    fail_case "$name" "the last word was still 'fix the file server' on a gateway fault"; return
+  fi
+  if ! warning_states "$flat" 'gateway checks above failed|fix the gateway first'; then
+    fail_case "$name" "nothing named the gateway as the thing to fix"; return
+  fi
+  # The lane is dropped for THIS emission and flagged as check-dropped, so the saved
+  # profile keeps it (see profile-refusing-runs-keep-the-saved-lane).
+  if ! warning_states "$flat" 'LANE_DROPPED=true'; then
+    fail_case "$name" "a check-dropped lane was not flagged for the profile guard"; return
+  fi
+
+  # Control: same file-lane failure, gateway PASSING — the offer must still be made.
+  out=$(run_verify_all_isolated "$funcs" public 0 200 0 up 8080 ok \
+        "https://files.example.test:8443" "probe-cred" true)
+  printf -- '--- live gateway + failed file lane ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  if ! warning_states "$flat" 'CONFIRM Show a gateway-only code'; then
+    fail_case "$name" "the gateway-only offer is gone even when the gateway passed — the guard above proves nothing"; return
+  fi
+  if ! warning_states "$flat" 'DIE .*Fix the file server'; then
+    fail_case "$name" "declining the offer no longer stops with the file-server remedy"; return
   fi
 
   PASS=$((PASS+1))
@@ -3225,12 +3709,32 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" profile-never-carries-secrets "*) true
   run_profile_secret_exclusion_case
 fi
 
+if [ -z "$ONLY" ] || case " $ONLY " in *" profile-refusing-runs-keep-the-saved-lane "*) true ;; *) false ;; esac; then
+  run_profile_overwrite_guard_case
+fi
+
 if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-warning-states-what-the-code-is "*) true ;; *) false ;; esac; then
   run_pairing_warning_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-adapter-suggestion-names-its-outcome "*) true ;; *) false ;; esac; then
   run_pairing_check_suggestion_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-code-restates-the-logout-caveat "*) true ;; *) false ;; esac; then
+  run_pairing_linger_caveat_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-code-warns-a-rotating-quick-tunnel "*) true ;; *) false ;; esac; then
+  run_pairing_quick_tunnel_reminder_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" moved-address-is-not-a-server-error "*) true ;; *) false ;; esac; then
+  run_moved_address_diagnosis_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" file-fault-does-not-mask-a-dead-gateway "*) true ;; *) false ;; esac; then
+  run_file_lane_failure_names_the_gateway_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" help-lists-public-meta-flags "*) true ;; *) false ;; esac; then
