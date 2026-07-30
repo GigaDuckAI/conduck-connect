@@ -4,6 +4,41 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The block that teaches your agent to use the file lane was installed
+  unreadable, and the run reported success.** Both file-server unit writers set
+  `umask 077` as a bare statement instead of scoping it, so the mask survived for
+  the rest of the process and every later write inherited it. `TOOLS.md` is
+  written after the unit, so on the ordinary OpenClaw shape — script run as root
+  on a VPS, agent running as uid 1000 inside the container — the guidance block
+  landed readable by its owner alone. The file existed, the run printed the green
+  line, and the agent never saw it; the live probe could not catch this because
+  it repeats the same instructions inline in its own test message, so it passes
+  whether or not the persistent copy is readable. The mask is now scoped to the
+  writes that need it, and is applied to those files BEFORE their contents,
+  because a mask governs creation only: a stale world-readable file from an
+  earlier run would otherwise hold the credential for the window between the
+  write and the `chmod`. A `TOOLS.md` this script creates is now explicitly
+  `0644` and verified after the fact; an existing one that only its owner can
+  read is left untouched and the block is not installed, with the exact
+  `chmod 644` named — widening a file you already own is not the script's call,
+  and writing into one your agent cannot read is the failure this closes.
+- **A stock Hermes config was refused the file lane because of a trailing
+  comment and some trailing whitespace.** The readiness gate that keeps the
+  connector from broadening Hermes privileges or guessing at a mount was doing
+  its job correctly; the YAML scanner feeding it was not. A value carrying an
+  inline comment puts the scanner into plain-scalar continuation mode, and the
+  column-0 `# ---` separator that follows in the shipped example config was then
+  read as content rather than as the comment it is — a comment can never continue
+  a plain scalar (YAML 1.2 §7.3.3). Separately, a "blank" line that actually held
+  spaces was truthy, so it was scanned as a child at indent 2. Either one made
+  the enclosing section ambiguous and the lane was dropped, which is the whole of
+  "Hermes used to have a file server and now it does not". Both are fixed at the
+  root: comments close a continuation at any indent, and a space-only line is
+  treated as the blank line it is. The second fix lands in the shared line reader,
+  because the same stray whitespace also rejected a block list and, after an
+  indentless root sequence, declared the entire document outside the editable
+  subset. Tabs and non-ASCII whitespace still fail closed exactly as before —
+  they are not valid YAML indentation, and this scanner refuses them on purpose.
 - **The only record of how to close an exposure lived in memory, so an
   interrupted run left one open with nothing on disk that named it.** `APPLIED`
   and `FS_APPLIED` are bash arrays and the undo recipe was only ever *printed*:

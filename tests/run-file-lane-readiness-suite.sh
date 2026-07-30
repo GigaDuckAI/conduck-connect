@@ -460,6 +460,148 @@ test_systemd_unit_writer() {
   fi
 }
 
+file_mode() { # file_mode <path> -> octal permission bits, portable across BSD/GNU stat
+  python3 -c 'import os,stat,sys; print("%o" % stat.S_IMODE(os.stat(sys.argv[1]).st_mode))' "$1"
+}
+
+# A bare `umask` inside a writer leaks for the remainder of the process, so
+# every file written LATER silently loses its group/other bits — TOOLS.md above
+# all. The assertion is the process mask itself, not a resulting file mode: the
+# mask is the defect, and a file-mode assertion would keep passing if the leak
+# merely moved to a different writer.
+test_unit_writer_umask_is_scoped() {
+  if (
+    reset_fake_home "umask-linux"
+    GW_ID="openclaw"
+    FS_CRED="umask-fixture-secret"
+    FS_LOCAL_PORT="5097"
+    local fake_bin="$TMP/fake-bin-umask" ws="$HOME/workspace" before after
+    mkdir -p "$fake_bin" "$ws"
+    printf '%s\n' '#!/usr/bin/env sh' 'exit 0' > "$fake_bin/rclone"
+    chmod 755 "$fake_bin/rclone"
+    PATH="$fake_bin:$PATH"
+    systemctl() { return 0; }
+    loginctl() { printf '%s\n' 'Linger=yes'; }
+    umask 022
+    before=$(umask)
+    write_fs_unit_linux "$ws" >/dev/null 2>&1 || exit 1
+    after=$(umask)
+    [ "$before" = "$after" ] \
+      && [ "$(file_mode "$STATE_DIR/fileserver-openclaw.env")" = "600" ] \
+      && [ "$(file_mode "$STATE_DIR/fileserver-openclaw.cred")" = "600" ]
+  ); then
+    pass "Linux unit writer leaves the process umask untouched"
+  else
+    fail "Linux unit writer leaves the process umask untouched" "the mask leaked or a credential file is not 0600"
+  fi
+
+  # A mask governs CREATION only, so a stale world-readable file from an earlier
+  # run keeps its mode while the credential is written into it. Pre-securing is
+  # what closes that window.
+  #
+  # COVERAGE LIMIT: this asserts the END STATE only. The write-then-chmod order
+  # that opens the window is not observable from the shell without instrumenting
+  # the writer, so this case passes against the unfixed source too. It catches a
+  # DROPPED chmod, never a reordered one — the ordering rests on review.
+  if (
+    reset_fake_home "umask-linux-stale"
+    GW_ID="openclaw"
+    FS_CRED="umask-fixture-secret"
+    FS_LOCAL_PORT="5098"
+    local fake_bin="$TMP/fake-bin-umask2" ws="$HOME/workspace"
+    mkdir -p "$fake_bin" "$ws" "$STATE_DIR"
+    printf '%s\n' '#!/usr/bin/env sh' 'exit 0' > "$fake_bin/rclone"
+    chmod 755 "$fake_bin/rclone"
+    PATH="$fake_bin:$PATH"
+    systemctl() { return 0; }
+    loginctl() { printf '%s\n' 'Linger=yes'; }
+    : > "$STATE_DIR/fileserver-openclaw.env"
+    : > "$STATE_DIR/fileserver-openclaw.cred"
+    chmod 644 "$STATE_DIR/fileserver-openclaw.env"
+    chmod 644 "$STATE_DIR/fileserver-openclaw.cred"
+    write_fs_unit_linux "$ws" >/dev/null 2>&1 || exit 1
+    [ "$(file_mode "$STATE_DIR/fileserver-openclaw.env")" = "600" ] \
+      && [ "$(file_mode "$STATE_DIR/fileserver-openclaw.cred")" = "600" ]
+  ); then
+    pass "a stale world-readable credential file does not survive the write"
+  else
+    fail "a stale world-readable credential file does not survive the write" "a credential file kept a permissive mode"
+  fi
+
+  # The mac twin carries the credential in the plist itself, so both its mask
+  # discipline and the plist mode matter.
+  if (
+    reset_fake_home "umask-mac"
+    GW_ID="openclaw"
+    FS_CRED="umask-fixture-secret"
+    FS_LOCAL_PORT="5099"
+    local fake_bin="$TMP/fake-bin-umask-mac" ws="$HOME/workspace" before after
+    local plist="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-openclaw.plist"
+    mkdir -p "$fake_bin" "$ws" "$HOME/Library/LaunchAgents"
+    printf '%s\n' '#!/usr/bin/env sh' 'exit 0' > "$fake_bin/rclone"
+    chmod 755 "$fake_bin/rclone"
+    PATH="$fake_bin:$PATH"
+    launchctl() { return 0; }
+    pmset() { printf '%s\n' ' sleep 0'; }
+    umask 022
+    before=$(umask)
+    write_fs_unit_mac "$ws" >/dev/null 2>&1 || exit 1
+    after=$(umask)
+    [ "$before" = "$after" ] \
+      && [ "$(file_mode "$plist")" = "600" ] \
+      && [ "$(file_mode "$STATE_DIR/fileserver-openclaw.cred")" = "600" ]
+  ); then
+    pass "mac unit writer leaves the process umask untouched and secures its plist"
+  else
+    fail "mac unit writer leaves the process umask untouched and secures its plist" "the mask leaked or the plist/credential is not 0600"
+  fi
+}
+
+# The guidance block is written by the wizard and READ by the agent, which runs
+# as its own uid — 1000 in the standard OpenClaw container, never the wizard's.
+# A block the agent cannot read installs perfectly and does nothing, so the mode
+# is the assertion: a content-only check would keep passing while the block sat
+# inert.
+test_tools_block_is_agent_readable() {
+  local ws="$TMP/tools-ws" target="$TMP/tools-ws/TOOLS.md"
+  mkdir -p "$ws"
+  if (
+    DRY_RUN=false
+    REUSE_ONLY=false
+    OPENCLAW_DIR="$TMP/no-compose-here"
+    confirm() { return 0; }
+    umask 077
+    install_conduck_tools_block "$ws" >/dev/null 2>&1 || exit 1
+    [ -f "$target" ] && [ "$(file_mode "$target")" = "644" ]
+  ); then
+    pass "TOOLS.md is created agent-readable even under a tight umask"
+  else
+    fail "TOOLS.md is created agent-readable even under a tight umask" "the file is missing or is not 0644"
+  fi
+
+  # A file the operator already owns is not ours to broaden. But installing into
+  # one the agent cannot read is the silent-success case, so it must refuse,
+  # leave the file alone, and name the remedy instead of reporting green.
+  printf '%s\n' '# my own notes' > "$target"
+  chmod 600 "$target"
+  if (
+    DRY_RUN=false
+    REUSE_ONLY=false
+    OPENCLAW_DIR="$TMP/no-compose-here"
+    confirm() { return 0; }
+    local out
+    out=$(install_conduck_tools_block "$ws" 2>&1)
+    printf '%s' "$out" | grep -q 'chmod 644' \
+      && ! printf '%s' "$out" | grep -q 'block installed' \
+      && [ "$(file_mode "$target")" = "600" ] \
+      && ! grep -q 'conduck-connect:begin' "$target"
+  ); then
+    pass "an unreadable existing TOOLS.md is refused unchanged, with the remedy named"
+  else
+    fail "an unreadable existing TOOLS.md is refused unchanged, with the remedy named" "the mode changed, the block was installed, or the remedy was not named"
+  fi
+}
+
 analysis_status() {
   hermes_config_analysis "$@" | awk -F '\t' '$1 == "status" { print $2; exit }'
 }
@@ -1065,6 +1207,121 @@ recall_home() { # <tag> — a fresh $HOME whose ~/.hermes looks like a working i
     'API_SERVER_PORT=8642' \
     'API_SERVER_KEY=fixture-api-server-key' \
     > "$HOME/.hermes/.env"
+}
+
+# Ordinary formatting — a trailing comment, a separator, trailing whitespace on
+# a blank line — cost Hermes its whole file lane, and none of it is reachable
+# from tidy fixtures, which is exactly why it survived. The POSITIVE cases carry
+# the stock config's own shapes. The NEGATIVE gates matter just as much: this
+# scanner backs a fail-closed decision, so a loosening past the intended one is
+# the real hazard, and these pin the refusals that must survive the fix.
+test_hermes_blank_and_comment_lines() {
+  local ws="$TMP/hermes-ws-blank" cfg="$TMP/hermes-blank.yaml"
+  mkdir -p "$ws"
+
+  # A value carrying a trailing comment puts the scanner into plain-continuation
+  # mode; a comment can never continue a plain scalar (YAML 1.2 §7.3.3), so the
+  # column-0 separator that follows must close it rather than fail the file.
+  printf '%s\n' \
+    'terminal:' \
+    "  cwd: \"$TMP/wrong-root\"" \
+    '  container_persistent: true    # Persist filesystem across sessions' \
+    '# ---' \
+    'platform_toolsets:' \
+    '  api_server:' \
+    '    - web' \
+    > "$cfg"
+  expect_eq "Hermes column-0 comment after an inline-commented value" \
+    "$(analysis_status "$cfg" "$ws")" "fix"
+
+  # A "blank" line that actually holds spaces is blank, not a child at indent 2.
+  printf '%s\n' \
+    'terminal:' \
+    "  cwd: \"$TMP/wrong-root\"" \
+    '  ' \
+    'platform_toolsets:' \
+    '  api_server:' \
+    '    - web' \
+    > "$cfg"
+  expect_eq "Hermes space-only line inside a scanned section" \
+    "$(analysis_status "$cfg" "$ws")" "fix"
+
+  # Same defect one layer up: in the root-form scan a space-only line after an
+  # indentless sequence item declared the WHOLE document unsupported, which is a
+  # harder failure than one ambiguous section.
+  printf '%s\n' \
+    'toolsets:' \
+    '- hermes-cli' \
+    '  ' \
+    'terminal:' \
+    "  cwd: \"$TMP/wrong-root\"" \
+    'platform_toolsets:' \
+    '  api_server:' \
+    '    - web' \
+    > "$cfg"
+  expect_eq "Hermes space-only line after an indentless root sequence" \
+    "$(analysis_status "$cfg" "$ws")" "fix"
+
+  # And inside a block list, where the same line reached the not-an-item refusal.
+  printf '%s\n' \
+    'terminal:' \
+    "  cwd: \"$TMP/wrong-root\"" \
+    'platform_toolsets:' \
+    '  api_server:' \
+    '    - web' \
+    '  ' \
+    > "$cfg"
+  expect_eq "Hermes space-only line inside a block sequence" \
+    "$(analysis_status "$cfg" "$ws")" "fix"
+
+  # All of it at once, shaped like the stock config rather than copying that
+  # third-party file into this repo.
+  printf '%s\n' \
+    '# Hermes configuration' \
+    'toolsets:' \
+    '- hermes-cli' \
+    '  ' \
+    '# ---' \
+    'terminal:' \
+    '  backend: local' \
+    "  cwd: \"$TMP/wrong-root\"" \
+    '  container_persistent: true    # Persist filesystem across sessions' \
+    '' \
+    '# ---' \
+    'platform_toolsets:' \
+    '  api_server:' \
+    '    - web' \
+    '  ' \
+    > "$cfg"
+  expect_eq "Hermes stock-shaped config with comments, separators and stray whitespace" \
+    "$(analysis_status "$cfg" "$ws")" "fix"
+
+  # NEGATIVE GATE: a tab is not YAML indentation and must keep failing closed.
+  # `strip(" ")`, not `strip()`, is what preserves this.
+  printf '%s\n' 'terminal:' "  cwd: \"$TMP/wrong-root\"" > "$cfg"
+  printf '\t\n' >> "$cfg"
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '    - web' >> "$cfg"
+  expect_eq "Hermes tab-only line still refuses" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  # NEGATIVE GATE: nor is any other Unicode whitespace. A non-breaking space is
+  # whitespace to Python and not to YAML, so `strip()` would have waved it past.
+  printf '%s\n' 'terminal:' "  cwd: \"$TMP/wrong-root\"" > "$cfg"
+  printf '\302\240\n' >> "$cfg"
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '    - web' >> "$cfg"
+  expect_eq "Hermes non-breaking-space-only line still refuses" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
+
+  # NEGATIVE GATE: the comment arm runs AFTER the tab check, so a tab-prefixed
+  # comment during a plain continuation stays refused rather than skipped.
+  printf '%s\n' \
+    'terminal:' \
+    "  cwd: \"$TMP/wrong-root\"" \
+    '  container_persistent: true    # Persist filesystem across sessions' > "$cfg"
+  printf '\t# tab-prefixed comment\n' >> "$cfg"
+  printf '%s\n' 'platform_toolsets:' '  api_server:' '    - web' >> "$cfg"
+  expect_eq "Hermes tab-prefixed comment during a plain continuation still refuses" \
+    "$(analysis_status "$cfg" "$ws")" "manual"
 }
 
 test_hermes_recall_classification() {
@@ -3251,7 +3508,10 @@ test_unsafe_existing_unit
 test_unsafe_cross_gateway_unit
 test_structural_unit_parsing
 test_systemd_unit_writer
+test_unit_writer_umask_is_scoped
+test_tools_block_is_agent_readable
 test_hermes_config
+test_hermes_blank_and_comment_lines
 test_hermes_recall_classification
 test_hermes_recall_edits
 test_hermes_recall_operator_flow

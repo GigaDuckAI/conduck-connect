@@ -679,8 +679,9 @@ fs_report_linger_linux() {
 # Write a per-gateway file-server unit that reads RCLONE_PASS from a 0600 env file
 # (credential never appears on the process command line / in `ps`).
 write_fs_unit_linux() { # write_fs_unit_linux <workspace>
-  local ws="$1" envf rclone_bin q_ws env_directive q_rclone
+  local ws="$1" envf credf rclone_bin q_ws env_directive q_rclone
   envf=$(state_env_file)
+  credf=$(state_cred_file)
   rclone_bin=$(command -v rclone)
   if ! credential_value_safe "$FS_CRED" \
      || ! q_ws=$(fs_systemd_quote "$ws") \
@@ -696,9 +697,18 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
   # is created 0700 and an already-open one is reported rather than left silent.
   mkdir -p "$(dirname "$FS_UNIT")"
   ensure_state_dir
-  umask 077
-  printf 'RCLONE_PASS=%s\n' "$FS_CRED" > "$envf"; chmod 600 "$envf"
-  printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
+  # Scoped, never bare. A bare `umask 077` here persists for the rest of the
+  # process and silently tightens every later write — TOOLS.md then landed 0600
+  # and the containerized agent, running as a different uid, could not read the
+  # guidance block the wizard had just reported installing.
+  #
+  # Create-and-chmod BEFORE writing: a mask only governs CREATION, so a stale
+  # 0644 file left by an earlier run would otherwise hold the credential for the
+  # window between the write and the chmod.
+  ( umask 077; : >> "$envf" ) && chmod 600 "$envf" || return 1
+  printf 'RCLONE_PASS=%s\n' "$FS_CRED" > "$envf" || return 1
+  ( umask 077; : >> "$credf" ) && chmod 600 "$credf" || return 1
+  printf '%s\n' "$FS_CRED" > "$credf" || return 1
   # systemd ExecStart: quote the workspace; rclone reads --user, pass via env.
   # --dir-cache-time 1s: rclone's VFS caches directory listings (default 5m), so a
   # file the AGENT writes directly into the folder (bypassing WebDAV) stays
@@ -720,6 +730,11 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 EOF
+  # The unit names the EnvironmentFile rather than carrying the credential, so
+  # its mode is not a secrecy boundary — but it is 0600 today and stays 0600
+  # explicitly now that the mask above no longer leaks this far. Mirrors the
+  # mac twin's chmod on its plist.
+  chmod 600 "$FS_UNIT" || return 1
   systemctl --user daemon-reload || return 1
   if systemctl --user enable --now "conduck-files-$GW_ID.service"; then
     ok "File server running in the background (a systemd user service)."
@@ -741,11 +756,19 @@ write_fs_unit_mac() { # write_fs_unit_mac <workspace>
   # and profile-*.json, so it goes through ensure_state_dir.
   mkdir -p "$(dirname "$FS_UNIT")"
   ensure_state_dir
-  umask 077
-  printf '%s\n' "$FS_CRED" > "$(state_cred_file)"; chmod 600 "$(state_cred_file)"
+  # Same scoping and same create-then-secure-then-write order as the Linux twin
+  # (see the comment there): a bare mask leaked into every later write, and a
+  # mask cannot tighten a file that already exists.
+  local credf; credf=$(state_cred_file)
+  ( umask 077; : >> "$credf" ) && chmod 600 "$credf" || return 1
+  printf '%s\n' "$FS_CRED" > "$credf" || return 1
   # Build the plist structurally with plistlib (correct escaping for any path).
+  # Unlike the Linux unit this file DOES embed the credential
+  # (EnvironmentVariables.RCLONE_PASS), so it is secured before plistlib opens
+  # it; the chmod below stays as the durable guarantee.
+  ( umask 077; : >> "$FS_UNIT" ) && chmod 600 "$FS_UNIT" || return 1
   RCLONE_BIN="$(command -v rclone)" WS="$1" PORT="$FS_LOCAL_PORT" CRED="$FS_CRED" \
-  LABEL="ai.gigaduck.conduck-files-$GW_ID" PLIST="$FS_UNIT" python3 - <<'PY'
+  LABEL="ai.gigaduck.conduck-files-$GW_ID" PLIST="$FS_UNIT" python3 - <<'PY' || return 1
 import os,plistlib
 d={
  "Label": os.environ["LABEL"],
@@ -1840,7 +1863,7 @@ install_conduck_tools_block() { # install_conduck_tools_block <workspace-host-pa
   fi
 
   if python3 - "$target" "$agent_ws" <<'PY'
-import os, sys
+import os, stat, sys
 
 target, agent_ws = sys.argv[1], sys.argv[2]
 BEGIN = "<!-- conduck-connect:begin -->"
@@ -1876,7 +1899,19 @@ if os.path.islink(target):
     print("TOOLS.md is a symlink — refusing to edit through it", file=sys.stderr)
     sys.exit(1)
 
-if os.path.exists(target):
+# The agent reads this file as ITS OWN uid — 1000 in the standard OpenClaw
+# container, never the uid running this wizard. A TOOLS.md only its owner can
+# read installs perfectly and stays invisible to the agent: the wizard reports
+# green for a step that did not take effect. Refuse instead, and name the fix —
+# broadening a file the operator already owns is not ours to decide.
+existed = os.path.exists(target)
+if existed and not (stat.S_IMODE(os.stat(target).st_mode) & 0o004):
+    print("TOOLS.md exists but only its owner can read it, so the agent would "
+          "never see the block. Fix the mode first:  chmod 644 %s" % target,
+          file=sys.stderr)
+    sys.exit(1)
+
+if existed:
     s = open(target).read()
     nb, ne = s.count(BEGIN), s.count(END)
     if nb == 0 and ne == 0:
@@ -1891,6 +1926,17 @@ else:
     s2 = block + "\n"
 
 open(target, "w").write(s2)
+
+# A file WE created must not inherit whatever mask happens to be in force: it
+# carries no secret and is useless unless a uid that is not ours can read it.
+# Verified rather than assumed — a chmod that silently does nothing would
+# recreate the exact failure this whole path exists to close.
+if not existed:
+    os.chmod(target, 0o644)
+    if not (stat.S_IMODE(os.stat(target).st_mode) & 0o004):
+        print("could not make TOOLS.md readable by the agent: %s" % target,
+              file=sys.stderr)
+        sys.exit(1)
 PY
   then
     ok "Conduck agent-guidance block installed in $target."

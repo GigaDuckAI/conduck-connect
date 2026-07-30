@@ -94,7 +94,20 @@ def content(line):
     # Config keys/lists in the paths we edit must not rely on YAML comments,
     # anchors, tags, or multiline scalars. Values we write are JSON-quoted,
     # which is valid YAML and makes spaces/# unambiguous.
-    return line.rstrip("\r\n")
+    #
+    # A space-only line is BLANK, not content at indent N. Every caller guards
+    # with `if not s`, so returning the raw spaces made each one read the line
+    # as an indented child: enough to make a section AMBIG, to reject a whole
+    # document in unsupported_root_form, and to refuse a block list in
+    # sequence(). Trailing whitespace on otherwise-blank lines is near-universal
+    # in hand-edited YAML, so this is ordinary input, not a corner case.
+    #
+    # Only ASCII spaces collapse. A tab-only or non-breaking-space-only line
+    # must stay on the fail-closed path — tabs are invalid YAML indentation and
+    # this scanner refuses them deliberately, so widening the strip would waive
+    # a refusal rather than fix a false one.
+    s = line.rstrip("\r\n")
+    return "" if not s.strip(" ") else s
 
 def quoted_mapping_key(s):
     """Decode a simple quoted YAML mapping key; None means not safely decoded."""
@@ -274,7 +287,8 @@ def child(section, name, src=None):
         # Root-level comments can follow the final section all the way to EOF.
         # Skip ordinary comments before demanding child indentation. A comment
         # inside a proved multiline quote remains scalar content and is scanned
-        # below; one inside a plain continuation is handled by that state.
+        # below; one arriving during a plain continuation is handled just past
+        # the tab check, which it must not be allowed to jump.
         if quote_kind is None and plain_indent is None \
            and s.lstrip().startswith("#"):
             continue
@@ -282,12 +296,26 @@ def child(section, name, src=None):
         if "\t" in prefix:
             return ("AMBIG", None, None, None, None)
         lead = len(prefix)
+        # A comment can never continue a plain scalar (YAML 1.2 §7.3.3), so it
+        # closes the continuation at ANY indent: keeping the state alive across
+        # a deeper comment would let the next line hide inside the prose
+        # accommodation instead of being structurally checked. Without this the
+        # column-0 comment that follows an inline-commented value in the stock
+        # Hermes config returned AMBIG at the guard below, costing the whole
+        # file lane.
+        #
+        # Matched on `lstrip(" ")`, never `lstrip()`: a tab-prefixed comment has
+        # already failed above, and any other Unicode whitespace prefix must
+        # fall through to the indentation refusal rather than be waved past it
+        # as a comment.
+        if quote_kind is None and plain_indent is not None \
+           and s.lstrip(" ").startswith("#"):
+            plain_indent = None
+            continue
         if lead <= 0:
             return ("AMBIG", None, None, None, None)
         if plain_indent is not None:
             if lead > plain_indent:
-                if s.lstrip().startswith("#"):
-                    continue
                 # A colon followed by separation whitespace cannot continue a
                 # YAML plain scalar. Treat it as structure instead of hiding a
                 # target-looking mapping inside the prose accommodation.
@@ -295,8 +323,6 @@ def child(section, name, src=None):
                     return ("AMBIG", None, None, None, None)
                 continue
             plain_indent = None
-            if s.lstrip().startswith("#"):
-                continue
         if quote_kind is not None:
             if lead <= quote_indent:
                 return ("AMBIG", None, None, None, None)
