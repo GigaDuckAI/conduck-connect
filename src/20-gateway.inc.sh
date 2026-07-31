@@ -49,7 +49,8 @@ detect_gateway() {
   say "    2) Hermes   $( [[ " ${found[*]-} " == *" hermes "* ]] && echo '(detected)' )"
   say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, your own adapter, …)"
   local choice
-  choice=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
+  choice=$(require_choice "Choose 1-3" '^[123]$' "nav.gateway") || die "$NO_ANSWER"
+  [ "$choice" = "q" ] && quit_run
   case "$choice" in
     1) GW_KIND="openclaw" ;;
     2) GW_KIND="hermes" ;;
@@ -112,7 +113,7 @@ _openclaw_prompt_secret() { # _openclaw_prompt_secret <ctx> <ask-prompt> <die-ms
     note "(dry-run: would prompt for the gateway credential)"
     return 0
   fi
-  GW_TOKEN=$(ask_secret "$ask")
+  GW_TOKEN=$(ask_secret "$ask" "stop; this credential is required")
   [ -n "$GW_TOKEN" ] || die "$diemsg"
 }
 
@@ -215,7 +216,7 @@ configure_openclaw() {
     warn "The OpenAI-compatible chat endpoint is OFF (it is off by default)."
     say  "  Without it the gateway looks healthy but no app can connect."
     if [ -f "$compose_dir/docker-compose.yml" ] || [ -f "$compose_dir/compose.yaml" ]; then
-      if run_step "enable the chat endpoint" \
+      if run_step "gateway.openclaw.enable_chat" "enable the chat endpoint" \
         docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
           dist/index.js config set --batch-json \
           '[{"path":"gateway.http.endpoints.chatCompletions.enabled","value":true}]'; then
@@ -225,13 +226,14 @@ configure_openclaw() {
         # walks straight into verification, so wait here too. HTTP-safe is FALSE
         # — this change IS the HTTP layer, so the epilogue must not promise it
         # cannot affect it. GW_LOCAL_PORT and GW_HEALTH_PATH are set just above.
-        if run_step "restart the gateway so the flag applies" \
+        if run_step "gateway.openclaw.restart_chat" "restart the gateway so the flag applies" \
           docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
           gw_note_restart_and_wait "chat-endpoint setting" false
         fi
       fi
     else
-      print_and_wait "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \
+      print_and_wait "gateway.openclaw.manual_enable_chat" \
+        "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \
         "openclaw config set gateway.http.endpoints.chatCompletions.enabled true" || true
     fi
     if ! $DRY_RUN; then
@@ -273,7 +275,7 @@ configure_hermes() {
       # reuse-only reuses what exists — it warns, never gates (a new die-by-default
       # prompt here would break "safe to point at a live gateway").
       note "(reuse-only: continuing with the existing config — if this is wrong, fix API_SERVER_PORT and re-run the wizard)"
-    elif ! confirm "  Continue with port 8645 anyway?"; then
+    elif ! confirm "  Continue with port 8645 anyway?" "gateway.hermes.accept_8645"; then
       die "Stopped — point API_SERVER_PORT in ~/.hermes/.env at the full-agent API server (default 8642), then re-run me."
     fi
   fi
@@ -296,7 +298,7 @@ configure_hermes() {
     say "    API_SERVER_PORT=$GW_LOCAL_PORT"
     if [ -n "$keyline" ]; then say "    API_SERVER_KEY=<freshly generated, not shown>"
     else say "    (keeping the API_SERVER_KEY already in your .env)"; fi
-    if confirm "  Append these now?"; then
+    if confirm "  Append these now?" "gateway.hermes.enable_api"; then
       [ -f "$envf" ] || ( umask 077; : > "$envf" )   # the key lands inside — never create it world-readable
       # No `|| true` here: a failed append (read-only fs, perms) must NOT report
       # "Written." and send the user on to a verify step that mis-diagnoses it.
@@ -313,10 +315,11 @@ configure_hermes() {
       # chmod fails, both live in secure_owned_file_mode.
       secure_owned_file_mode "$envf" "your API server key" || true
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
-        run_step "restart Hermes so the API server starts" \
+        run_step "gateway.hermes.restart_api" "restart Hermes so the API server starts" \
           systemctl --user restart hermes-gateway.service || true
       else
-        print_and_wait "Restart Hermes however it runs on this machine so the new API server settings load." \
+        print_and_wait "gateway.hermes.manual_restart_api" \
+          "Restart Hermes however it runs on this machine so the new API server settings load." \
           "systemctl --user restart hermes-gateway.service   # or your own restart method" || true
       fi
     else
@@ -328,7 +331,7 @@ configure_hermes() {
   if [ -n "$GW_TOKEN" ]; then ok "Read API_SERVER_KEY from ~/.hermes/.env (not shown)."
   elif $DRY_RUN; then note "(dry-run: would prompt for the Hermes API server key)"
   else
-    GW_TOKEN=$(ask_secret "Paste the Hermes API server key (hidden)")
+    GW_TOKEN=$(ask_secret "Paste the Hermes API server key (hidden)" "stop; Hermes requires a key")
     [ -n "$GW_TOKEN" ] || die "An API key is required for Hermes."
   fi
 
@@ -499,44 +502,108 @@ try:
 except Exception: pass' 2>/dev/null
 }
 
+# A bounded value prompt, unlike the free-form name/model/token prompts. `b` is
+# safe here because a custom-server answer has changed nothing yet; it restarts
+# this short answer group. The answer is assigned directly so q can exit the
+# parent shell (a command substitution would trap that exit in a subshell).
+ask_custom_gateway_port() { # sets GW_LOCAL_PORT; 0 value / 10 back / 1 EOF
+  local reply
+  while true; do
+    read -r -p "  Local port (e.g. 11434; Enter = no default; i = explain; b = restart these answers; q = stop): " reply \
+      || return 1
+    case "$reply" in
+      [iI]|\?) explain_prompt "gateway.custom.port"; continue ;;
+      [bB]) return 10 ;;
+      [qQ]) quit_run ;;
+      '') warn "A local setup needs a port. Enter its number, or press b to restart these answers and choose HTTPS." ;;
+      *[!0-9]*) warn "That's not a port number — digits only (e.g. 11434)." ;;
+      # Length-bound BEFORE the numeric test (6+ digits can't be a port): bash
+      # 3.2 errors out loudly on an integer comparison wider than intmax.
+      ??????*) warn "Ports go from 1 to 65535." ;;
+      *)
+        if [ "$reply" -ge 1 ] && [ "$reply" -le 65535 ]; then
+          GW_LOCAL_PORT="$reply"
+          return 0
+        fi
+        warn "Ports go from 1 to 65535."
+        ;;
+    esac
+  done
+}
+
+review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
+  local address auth model reply
+  if [ -n "$GW_URL" ]; then address="$GW_URL"
+  else address="http://127.0.0.1:$GW_LOCAL_PORT (local; HTTPS comes next)"; fi
+  if [ "$GW_AUTH" = "bearer" ]; then auth="Bearer token configured (hidden)"
+  else auth="No token — allowed only on a private path unless explicitly overridden"; fi
+  if [ -n "$GW_MODEL" ]; then model=$(safe_display "$GW_MODEL" 4096)
+  else model="Server/app default (no model fixed in the setup code)"; fi
+
+  say ""
+  say "  ${BOLD}Review this gateway${RESET}"
+  say "    Name:           $(safe_display "$GW_NAME" 200)"
+  say "    Address:        $(safe_display "$address" 4096)"
+  say "    Authentication: $auth"
+  say "    Model:          $model"
+  say ""
+  while true; do
+    read -r -p "  Enter = continue; b = re-enter these answers; i = explain; q = stop: " reply \
+      || die "$NO_ANSWER"
+    case "$reply" in
+      '') return 0 ;;
+      [bB]) return 10 ;;
+      [iI]|\?) explain_prompt "gateway.custom.review" ;;
+      [qQ]) quit_run ;;
+      *) warn "Press Enter to continue, b to re-enter, i for an explanation, or q to stop." ;;
+    esac
+  done
+}
+
 configure_generic() {
   head_ "Step 2 — your OpenAI-compatible server"
-  GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
-  GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
-  if confirm "  Does it already have an https:// URL?"; then
-    GW_LOCAL_PORT=""
-    GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
-    apply_gateway_url_normalization
-  else
-    while true; do
-      GW_LOCAL_PORT=$(ask "  Local port it listens on (e.g. 11434 for Ollama)" "")
-      [ -n "$GW_LOCAL_PORT" ] || die "Need the local port (or an https URL)."
-      case "$GW_LOCAL_PORT" in
-        *[!0-9]*) warn "That's not a port number — digits only (e.g. 11434)." ;;
-        # Length-bound BEFORE the numeric test (6+ digits can't be a port): bash
-        # 3.2 errors out loudly on an integer comparison wider than intmax.
-        ??????*) warn "Ports go from 1 to 65535." ;;
-        *) [ "$GW_LOCAL_PORT" -ge 1 ] && [ "$GW_LOCAL_PORT" -le 65535 ] && break
-           warn "Ports go from 1 to 65535." ;;
-      esac
-    done
-  fi
-  GW_HEALTH_PATH=""   # no portable health endpoint on arbitrary servers
-  if confirm "  Does it require a bearer token / API key?"; then
-    GW_AUTH="bearer"
-    if $DRY_RUN; then note "(dry-run: would prompt for the token)"; GW_TOKEN="<token>"
-    else GW_TOKEN=$(ask_secret "Paste it (hidden)"); [ -n "$GW_TOKEN" ] || die "Empty token."; fi
-  else
-    GW_AUTH="none"; GW_TOKEN=""
-    note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
-    note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
-  fi
-  say "  Some servers (Ollama, vLLM, LiteLLM without a default) need the app to"
-  say "  name a model in every request."
-  local model_default=""; $DRY_RUN || model_default=$(probe_single_model "$GW_LOCAL_PORT")
-  if [ -n "$model_default" ]; then
-    GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
-  else
-    GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
-  fi
+  while true; do
+    # Clear the whole draft before a correction, especially the hidden token.
+    GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
+    GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""
+
+    GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
+    GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
+    if confirm "  Does it already have an https:// URL?" "gateway.custom.has_https"; then
+      GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
+      apply_gateway_url_normalization
+    else
+      ask_custom_gateway_port
+      local port_rc=$?
+      if [ "$port_rc" = "10" ]; then
+        note "↩ Restarting the custom gateway answers. Nothing has been changed."
+        continue
+      fi
+      [ "$port_rc" = "0" ] || die "Need the local port (or an https URL)."
+    fi
+    GW_HEALTH_PATH=""   # no portable health endpoint on arbitrary servers
+    if confirm "  Does it require a bearer token / API key?" "gateway.custom.has_auth"; then
+      GW_AUTH="bearer"
+      if $DRY_RUN; then note "(dry-run: would prompt for the token)"; GW_TOKEN="<token>"
+      else GW_TOKEN=$(ask_secret "Paste it (hidden)" "stop; you said this gateway requires a token"); [ -n "$GW_TOKEN" ] || die "Empty token."; fi
+    else
+      GW_AUTH="none"; GW_TOKEN=""
+      note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
+      note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
+    fi
+    say "  Some servers (Ollama, vLLM, LiteLLM without a default) need the app to"
+    say "  name a model in every request."
+    local model_default=""; $DRY_RUN || model_default=$(probe_single_model "$GW_LOCAL_PORT")
+    if [ -n "$model_default" ]; then
+      GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
+    else
+      GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
+    fi
+
+    review_custom_gateway
+    local review_rc=$?
+    [ "$review_rc" = "0" ] && return 0
+    [ "$review_rc" = "10" ] || return "$review_rc"
+    say ""; note "↩ Re-entering the custom gateway answers. Nothing has been changed."
+  done
 }

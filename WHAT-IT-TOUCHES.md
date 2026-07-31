@@ -1,6 +1,11 @@
 # What conduck-connect touches
 
-Every file, service, and network port the script may read or change — and how to undo each. The script always shows you a change before making it. `--setup --dry-run` lists all of this for *your* host without changing anything, so start there:
+Every file, service, and network port the script may read or change — and how
+to undo each. Gateway or user-owned configuration and network-exposure changes
+are previewed and require a bounded approval. Connector-owned bookkeeping and
+exact verification artifacts described below may be created automatically
+inside a setup or check action you already chose. `--setup --dry-run` lists all
+of this for *your* host without changing anything, so start there:
 
 ```bash
 bash conduck-connect.sh --setup --dry-run
@@ -32,7 +37,13 @@ connector-owned categories. Every curl invocation puts `-q` first, so curl
 configuration files (and files they might include) are not read. No persistent
 file is changed unless it appears in the next table.
 
-## May change — always with your confirmation
+## May change during an approved setup action
+
+Changes to gateway or user-owned configuration and network exposure get their
+own preview and approval. Connector-owned state, service files, credentials,
+and exact probe artifacts are created only inside the setup or file-lane action
+you chose, but each bookkeeping write is not a separate prompt. The table makes
+both categories explicit and gives the corresponding undo.
 
 | Change | Detail | How to undo |
 |---|---|---|
@@ -62,6 +73,12 @@ file is changed unless it appears in the next table.
 ## When it cannot prove what it did
 
 Every exposure change is re-checked against `tailscale serve status --json` afterwards. If that check cannot confirm the result — the command needed rights it did not have, or the status could not be read — the script says so plainly and prints the exact commands to fix it by hand. It never reports a change as done on faith, and it will not end a run silently while a file server it exposed may still be reachable.
+
+The prompt controls do not turn setup into a transaction. **`i`** only explains
+the current action and asks again. **`q`** stops setup deliberately; **`b`** is
+shown only where the wizard can safely return to a defined earlier choice.
+Neither `q` nor `b` undoes configuration changes already approved, commands you
+already ran, or exposure changes already confirmed.
 
 Setup is consented step-by-step, not one transaction. A narrow Hermes
 `terminal.cwd`/API-server-toolset edit or marker-delimited guidance edit that

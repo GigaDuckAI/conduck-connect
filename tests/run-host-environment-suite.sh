@@ -520,7 +520,7 @@ priv_retry_out() { # priv_retry_out <uid> <sudo|doas|none> <accept y/n> <why> <b
       esac
     }
     warn() { printf 'warn: %s\n' "$*"; }
-    print_and_wait() { printf 'WHY: %s\nRETRY: %s\n' "$1" "$2"; [ "$accept" = y ]; }
+    print_and_wait() { printf 'ACTION: %s\nWHY: %s\nRETRY: %s\n' "$1" "$2" "$3"; [ "$accept" = y ]; }
     ts_priv_retry "$@"
     printf 'rc=%s\n' "$?"
   ) 2>&1
@@ -529,6 +529,8 @@ priv_retry_out() { # priv_retry_out <uid> <sudo|doas|none> <accept y/n> <why> <b
 test_ts_priv_retry() {
   local out why="Tailscale serve/funnel often needs operator or root rights."
   out=$(priv_retry_out 1000 sudo y "$why" "tailscale serve --https=443 http://127.0.0.1:8080")
+  expect_has "ts retry: carries its explanation action" \
+    "$out" "ACTION: exposure.tailscale.privileged_retry"
   expect_has "ts retry: sudo box gets the prefixed retry" \
     "$out" "RETRY: sudo tailscale serve --https=443 http://127.0.0.1:8080"
   expect_has "ts retry: an accepted retry reports success" "$out" "rc=0"
@@ -597,7 +599,7 @@ expose_out() { # expose_out <uid> <sudo|doas|none> <accept y/n> <before> <after>
         *)    return 1 ;;
       esac
     }
-    print_and_wait() { printf 'WHY: %s\nRETRY: %s\n' "$1" "$2"; [ "$accept" = y ]; }
+    print_and_wait() { printf 'ACTION: %s\nWHY: %s\nRETRY: %s\n' "$1" "$2" "$3"; [ "$accept" = y ]; }
     # Tailscale refuses everything — the whole point of this path.
     tailscale() { printf 'tailscale refused: %s\n' "$*" >&2; return 1; }
     # The post-attempt re-read lands on whatever state the case declares.
@@ -667,7 +669,7 @@ unmap_out() { # unmap_out <uid> <sudo|doas|none>
         *)    return 1 ;;
       esac
     }
-    print_and_wait() { printf 'WHY: %s\nRETRY: %s\n' "$1" "$2"; return 0; }
+    print_and_wait() { printf 'ACTION: %s\nWHY: %s\nRETRY: %s\n' "$1" "$2" "$3"; return 0; }
     tailscale() { return 1; }
     ts_targets() { TS_PORTS=(); }
     ts_unmap 8443 serve
@@ -707,7 +709,7 @@ sweep_out() { # sweep_out <uid> <sudo|doas|none>
         *)    return 1 ;;
       esac
     }
-    print_and_wait() { printf 'WHY: %s\nRETRY: %s\n' "$1" "$2"; return 0; }
+    print_and_wait() { printf 'ACTION: %s\nWHY: %s\nRETRY: %s\n' "$1" "$2" "$3"; return 0; }
     tailscale() { return 1; }
     ts_targets() { TS_PORTS=(); }
     sweep_stale_public_funnels 8080 443 host.example.ts.net

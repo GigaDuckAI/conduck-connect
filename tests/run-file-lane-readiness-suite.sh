@@ -94,16 +94,17 @@ mutate_guard() {
 # config change must stay refusable, or "reuse-only changed nothing" would pass on a
 # stub that quietly ran it. The operator y/N the real ones wrap is auto-accepted.
 run_step() {
-  local desc="$1"; shift
+  local action="$1" desc="$2"; shift 2
   if $DRY_RUN; then plan_add "RUN  $*"; return 0; fi
   mutate_guard "$desc" || return 1
-  printf '[run_step] %s\n' "$desc"
+  printf '[run_step] %s (%s)\n' "$desc" "$action"
   return 0
 }
 print_and_wait() {
-  if $DRY_RUN; then plan_add "YOU RUN  $2  ($1)"; return 0; fi
-  mutate_guard "$1" || return 1
-  printf '[by-hand] %s\n' "$1"
+  local action="$1" why="$2" command="$3"
+  if $DRY_RUN; then plan_add "YOU RUN  $command  ($why)"; return 0; fi
+  mutate_guard "$why" || return 1
+  printf '[by-hand] %s (%s)\n' "$why" "$action"
   return 0
 }
 ask_secret() { printf '%s' "fixture-secret"; }
@@ -3385,8 +3386,8 @@ openclaw_fix_config() { # openclaw_fix_config <path> <ready|needs-fix>
 #   POLICY_RESTART_RC  — 1 declines the restart half, the way an operator does.
 POLICY_CFG=""
 POLICY_RESTART_RC=0
-policy_run_step() { # policy_run_step <description> [command…]
-  local desc="$1"
+policy_run_step() { # policy_run_step <action-id> <description> [command…]
+  local action="$1" desc="$2"
   case "$desc" in
     *restart*)
       if [ "$POLICY_RESTART_RC" != "0" ]; then
@@ -3396,7 +3397,7 @@ policy_run_step() { # policy_run_step <description> [command…]
       ;;
     *"tool policy"*) openclaw_fix_config "$POLICY_CFG" ready ;;
   esac
-  printf '[run_step] %s\n' "$desc"
+  printf '[run_step] %s (%s)\n' "$desc" "$action"
   return 0
 }
 

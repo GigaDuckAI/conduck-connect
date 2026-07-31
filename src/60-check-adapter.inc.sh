@@ -238,7 +238,7 @@ doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stder
   say "  Plain http:// is fine toward this machine (127.0.0.1/localhost) — test locally first," >&2
   say "  expose over HTTPS after." >&2
   while true; do
-    read -r -p "  URL (e.g. http://127.0.0.1:8080) > " reply || return 1   # EOF: caller dies
+    read -r -p "  URL (e.g. http://127.0.0.1:8080; Enter = no default) > " reply || return 1   # EOF: caller dies
     if url=$(doctor_accept_url "$reply"); then
       printf '  %s→ testing %s%s\n' "$DIM" "$url" "$RESET" >&2
       printf '%s' "$url"; return 0

@@ -91,8 +91,9 @@ run_setup() {
   if $REUSE_ONLY; then
     note "(reuse-only: I'll reuse what's set up and refuse configuration changes; live verification still sends requests and may write/delete a file probe)"
   fi
-  say "Every change asks first, and you see the exact command before it happens. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
-  note "Some commands I offer to run for you (you say yes or no to each); the rest you copy-paste and run yourself while I wait."
+  say "Gateway, service, and network changes ask first, and you see the exact command. No telemetry — verification talks only to your own gateway."
+  note "At bounded questions: i explains this step, q stops, and b appears only where going back is safe. Every prompt states what Enter does."
+  note "q or Ctrl-C stops the run; it does not undo an earlier change you approved. Exposure undo commands are preserved and printed if needed."
 
   # The single-instance gate, taken HERE because this is the one choke point both
   # entries pass through: the --setup dispatch below, and the check → setup handoff
@@ -145,7 +146,7 @@ run_setup() {
       choose_exposure && break
       local rc=$?
       [ "$rc" = "10" ] || break
-      say ""; note "↩ Back to the gateway choice."
+      say ""; note "↩ Back to the gateway choice. Earlier approved gateway changes stay in place; setup is not transactional."
     done
   fi
 
@@ -188,7 +189,7 @@ finish_successful_check() { # finish_successful_check <server|adapter>
   trap on_exit EXIT
 
   say ""
-  if ! confirm "  Would you like to continue with setup and pairing?"; then
+  if ! confirm "  Would you like to continue with setup and pairing?" "check.continue_setup"; then
     note "Check complete. No setup changes were made."
     exit 0
   fi
