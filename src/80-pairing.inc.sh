@@ -142,6 +142,25 @@ emit_payload() {
   local pairing="conduck-setup:v${PAYLOAD_VERSION}:$encoded"
 
   say ""
+  # What this code actually carries, in one place, immediately before it is shown.
+  # EVERY route that drops the file lane converges here — a confirmed skip at the
+  # address prompt, a live probe that failed, an agent gate that could not be
+  # proved — so this states the outcome without depending on WHY, and without the
+  # operator having to reconstruct it from warnings that have scrolled away.
+  # It earns its line because the mistake is expensive and one-directional: the
+  # code gets scanned, and adding a lane afterwards means re-running setup, since
+  # --show-code can only re-emit a lane the profile already holds.
+  # Same condition build_pairing_payload_json uses to attach fileServer, so this
+  # summary cannot disagree with the code it describes.
+  say "  ${BOLD}This code carries:${RESET}"
+  ok "Chat with your gateway"
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+    ok "File transfer — attachments via $FS_URL"
+  else
+    warn "File transfer is NOT included — attachments stay inline-only."
+    note "To add it later, re-run setup and give the file lane an address."
+  fi
+  say ""
   # The file-lane clause must ride the SAME condition build_pairing_payload_json uses to
   # attach fileServer — warning about a shared folder that isn't in this code is a lie the
   # user cannot check, and omitting it when it IS in the code understates what they hold.

@@ -1226,6 +1226,48 @@ fs_warn_quick_tunnel_url() {
   say ""
 }
 
+# The file-lane address prompts accept a blank as "leave file transfer out", and
+# by the time any of them runs a server EXISTS and has passed its local
+# read/write check — so a blank there discards a working capability the operator
+# already said yes to at "Set it up?". A fumbled paste, a stray Enter and a
+# deliberate skip all arrive as the same empty string, and the cost of getting it
+# wrong is a FULL re-run: --show-code re-emits the saved profile and cannot add a
+# lane that was never in it.
+#
+# So a blank asks once, and a NO returns to the address prompt. That keeps the
+# escape hatch (someone says yes, then finds they have no HTTPS route to give,
+# and must not have to Ctrl-C the run) while making the skip deliberate and the
+# fumble free to retry. Answering with an address costs nothing extra — the
+# question exists only on the path that throws the lane away.
+#
+# Blank-then-EOF ends the loop: ask_url returns nonzero on a closed stdin, which
+# this propagates so the caller's `|| die "$NO_ANSWER"` still fires.
+ask_fs_url() { # ask_fs_url <prompt> -> echoes the address, or "" for a skip
+  local prompt="$1" u tries=0
+  while [ "$tries" -lt 3 ]; do
+    tries=$((tries + 1))
+    u=$(ask_url "$prompt" "https://files.example.com" 1) || return 1
+    if [ -n "$u" ]; then printf '%s' "$u"; return 0; fi
+    # stderr, like every other human line in a prompt helper: this runs inside
+    # $( ), where anything on stdout would be captured AS THE ADDRESS. confirm
+    # gets the same redirect even though `read -p` already prompts on stderr —
+    # the helper's contract is "nothing but the address reaches stdout", and that
+    # must hold from reading this function, not from knowing what confirm does.
+    warn "No address was entered." >&2
+    confirm "  Leave file transfer OUT of this setup code?" >&2 && return 0
+    note "Let's try that address again." >&2
+  done
+  # BOUNDED, because --setup is not gated on an interactive terminal: a stdin
+  # that keeps yielding empty lines (a pipe, `printf '\n\n\n' |`, a wedged paste)
+  # would spin here forever, and a hang is a worse failure than the one this
+  # confirmation exists to prevent. EOF already returns above — this is only for
+  # a stdin that answers, emptily, without end. Falling through to the skip keeps
+  # the old behaviour as the floor, and Step 6 still states that the code carries
+  # no file transfer, so the run cannot end quietly wrong.
+  warn "Still no address after three tries — leaving file transfer out of this code." >&2
+  return 0
+}
+
 # Promote a private file lane to PUBLIC (Funnel) so it matches a public gateway.
 # Publication event → a SECOND explicit confirm on top of the menu choice.
 fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> <host>
@@ -2278,15 +2320,15 @@ setup_file_lane() {
       # confirm they made it (or say they already have one).
       if $REUSE_ONLY; then
         note "(reuse-only: assuming your file-lane ingress rule already exists)"
-        local h; h=$(ask_url "The file-lane web address (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
+        local h; h=$(ask_fs_url "The file-lane web address (blank to skip the file lane)") || die "$NO_ANSWER"
         if [ -n "$h" ]; then FS_URL="$h"; FS_ROUTE_SELF_MANAGED=true; fs_warn_quick_tunnel_url
-        else note "No address — leaving the file lane out of the QR."; FS_CRED=""; fs_lane_residue_note; fi
+        else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
       elif print_and_wait "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
         "cloudflared tunnel route dns <your-tunnel> files.YOURDOMAIN"; then
         FS_ROUTE_SELF_MANAGED=true
-        local h2; h2=$(ask_url "The file-lane web address you configured (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
+        local h2; h2=$(ask_fs_url "The file-lane web address you configured (blank to skip the file lane)") || die "$NO_ANSWER"
         if [ -n "$h2" ]; then FS_URL="$h2"; fs_warn_quick_tunnel_url
-        else note "No address — leaving the file lane out of the QR."; FS_CRED=""; fs_lane_residue_note; fi
+        else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
       else FS_CRED=""; fs_lane_residue_note; fi
       ;;
     public)
@@ -2295,13 +2337,13 @@ setup_file_lane() {
       say "  (a second server block, a subdomain, or another port)."
       note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
       note "Its certificate must be trusted the same way the gateway's is; the app applies one rule to both."
-      local h; h=$(ask_url "The https:// web address that reaches it (blank to skip the file lane)" "https://files.example.com" 1) || die "$NO_ANSWER"
+      local h; h=$(ask_fs_url "The https:// web address that reaches it (blank to skip the file lane)") || die "$NO_ANSWER"
       if [ -n "$h" ]; then
         FS_URL="$h"
         FS_ROUTE_SELF_MANAGED=true   # their own web server holds it; only they can take it back down
         fs_warn_quick_tunnel_url     # "my own HTTPS" reaches a quick tunnel just as easily
       else
-        note "Skipped the file lane (Conduck still works — inline-only attachments)."
+        warn "File transfer is NOT in this setup code — chat still works (inline-only attachments)."
         FS_CRED=""
         fs_lane_residue_note
       fi

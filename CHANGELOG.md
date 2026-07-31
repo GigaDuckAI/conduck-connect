@@ -4,6 +4,27 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **A blank at the file-lane address prompt threw away a working file server, and
+  the setup code went out without it.** By the time that prompt appears the
+  connector has found the operator's file server, recovered its credential and
+  proved it answers a read and a write — and then read an empty line as "leave
+  file transfer out", identical to a deliberate skip. A paste that did not land, a
+  stray Enter and a considered no all arrived as the same empty string, and the
+  outcome was announced in a dim one-line note. The operator scans the code and
+  finds out on their phone; the only way back is a full re-run, because
+  `--show-code` re-emits a lane the profile already holds and cannot invent one.
+  Blank stays a valid answer — someone can accept the lane and then find they have
+  no HTTPS route to give it — so it is now confirmed rather than assumed, and
+  declining the skip returns to the address prompt, which makes a mis-paste cost
+  one keystroke instead of the whole run. A confirmed skip says so as a warning
+  rather than a note. This is the same failure the end-of-run residue report was
+  added for; that report tells you afterwards, and this stops it happening.
+  Step 6 now also states what the code **carries**, immediately before showing it:
+  chat always, file transfer only when the lane really rides in the payload. It is
+  decided by the same condition the payload builder uses, so the summary cannot
+  disagree with the code it describes, and it covers every other route that drops
+  a lane — a live probe that failed, an agent gate that could not be proved — not
+  only this one.
 - **The wizard told you to write a Hermes config line it would then refuse to
   read.** When it cannot make the `platform_toolsets.api_server` edit itself it
   prints the list to write by hand, and printed it as a bare YAML flow sequence:

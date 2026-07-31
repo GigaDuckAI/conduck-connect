@@ -2792,6 +2792,114 @@ test_new_lane_folder_recording() {
     *) fail "new lane: its teardown commands are handed over" "$out" ;; esac
 }
 
+# ========================= a blank file-lane address is confirmed, not assumed ===
+#
+# The measured bug: an operator answered y to "Set it up?", the wizard found and
+# byte-verified their existing file server, and then a paste that did not land
+# left the address prompt blank. That shipped a pairing code with no file lane —
+# discovered on the phone, and recoverable only by a FULL re-run, because
+# --show-code can re-emit a saved lane but cannot invent one. A fumbled paste, a
+# stray Enter and a deliberate skip all arrived as the same empty string.
+#
+# Blank stays a valid answer — someone can say yes and then find they have no
+# HTTPS route to give — so it is CONFIRMED instead, and a no returns to the
+# prompt so the fumble costs one keystroke rather than the whole run.
+fs_url_run() { # fs_url_run <confirm-script> <ask_url answer…> -> transcript + RESULT/RC
+  local script="$1"; shift
+  local queue="$TMP/fs-url-answers"
+  printf '%s\n' "$@" > "$queue"
+  (
+    CONFIRM_SCRIPT="$script"
+    CONFIRM_ANSWER="n"
+    URL_QUEUE="$queue"
+    # The SHARED confirm stub is used deliberately, marker on stdout and all.
+    # ask_fs_url runs inside $( ), so anything a prompt helper leaks to stdout is
+    # captured as the address — which is how this very feature first broke the
+    # suite. Production redirects confirm to stderr for exactly that reason, so
+    # leaving the noisy stub in place turns these cases into the regression test
+    # for that redirect: drop it and the marker lands in RESULT below.
+    # A file, not a variable: ask_fs_url calls this inside $( ), so a queue index
+    # kept in a variable would die with that subshell and re-serve answer one
+    # forever — which is exactly the infinite loop this feature could introduce.
+    ask_url() {
+      local reply=""
+      [ -s "$URL_QUEUE" ] || return 1          # exhausted: the real one returns nonzero on EOF
+      reply=$(head -n 1 "$URL_QUEUE")
+      sed '1d' "$URL_QUEUE" > "$URL_QUEUE.rest" && mv "$URL_QUEUE.rest" "$URL_QUEUE"
+      printf '[ask_url] %s\n' "$1" >&2
+      case "$reply" in
+        __EOF__)   return 1 ;;
+        __BLANK__) printf '' ;;
+        *)         printf '%s' "$reply" ;;
+      esac
+    }
+    local result rc
+    result=$(ask_fs_url "The https:// web address that reaches it"); rc=$?
+    printf 'RESULT=%s\nRC=%s\n' "$result" "$rc"
+  ) 2>&1
+}
+
+test_file_lane_blank_address_confirm() {
+  local out
+
+  # A no at the confirmation returns to the address prompt, and the address given
+  # on the second pass is the one that ships. This is the fumbled-paste recovery.
+  out=$(fs_url_run "n" "__BLANK__" "https://files.example.test")
+  case "$out" in *"RESULT=https://files.example.test"*)
+      pass "blank address: declining the skip returns to the prompt and takes the address" ;;
+    *) fail "blank address: declining the skip returns to the prompt and takes the address" "$out" ;; esac
+  case "$out" in *"No address was entered"*)
+      pass "blank address: the blank is named out loud" ;;
+    *) fail "blank address: the blank is named out loud" "$out" ;; esac
+  case "$out" in *"[confirm]"*"Leave file transfer OUT"*)
+      pass "blank address: the skip is put as a question" ;;
+    *) fail "blank address: the skip is put as a question" "$out" ;; esac
+
+  # A yes still skips — the escape hatch survives, it is just deliberate now.
+  out=$(fs_url_run "y" "__BLANK__")
+  case "$out" in *"RESULT=https"*)
+      fail "blank address: a confirmed skip returns no address" "$out" ;;
+    *) pass "blank address: a confirmed skip returns no address" ;; esac
+  case "$out" in *"RC=0"*)
+      pass "blank address: a confirmed skip is not an error" ;;
+    *) fail "blank address: a confirmed skip is not an error" "$out" ;; esac
+
+  # Two blanks then an address: the loop keeps asking rather than giving up, and
+  # it must consume a fresh answer each time (a re-served answer would hang).
+  out=$(fs_url_run "n:n" "__BLANK__" "__BLANK__" "https://files.second.test")
+  case "$out" in *"RESULT=https://files.second.test"*)
+      pass "blank address: a second blank is asked about again, not assumed" ;;
+    *) fail "blank address: a second blank is asked about again, not assumed" "$out" ;; esac
+
+  # A stdin that answers emptily WITHOUT END must not hang. --setup is not gated
+  # on an interactive terminal, so `printf '\n\n\n' | conduck-connect.sh --setup`
+  # reaches this prompt; before the bound it would loop forever, which is a worse
+  # failure than the silent skip the confirmation exists to prevent.
+  out=$(fs_url_run "n:n:n:n:n" "__BLANK__" "__BLANK__" "__BLANK__" "__BLANK__" "__BLANK__")
+  case "$out" in *"RC=0"*)
+      pass "blank address: an endlessly empty stdin gives up instead of looping" ;;
+    *) fail "blank address: an endlessly empty stdin gives up instead of looping" "$out" ;; esac
+  case "$out" in *"after three tries"*)
+      pass "blank address: giving up says so" ;;
+    *) fail "blank address: giving up says so" "$out" ;; esac
+  case "$out" in *"RESULT=https"*)
+      fail "blank address: giving up ships no address" "$out" ;;
+    *) pass "blank address: giving up ships no address" ;; esac
+
+  # A closed stdin must still end the run through the caller's `|| die`, not spin.
+  out=$(fs_url_run "n" "__EOF__")
+  case "$out" in *"RC=1"*)
+      pass "blank address: EOF propagates so the caller can die" ;;
+    *) fail "blank address: EOF propagates so the caller can die" "$out" ;; esac
+
+  # And an address given first time asks nothing extra — the cost lands only on
+  # the path that throws the lane away.
+  out=$(fs_url_run "" "https://files.direct.test")
+  case "$out" in *"[confirm]"*)
+      fail "blank address: a supplied address adds no prompt" "$out" ;;
+    *) pass "blank address: a supplied address adds no prompt" ;; esac
+}
+
 # ================================ a file-lane address that will not survive ===
 #
 # The measured bug: a quick tunnel came back after a reboot on a NEW public
@@ -3568,6 +3676,7 @@ test_request_credential_controls
 test_show_code_live_folder
 test_shared_folder_gate
 test_new_lane_folder_recording
+test_file_lane_blank_address_confirm
 test_file_lane_quick_tunnel_warning
 test_lane_residue_report
 test_inactive_unit_report

@@ -1829,6 +1829,11 @@ run_emit_payload_isolated() {
 eval "$FUNCS"
 say()   { printf "%s\n" "$*"; }
 warn()  { printf "WARNLINE %s\n" "$*"; }
+# Tagged like warn(): the pre-code summary states what the operator is about to
+# scan, and the positive half of it is an ok() line. Untagged (or undefined) it
+# would be indistinguishable from the surrounding prose, and an undefined ok()
+# would send the line to stderr where these assertions could never see it.
+ok()    { printf "OKLINE %s\n" "$*"; }
 note()  { printf "%s\n" "$*"; }
 head_() { printf "%s\n" "$*"; }
 die()   { printf "Error: %s\n" "$*" >&2; exit 1; }
@@ -1946,6 +1951,23 @@ run_pairing_warning_case() {
   fi
   if warning_states "$block_bare" 'credential|shared folder|file server|file-server'; then
     fail_case "$name" "a run WITHOUT a file lane still claimed a file-server credential or shared folder"; return
+  fi
+
+  # FACT 7 — say what the code CARRIES, before it is shown. Every route that
+  # drops the file lane converges on this emit — a confirmed skip at the address
+  # prompt, a live probe that failed, an agent gate that could not be proved — so
+  # this is the one statement that holds regardless of WHY the lane is missing,
+  # and the last moment it is cheap: after the code is scanned, adding a lane
+  # costs a full re-run of setup. An absence is not a statement, so the run
+  # WITHOUT a lane has to say so in words rather than leave it to be noticed.
+  if ! printf '%s\n' "$out_files" | grep -qiE '^OKLINE .*file transfer'; then
+    fail_case "$name" "a run WITH a file lane never states that the code carries file transfer"; return
+  fi
+  if ! printf '%s\n' "$out_bare" | grep -qiE '^WARNLINE .*file transfer.*(not included|not in this|missing)'; then
+    fail_case "$name" "a run WITHOUT a file lane never states that file transfer is missing from the code"; return
+  fi
+  if printf '%s\n' "$out_bare" | grep -qiE '^OKLINE .*file transfer'; then
+    fail_case "$name" "a run WITHOUT a file lane claimed the code carries file transfer"; return
   fi
 
   # Control: the exact regression FACT 6 exists for — an emit whose file-lane
