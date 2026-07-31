@@ -188,6 +188,47 @@ local_health_ok() { # local_health_ok <url> -> 0 when the server answered with <
   case "$code" in ''|000) return 1 ;; 5??) return 1 ;; *) return 0 ;; esac
 }
 
+# The loopback address of the SAME endpoint the public URL addresses. A check → setup
+# handoff can carry a base path (https://host/api), and a comparison that dropped it
+# would probe a DIFFERENT endpoint and then blame the difference on the route.
+gw_loopback_base() { # gw_loopback_base -> http://127.0.0.1:<port><base-path>; "" with no port
+  [ -n "${GW_LOCAL_PORT:-}" ] || return 0
+  printf 'http://127.0.0.1:%s%s' "$GW_LOCAL_PORT" "${CHECKED_PATH_PREFIX:-}"
+}
+
+# Does the gateway answer THIS machine successfully, carrying the same credential the
+# public request carried? Deliberately stricter than local_health_ok, which counts every
+# status below 500 as "up": the only question asked here is "succeeds here, forbidden
+# there", and a local 403 counted as "up" would assert the very mismatch it exists to
+# disprove. The credential is preserved for the same reason the endpoint and the base
+# path are — the route is meant to be the ONLY difference between the two requests, and
+# an unauthenticated probe would go blind exactly when the gateway correctly wants a token.
+# The bearer rides a stdin curl config, never argv (argv shows in `ps`).
+# `Accept: application/json` for the same reason as the credential: models_is_json sends
+# it on the public request, and "this very request" is a claim about BOTH of them — a
+# front that grades content negotiation would otherwise refuse the public request, wave
+# the probe's default `Accept: */*` through, and be handed the all-clear for it.
+# `--noproxy '*'` is mandatory, not cosmetic: the target is unconditionally 127.0.0.1 and
+# curl has NO loopback exemption, while `-q` suppresses ~/.curlrc but not
+# $http_proxy/$ALL_PROXY — without it the token leaves the machine in cleartext to
+# whatever host those variables name.
+gw_answers_on_loopback() { # gw_answers_on_loopback <base-url> -> 0 when /v1/models answers 2xx
+  local code
+  if [ "$GW_AUTH" = "bearer" ] && [ -n "${GW_TOKEN:-}" ]; then
+    credential_value_safe "$GW_TOKEN" || return 1
+    local tok="$GW_TOKEN"; tok="${tok//\\/\\\\}"; tok="${tok//\"/\\\"}"   # curl-config quoting
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+      | curl -q -sS --max-time 10 --noproxy '*' --config - \
+        -H "Accept: application/json" \
+        -o /dev/null -w '%{http_code}' "$1/v1/models" 2>/dev/null) || return 1
+  else
+    code=$(curl -q -sS --max-time 10 --noproxy '*' \
+      -H "Accept: application/json" \
+      -o /dev/null -w '%{http_code}' "$1/v1/models" 2>/dev/null) || return 1
+  fi
+  case "$code" in 2??) return 0 ;; *) return 1 ;; esac
+}
+
 # Name a MOVED ADDRESS as its own cause, on the two transports whose live exposure this
 # script cannot introspect. The HTTP-code map alone reads as a server fault, and here that
 # is usually the wrong culprit: Cloudflare answers 530 for a hostname with no tunnel
@@ -236,6 +277,57 @@ gw_url_drift_note() { # reads TRANSPORT / GW_LOCAL_PORT / MODELS_CURL_RC / MODEL
   else
     note "Read the address that is live now, then re-run me so the code carries that one."
   fi
+}
+
+# A 403 is a REFUSAL of the request, and on a keyless gateway there is no credential for
+# it to be about — so the one message this arm used to print was not merely unhelpful
+# there, it was false. The commonest cause on the transports this script offers is the
+# `Host` header: Ollama, and other servers meant to be reached only from the machine they
+# run on, accept only a local one, while a tunnel forwards the public name it was asked
+# for. A tunnel pointed straight at such a server therefore cannot ever succeed, however
+# healthy the server is.
+# What the probe below proves is NARROWER than that, and is stated as narrowly: the same
+# request, with the same credential, on the same endpoint, succeeding on loopback and
+# forbidden over HTTPS, isolates the fault to the ROUTE — a Host rewrite, a WAF, an IP
+# allowlist and an access layer all live there. Naming the route is what turns a dead end
+# into a fix; the `Host` cure is offered as the likely one, never asserted as the verdict.
+gw_403_route_note() { # reads GW_AUTH / GW_LOCAL_PORT / MODELS_CURL_RC / MODELS_HTTP_CODE
+  [ "$MODELS_CURL_RC" = "0" ] || return 0
+  [ "$MODELS_HTTP_CODE" = "403" ] || return 0
+  local base; base=$(gw_loopback_base)
+  if [ -n "$base" ] && gw_answers_on_loopback "$base"; then
+    warn "Your gateway answers this very request on this machine ($base) and forbids it when it"
+    # The all-clear is worded per auth mode for the same reason the status line above is:
+    # clearing "your credentials" on a run that carries none re-imports the credential
+    # framing this whole arm exists to remove, and leaves the reader looking for a token
+    # to inspect. The probe carried whatever the public request carried, so a bearer run
+    # really has cleared its token and a keyless run has cleared nothing but the server.
+    if [ "$GW_AUTH" = "bearer" ]; then
+      warn "arrives through your HTTPS address, so the server is up and your token is fine."
+    else
+      warn "arrives through your HTTPS address, so the server is up and accepting this request."
+    fi
+    warn "Something on the HTTPS route in front of it is refusing or changing the request."
+  else
+    note "A 403 means the request arrived and was refused — the address and the network are fine."
+    note "I could not prove the gateway accepts it directly on this machine, so the refusal may come"
+    note "from the gateway itself or from any HTTPS layer in front of it."
+  fi
+  note "The likeliest cause is the Host header — the address name every request carries. Ollama and"
+  note "servers like it accept only a local name, and an HTTPS front passes on the public one."
+  note "Fix it on whatever fronts the gateway. In nginx that is: proxy_set_header Host 127.0.0.1:${GW_LOCAL_PORT:-<gateway port>};"
+  # OLLAMA_ORIGINS is named as a DEAD END on purpose: it is the most-cited answer to
+  # "Ollama refuses my remote request", and it cannot work here — it sets the browser
+  # CORS allow-list, while this 403 comes from a separate Host allow-list that never
+  # reads it (ollama server/routes.go: allowedHostsMiddleware → allowedHost, which
+  # consults only "localhost", this machine's hostname, and the .localhost/.local/
+  # .internal suffixes). Sending the operator to a setting that changes nothing is the
+  # same defect as blaming a token they never configured, so it is disarmed by name.
+  # The second cure is real for the same source reason: the middleware skips the Host
+  # check entirely when the listening address is not loopback.
+  note "OLLAMA_ORIGINS does not help here — it sets browser CORS, not this check. Ollama does skip the"
+  note "check when it listens on a non-loopback address (OLLAMA_HOST=0.0.0.0), which also opens that port"
+  note "to everything that can reach this machine — so rewriting Host on the front is the safer of the two."
 }
 
 agent_file_lane_gate() {
@@ -336,7 +428,24 @@ verify_all() {
       esac
     else
       case "$MODELS_HTTP_CODE" in
-        401|403) why="HTTP $MODELS_HTTP_CODE — token rejected (or an access layer in front wants a login)" ;;
+        # 401 and 403 are different refusals, and only one of them is ever about a
+        # credential — so each is also split on $GW_AUTH. A gateway the operator
+        # configured KEYLESS carries no token to reject, and naming one there sends them
+        # hunting for a secret that does not exist. Same care the 530 arm below is split
+        # out with, and the reason 403 keeps its wording route-level: which layer on the
+        # route refused is what gw_403_route_note goes and finds out.
+        401)
+          if [ "$GW_AUTH" = "bearer" ]; then
+            why="HTTP 401 — token rejected (or an access layer in front wants a login)"
+          else
+            why="HTTP 401 — this gateway is keyless, so no token was sent: either the server wants one after all, or an access layer in front of it does"
+          fi ;;
+        403)
+          if [ "$GW_AUTH" = "bearer" ]; then
+            why="HTTP 403 — refused: either the token, or the request itself as it arrived over your HTTPS route"
+          else
+            why="HTTP 403 — this gateway is keyless, so there is no token to reject: the request itself was refused as it arrived over your HTTPS route"
+          fi ;;
         3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward credentials across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
         # 530 BEFORE the 5xx bucket, which would file it as a server fault. It is the
@@ -350,6 +459,7 @@ verify_all() {
     fi
     bad "$GW_URL/v1/models failed: $why"
     gw_url_drift_note
+    gw_403_route_note
     VERIFY_FAILED=true
   fi
 

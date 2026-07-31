@@ -2036,7 +2036,8 @@ ARMS
 run_emit_payload_isolated() {
   FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" GW_KIND_IN="${4:-custom}" \
   OS_IN="${5:-Darwin}" FS_UNIT_IN="${6:-}" LINGER_IN="${7:-on}" \
-  GW_URL_IN="${8:-https://gw.example.test}" bash -c '
+  GW_URL_IN="${8:-https://gw.example.test}" VF_IN="${9:-false}" \
+  GW_PORT_IN="${10:-}" bash -c '
 eval "$FUNCS"
 say()   { printf "%s\n" "$*"; }
 warn()  { printf "WARNLINE %s\n" "$*"; }
@@ -2051,13 +2052,14 @@ die()   { printf "Error: %s\n" "$*" >&2; exit 1; }
 render_qr()        { return 1; }   # no QR here; the paste string still prints
 write_profile()    { :; }          # this case grades emitted text, not saved state
 cleanup_exposures() { :; }
+gw_restart_timing_note() { :; }    # self-guarding on a real run; silent either way here
 # loginctl cannot be driven from a test, so the ANSWER is injected — the production
 # call site, and the fact that it is asked at all, is what these cases grade.
 fs_linger_enabled_linux() { [ "$LINGER_IN" = "on" ]; }
 OS="$OS_IN"
 FS_UNIT="$FS_UNIT_IN"
 BOLD=""; RESET=""
-VERIFY_FAILED=false
+VERIFY_FAILED=$VF_IN
 FS_ROLLBACK_INCOMPLETE=false
 EMITTED=false
 PAYLOAD_VERSION=1
@@ -2067,7 +2069,8 @@ GW_URL="$GW_URL_IN"
 GW_AUTH="bearer"
 GW_TOKEN="probe-token"
 GW_MODEL=""
-GW_LOCAL_PORT=""
+GW_LOCAL_PORT="$GW_PORT_IN"
+CHECKED_PATH_PREFIX=""
 TRANSPORT="public"
 FS_URL="$FS_URL_IN"
 FS_CRED="$FS_CRED_IN"
@@ -2265,6 +2268,92 @@ run_pairing_check_suggestion_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# The diagnostic a failed run recommends has to exercise the route that failed. Aimed at
+# loopback it PASSES on every fault that lives in the HTTPS front — the Ollama Host-header
+# 403 is exactly that shape, 200 on 127.0.0.1 and 403 through the tunnel — so the operator
+# watches the recommended check go green after a red run and concludes the wizard is
+# broken. A recovery path that confirms the wrong theory is worse than a misleading
+# message, because the operator now has evidence for it.
+#
+# Both screens are graded together because they carried the same substitution and only one
+# of them was ever a trap: on the SUCCESS screen the public route is the one just proven
+# and the one the app takes, so it is simply the right target; on the FAILURE screen it is
+# the route under investigation, and the loopback run is the second half of a comparison
+# whose SPLIT is the diagnosis.
+run_pairing_check_targets_the_failed_route_case() {
+  local name="pairing-checks-target-the-route-that-failed" emit out flat
+  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url gw_loopback_base)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'gw_loopback_base()'; then
+    fail_case "$name" "could not extract emit_payload + gw_loopback_base from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # FAILURE screen, local port known — the arm that used to hand out the loopback trap.
+  out=$(run_emit_payload_isolated "$emit" "" "" custom Darwin "" on \
+        "https://gw.example.test" true 11434)
+  printf -- '--- failed run, local port known ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+
+  # Non-vacuous: this really is the failure screen, and it really does still suggest checks.
+  if ! warning_states "$flat" 'checks failed above' || ! warning_states "$flat" '[-][-]check-server'; then
+    fail_case "$name" "the arm did not reach the failure screen's check suggestions"; return
+  fi
+  # FACT 1 — the app-compatibility and adapter checks both address the failed HTTPS route.
+  if ! warning_states "$flat" '[-][-]check-server https://gw\.example\.test' ||
+     ! warning_states "$flat" '[-][-]check-adapter https://gw\.example\.test'; then
+    fail_case "$name" "a failed run still sent both checks somewhere other than the route that failed"; return
+  fi
+  # FACT 2 — loopback is still offered, because a bad envelope really is diagnosed there.
+  if ! warning_states "$flat" '[-][-]check-server http://127\.0\.0\.1:11434'; then
+    fail_case "$name" "the loopback comparison was dropped instead of being labelled"; return
+  fi
+  # FACT 3 — and it is labelled as the OTHER route, with what the split proves. Unlabelled,
+  # a green loopback check is read as "the wizard was wrong", which is the whole defect.
+  if ! warning_states "$flat" 'skipping the HTTPS route|without (its|the) HTTPS|compare it against the server'; then
+    fail_case "$name" "the loopback check was suggested without saying it tests a different route"; return
+  fi
+  if ! warning_states "$flat" '(green|passes).*(red|fails)|HTTPS route is refusing'; then
+    fail_case "$name" "nothing said what a green loopback and a red HTTPS route together mean"; return
+  fi
+  # FACT 4 — the adapter grade is not duplicated onto loopback. The question the second
+  # command answers is "the server, or the route?"; a fourth near-identical line buries it.
+  if warning_states "$flat" '[-][-]check-adapter http://127\.0\.0\.1'; then
+    fail_case "$name" "a second grader on loopback buried the one comparison that matters"; return
+  fi
+
+  # FAILURE screen, no local port: nothing to compare against, so nothing may be offered.
+  out=$(run_emit_payload_isolated "$emit" "" "" custom Darwin "" on \
+        "https://gw.example.test" true "")
+  printf -- '--- failed run, no local port ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  if ! warning_states "$flat" '[-][-]check-server https://gw\.example\.test'; then
+    fail_case "$name" "a failed run with no local port stopped suggesting the failed route"; return
+  fi
+  if warning_states "$flat" '127\.0\.0\.1'; then
+    fail_case "$name" "a loopback comparison was offered for a gateway with no recorded port"; return
+  fi
+
+  # SUCCESS screen: verification just proved the public route, so that is what a re-check
+  # must grade — a loopback grade describes a route neither the app nor this script takes.
+  out=$(run_emit_payload_isolated "$emit" "" "" custom Darwin "" on \
+        "https://gw.example.test" false 11434)
+  printf -- '--- success screen, local port known ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
+    fail_case "$name" "the success arm printed no pairing code — the screen proves nothing"; return
+  fi
+  if ! warning_states "$flat" '[-][-]check-server https://gw\.example\.test' ||
+     ! warning_states "$flat" '[-][-]check-adapter https://gw\.example\.test'; then
+    fail_case "$name" "the success screen re-check no longer grades the route the app uses"; return
+  fi
+  if warning_states "$flat" '127\.0\.0\.1'; then
+    fail_case "$name" "a proven public route was re-checked on loopback instead"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 # A systemd USER file server stops shortly after that user's last logout unless
 # lingering is on — and this is a 24/7 gateway product, so a lane that verifies green
 # inside the SSH session that built it is not yet a lane that survives that session.
@@ -2434,13 +2523,19 @@ ARMS
 # models_is_json reports it (return code + MODELS_* diagnostics), which is the same
 # contract verify_all reads on a live run.
 # Args: <function-source> <transport> <models-rc> <http-code> <curl-rc> <loopback>
-#       <local-port> <chat> <fs-url> <fs-cred> <show-qr>
+#       <local-port> <chat> <fs-url> <fs-cred> <show-qr> [gw-auth] [loopback-2xx]
 #   loopback: up|down — what a 127.0.0.1 health probe answers
 #   chat:     ok|fail — whether the live round-trip decodes
 #   fs-url/fs-cred: a pair makes the file-lane block run; its probe always FAILS here
+#   gw-auth:  bearer|none — the auth mode the operator configured for this gateway
+#   loopback-2xx: yes|no — whether the gateway answers the SAME request on loopback.
+#     Stubbed, and it prints its target: a case that grades a diagnosis drawn from a
+#     live comparison has to be able to assert the comparison was actually made, and
+#     the suite must never reach a real port to find that out.
 run_verify_all_isolated() {
   FUNCS="$1" TRANSPORT_IN="$2" MRC="$3" MCODE="$4" MCURL="$5" LOOP="$6" \
-  LPORT="$7" CHAT="$8" FSU="$9" FSC="${10}" SQ="${11}" bash -c '
+  LPORT="$7" CHAT="$8" FSU="$9" FSC="${10}" SQ="${11}" \
+  GWAUTH="${12:-bearer}" LB2XX="${13:-no}" bash -c '
 eval "$FUNCS"
 say()   { printf "%s\n" "$*"; }
 ok()    { printf "OK %s\n" "$*"; }
@@ -2456,6 +2551,7 @@ models_is_json() {
   return "$MRC"
 }
 local_health_ok() { [ "$LOOP" = "up" ]; }
+gw_answers_on_loopback() { printf "LOOPBACK-PROBE %s\n" "$1"; [ "$LB2XX" = "yes" ]; }
 app_chat_eval()   { CCE_LEN=4; CCE_REASON="stubbed failure"; [ "$CHAT" = "ok" ]; }
 curl_fs()         { return 22; }                       # the file-lane probe never succeeds
 drop_file_lane()  { FS_URL=""; FS_CRED=""; printf "DROPPED-LANE\n"; }
@@ -2470,6 +2566,9 @@ GW_KIND="custom"
 GW_URL="https://moved.example.test"
 GW_LOCAL_PORT="$LPORT"
 GW_HEALTH_PATH=""
+GW_AUTH="$GWAUTH"
+GW_TOKEN="probe-token"
+CHECKED_PATH_PREFIX=""
 GW_MODEL=""
 FS_URL="$FSU"
 FS_CRED="$FSC"
@@ -2558,6 +2657,187 @@ ARMS
   if ! warning_states "$(printf '%s\n' "$out" | tr '\n' ' ')" 'no longer reach|does not reach|doesn.t reach'; then
     fail_case "$name" "a hostname that no longer resolves was not diagnosed as a moved address"; return
   fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Ollama refuses any request whose Host header is not a local address, and a tunnel
+# forwards the ORIGINAL host — so a quick tunnel pointed straight at it answers 403
+# forever, on the exact setup this script's own prompt suggests ("e.g. 11434 for
+# Ollama"). Answering that with "token rejected" on a gateway the operator configured
+# KEYLESS is not merely unhelpful: there is no token in that run, so the sentence is
+# false and it sends them hunting for a secret that does not exist.
+#
+# Facts, not paragraphs, arm by arm. The 401 arms and the 404 arm are the non-vacuity
+# half: a note that fired on every failure would diagnose nothing, and 401 is a genuine
+# credential refusal whose bearer wording is correct as it stands.
+#
+# The loopback comparison is STUBBED (run_verify_all_isolated prints its target), so
+# what is graded here is the diagnosis drawn from it. That the probe itself requires a
+# 2xx and carries the configured credential is proved against real loopback servers in
+# tests/run-file-lane-readiness-suite.sh.
+# The two STANDALONE diagnostics carry their own copy of the status ladder, and a failed
+# setup now names --check-server as the first thing to run. So the keyless-403 rule proved
+# for the setup path above has to hold here too, or the operator's very next screen undoes
+# it. Written as a rule about the released artifact rather than about one call site: the
+# arms are pure string assignment with no reachable side effect, so grading their text is
+# the whole behaviour, and a live 403 fixture per arm would buy nothing but runtime.
+run_standalone_check_keyless_403_case() {
+  local name="standalone-checks-do-not-invent-a-keyless-token" fn body arm
+  : > "$TMP/doctor.out"
+
+  # fn|label
+  local paths='compat_models_check|--check-server
+doctor_models_check|--check-adapter'
+  while IFS='|' read -r fn arm; do
+    [ -n "$fn" ] || continue
+    body=$(extract_funcs "$fn")
+    if [ -z "$body" ]; then
+      fail_case "$name" "[$arm] could not extract $fn from the release artifact"; return
+    fi
+    printf -- '--- %s (%s) ---\n%s\n' "$arm" "$fn" "$body" >> "$TMP/doctor.out"
+
+    # The 401 and 403 arms must be SEPARATE. A shared `401|403)` is what produced the
+    # defect, so its absence is the structural half of this guard — a future merge that
+    # recombines them fails here rather than at a user's terminal.
+    if printf '%s\n' "$body" | grep -qE '^[[:space:]]*401\|403\)'; then
+      fail_case "$name" "[$arm] 401 and 403 share one arm again — a keyless 403 will be told to supply a token"; return
+    fi
+    if ! printf '%s\n' "$body" | grep -qE '^[[:space:]]*403\)'; then
+      fail_case "$name" "[$arm] no 403 arm at all"; return
+    fi
+
+    # FACT 1 — the 403 arm never sends a keyless run after a credential. This is the
+    # sentence that made the recommended recovery actively misleading.
+    local arm403
+    arm403=$(printf '%s\n' "$body" | sed -n '/^[[:space:]]*403)/,/^[[:space:]]*[0-9?]\{3\})/p')
+    if printf '%s\n' "$arm403" | grep -qF 'CONDUCK_TOKEN'; then
+      fail_case "$name" "[$arm] a 403 still tells the operator to set CONDUCK_TOKEN"; return
+    fi
+
+    # FACT 2 — it names what a 403 actually is, and the cause worth checking first.
+    if ! printf '%s\n' "$arm403" | grep -qiE 'refused|as it arrived'; then
+      fail_case "$name" "[$arm] a 403 does not say the request was refused as it arrived"; return
+    fi
+    if ! printf '%s\n' "$arm403" | grep -qiF 'Host'; then
+      fail_case "$name" "[$arm] a 403 never names the Host check as the likely cause"; return
+    fi
+
+    # FACT 3 — the 401 arm KEEPS the token advice. It is correct there (a server that
+    # wants auth answers 401), and deleting it would trade one wrong cure for another.
+    local arm401
+    arm401=$(printf '%s\n' "$body" | sed -n '/^[[:space:]]*401)/,/^[[:space:]]*403)/p')
+    if ! printf '%s\n' "$arm401" | grep -qF 'CONDUCK_TOKEN'; then
+      fail_case "$name" "[$arm] a keyless 401 no longer tells the operator how to supply a token"; return
+    fi
+  done <<EOF
+$paths
+EOF
+  PASS=$((PASS+1)); printf 'SUITE ✓ %s\n' "$name"
+}
+
+run_keyless_403_diagnosis_case() {
+  local name="keyless-403-is-not-a-rejected-token" funcs out flat arm
+  funcs=$(extract_funcs verify_all gw_url_drift_note gw_403_route_note gw_loopback_base)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_403_route_note()'; then
+    fail_case "$name" "could not extract verify_all + gw_403_route_note from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # arm|auth|http-code|local-port|loopback-2xx|expect-route-note|expect-probe|expect-server-fine
+  local arms='keyless-403-answers-locally|none|403|11434|yes|yes|yes|yes
+keyless-403-silent-locally|none|403|11434|no|yes|yes|no
+keyless-403-no-local-port|none|403||no|yes|no|no
+bearer-403|bearer|403|11434|yes|yes|yes|yes
+keyless-401|none|401|11434|yes|no|no|no
+bearer-401|bearer|401|11434|yes|no|no|no
+keyless-404|none|404|11434|yes|no|no|no'
+  local auth code port lb want_note want_probe want_fine
+  while IFS='|' read -r arm auth code port lb want_note want_probe want_fine; do
+    [ -n "$arm" ] || continue
+    out=$(run_verify_all_isolated "$funcs" public 1 "$code" 0 up "$port" ok "" "" false "$auth" "$lb") \
+      || { printf '%s\n' "$out" >> "$TMP/doctor.out"
+           fail_case "$name" "[$arm] verify_all failed to run in isolation"; return; }
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+
+    # FACT 1 — the false sentence, in the exact words that sent keyless users after a
+    # credential they never configured. Never sayable when GW_AUTH is none, whatever
+    # the status; still sayable for a bearer gateway, where it is true.
+    if [ "$auth" = "none" ] && warning_states "$flat" 'token (was )?(rejected|refused)|rejected (your|the) token'; then
+      fail_case "$name" "[$arm] a keyless gateway was told its token was rejected"; return
+    fi
+    if [ "$auth" = "bearer" ] && [ "$code" = "401" ] && ! warning_states "$flat" 'token rejected'; then
+      fail_case "$name" "[$arm] a real rejected bearer token no longer reads as one"; return
+    fi
+    # FACT 2 — on the two statuses that ARE about being allowed in, a keyless run says
+    # so, which is what tells the reader why no credential is named. Scoped to those two
+    # deliberately: a 404 is not an authentication answer, and saying "keyless" there
+    # would be noise attached to a status the auth mode has nothing to do with.
+    if [ "$auth" = "none" ] && case "$code" in 401|403) true ;; *) false ;; esac &&
+       ! warning_states "$flat" 'keyless'; then
+      fail_case "$name" "[$arm] a keyless gateway's refusal never mentioned that it is keyless"; return
+    fi
+
+    # FACT 3 — the route explanation and its cure ride 403 ONLY. On 401 the credential
+    # really is what was refused, and a Host lecture there is a wrong turn.
+    case "$want_note" in
+      yes)
+        if ! warning_states "$flat" 'HTTPS route|arrives through your HTTPS|HTTPS layer in front|HTTPS front'; then
+          fail_case "$name" "[$arm] a 403 never named the HTTPS route as what refused the request"; return
+        fi
+        if ! warning_states "$flat" 'host header'; then
+          fail_case "$name" "[$arm] the likeliest cause of a 403 was not named"; return
+        fi
+        if ! warning_states "$flat" 'proxy_set_header Host' ||
+           ! warning_states "$flat" 'OLLAMA_HOST=0\.0\.0\.0|non-loopback address'; then
+          fail_case "$name" "[$arm] a 403 named the cause but not a cure that works"; return
+        fi
+        # OLLAMA_ORIGINS may be MENTIONED (it is the most-cited answer to "Ollama refuses
+        # my remote request", so disarming it saves a wasted round) but never PRESCRIBED:
+        # it sets the browser CORS allow-list, while this 403 comes from a separate Host
+        # allow-list that never reads it. Prescribing it would be this case's own defect
+        # in a new costume — a confident instruction that cannot work.
+        if warning_states "$flat" 'set OLLAMA_ORIGINS|OLLAMA_ORIGINS on the server|OLLAMA_ORIGINS so it'; then
+          fail_case "$name" "[$arm] OLLAMA_ORIGINS was prescribed as a cure; it only governs browser CORS"; return
+        fi ;;
+      no)
+        if warning_states "$flat" 'proxy_set_header Host|OLLAMA_ORIGINS'; then
+          fail_case "$name" "[$arm] a failure the Host header cannot explain was given the Host cure"; return
+        fi ;;
+    esac
+
+    # FACT 4 — the comparison is MADE, not described, and only where it can be made.
+    case "$want_probe" in
+      yes) if ! warning_states "$flat" 'LOOPBACK-PROBE http://127\.0\.0\.1:11434'; then
+             fail_case "$name" "[$arm] the loopback comparison was never attempted"; return
+           fi ;;
+      no)  if warning_states "$flat" 'LOOPBACK-PROBE'; then
+             fail_case "$name" "[$arm] a loopback comparison ran where there is nothing to compare"; return
+           fi ;;
+    esac
+
+    # FACT 5 — "your server is fine" is claimed only when loopback actually answered.
+    # An unproven all-clear is the same defect in the other direction: it would send
+    # the operator away from a gateway that is genuinely refusing everyone.
+    case "$want_fine" in
+      yes) if ! warning_states "$flat" 'server is up|credentials are fine'; then
+             fail_case "$name" "[$arm] a proven-healthy server was not reported as healthy"; return
+           fi ;;
+      no)  if warning_states "$flat" 'server is up|credentials are fine'; then
+             fail_case "$name" "[$arm] the server was cleared without a loopback answer to clear it"; return
+           fi ;;
+    esac
+    # FACT 6 — and the all-clear is worded for the auth mode that produced it. Clearing
+    # "your credentials" on a run that carries none puts the reader back to hunting for a
+    # token to inspect, which is the same wrong turn as FACT 1 taken one line later.
+    if [ "$auth" = "none" ] && warning_states "$flat" 'credentials are fine|token is fine'; then
+      fail_case "$name" "[$arm] a keyless gateway was told its credentials checked out"; return
+    fi
+  done <<ARMS
+$arms
+ARMS
 
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -3970,8 +4250,20 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-code-warns-a-rotating-quick-tu
   run_pairing_quick_tunnel_reminder_case
 fi
 
+if [ -z "$ONLY" ] || case " $ONLY " in *" pairing-checks-target-the-route-that-failed "*) true ;; *) false ;; esac; then
+  run_pairing_check_targets_the_failed_route_case
+fi
+
 if [ -z "$ONLY" ] || case " $ONLY " in *" moved-address-is-not-a-server-error "*) true ;; *) false ;; esac; then
   run_moved_address_diagnosis_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" keyless-403-is-not-a-rejected-token "*) true ;; *) false ;; esac; then
+  run_keyless_403_diagnosis_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" standalone-checks-do-not-invent-a-keyless-token "*) true ;; *) false ;; esac; then
+  run_standalone_check_keyless_403_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" file-fault-does-not-mask-a-dead-gateway "*) true ;; *) false ;; esac; then

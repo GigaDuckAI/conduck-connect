@@ -292,10 +292,20 @@ compat_models_check() {
       esac
     else
       case "$MODELS_HTTP_CODE" in
-        401|403) if [ "${GW_AUTH:-}" = "none" ]; then
-                   why="HTTP $MODELS_HTTP_CODE and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+        401)     if [ "${GW_AUTH:-}" = "none" ]; then
+                   why="HTTP 401 and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
                  else
-                   why="HTTP $MODELS_HTTP_CODE with the credential you gave me — the app would fail the same way"
+                   why="HTTP 401 with the credential you gave me — the app would fail the same way"
+                 fi ;;
+        # 403 split from 401, because "supply a credential" is the wrong cure for it. A server
+        # that WANTS auth answers 401; 403 means it read the request and refused it as it
+        # arrived. On a keyless run there is nothing to supply, and this check is the first
+        # thing a failed setup now recommends — so a stray "set CONDUCK_TOKEN" here would send
+        # the operator to invent a token for the one server that will ignore it.
+        403)     if [ "${GW_AUTH:-}" = "none" ]; then
+                   why="HTTP 403 and no credential was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
+                 else
+                   why="HTTP 403 — refused: either the credential you gave me, or the request itself as it arrived (the app would fail the same way)"
                  fi ;;
         3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;

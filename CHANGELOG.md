@@ -4,6 +4,47 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **A 403 was reported as a rejected token — on gateways configured as keyless,
+  where no token exists to reject.** `401` and `403` shared one arm, so the most
+  common first-run failure of the most common local model server produced a
+  sentence that was not merely unhelpful but false. Ollama refuses any request
+  whose `Host` header is not a local name, and a tunnel forwards the public
+  hostname unchanged, so the wizard's own suggestion — expose the port it names
+  (`e.g. 11434 for Ollama`) with a quick tunnel — fails 100% of the time and then
+  blames a credential the operator was never asked for. The two statuses are now
+  separate, and each splits again on whether the gateway has a token: a keyless
+  403 says there is nothing to reject and that the request itself was refused as
+  it arrived. Where a local port is known the wizard sends the same request with
+  the same credential to loopback and reports the split — green there and red
+  over HTTPS proves the server and the credentials are fine and the route in
+  front is at fault — and where it cannot prove that, it says so instead of
+  implying it. The cure is named: make whatever fronts the gateway **rewrite**
+  `Host` rather than forward it.
+- **`OLLAMA_ORIGINS` is named as a dead end rather than prescribed as the fix.**
+  It is the most-cited answer to an Ollama 403 and it cannot work: upstream reads
+  it only into the browser CORS allow-list, never into the host check that
+  produced the refusal, and neither Conduck nor this wizard sends an `Origin`
+  header. Prescribing it would have cost the operator a restart and a re-run to
+  arrive back at the identical 403 — the same dead end this change exists to
+  close. Ollama's real second lever is that the host check is skipped when it
+  listens beyond loopback (`OLLAMA_HOST=0.0.0.0`), stated with its cost.
+- **The recovery a failed run recommends now exercises the route that failed.**
+  Both checks offered at the end of a failed custom-gateway run substituted
+  `http://127.0.0.1:<port>` whenever a local port was known — the one address
+  where a `Host` mismatch cannot occur. The operator was told their token was
+  rejected, ran the diagnostic the wizard itself recommended, watched it pass,
+  and concluded their server was fine and the wizard was broken: a recovery path
+  that actively confirmed the wrong theory. Both checks now target the address
+  that failed, and the loopback run is offered separately, as a deliberate
+  comparison, with one line on what the split between them proves. The same
+  substitution on the success screen is fixed too.
+- **`--check-server` and `--check-adapter` no longer tell a keyless run to invent
+  a token.** Each carries its own copy of the status ladder, and each answered a
+  keyless 401 *or* 403 with `set CONDUCK_TOKEN=<token>`. That was survivable while
+  a failed setup pointed at loopback, where the check passed and the line never
+  printed; it is not survivable now that a failed setup names `--check-server` as
+  the first thing to run. A server that wants auth answers 401, so the token
+  advice stays there and is gone from 403.
 - **A blank at the file-lane address prompt threw away a working file server, and
   the setup code went out without it.** By the time that prompt appears the
   connector has found the operator's file server, recovered its credential and

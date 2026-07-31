@@ -122,14 +122,28 @@ emit_payload() {
     # Custom targets only. Route by provenance: existing OpenAI-compatible
     # software uses the app-compatibility grader; adapters written for Conduck
     # use the stricter contract grader. OpenClaw/Hermes users need neither hint.
+    # Both address the PUBLIC url, because that is the route that just failed and
+    # the only one the app ever takes. Aimed at loopback they PASS on every fault
+    # that lives in the HTTPS front — the operator then watches the recommended
+    # diagnostic go green after a red run and concludes the wizard is broken. A
+    # recovery that proves the wrong thing is worse than no recovery at all.
+    # The loopback run is offered SECOND and named as a comparison, because the
+    # split between the two is itself the diagnosis. One loopback command, not
+    # two: it answers "the server, or the route?", and a second grader beside it
+    # would bury that question under four near-identical lines.
     if [ "$GW_KIND" = "custom" ]; then
-      local dt="$GW_URL"
-      [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
+      local lb; lb=$(gw_loopback_base)
       say ""
-      say "  Existing OpenAI-compatible server? Check app compatibility:"
-      say "    ${BOLD}bash conduck-connect.sh --check-server $dt${RESET}"
-      say "  Adapter built for Conduck? Check the stricter adapter contract:"
-      say "    ${BOLD}bash conduck-connect.sh --check-adapter $dt${RESET}"
+      say "  Existing OpenAI-compatible server? Check app compatibility on the route that failed:"
+      say "    ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+      say "  Adapter built for Conduck? Grade that same route against the stricter contract:"
+      say "    ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
+      if [ -n "$lb" ]; then
+        say "  Then compare it against the server itself, skipping the HTTPS route in front of it:"
+        say "    ${BOLD}bash conduck-connect.sh --check-server $lb${RESET}"
+        note "Green there and red above means the server is fine and the HTTPS route is refusing or"
+        note "changing the request — fix the route, not the server."
+      fi
     fi
     exit 1
   fi
@@ -234,14 +248,16 @@ emit_payload() {
   fi
   say "  Run this script again any time to check the connection or show the code again."
   # Custom targets only (see the matching gate in emit_payload's failure branch).
+  # Both address the PUBLIC url: it is the route the app takes and the one verification
+  # just proved, so a re-check grades what this pairing actually uses. A loopback target
+  # would grade a route neither the app nor this script ever takes, and a front that
+  # breaks these requests is exactly what the operator needs to hear about.
   # The adapter line rides a SUCCESS screen, so it needs the outcome named with it:
   # this pairing already works, and a user who runs the strict grader on generic
   # software gets a FAIL that means nothing about the setup they just proved.
   if [ "$GW_KIND" = "custom" ]; then
-    local dt="$GW_URL"
-    [ -n "$GW_LOCAL_PORT" ] && dt="http://127.0.0.1:$GW_LOCAL_PORT"
-    say "  Existing OpenAI-compatible server? Re-check it with:  ${BOLD}bash conduck-connect.sh --check-server $dt${RESET}"
-    say "  Adapter built for Conduck? Grade it with:             ${BOLD}bash conduck-connect.sh --check-adapter $dt${RESET}"
+    say "  Existing OpenAI-compatible server? Re-check that route with:  ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+    say "  Adapter built for Conduck? Grade that same route with:        ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
     note "The adapter grade only fits software built for Conduck: generic servers (Ollama, LiteLLM,"
     note "Open WebUI) fail rules that are correct for them — that does not undo the pairing above."
   fi

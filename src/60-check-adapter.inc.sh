@@ -564,10 +564,18 @@ doctor_models_check() {
     esac
   else
     case "$MODELS_HTTP_CODE" in
-      401|403) if [ "${GW_AUTH:-}" = "none" ]; then
-                 why="HTTP $MODELS_HTTP_CODE and no token was sent — this run is keyless, so the server is asking for auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+      401)     if [ "${GW_AUTH:-}" = "none" ]; then
+                 why="HTTP 401 and no token was sent — this run is keyless, so the server is asking for auth you didn't supply (set CONDUCK_TOKEN=<token>)"
                else
-                 why="HTTP $MODELS_HTTP_CODE with the token you gave me — the server rejected it (typo? or an access layer in front wants its own login)"
+                 why="HTTP 401 with the token you gave me — the server rejected it (typo? or an access layer in front wants its own login)"
+               fi ;;
+      # 403 split from 401 for the same reason as in --check-server: a server that WANTS auth
+      # answers 401, while 403 means it read the request and refused it as it arrived. Telling
+      # a keyless run to supply a token names the one thing that cannot be the cause.
+      403)     if [ "${GW_AUTH:-}" = "none" ]; then
+                 why="HTTP 403 and no token was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
+               else
+                 why="HTTP 403 — refused: either the token you gave me, or the request itself as it arrived (typo? an access layer in front? a Host check?)"
                fi ;;
       3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (the check does not forward credentials across redirects)" ;;
       404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;

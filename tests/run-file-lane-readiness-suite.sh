@@ -3237,6 +3237,91 @@ test_probe_write_failure_wording() {
     *) pass "absent probe: no residue warning for a probe never stored" ;; esac
 }
 
+# ============================ the loopback half of a 403 route diagnosis ======
+#
+# When the public URL answers 403, gw_403_route_note repeats the SAME request on
+# loopback and, if it succeeds there, tells the operator the server is fine and the
+# HTTPS route is not. That sentence is only worth printing if the probe underneath it
+# is honest, so both of its load-bearing properties are proved here against a real
+# loopback server rather than a stub:
+#
+#   1. it requires a 2xx. `local_health_ok`, the probe that already existed, counts
+#      EVERY status below 500 as "up" — so on a server that answers 403 locally it
+#      would report "answering" and the note would assert the very difference between
+#      local and public that does not exist. The auth-403 fixture is that server, and
+#      the local_health_ok control below is what keeps this from being a tautology.
+#   2. it carries the configured credential. The whole claim is that the ROUTE is the
+#      only difference between the two requests, which is false the moment the loopback
+#      request drops the token — and on a token-enforcing gateway an unauthenticated
+#      probe simply 401s, going blind exactly where the diagnosis is needed.
+test_403_loopback_probe() {
+  local token="loopback-probe-token" saved_auth="$GW_AUTH" saved_token="${GW_TOKEN:-}"
+  local saved_port="${GW_LOCAL_PORT:-}" saved_prefix="${CHECKED_PATH_PREFIX:-}"
+
+  # Existence first. Half the assertions below are expect_false, and an undefined
+  # function exits 127 — which every one of them would read as the refusal it wanted.
+  # Without this guard, deleting the probe would make its own regressions go green.
+  local fn
+  for fn in gw_answers_on_loopback gw_loopback_base; do
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+      fail "403 loopback probe: $fn is present" "src/50-verification.inc.sh defines no $fn"
+      return
+    fi
+  done
+
+  # `good` mode answers /v1/models only to the right bearer, and 401s without it.
+  start_adapter good "$TMP/probe-403-good" "$token" || {
+    fail "403 loopback probe: fixture failed to start" "adapter did not report READY"; return; }
+  local base="http://127.0.0.1:$READY_PORT"
+
+  GW_AUTH="bearer"; GW_TOKEN="$token"
+  expect_true "403 loopback probe: an authenticated 2xx counts as answering" \
+    gw_answers_on_loopback "$base"
+  # The same server, same endpoint, credential dropped: 401. Proves the pass above was
+  # the token doing its work, and that a 401 is not mistaken for a healthy server.
+  GW_AUTH="none"; GW_TOKEN=""
+  expect_false "403 loopback probe: a keyless request this server refuses is not answering" \
+    gw_answers_on_loopback "$base"
+  GW_AUTH="bearer"; GW_TOKEN="wrong-$token"
+  expect_false "403 loopback probe: a rejected token is not answering" \
+    gw_answers_on_loopback "$base"
+  # Nothing is listening on the closed port the fixture just vacated is not provable
+  # here, so use a port no fixture in this suite binds: a refused connection is not 2xx.
+  expect_false "403 loopback probe: a refused connection is not answering" \
+    gw_answers_on_loopback "http://127.0.0.1:1"
+  stop_adapter
+
+  # A server that answers 403 locally: the note must NOT claim the route is at fault,
+  # because there is no local/public difference to attribute it to.
+  start_adapter auth-403 "$TMP/probe-403-forbidden" "$token" || {
+    fail "403 loopback probe: auth-403 fixture failed to start" "adapter did not report READY"; return; }
+  base="http://127.0.0.1:$READY_PORT"
+  GW_AUTH="none"; GW_TOKEN=""
+  expect_false "403 loopback probe: a local 403 is not answering" \
+    gw_answers_on_loopback "$base"
+  # The control. local_health_ok calls that same 403 "up" — which is exactly why the
+  # note may not be built on it, and why this case fails loudly if someone swaps it in.
+  expect_true "403 loopback probe: the looser health probe really does call that 403 up" \
+    local_health_ok "$base/v1/models"
+  stop_adapter
+
+  # The comparison must address the same endpoint the public URL does. A check → setup
+  # handoff carries the checked server's base path, and dropping it would probe a
+  # different endpoint and then blame the difference on the HTTPS route.
+  GW_LOCAL_PORT="11434"; CHECKED_PATH_PREFIX=""
+  expect_eq "403 loopback probe: the loopback base is the recorded port" \
+    "$(gw_loopback_base)" "http://127.0.0.1:11434"
+  CHECKED_PATH_PREFIX="/api"
+  expect_eq "403 loopback probe: the loopback base keeps a checked base path" \
+    "$(gw_loopback_base)" "http://127.0.0.1:11434/api"
+  GW_LOCAL_PORT=""
+  expect_eq "403 loopback probe: no recorded port means no comparison to offer" \
+    "$(gw_loopback_base)" ""
+
+  GW_AUTH="$saved_auth"; GW_TOKEN="$saved_token"
+  GW_LOCAL_PORT="$saved_port"; CHECKED_PATH_PREFIX="$saved_prefix"
+}
+
 # ===================================== a gateway we restarted, coming back ====
 #
 # The measured bug these cover: on a stock OpenClaw Docker install the tool-policy
@@ -3696,6 +3781,7 @@ test_file_lane_quick_tunnel_warning
 test_lane_residue_report
 test_inactive_unit_report
 test_probe_write_failure_wording
+test_403_loopback_probe
 
 printf '\nFILE READY RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ] || exit 1
