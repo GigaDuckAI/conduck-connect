@@ -2737,6 +2737,122 @@ EOF
   PASS=$((PASS+1)); printf 'SUITE ✓ %s\n' "$name"
 }
 
+# A keyless run that gets a 5xx is told "the server errored", which is wrong for every
+# server that reports a MISSING credential from inside its own error handler — LiteLLM
+# without a database answers 500 there, measured, because the handler imports a module
+# only DB deployments install. The connector settles it by experiment rather than by
+# guessing, so what this case grades is the EXPERIMENT: the control must hold before any
+# claim is made, and no claim may be made when the difference is not attributable to the
+# credential. Driven against a fixture whose status genuinely depends on the
+# Authorization header, because a structural assertion cannot show a probe running in
+# the wrong order.
+run_keyless_5xx_credential_case() {
+  local name="keyless-5xx-names-the-missing-credential" funcs out i line FPID="" FPORT=""
+  funcs=$(extract_funcs curl_gw gw_5xx_credential_note)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_5xx_credential_note()'; then
+    fail_case "$name" "could not extract curl_gw + gw_5xx_credential_note from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # Auth-sensitive fixture: 500 with no Authorization header, 400 with one — the shape
+  # measured on a real DB-less LiteLLM. Status depends on the header and nothing else, so
+  # an arm that stays silent can only have done so by failing a guard, never by chance.
+  cat > "$TMP/fixture-auth-5xx.py" <<'PYFIX'
+import socketserver
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        code = 400 if self.headers.get("Authorization") is not None else 500
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+    def log_message(self, *a):
+        pass
+class S(HTTPServer):
+    # Same rule as every other fixture here: never reverse-resolve the bind address,
+    # or READY is withheld for the resolver timeout on a host with no reverse zone.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+srv = S(("127.0.0.1", 0), H)
+print("READY %d" % srv.server_address[1], flush=True)
+srv.serve_forever()
+PYFIX
+
+  : > "$TMP/auth5xx.out"
+  python3 "$TMP/fixture-auth-5xx.py" > "$TMP/auth5xx.out" 2>"$TMP/auth5xx.err" &
+  FPID=$!
+  i=0
+  while [ "$i" -lt "$FIXTURE_READY_TICKS" ]; do
+    line=$(head -n 1 "$TMP/auth5xx.out" 2>/dev/null)
+    case "$line" in READY\ *) FPORT="${line#READY }"; break ;; esac
+    kill -0 "$FPID" 2>/dev/null || break
+    i=$((i+1)); sleep 0.1
+  done
+  if [ -z "$FPORT" ]; then
+    fixture_start_failed "auth-sensitive 5xx fixture" "$TMP/auth5xx.out" "$TMP/auth5xx.err"
+    fail_case "$name" "auth-sensitive fixture never printed READY"
+    kill "$FPID" 2>/dev/null; return
+  fi
+
+  # arm|auth|claimed-status|expect-claim. The fixture always answers 500 unauthenticated,
+  # so a claimed 503 is the CONTROL: the status does not reproduce, and nothing may be
+  # concluded from a second request that merely came out different.
+  local arms='diagnoses-the-credential|none|500|yes
+control-status-does-not-reproduce|none|503|no
+bearer-run-is-not-this-arms-business|bearer|500|no
+wrong-status-401|none|401|no
+wrong-status-404|none|404|no'
+  local arm auth claimed expect
+  while IFS='|' read -r arm auth claimed expect; do
+    [ -n "$arm" ] || continue
+    out=$(FUNCS="$funcs" URL="http://127.0.0.1:$FPORT" MCODE="$claimed" GWAUTH="$auth" bash -c '
+eval "$FUNCS"
+warn() { printf "WARN %s\n" "$*"; }
+note() { printf "NOTE %s\n" "$*"; }
+DOCTOR=false; COMPAT=false
+GW_AUTH="$GWAUTH"; GW_TOKEN=""
+GW_CREDENTIAL_PROBE_TOKEN="conduck-connect-probe-not-a-real-token"
+GW_URL="$URL"
+MODELS_CURL_RC=0; MODELS_HTTP_CODE="$MCODE"
+gw_5xx_credential_note
+') || { printf '%s\n' "$out" >> "$TMP/doctor.out"
+            fail_case "$name" "[$arm] the note function itself failed"
+            kill "$FPID" 2>/dev/null; return; }
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+
+    case "$expect" in
+      yes)
+        if ! printf '%s\n' "$out" | grep -qF 'wants a token after all'; then
+          fail_case "$name" "[$arm] a keyless gateway whose answer depends on the credential was not told so"
+          kill "$FPID" 2>/dev/null; return
+        fi
+        # Both observed statuses must be shown, or the operator is asked to take the
+        # verdict on faith instead of reading the measurement that produced it.
+        if ! printf '%s\n' "$out" | grep -qF 'HTTP 500 without one' ||
+           ! printf '%s\n' "$out" | grep -qF 'HTTP 400 with one'; then
+          fail_case "$name" "[$arm] the claim did not show the two statuses it rests on"
+          kill "$FPID" 2>/dev/null; return
+        fi
+        ;;
+      no)
+        if [ -n "$out" ]; then
+          fail_case "$name" "[$arm] claimed something the experiment does not support"
+          kill "$FPID" 2>/dev/null; return
+        fi
+        ;;
+    esac
+  done <<EOF
+$arms
+EOF
+  kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
+  PASS=$((PASS+1)); printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_keyless_403_diagnosis_case() {
   local name="keyless-403-is-not-a-rejected-token" funcs out flat arm
   funcs=$(extract_funcs verify_all gw_url_drift_note gw_403_route_note gw_loopback_base)
@@ -4260,6 +4376,10 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" keyless-403-is-not-a-rejected-token "*) true ;; *) false ;; esac; then
   run_keyless_403_diagnosis_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" keyless-5xx-names-the-missing-credential "*) true ;; *) false ;; esac; then
+  run_keyless_5xx_credential_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" standalone-checks-do-not-invent-a-keyless-token "*) true ;; *) false ;; esac; then

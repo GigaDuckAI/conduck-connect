@@ -7811,6 +7811,54 @@ gw_403_route_note() { # reads GW_AUTH / GW_LOCAL_PORT / MODELS_CURL_RC / MODELS_
   note "to everything that can reach this machine — so rewriting Host on the front is the safer of the two."
 }
 
+# A 5xx on a KEYLESS run is not reliably a server fault. Some servers mishandle a MISSING
+# credential inside their own error path and answer 5xx where they mean 401 — LiteLLM
+# without a database is the one this script meets most often, because its auth-error
+# handler imports a module only DB deployments install, so the handler itself raises
+# before it can answer. The operator is then sent to read server logs over what is really
+# "you told me this gateway is keyless, and it is not".
+# The probe is DECISIVE rather than a guess, and it is the same shape as the 403 one:
+# resend the request that just failed, changing exactly one thing — an Authorization
+# header — and see whether the answer changes. A genuinely broken server answers a
+# credentialled request exactly as badly; only a server whose reply DEPENDS on the
+# credential can answer differently. Silence when the status is unchanged is therefore
+# the honest outcome, not a missed diagnosis.
+# `curl_gw` is reused rather than a fresh curl so the probe inherits the same timeout,
+# config-file refusal and proxy policy as the request it is compared against — anything
+# else and the two would differ by more than the header, which is the whole claim.
+# The token is a fixed non-secret literal, so unlike every real credential here it may
+# ride argv: there is nothing for `ps` to disclose. It is deliberately self-describing,
+# because it lands in the gateway's auth log and the operator reading that log should
+# find something that explains itself.
+GW_CREDENTIAL_PROBE_TOKEN='conduck-connect-probe-not-a-real-token'
+gw_5xx_credential_note() { # reads GW_AUTH / GW_URL / MODELS_CURL_RC / MODELS_HTTP_CODE
+  [ "$MODELS_CURL_RC" = "0" ] || return 0
+  [ "$GW_AUTH" != "bearer" ] || return 0
+  case "$MODELS_HTTP_CODE" in 5??) ;; *) return 0 ;; esac
+  local base_again code
+  # The CONTROL comes first, and it is what makes this a measurement rather than a guess.
+  # A 5xx is the status most likely to be transient — a restarting gateway, a cold model
+  # load, a proxy hiccup — and any second request that merely came out different would
+  # otherwise be read as proof about the credential. So the unauthenticated request is
+  # repeated first: unless the SAME status reproduces, the run is too unstable to
+  # conclude anything from and this stays silent. Failing the control also skips sending
+  # the probe token at all, which is the cheap path in the common transient case.
+  base_again=$(curl_gw -H "Accept: application/json" \
+    -o /dev/null -w '%{http_code}' "$GW_URL/v1/models" 2>/dev/null) || return 0
+  [ "$base_again" = "$MODELS_HTTP_CODE" ] || return 0
+  code=$(curl_gw -H "Accept: application/json" \
+    -H "Authorization: Bearer $GW_CREDENTIAL_PROBE_TOKEN" \
+    -o /dev/null -w '%{http_code}' "$GW_URL/v1/models" 2>/dev/null) || return 0
+  [ -n "$code" ] || return 0
+  [ "$code" != "$MODELS_HTTP_CODE" ] || return 0
+  warn "This gateway is configured as keyless, but its answer CHANGES when a credential is"
+  warn "sent — HTTP $MODELS_HTTP_CODE without one, HTTP $code with one. It wants a token after all."
+  note "A server that is simply broken answers both the same way, so this is the credential."
+  note "Some servers report a missing one as a 5xx from inside their own error handler rather"
+  note "than as 401 — LiteLLM without a database does exactly this."
+  note "Re-run setup, say this gateway DOES need a bearer token, and give it the expected one."
+}
+
 agent_file_lane_gate() {
   local agent_name fix_hint
   case "$GW_KIND" in
@@ -7941,6 +7989,7 @@ verify_all() {
     bad "$GW_URL/v1/models failed: $why"
     gw_url_drift_note
     gw_403_route_note
+    gw_5xx_credential_note
     VERIFY_FAILED=true
   fi
 

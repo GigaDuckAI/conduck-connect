@@ -4,6 +4,23 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **A 5xx on a keyless gateway is no longer reported as a server fault when the
+  server is really asking for a credential.** Some servers mishandle a *missing*
+  credential inside their own error path and answer 5xx where they mean 401.
+  LiteLLM without a database is the one this script meets most: its auth-error
+  handler imports a module only database deployments install, so the handler
+  itself raises before it can answer — measured, on a stock install, `no
+  Authorization header → 500` while `wrong token → 400` and `correct token →
+  200`. An operator who tells the wizard their LiteLLM is keyless was sent to
+  read server logs over what is really "this gateway is not keyless". The wizard
+  now settles it by experiment instead of guessing, in the same shape as the 403
+  probe: repeat the failed request unchanged, and only if the same status
+  reproduces, send it once more with a throwaway credential. A server that is
+  simply broken answers both the same way; only one whose reply depends on the
+  credential can differ. Both observed statuses are printed, so the operator
+  reads the measurement rather than taking the verdict on faith, and the control
+  running FIRST means a transient 5xx — a restarting gateway, a cold model load
+  — stays silent instead of producing a confident wrong answer.
 - **A 403 was reported as a rejected token — on gateways configured as keyless,
   where no token exists to reject.** `401` and `403` shared one arm, so the most
   common first-run failure of the most common local model server produced a
