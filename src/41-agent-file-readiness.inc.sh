@@ -868,10 +868,11 @@ restart_hermes_for_config() {
   local restarted=1
   if [ "$OS" = "Linux" ] && have systemctl \
      && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
-    run_step "restart Hermes so the approved config change applies" \
+    run_step "file.hermes.restart_config" "restart Hermes so the approved config change applies" \
       systemctl --user restart hermes-gateway.service && restarted=0
   else
-    print_and_wait "Restart Hermes however it runs on this machine so the approved config change takes effect." \
+    print_and_wait "file.hermes.manual_restart" \
+      "Restart Hermes however it runs on this machine so the approved config change takes effect." \
       "systemctl --user restart hermes-gateway.service   # or your own restart method" && restarted=0
   fi
   # Hermes's API server is not listening the moment the restart command returns,
@@ -992,7 +993,7 @@ hermes_recall_remove_step() { # hermes_recall_remove_step <config> -> 0 when the
   say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
   say "  surfaces are untouched — but anything else talking to this same API server loses"
   say "  its memory too."
-  if ! confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+  if ! confirm "  Remove Hermes's recall tools from its API-server scope?" "gateway.hermes.remove_recall"; then
     note "Leaving it as it is."
     HERMES_RECALL_DECLINED=true
     return 1
@@ -1068,7 +1069,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
       say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
       say "  surfaces are untouched — but anything else talking to this same API server loses"
       say "  its memory too."
-      if confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+      if confirm "  Remove Hermes's recall tools from its API-server scope?" "file.hermes.remove_recall"; then
         approved_scope="$HERMES_RECALL_SCOPE"
         # Re-read with the approval folded in, so the operator sees ONE
         # before→after for this file rather than two overlapping ones.
@@ -1127,7 +1128,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
     warn "(reuse-only: not changing Hermes config; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Apply exactly these Hermes changes?"; then
+  if ! confirm "  Apply exactly these Hermes changes?" "file.hermes.apply_config"; then
     note "Leaving the file lane out — chat is unaffected."
     if [ -n "$approved_scope" ]; then
       note "The API-server scope is unchanged too; nothing in this file was touched."
@@ -1262,7 +1263,7 @@ install_conduck_hermes_block() { # install_conduck_hermes_block <workspace>
     warn "(reuse-only: guidance is absent/stale and cannot be changed; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Install/refresh that Hermes guidance block?"; then
+  if ! confirm "  Install/refresh that Hermes guidance block?" "file.hermes.guidance"; then
     note "Leaving the file lane out — chat is unaffected."
     return 1
   fi

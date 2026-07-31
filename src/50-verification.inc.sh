@@ -267,7 +267,7 @@ agent_file_lane_gate() {
     return 1
   fi
   if $SHOW_QR; then
-    if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+    if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)" "verification.gateway_only"; then
       FS_LANE_DROPPED_BY_CHECK=true
       drop_file_lane
       return 1
@@ -413,7 +413,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
         curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
         FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane
-      elif confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+      elif confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)" "verification.gateway_only"; then
         curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
         FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane

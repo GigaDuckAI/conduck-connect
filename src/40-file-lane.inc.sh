@@ -433,7 +433,7 @@ ensure_existing_fs_envfile_linux() {
     warn "(reuse-only: not repairing the legacy unit; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Repair this connector-owned unit now?"; then
+  if ! confirm "  Repair this connector-owned unit now?" "file.unit.repair_envfile"; then
     note "Leaving the file lane out; chat is unaffected."
     fs_envfile_exposure_warning
     return 1
@@ -663,7 +663,7 @@ fs_report_linger_linux() {
     note "(reuse-only: changing nothing.) Turn it on yourself with:  ${priv:+$priv }loginctl enable-linger $u"
     return 0
   fi
-  run_step "enable linger so the file server survives logout and reboot" \
+  run_step "file.service.enable_linger" "enable linger so the file server survives logout and reboot" \
     ${privcmd[@]+"${privcmd[@]}"} loginctl enable-linger "$u" || true
   $DRY_RUN && return 0
   if fs_linger_enabled_linux; then
@@ -972,7 +972,7 @@ fs_inactive_unit_report() {
     note "(reuse-only: not moving the lane to another port — re-run without --reuse-only to do that.)"
     return 1
   fi
-  if ! confirm "  Move this file lane to a different free port and start it there?"; then
+  if ! confirm "  Move this file lane to a different free port and start it there?" "file.service.move_port"; then
     note "Leaving the file lane out of this setup code; chat is unaffected."
     return 1
   fi
@@ -1242,20 +1242,22 @@ fs_warn_quick_tunnel_url() {
 #
 # Blank-then-EOF ends the loop: ask_url returns nonzero on a closed stdin, which
 # this propagates so the caller's `|| die "$NO_ANSWER"` still fires.
-ask_fs_url() { # ask_fs_url <prompt> -> echoes the address, or "" for a skip
+#
+# This helper deliberately runs in the PARENT shell and returns its value through
+# ASK_FS_URL_RESULT. The confirmation accepts q, and `quit_run` must exit the real
+# setup process—not a command-substitution subshell that would turn q into an
+# empty successful URL and continue as though the operator deliberately skipped.
+ASK_FS_URL_RESULT=""
+ask_fs_url() { # ask_fs_url <prompt> -> sets ASK_FS_URL_RESULT; 1 on URL-prompt EOF
   local prompt="$1" u tries=0
+  ASK_FS_URL_RESULT=""
   while [ "$tries" -lt 3 ]; do
     tries=$((tries + 1))
-    u=$(ask_url "$prompt" "https://files.example.com" 1) || return 1
-    if [ -n "$u" ]; then printf '%s' "$u"; return 0; fi
-    # stderr, like every other human line in a prompt helper: this runs inside
-    # $( ), where anything on stdout would be captured AS THE ADDRESS. confirm
-    # gets the same redirect even though `read -p` already prompts on stderr —
-    # the helper's contract is "nothing but the address reaches stdout", and that
-    # must hold from reading this function, not from knowing what confirm does.
-    warn "No address was entered." >&2
-    confirm "  Leave file transfer OUT of this setup code?" >&2 && return 0
-    note "Let's try that address again." >&2
+    u=$(ask_url "$prompt" "https://files.example.com" 1 "review omitting file transfer") || return 1
+    if [ -n "$u" ]; then ASK_FS_URL_RESULT="$u"; return 0; fi
+    warn "No address was entered."
+    confirm "  Leave file transfer OUT of this setup code?" "file.address.skip" && return 0
+    note "Let's try that address again."
   done
   # BOUNDED, because --setup is not gated on an interactive terminal: a stdin
   # that keeps yielding empty lines (a pipe, `printf '\n\n\n' |`, a wedged paste)
@@ -1272,7 +1274,7 @@ ask_fs_url() { # ask_fs_url <prompt> -> echoes the address, or "" for a skip
 # Publication event → a SECOND explicit confirm on top of the menu choice.
 fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
-  if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?"; then
+  if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?" "file.exposure.make_public"; then
     FS_CRED=""; note "Leaving the file lane out — keeping your files off the public internet."
     fs_note_existing_mapping "$ehttps" "$everb"
     fs_lane_residue_note
@@ -1295,7 +1297,7 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
         # No Funnel port free — NOTHING was changed, the lane is still private. Don't
         # silently drop a working lane: offer to keep it private instead of losing it.
         warn "Couldn't make the file lane public — all three Funnel ports (443/8443/10000) are already in use by other services on this machine."
-        if confirm "  Keep the file lane PRIVATE instead (reachable on your Tailscale network)?"; then
+        if confirm "  Keep the file lane PRIVATE instead (reachable on your Tailscale network)?" "file.exposure.keep_private"; then
           FS_URL="https://$host:$ehttps"; FS_REACH="private"
           warn "Keeping the file lane private at $FS_URL."
           warn "Heads-up: the gateway is PUBLIC but this file lane stays Tailscale-only, so attachments work only on your Tailscale-connected devices — an Apple Watch used away from your iPhone won't reach them. Chat still works everywhere."
@@ -1361,7 +1363,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    1) Leave the file lane out — chat still works everywhere; no attachments"
       say "    2) Include it as-is  (advanced) — attachments only on your Tailscale devices"
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      [ "$c" = "q" ] && quit_run
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -1374,7 +1377,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat still works everywhere; no attachments"
     say "    3) Include it as-is  (advanced) — attachments only on your Tailscale devices;"
     say "       the file server itself stays private"
-    c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    [ "$c" = "q" ] && quit_run
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway."
@@ -1388,7 +1392,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    2) Keep it public anyway  (advanced) — the file server stays reachable"
       say "       from the whole internet, unlike the gateway"
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      [ "$c" = "q" ] && quit_run
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -1401,7 +1406,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat unaffected; no attachments"
     say "    3) Keep it public anyway  (advanced) — the file server stays reachable"
     say "       from the whole internet, unlike the gateway"
-    c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    [ "$c" = "q" ] && quit_run
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out."
@@ -1788,11 +1794,11 @@ openclaw_tool_policy_step() {
     else
       local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
       if [ -f "$compose_dir/docker-compose.yml" ] || [ -f "$compose_dir/compose.yaml" ]; then
-        if run_step "allow the agent's file tools in OpenClaw's tool policy" \
+        if run_step "file.openclaw.allow_tools" "allow the agent's file tools in OpenClaw's tool policy" \
           docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
             dist/index.js config set --batch-json "$ops"; then
           policy_saved=true
-          if run_step "restart the gateway so the policy applies" \
+          if run_step "file.openclaw.restart_tools" "restart the gateway so the policy applies" \
             docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
             restart_done=true
             gw_note_restart_and_wait "tool-policy change" true
@@ -1804,7 +1810,8 @@ openclaw_tool_policy_step() {
         # One step covers both halves here, so its confirmation is the only signal
         # available for either — the same boot window follows an operator's own
         # restart, so the same wait follows it.
-        if print_and_wait "Not the standard Docker setup — apply the policy change with your install's CLI, then restart the gateway." \
+        if print_and_wait "file.openclaw.manual_tools" \
+          "Not the standard Docker setup — apply the policy change with your install's CLI, then restart the gateway." \
           "$joined"; then
           policy_saved=true
           restart_done=true
@@ -1842,7 +1849,7 @@ openclaw_tool_policy_step() {
     note "(keeping the file lane in this read-only pass; a real run asks)"
     return 0
   fi
-  if confirm "  Keep the file lane anyway (fix the policy later, then re-run me)?"; then
+  if confirm "  Keep the file lane anyway (fix the policy later, then re-run me)?" "file.openclaw.keep_unready"; then
     return 0
   fi
   return 1
@@ -1899,7 +1906,7 @@ install_conduck_tools_block() { # install_conduck_tools_block <workspace-host-pa
     say "  Your TOOLS.md exists — the block is appended (or refreshed in place between its"
     say "  markers); everything else in the file stays byte-identical."
   fi
-  if ! confirm "  Install/refresh the block?"; then
+  if ! confirm "  Install/refresh the block?" "file.openclaw.guidance"; then
     note "Skipped — the README's file-lane troubleshooting carries the same guidance for manual setup."
     return 0
   fi
@@ -2000,7 +2007,7 @@ setup_file_lane() {
   say "  How: a small password-protected file server (rclone WebDAV — a standard way"
   say "  to read and write files over the web) over the agent's working folder,"
   say "  shared the same way as the gateway."
-  if ! confirm "  Set it up?"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
+  if ! confirm "  Set it up?" "file.setup.enable"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
 
   # rclone FIRST, because asking is free: without it no lane can be built at all,
   # and changing a foreign gateway's tool policy (and restarting it) for a lane
@@ -2126,7 +2133,7 @@ setup_file_lane() {
       hermes)   workspace="$HOME/.hermes/files" ;;
       *)        workspace="$HOME/conduck-files" ;;
     esac
-    if [ "$GW_KIND" = "custom" ] || confirm "  Use a different folder than $workspace?"; then
+    if [ "$GW_KIND" = "custom" ] || confirm "  Use a different folder than $workspace?" "file.folder.override"; then
       while true; do
         local w; w=$(ask "  Absolute path to the agent's working folder" "$workspace")
         case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
@@ -2320,13 +2327,18 @@ setup_file_lane() {
       # confirm they made it (or say they already have one).
       if $REUSE_ONLY; then
         note "(reuse-only: assuming your file-lane ingress rule already exists)"
-        local h; h=$(ask_fs_url "The file-lane web address (blank to skip the file lane)") || die "$NO_ANSWER"
+        local h
+        ask_fs_url "The file-lane web address (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+        h="$ASK_FS_URL_RESULT"
         if [ -n "$h" ]; then FS_URL="$h"; FS_ROUTE_SELF_MANAGED=true; fs_warn_quick_tunnel_url
         else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
-      elif print_and_wait "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
+      elif print_and_wait "file.cloudflare.route" \
+        "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
         "cloudflared tunnel route dns <your-tunnel> files.YOURDOMAIN"; then
         FS_ROUTE_SELF_MANAGED=true
-        local h2; h2=$(ask_fs_url "The file-lane web address you configured (blank to skip the file lane)") || die "$NO_ANSWER"
+        local h2
+        ask_fs_url "The file-lane web address you configured (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+        h2="$ASK_FS_URL_RESULT"
         if [ -n "$h2" ]; then FS_URL="$h2"; fs_warn_quick_tunnel_url
         else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
       else FS_CRED=""; fs_lane_residue_note; fi
@@ -2337,7 +2349,9 @@ setup_file_lane() {
       say "  (a second server block, a subdomain, or another port)."
       note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
       note "Its certificate must be trusted the same way the gateway's is; the app applies one rule to both."
-      local h; h=$(ask_fs_url "The https:// web address that reaches it (blank to skip the file lane)") || die "$NO_ANSWER"
+      local h
+      ask_fs_url "The https:// web address that reaches it (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+      h="$ASK_FS_URL_RESULT"
       if [ -n "$h" ]; then
         FS_URL="$h"
         FS_ROUTE_SELF_MANAGED=true   # their own web server holds it; only they can take it back down

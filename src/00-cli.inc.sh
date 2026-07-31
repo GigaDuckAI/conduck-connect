@@ -28,7 +28,7 @@
 #     bash conduck-connect.sh --setup --dry-run
 #                                        # preview setup; changes nothing
 #
-# What this script DOES (always with your confirmation, step by step):
+# What this script DOES (with host and network changes shown for approval):
 #   1. Finds your gateway (OpenClaw, Hermes, or any OpenAI-compatible server).
 #   2. Enables the OpenAI-compatible chat endpoint if it is off (the #1 setup trap).
 #   3. Helps you expose the gateway over HTTPS (works WITH what you have installed:
@@ -58,6 +58,12 @@
 # encoder (Project Nayuki, MIT — the big, inert block near the end of this file;
 # it needs Python 3.7+ — on an older Python you just use the printed code).
 # The pairing string is always printed too, so the QR is never required.
+#
+# Interactive controls:
+#   i  explain the current bounded decision, then ask it again
+#   q  stop cleanly (does not undo changes you already approved)
+#   b  go back only where the prompt offers it; Back is navigation, not undo
+# Every interactive prompt states what pressing Enter will do.
 #
 # Usage:
 #   bash conduck-connect.sh                 # welcome menu

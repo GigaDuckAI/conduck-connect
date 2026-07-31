@@ -393,7 +393,7 @@ ts_priv_retry() { # ts_priv_retry <why> <bare-command>… -> 0 ran it, 1 decline
     retry="${retry:+$retry; }${priv:+$priv }$c"
   done
   [ -n "$priv" ] || why="$why This shell is not root and has neither sudo nor doas, so run it from a root shell."
-  print_and_wait "$why" "$retry"
+  print_and_wait "exposure.tailscale.privileged_retry" "$why" "$retry"
 }
 
 # Run a serve/funnel mapping, then CONFIRM it actually took (never trust Enter).
@@ -429,7 +429,7 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     plan_add "RUN  $cmd"; note "(dry-run: would run the above)"; return 0
   fi
   mutate_guard "expose port $httpsport via tailscale $verb" || return 1
-  if confirm "  Run '$cmd' now?"; then
+  if confirm "  Run '$cmd' now?" "exposure.tailscale.apply"; then
     # Snapshot only once the user has AGREED — a declined confirm must leave no
     # rollback record for a port we never touched. Memory AND disk, both BEFORE
     # the first mutating command below (the demote already changes the port), so
@@ -480,7 +480,7 @@ cleanup_exposures() {
   if entries_have_public_prior "${all[@]}"; then
     warn "The PUBLIC line above is NOT included — I never re-publish a port on your behalf."
   fi
-  if ! $REUSE_ONLY && confirm "  Run these cleanup commands now?"; then
+  if ! $REUSE_ONLY && confirm "  Run these cleanup commands now?" "exposure.rollback.failed_run"; then
     # Reverse order: the LAST mapping applied is undone first, so when two records
     # touch one port the earliest-recorded prior state is the one that survives.
     local i
@@ -646,7 +646,7 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
       warn "(--reuse-only: leaving it as-is — re-run without --reuse-only to remove it.)"
       continue
     fi
-    if ! confirm "  Turn that public exposure off now?"; then
+    if ! confirm "  Turn that public exposure off now?" "exposure.cleanup.stale_public"; then
       warn "Leaving it live: this backend stays reachable at https://$host:$rport from the internet."
       continue
     fi
@@ -766,7 +766,7 @@ reconcile_orphaned_exposures() {
     warn "(--reuse-only: leaving it as-is — run the commands above, or re-run without --reuse-only.)"
     return 0
   fi
-  if ! confirm "  Close it now?"; then
+  if ! confirm "  Close it now?" "exposure.cleanup.orphaned"; then
     warn "Leaving it live. The commands above close it whenever you want."
     return 0
   fi
@@ -896,7 +896,7 @@ choose_exposure() {
   if $SETUP_FROM_CHECK; then
     say "  ${DIM}b) stop this setup (the completed check remains unchanged)${RESET}"
   else
-    say "  ${DIM}b) go back to the gateway choice${RESET}"
+    say "  ${DIM}b) go back to the gateway choice (earlier approved changes stay in place)${RESET}"
   fi
   say ""
   say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
@@ -904,9 +904,10 @@ choose_exposure() {
   say ""
   local back_word="goes back"
   $SETUP_FROM_CHECK && back_word="stops setup"
-  local choice; choice=$(require_choice "Choose 1-4 ('?' compares them in plain words, 'b' $back_word)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
+  local choice; choice=$(require_choice "Choose 1-4 ('i' compares them, 'b' $back_word)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
+  [ "$choice" = "q" ] && quit_run
   [[ "$choice" =~ ^[bB]$ ]] && return 10   # back/stop — no exposure change has happened yet
-  $DRY_RUN || note "From here I may apply changes to this machine; to change an earlier choice, stop (Ctrl-C) and re-run."
+  $DRY_RUN || note "From here I may apply changes to this machine. q/Ctrl-C stops; neither undoes an earlier approved change."
 
   case "$choice" in
     1|2)
@@ -944,11 +945,13 @@ choose_exposure() {
         if $funnel && [ "$everb" = "serve" ]; then
           warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
           warn "https://$host:$gw_https reachable from the public internet."
-          confirm "  Make it public?" || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
+          confirm "  Make it public?" "exposure.tailscale.make_public" \
+            || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
         elif ! $funnel && [ "$everb" = "funnel" ]; then
           warn "Port $gw_https is currently PUBLIC (Tailscale Funnel). Going private turns the"
           warn "public URL off — afterwards only devices on your tailnet reach this gateway."
-          confirm "  Make it private (turn the public URL off)?" || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
+          confirm "  Make it private (turn the public URL off)?" "exposure.tailscale.make_private" \
+            || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
         fi
       fi
       tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
@@ -982,10 +985,11 @@ choose_exposure() {
       if $REUSE_ONLY; then
         note "(reuse-only: assuming your gateway ingress rule already exists — I won't guide changes)"
       else
-        print_and_wait "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
+        print_and_wait "exposure.cloudflare.gateway" \
+          "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
           "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
       fi
-      local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "")
+      local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "" "stop this option without a hostname")
       case "$h" in http://*|https://*) h="${h#*://}" ;; esac   # tolerate a pasted URL — keep the host part
       while [ "${h%/}" != "$h" ]; do h="${h%/}"; done
       [ -n "$h" ] || die "No hostname given. This option needs a domain already added to your Cloudflare account; if you don't have one yet, re-run and pick Tailscale instead, or add a domain in Cloudflare first."
@@ -1034,7 +1038,8 @@ scope_choice() {
   note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
   say "    1) Public — reachable from the open internet"
   say "    2) Private — only my own network / VPN (Tailscale, home or office LAN)"
-  local c; c=$(require_choice "Is this address public or private? Choose 1-2 ('?' explains)" '^[12]$' explain_scope_choice) || die "$NO_ANSWER"
+  local c; c=$(require_choice "Is this address public or private? Choose 1-2 ('i' explains)" '^[12]$' explain_scope_choice) || die "$NO_ANSWER"
+  [ "$c" = "q" ] && quit_run
   if [ "$c" = "1" ]; then SCOPE="public"; else SCOPE="private"; fi
 }
 

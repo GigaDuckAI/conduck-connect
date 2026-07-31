@@ -78,9 +78,11 @@ confirm() {
   # The marker is what the flow assertions count: "was the operator asked twice?"
   # is a question about prompts, and only a printed prompt can be counted from a
   # captured transcript.
-  printf '[confirm] %s -> %s\n' "$1" "$reply"
+  printf '[confirm] %s -> %s action=%s\n' "$1" "$reply" "${2:-general}"
+  [ "$reply" = "q" ] && quit_run
   [ "$reply" = "y" ]
 }
+quit_run() { printf '[quit]\n'; exit 0; }
 # The real one `die`s under --reuse-only; `die` here returns 1, so the guard has
 # to return explicitly or the caller would read a refusal as permission.
 mutate_guard() {
@@ -94,16 +96,17 @@ mutate_guard() {
 # config change must stay refusable, or "reuse-only changed nothing" would pass on a
 # stub that quietly ran it. The operator y/N the real ones wrap is auto-accepted.
 run_step() {
-  local desc="$1"; shift
+  local action="$1" desc="$2"; shift 2
   if $DRY_RUN; then plan_add "RUN  $*"; return 0; fi
   mutate_guard "$desc" || return 1
-  printf '[run_step] %s\n' "$desc"
+  printf '[run_step] %s (%s)\n' "$desc" "$action"
   return 0
 }
 print_and_wait() {
-  if $DRY_RUN; then plan_add "YOU RUN  $2  ($1)"; return 0; fi
-  mutate_guard "$1" || return 1
-  printf '[by-hand] %s\n' "$1"
+  local action="$1" why="$2" command="$3"
+  if $DRY_RUN; then plan_add "YOU RUN  $command  ($why)"; return 0; fi
+  mutate_guard "$why" || return 1
+  printf '[by-hand] %s (%s)\n' "$why" "$action"
   return 0
 }
 ask_secret() { printf '%s' "fixture-secret"; }
@@ -2813,14 +2816,10 @@ fs_url_run() { # fs_url_run <confirm-script> <ask_url answer…> -> transcript +
     CONFIRM_ANSWER="n"
     URL_QUEUE="$queue"
     # The SHARED confirm stub is used deliberately, marker on stdout and all.
-    # ask_fs_url runs inside $( ), so anything a prompt helper leaks to stdout is
-    # captured as the address — which is how this very feature first broke the
-    # suite. Production redirects confirm to stderr for exactly that reason, so
-    # leaving the noisy stub in place turns these cases into the regression test
-    # for that redirect: drop it and the marker lands in RESULT below.
-    # A file, not a variable: ask_fs_url calls this inside $( ), so a queue index
-    # kept in a variable would die with that subshell and re-serve answer one
-    # forever — which is exactly the infinite loop this feature could introduce.
+    # ask_fs_url itself must run in this parent shell so q exits the flow instead
+    # of only exiting a nested command substitution. ask_url still runs inside
+    # $( ), so its answer queue lives in a file; a variable index would die with
+    # that subshell and re-serve answer one forever.
     ask_url() {
       local reply=""
       [ -s "$URL_QUEUE" ] || return 1          # exhausted: the real one returns nonzero on EOF
@@ -2834,7 +2833,8 @@ fs_url_run() { # fs_url_run <confirm-script> <ask_url answer…> -> transcript +
       esac
     }
     local result rc
-    result=$(ask_fs_url "The https:// web address that reaches it"); rc=$?
+    ask_fs_url "The https:// web address that reaches it"; rc=$?
+    result="$ASK_FS_URL_RESULT"
     printf 'RESULT=%s\nRC=%s\n' "$result" "$rc"
   ) 2>&1
 }
@@ -2854,6 +2854,21 @@ test_file_lane_blank_address_confirm() {
   case "$out" in *"[confirm]"*"Leave file transfer OUT"*)
       pass "blank address: the skip is put as a question" ;;
     *) fail "blank address: the skip is put as a question" "$out" ;; esac
+  case "$out" in *"action=file.address.skip"*)
+      pass "blank address: the skip has contextual explanation" ;;
+    *) fail "blank address: the skip has contextual explanation" "$out" ;; esac
+
+  # q at this composed path must stop the parent flow. Calling ask_fs_url through
+  # $( ) would let quit_run exit only that inner shell, then print RESULT below
+  # and continue as a successful blank skip—the exact merge-only failure caught
+  # by this regression.
+  out=$(fs_url_run "q" "__BLANK__")
+  case "$out" in *"[quit]"*)
+      pass "blank address: q stops the parent flow" ;;
+    *) fail "blank address: q stops the parent flow" "$out" ;; esac
+  case "$out" in *"RESULT="*)
+      fail "blank address: q does not continue as a successful skip" "$out" ;;
+    *) pass "blank address: q does not continue as a successful skip" ;; esac
 
   # A yes still skips — the escape hatch survives, it is just deliberate now.
   out=$(fs_url_run "y" "__BLANK__")
@@ -3493,8 +3508,8 @@ openclaw_fix_config() { # openclaw_fix_config <path> <ready|needs-fix>
 #   POLICY_RESTART_RC  — 1 declines the restart half, the way an operator does.
 POLICY_CFG=""
 POLICY_RESTART_RC=0
-policy_run_step() { # policy_run_step <description> [command…]
-  local desc="$1"
+policy_run_step() { # policy_run_step <action-id> <description> [command…]
+  local action="$1" desc="$2"
   case "$desc" in
     *restart*)
       if [ "$POLICY_RESTART_RC" != "0" ]; then
@@ -3504,7 +3519,7 @@ policy_run_step() { # policy_run_step <description> [command…]
       ;;
     *"tool policy"*) openclaw_fix_config "$POLICY_CFG" ready ;;
   esac
-  printf '[run_step] %s\n' "$desc"
+  printf '[run_step] %s (%s)\n' "$desc" "$action"
   return 0
 }
 

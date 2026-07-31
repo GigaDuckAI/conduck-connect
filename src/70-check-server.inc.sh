@@ -359,7 +359,7 @@ run_compat() {
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter for keyless — the app's explicit no-auth mode)") \
+    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode") \
       || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
       GW_AUTH="none"

@@ -56,7 +56,7 @@ bash conduck-connect.sh --setup --dry-run
 # 4. Open the welcome menu
 bash conduck-connect.sh
 
-# Or go straight to setup (every change still asks first)
+# Or go straight to setup (review and approve bounded actions as you go)
 bash conduck-connect.sh --setup
 ```
 
@@ -68,6 +68,30 @@ shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-
 ```
 
 No `chmod` needed. The one large block near the bottom of the script is a vendored, unmodified QR-code encoder (Project Nayuki, MIT) used to draw the QR locally. It is inert — Python standard library only, no network, file, or process access — and safe to skip when reading.
+
+### Prompt controls
+
+At each interactive decision, the prompt lists the controls available for that
+step and states exactly what pressing **Enter** will do. The controls are
+contextual:
+
+- **`i` — explain this step.** Shows what the current action does, why it is
+  part of setup, what it may read, change, contact, restart, or expose, and what
+  declining means. The same decision is then shown again.
+- **`q` — stop setup.** Stops deliberately instead of treating the answer as
+  “no.” It does not undo configuration changes you already approved, commands
+  you already ran, or exposure changes already confirmed.
+- **`b` — go back.** Appears only where setup has a safe, defined earlier
+  choice to return to. It is not offered after an external command handoff or
+  where “back” could be mistaken for undo, and it never rolls back earlier
+  approved changes.
+
+Enter is not one global answer: at `[y/N]` it means **No**, at a value with a
+displayed default it accepts that value, and at a
+menu with no default it makes no selection and asks again. At an explicitly
+optional value it skips or selects keyless mode only when the prompt says so.
+After setup prints a command for you to run, Enter means **“I ran it; continue”**;
+the script does not run that command for you.
 
 ## Public commands and flags
 
@@ -157,7 +181,7 @@ The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_S
 
 - Runs on **your** gateway host. **No telemetry, ever — there is no GigaDuck server.** Its own HTTP probes go only to the gateway and file lane you name, and the QR is generated locally. The exception is the exposure path you choose: `tailscale serve` / `tailscale funnel` and `cloudflared tunnel list` are that vendor's own commands, and running them contacts that vendor's control plane.
 - Never installs gateways, Tailscale, cloudflared, rclone, or any daemon it didn't create.
-- Asks before every change. Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
+- Previews and asks before changing gateway or user-owned configuration and before changing network exposure. Connector-owned bookkeeping and exact verification artifacts may be created automatically inside the bounded setup or check action you chose; the complete list and undo guidance is in [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md). Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
 - Never elevates silently. Every command that needs higher rights is shown in full first — prefixed with `sudo` or `doas`, whichever this machine has, and bare when you are already root or have neither — and all but one are printed for you to review and run yourself (Tailscale operator rights, `pmset`). The exception is `loginctl enable-linger <user>` in the file-lane step — lingering is what keeps your file server running after you log out. The script runs that one itself, and only after you approve the exact command at a `y/N` prompt; decline and it prints it as a tip instead.
 - Never makes your gateway public without telling you, in plain words, that it will — and refuses to publish a keyless gateway unless you run setup with `--setup --allow-keyless-public`.
 - Re-running is safe; `--show-code` re-shows your saved pairing code without changing configuration. Its live verification still sends gateway requests and briefly writes/removes small randomized probes when a file lane is configured (including a real OpenClaw/Hermes agent file turn).

@@ -1000,28 +1000,211 @@ run_noarg_noninteractive_case() {
 
 run_menu_q_case() {
   local name="menu-q-exit" rc=0
-  PTY_ENV=()
-  pty_run 10 $'q\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  local home="$TMP/menu-q-home" state="$TMP/menu-q-state" prompt_count
+  mkdir -p "$home" "$state"
+  # Info must be additive, bad input must retry, and q must still leave the
+  # top-level menu without dispatching an action or creating setup state.
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+  pty_run 10 $'i\nbogus\nq\n' > "$TMP/doctor.out" 2>&1 || rc=$?
   if [ "$rc" != "0" ] ||
      ! grep -qF 'Welcome to Conduck Connect' "$TMP/doctor.out" ||
+     ! grep -qF 'About this step: Choose what conduck-connect should do' "$TMP/doctor.out" ||
+     ! grep -qF 'Please enter one of the listed options.' "$TMP/doctor.out" ||
      ! grep -qF 'Nothing changed.' "$TMP/doctor.out"; then
-    fail_case "$name" "q did not exit the PTY menu cleanly"; return
+    fail_case "$name" "info / invalid retry / q did not complete the PTY menu flow"; return
   fi
+  prompt_count=$(grep -c 'Choose an option (Enter = no default; i = explain; q = stop)' "$TMP/doctor.out")
+  if [ "$prompt_count" != "3" ]; then
+    fail_case "$name" "the menu prompt appeared $prompt_count times, expected once per info/retry/q answer"; return
+  fi
+  if grep -qF 'Step 1 — find your gateway' "$TMP/doctor.out" ||
+     [ -n "$(find "$home" "$state" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    fail_case "$name" "q dispatched setup or wrote state after an explanation/retry"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Exercise the prompt primitives in a real PTY without entering setup. This is
+# deliberately below the menu case: `i`, `?`, `b`, and `q` are controls only at
+# bounded decision prompts. Free-form and hidden-value prompts must keep those
+# exact bytes as data, while every visible Enter meaning remains testable.
+run_prompt_controls_case() {
+  local name="prompt-controls-and-defaults" funcs input out rc=0
+  local confirm_marker="$TMP/prompt-confirm-ran" manual_marker="$TMP/prompt-manual-ran"
+  local quit_marker="$TMP/prompt-after-quit" choice_marker="$TMP/prompt-choice-q-ran"
+
+  funcs=$(extract_funcs \
+    explain_prompt quit_run confirm ask ask_default ask_secret require_choice print_and_wait)
+  for fn in explain_prompt quit_run confirm ask ask_default ask_secret require_choice print_and_wait; do
+    if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
+      fail_case "$name" "could not extract $fn from the release artifact"; return
+    fi
+  done
+
+  input=$'bogus\ni\n\n'          # confirm: invalid, info, Enter = No
+  input+=$'b\n'                   # confirm with allow-back: b = status 10
+  input+=$'b\n\n'                # ordinary confirm: b rejected, Enter = No
+  input+=$'\nnope\n?\n2\n'       # required choice: no default, invalid, help, valid
+  input+=$'bogus\ni\n\n'          # printed command: invalid, info, Enter = ran
+  input+=$'\n'                     # value prompt: Enter = displayed default
+  input+=$'i\nb\nq\n'             # free-form values stay literal
+  input+=$'i\nb\nq\n'             # secret values stay literal too
+
+  out=$(env -u CI TERM=dumb FUNCS="$funcs" \
+      CONFIRM_MARKER="$confirm_marker" MANUAL_MARKER="$manual_marker" \
+      python3 "$PTY_RUN" 10 "$input" bash -c '
+eval "$FUNCS"
+BOLD=""; DIM=""; RESET=""
+DRY_RUN=false; REUSE_ONLY=false
+say()  { printf "SAY %s\n" "$*"; }
+note() { printf "NOTE %s\n" "$*"; }
+warn() { printf "WARN %s\n" "$*"; }
+explain_action() { printf "INFO %s\n" "$1"; }
+mutate_guard() { printf "GUARD %s\n" "$1"; return 0; }
+plan_add() { printf "PLAN %s\n" "$*"; }
+
+if confirm "Fixture confirmation" "fixture.confirm"; then
+  : > "$CONFIRM_MARKER"
+  printf "CONFIRM=yes\n"
+else
+  printf "CONFIRM=no rc=%s\n" "$?"
+fi
+
+confirm "Back-capable confirmation" "fixture.back" true
+printf "BACK_ALLOWED_RC=%s\n" "$?"
+confirm "Ordinary confirmation" "fixture.no_back"
+printf "BACK_BLOCKED_RC=%s\n" "$?"
+
+choice=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice")
+printf "CHOICE=%s rc=%s\n" "$choice" "$?"
+
+if print_and_wait "fixture.manual" "fixture manual action" "touch $MANUAL_MARKER"; then
+  printf "MANUAL=acknowledged\n"
+else
+  printf "MANUAL=skipped rc=%s\n" "$?"
+fi
+
+defaulted=$(ask_default "Fixture value" "fixture-default")
+printf "DEFAULT=%s\n" "$defaulted"
+free_i=$(ask "Free i" ""); free_b=$(ask "Free b" ""); free_q=$(ask "Free q" "")
+printf "FREEFORM=%s|%s|%s\n" "$free_i" "$free_b" "$free_q"
+secret_i=$(ask_secret "Secret i" "leave empty"); secret_b=$(ask_secret "Secret b" "leave empty"); secret_q=$(ask_secret "Secret q" "leave empty")
+printf "SECRETS=%s|%s|%s\n" "$secret_i" "$secret_b" "$secret_q"
+' 2>&1) || rc=$?
+  printf -- '--- prompt primitives ---\n%s\n' "$out" > "$TMP/doctor.out"
+
+  if [ "$rc" != "0" ] ||
+     ! printf '%s\n' "$out" | grep -qF 'CONFIRM=no rc=1' ||
+     ! printf '%s\n' "$out" | grep -qF 'INFO fixture.confirm' ||
+     ! printf '%s\n' "$out" | grep -qF 'Please answer y or n, press Enter for No' ||
+     ! printf '%s\n' "$out" | grep -qF 'BACK_ALLOWED_RC=10' ||
+     ! printf '%s\n' "$out" | grep -qF 'Enter = No; i = explain; b = back; q = stop' ||
+     ! printf '%s\n' "$out" | grep -qF 'BACK_BLOCKED_RC=1' ||
+     ! printf '%s\n' "$out" | grep -qF 'Back is not available at this step' ||
+     ! printf '%s\n' "$out" | grep -qF 'CHOICE=2 rc=0' ||
+     ! printf '%s\n' "$out" | grep -qF 'INFO fixture.choice' ||
+     [ "$(printf '%s\n' "$out" | grep -c 'Please enter one of the listed options.')" != "2" ]; then
+    fail_case "$name" "confirm or required-choice controls lost their retry/info/default semantics"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'MANUAL=acknowledged' ||
+     ! printf '%s\n' "$out" | grep -qF 'INFO fixture.manual' ||
+     ! printf '%s\n' "$out" | grep -qF 'Please press Enter only after running it' ||
+     ! printf '%s\n' "$out" | grep -qF 'DEFAULT=fixture-default' ||
+     [ -e "$confirm_marker" ] || [ -e "$manual_marker" ]; then
+    fail_case "$name" "an Enter default was unclear, changed meaning, or executed the displayed command"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'FREEFORM=i|b|q' ||
+     ! printf '%s\n' "$out" | grep -qF 'SECRETS=i|b|q' ||
+     ! printf '%s\n' "$out" | grep -qF 'Secret i (Enter = leave empty)'; then
+    fail_case "$name" "a navigation key was consumed by a free-form or secret prompt"; return
+  fi
+
+  # require_choice runs in $(), so q must survive as a literal sentinel for its
+  # parent to interpret; it must not exit from inside the subshell.
+  rc=0
+  out=$(env -u CI TERM=dumb FUNCS="$funcs" CHOICE_MARKER="$choice_marker" \
+      python3 "$PTY_RUN" 10 $'q\n' bash -c '
+eval "$FUNCS"
+BOLD=""; RESET=""
+say() { printf "SAY %s\n" "$*"; }; note() { printf "NOTE %s\n" "$*"; }; warn() { printf "WARN %s\n" "$*"; }
+choice=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice") || exit $?
+printf "CHOICE_SENTINEL=%s\n" "$choice"
+[ "$choice" = q ] || : > "$CHOICE_MARKER"
+' 2>&1) || rc=$?
+  printf -- '--- required-choice q ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'CHOICE_SENTINEL=q' || [ -e "$choice_marker" ]; then
+    fail_case "$name" "require_choice did not return literal q through command substitution"; return
+  fi
+
+  # At a consent prompt q belongs to the whole run. Nothing after the prompt may
+  # execute, and the clean stop still explains that earlier actions are not undone.
+  rc=0
+  out=$(env -u CI TERM=dumb FUNCS="$funcs" QUIT_MARKER="$quit_marker" \
+      python3 "$PTY_RUN" 10 $'q\n' bash -c '
+eval "$FUNCS"
+BOLD=""; RESET=""
+say() { printf "SAY %s\n" "$*"; }; note() { printf "NOTE %s\n" "$*"; }; warn() { printf "WARN %s\n" "$*"; }
+confirm "Fixture confirmation" "fixture.confirm"
+: > "$QUIT_MARKER"
+' 2>&1) || rc=$?
+  printf -- '--- consent q ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$rc" != "0" ] ||
+     ! printf '%s\n' "$out" | grep -qF 'Stopped here. No further setup actions will run.' ||
+     ! printf '%s\n' "$out" | grep -qF 'does not undo' ||
+     [ -e "$quit_marker" ]; then
+    fail_case "$name" "q did not stop cleanly before the next action"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A syntactically valid port can still be the wrong server. The review screen is
+# the last mutation-free place to catch that mistake, so b must clear the draft,
+# collect it again, and carry only the corrected value into the exposure step.
+run_custom_review_back_case() {
+  local name="custom-review-back-corrects-port" rc=0 review_count
+  local home="$TMP/custom-review-home" state="$TMP/custom-review-state"
+  mkdir -p "$home" "$state"
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+  pty_run 10 $'Wrong gateway\nn\n1111\nn\n\nb\nCorrected gateway\nn\n2222\nn\n\n\nq\n' \
+    --generic --dry-run > "$TMP/doctor.out" 2>&1 || rc=$?
+
+  review_count=$(grep -c 'Review this gateway' "$TMP/doctor.out")
+  if [ "$rc" != "0" ] || [ "$review_count" != "2" ] ||
+     ! grep -qF 'Name:           Wrong gateway' "$TMP/doctor.out" ||
+     ! grep -qF 'Address:        http://127.0.0.1:1111 (local; HTTPS comes next)' "$TMP/doctor.out" ||
+     ! grep -qF '↩ Re-entering the custom gateway answers. Nothing has been changed.' "$TMP/doctor.out" ||
+     ! grep -qF 'Name:           Corrected gateway' "$TMP/doctor.out" ||
+     ! grep -qF 'Address:        http://127.0.0.1:2222 (local; HTTPS comes next)' "$TMP/doctor.out" ||
+     ! grep -qF 'Step 3 — how should your phone reach this gateway?' "$TMP/doctor.out" ||
+     ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
+    fail_case "$name" "review b did not replace the valid-but-wrong custom port before continuing"; return
+  fi
+  if [ "$(grep -c 'Enter = continue; b = re-enter these answers; i = explain; q = stop' "$TMP/doctor.out")" != "2" ] ||
+     [ -n "$(find "$home" "$state" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    fail_case "$name" "review did not show its Enter/b meanings twice or the dry run wrote state"; return
+  fi
+
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
 }
 
 run_menu_setup_case() {
   local name="menu-action-1-setup" rc=0
+  local home="$TMP/menu-setup-home" state="$TMP/menu-setup-state"
   # 1 = setup, 3 = another server, Enter = default name, n = local,
-  # Enter = invalid blank port and a deliberate clean stop.
-  PTY_ENV=()
-  pty_run 10 $'1\n3\n\nn\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" = "0" ] ||
+  # Enter = invalid blank port (which re-prompts), q = deliberate clean stop.
+  mkdir -p "$home" "$state"
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+  pty_run 10 $'1\n3\n\nn\n\nq\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  if [ "$rc" != "0" ] ||
      ! grep -qF 'Step 1 — find your gateway' "$TMP/doctor.out" ||
      ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out" ||
-     ! grep -qF 'Need the local port (or an https URL).' "$TMP/doctor.out"; then
-    fail_case "$name" "menu option 1 did not enter setup"; return
+     ! grep -qF 'A local setup needs a port. Enter its number, or press b to restart these answers and choose HTTPS.' "$TMP/doctor.out" ||
+     ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
+    fail_case "$name" "menu option 1 did not retry the blank port and stop cleanly"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -1034,11 +1217,12 @@ run_detected_requires_choice_case() {
   # Blank at the gateway question must re-prompt even though OpenClaw is found;
   # 3 then proves the user can deliberately configure another server.
   PTY_ENV=(HOME="$home")
-  pty_run 10 $'\n3\n\nn\n\n' --setup > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" = "0" ] ||
+  pty_run 10 $'\n3\n\nn\n\nq\n' --setup > "$TMP/doctor.out" 2>&1 || rc=$?
+  if [ "$rc" != "0" ] ||
      ! grep -qF 'We found these on this machine: openclaw' "$TMP/doctor.out" ||
      ! grep -qF 'Please enter one of the listed options.' "$TMP/doctor.out" ||
-     ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out"; then
+     ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out" ||
+     ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
     fail_case "$name" "a detected gateway was treated as an Enter default"; return
   fi
   if grep -qF 'Step 2 — OpenClaw' "$TMP/doctor.out"; then
@@ -1377,17 +1561,30 @@ run_own_https_trust_gate_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
-# Drive the PRODUCTION exposure menu and its `?` explainer without touching the
-# host: `?` prints the comparison and `b` goes back, so no branch past the menu is
+# Drive the PRODUCTION exposure menu and its `i` explainer without touching the
+# host: `i` prints the comparison and `b` goes back, so no branch past the menu is
 # ever entered and nothing is ever exposed. The explainer has to print on STDERR
 # here — the real require_choice runs inside a command substitution, so help text
 # on stdout would BE the answer. Its lines are tagged so the menu rows and the
 # explainer can be graded apart.
 # Args: <function-source> <cloudflared-present: yes|no>.
 run_exposure_menu_isolated() {
-  FUNCS="$1" CF_PRESENT="$2" bash -c '
+  env -u CI TERM=dumb FUNCS="$1" CF_PRESENT="$2" \
+    python3 "$PTY_RUN" 10 $'i\nb\n' bash -c '
 eval "$FUNCS"
-say()   { printf "%s\n" "$*"; }
+original=$(declare -f explain_exposure_paths)
+eval "${original/explain_exposure_paths/original_explain_exposure_paths}"
+EXPLAINING=false
+explain_exposure_paths() {
+  EXPLAINING=true
+  original_explain_exposure_paths
+  EXPLAINING=false
+}
+say() {
+  if [ "$EXPLAINING" = true ]; then printf "EXPLAINER %s\n" "$*"
+  else printf "%s\n" "$*"
+  fi
+}
 note()  { printf "%s\n" "$*"; }
 head_() { printf "%s\n" "$*"; }
 ok()    { printf "OK %s\n" "$*"; }
@@ -1396,11 +1593,14 @@ die()   { printf "DIE %s\n" "$*"; exit 1; }
 have()  { case "$1" in cloudflared) [ "$CF_PRESENT" = yes ] ;; *) return 1 ;; esac; }
 ts_targets()         { :; }
 tailscale_dns_name() { printf ""; }
-require_choice() {
-  printf "PROMPT %s\n" "$1" >&2
-  "$3" | sed "s/^/EXPLAINER /" >&2
-  printf "b\n"
-}
+# Any branch after the menu is a test failure: i and b must not expose, classify,
+# or even ask for another value.
+keyless_public_guard() { printf "SIDE_EFFECT keyless guard\n"; return 99; }
+tailscale_expose()     { printf "SIDE_EFFECT tailscale\n"; return 99; }
+print_and_wait()       { printf "SIDE_EFFECT printed command\n"; return 99; }
+ask()                  { printf "SIDE_EFFECT free-form ask\n"; return 99; }
+ask_url()              { printf "SIDE_EFFECT URL ask\n"; return 99; }
+scope_choice()         { printf "SIDE_EFFECT scope\n"; return 99; }
 BOLD=""; RESET=""; DIM=""
 DRY_RUN=true
 SETUP_FROM_CHECK=false
@@ -1424,10 +1624,12 @@ run_exposure_menu_quick_tunnel_case() {
   local name="exposure-menu-places-the-quick-tunnel" funcs out out_nocf rc
   local row3 row4 explainer prompt row lines
 
-  funcs=$(extract_funcs choose_exposure explain_exposure_paths)
+  funcs=$(extract_funcs choose_exposure explain_exposure_paths require_choice explain_prompt)
   if [ -z "$funcs" ] ||
      ! printf '%s\n' "$funcs" | grep -qF 'choose_exposure()' ||
-     ! printf '%s\n' "$funcs" | grep -qF 'explain_exposure_paths()'; then
+     ! printf '%s\n' "$funcs" | grep -qF 'explain_exposure_paths()' ||
+     ! printf '%s\n' "$funcs" | grep -qF 'require_choice()' ||
+     ! printf '%s\n' "$funcs" | grep -qF 'explain_prompt()'; then
     fail_case "$name" "could not extract the exposure menu from the release artifact"; return
   fi
 
@@ -1437,6 +1639,9 @@ run_exposure_menu_quick_tunnel_case() {
   # 10 is the menu's own go-back status: 'b' was taken, no exposure was attempted.
   if [ "$rc" != "10" ]; then
     fail_case "$name" "the menu did not go back on 'b' (status $rc) — the rows below may come from another path"; return
+  fi
+  if printf '%s\n' "$out" | grep -qF 'SIDE_EFFECT '; then
+    fail_case "$name" "info then back entered an exposure branch"; return
   fi
   for row in 1 2 3 4; do
     if ! printf '%s\n' "$out" | grep -qF "  $row)"; then
@@ -1475,33 +1680,36 @@ run_exposure_menu_quick_tunnel_case() {
     fi
   done
   # Still an explicit choice with no default and no favourite.
-  prompt=$(printf '%s\n' "$out" | grep '^PROMPT ')
+  prompt=$(printf '%s\n' "$out" | grep "Choose 1-4 ('i' compares them")
   if ! printf '%s\n' "$prompt" | grep -qF 'Choose 1-4'; then
     fail_case "$name" "the menu prompt no longer asks for an explicit 1-4"; return
+  fi
+  if [ "$(printf '%s\n' "$prompt" | grep -c 'Enter = no default; i = explain; q = stop')" != "2" ]; then
+    fail_case "$name" "i did not return to the same no-default exposure prompt"; return
   fi
   if printf '%s\n' "$out" | grep -qiE 'recommend|\(default'; then
     fail_case "$name" "the menu or its comparison started recommending one of the four paths"; return
   fi
 
-  # The `?` comparison has to agree with the row it explains, or the two drift and
+  # The `i` comparison has to agree with the row it explains, or the two drift and
   # the user gets a different answer depending on which one they read.
   explainer=$(printf '%s\n' "$out" | grep '^EXPLAINER ' | tr '\n' ' ')
   if [ -z "$explainer" ]; then
-    fail_case "$name" "the '?' comparison printed nothing"; return
+    fail_case "$name" "the 'i' comparison printed nothing"; return
   fi
   for row in '1)' '2)' '3)' '4)'; do
     case "$explainer" in *"$row"*) ;; *)
-      fail_case "$name" "the '?' comparison stopped explaining option $row"; return ;;
+      fail_case "$name" "the 'i' comparison stopped explaining option $row"; return ;;
     esac
   done
   if ! printf '%s\n' "$explainer" | grep -qiF 'trycloudflare.com' ||
      ! printf '%s\n' "$explainer" | grep -qiF 'cloudflared tunnel --url'; then
-    fail_case "$name" "the '?' comparison does not name the quick tunnel or the command that prints its address"; return
+    fail_case "$name" "the 'i' comparison does not name the quick tunnel or the command that prints its address"; return
   fi
   # Facts, not phrasing: reword freely and EXTEND the alternation. The pointer has
   # to place the quick tunnel on 4 rather than 3 — that is the whole confusion.
   if ! printf '%s\n' "$explainer" | grep -qiE 'this one, not 3|this option, not 3|option 4, not 3|not option 3|belongs here'; then
-    fail_case "$name" "the '?' comparison no longer places the quick tunnel on option 4 rather than 3"; return
+    fail_case "$name" "the 'i' comparison no longer places the quick tunnel on option 4 rather than 3"; return
   fi
 
   # A host with no cloudflared: the cue is about the address the user HOLDS, not
@@ -1511,6 +1719,9 @@ run_exposure_menu_quick_tunnel_case() {
   printf -- '--- menu, cloudflared absent ---\n%s\n' "$out_nocf" >> "$TMP/doctor.out"
   if [ "$rc" != "10" ]; then
     fail_case "$name" "the menu did not go back on 'b' without cloudflared (status $rc)"; return
+  fi
+  if printf '%s\n' "$out_nocf" | grep -qF 'SIDE_EFFECT '; then
+    fail_case "$name" "info then back entered an exposure branch without cloudflared"; return
   fi
   if ! printf '%s\n' "$out_nocf" | grep '^  3)' | grep -qF 'not installed'; then
     fail_case "$name" "row 3 reported cloudflared on a host without it — the stub is not wired"; return
@@ -3673,6 +3884,14 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" menu-q-exit "*) true ;; *) false ;; esac; then
   run_menu_q_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" prompt-controls-and-defaults "*) true ;; *) false ;; esac; then
+  run_prompt_controls_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" custom-review-back-corrects-port "*) true ;; *) false ;; esac; then
+  run_custom_review_back_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" menu-action-1-setup "*) true ;; *) false ;; esac; then

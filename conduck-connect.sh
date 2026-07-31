@@ -28,7 +28,7 @@
 #     bash conduck-connect.sh --setup --dry-run
 #                                        # preview setup; changes nothing
 #
-# What this script DOES (always with your confirmation, step by step):
+# What this script DOES (with host and network changes shown for approval):
 #   1. Finds your gateway (OpenClaw, Hermes, or any OpenAI-compatible server).
 #   2. Enables the OpenAI-compatible chat endpoint if it is off (the #1 setup trap).
 #   3. Helps you expose the gateway over HTTPS (works WITH what you have installed:
@@ -58,6 +58,12 @@
 # encoder (Project Nayuki, MIT — the big, inert block near the end of this file;
 # it needs Python 3.7+ — on an older Python you just use the printed code).
 # The pairing string is always printed too, so the QR is never required.
+#
+# Interactive controls:
+#   i  explain the current bounded decision, then ask it again
+#   q  stop cleanly (does not undo changes you already approved)
+#   b  go back only where the prompt offers it; Back is navigation, not undo
+# Every interactive prompt states what pressing Enter will do.
 #
 # Usage:
 #   bash conduck-connect.sh                 # welcome menu
@@ -342,7 +348,7 @@ choose_main_action() {
   say ""
   local choice regex='^([1-3]|[qQ])$'
   $have_saved && regex='^([1-4]|[qQ])$'
-  choice=$(require_choice "Choose an option" "$regex") || die "$NO_ANSWER"
+  choice=$(require_choice "Choose an option" "$regex" "nav.main") || die "$NO_ANSWER"
   case "$choice" in
     1) COMMAND="setup" ;;
     2) COMMAND="check-server" ;;
@@ -406,15 +412,68 @@ validate_cli() {
 PLAN=()
 plan_add() { PLAN+=("$*"); }
 
-confirm() {  # confirm "question" -> 0 yes / 1 no
-  local reply
-  read -r -p "$1 [y/N] " reply || return 1
-  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+# Explain one bounded prompt without changing its answer. Most callers pass an
+# action id that the explanation catalogue resolves; the few older/specialised
+# menus pass their existing help function instead. Keeping this indirection here
+# makes the prompt primitives usable in isolated tests and in partial-source
+# harnesses too: when the catalogue is not loaded, `i` still gives an honest
+# generic explanation rather than failing.
+explain_prompt() { # explain_prompt [action-id | help-function]
+  local help="${1:-}"
+  case "$help" in
+    ''|*[!a-zA-Z0-9_]*) ;;
+    *) if declare -F "$help" >/dev/null 2>&1; then "$help"; return 0; fi ;;
+  esac
+  if declare -F explain_action >/dev/null 2>&1; then
+    explain_action "${help:-general}"
+    return 0
+  fi
+  say ""
+  say "  ${BOLD}About this step${RESET}"
+  say "  This question controls the action described immediately above it."
+  say "  Answering No or skipping leaves that action undone; it does not undo"
+  say "  anything you approved earlier in this run."
+  say ""
 }
 
-ask() {  # ask "prompt" "default" -> echoes answer (free-form; default optional)
-  local reply
-  read -r -p "$1${2:+ [$2]}: " reply
+quit_run() { # stop cleanly; EXIT traps still report any exposure undo commands
+  say ""
+  note "Stopped here. No further setup actions will run."
+  note "This does not undo changes you already approved: config edits, restarts,"
+  note "services, folders, and commands stay in place."
+  note "If this run applied a tracked Tailscale exposure, its exact undo commands"
+  note "are printed below and kept for the next run. A Cloudflare or reverse-proxy"
+  note "command you ran remains yours to undo."
+  exit 0
+}
+
+confirm() {  # confirm "question" [action-id] [allow-back] -> 0 yes / 1 no / 10 back
+  local reply action="${2:-general}" allow_back="${3:-false}" controls
+  controls="Enter = No; i = explain; q = stop"
+  case "$allow_back" in true|1|yes) controls="Enter = No; i = explain; b = back; q = stop" ;; esac
+  while true; do
+    read -r -p "$1 [y/N] ($controls): " reply || return 1
+    case "$reply" in
+      [yY]|[yY][eE][sS]) return 0 ;;
+      ''|[nN]|[nN][oO]) return 1 ;;
+      [iI]|\?) explain_prompt "$action" ;;
+      [qQ]) quit_run ;;
+      [bB])
+        case "$allow_back" in true|1|yes) return 10 ;; esac
+        warn "Back is not available at this step; choose Yes, No, info, or stop."
+        ;;
+      *) warn "Please answer y or n, press Enter for No, i for an explanation, or q to stop." ;;
+    esac
+  done
+}
+
+ask() {  # ask "prompt" "default" [blank-meaning] -> echoes answer
+  local reply blank_meaning="${3:-leave blank}"
+  if [ -n "${2:-}" ]; then
+    read -r -p "$1 (Enter = $2): " reply
+  else
+    read -r -p "$1 (Enter = $blank_meaning): " reply
+  fi
   printf '%s' "${reply:-${2:-}}"
 }
 
@@ -435,9 +494,9 @@ ask_default() {  # ask_default "prompt" "default" -> echoes resolved value
 # keyless scheme, while EOF means nobody was asked at all. Callers that treat an
 # empty token as "keyless" MUST pair this with `|| die`, or a redirected run would
 # infer no-auth from a missing answer — the fail-closed-auth invariant.
-ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden); 1 on EOF
-  local reply rc=0
-  read -rs -p "  $1: " reply || rc=1
+ask_secret() {  # ask_secret "prompt" "empty-meaning" -> secret (hidden); 1 on EOF
+  local reply rc=0 empty_meaning="${2:-leave empty}"
+  read -rs -p "  $1 (Enter = $empty_meaning): " reply || rc=1
   printf '\n' >&2
   printf '%s' "$reply"
   return $rc
@@ -449,15 +508,22 @@ ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden); 1 on 
 # would then silently decide a safety question. On EOF it RETURNS NONZERO rather
 # than calling die: a `die` inside $() kills only the subshell, so the parent
 # must be the one to stop (every caller pairs this with `|| die`).
-# Optional 3rd arg names a help function: answering `?` prints it and re-asks.
+# Optional 3rd arg names an action id or help function: answering `i` (or the
+# older `?` alias) prints it and re-asks. `q` is always recognised, even when the
+# caller's own regex does not list it. Because callers capture this function with
+# $(), it ECHOES the literal sentinel `q`; the parent caller must call quit_run.
 # Help is ADDITIVE only — it explains the same options in plain words, never
 # changes them (the canonical menu/prompt strings stay the single source).
 # The help function's stdout is redirected to stderr here, same $()-capture rule.
-require_choice() {  # require_choice "prompt" "regex" [help_fn] -> echoes the choice
+require_choice() {  # require_choice "prompt" "regex" [action-id | help-fn] -> choice | q
   local reply
   while true; do
-    read -r -p "  $1: " reply || return 1     # closed stdin — never spin the loop
-    if [ -n "${3:-}" ] && [ "$reply" = "?" ]; then "$3" >&2; continue; fi
+    read -r -p "  $1 (Enter = no default; i = explain; q = stop): " reply \
+      || return 1     # closed stdin — never spin the loop
+    case "$reply" in
+      [iI]|\?) explain_prompt "${3:-general}" >&2; continue ;;
+      [qQ]) printf 'q'; return 0 ;;
+    esac
     if [[ "$reply" =~ $2 ]]; then printf '%s' "$reply"; return 0; fi
     warn "Please enter one of the listed options." >&2
   done
@@ -469,11 +535,16 @@ NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask 
 # (or blank, when allow_blank=1, where leaving it out is a valid choice). Trims
 # whitespace, accepts a capitalised scheme, always shows an example. All human
 # output goes to stderr so $(...) captures only the URL.
-ask_url() {  # ask_url "prompt" "example" [allow_blank] -> echoes the URL (or "")
-  local prompt="$1" example="$2" allow_blank="${3:-0}" reply
+ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] -> URL or ""
+  local prompt="$1" example="$2" allow_blank="${3:-0}"
+  local blank_meaning="${4:-skip}" reply
   say "  $prompt" >&2
   while true; do
-    read -r -p "  https URL (e.g. $example) > " reply || return 1   # EOF: caller dies (see require_choice)
+    if [ "$allow_blank" = "1" ]; then
+      read -r -p "  https URL (e.g. $example; Enter = $blank_meaning) > " reply || return 1
+    else
+      read -r -p "  https URL (e.g. $example; Enter = no default) > " reply || return 1
+    fi
     reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
     while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done   # trailing / would make //v1/… requests
     if [ -z "$reply" ]; then
@@ -494,13 +565,15 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] -> echoes the URL (or ""
 
 # Rung 1 of the consent ladder: a single command we run for you, with consent.
 # In --dry-run it is only recorded; in --reuse-only it is refused (see mutate_guard).
-run_step() {  # run_step "description" cmd args...
-  local desc="$1"; shift
+# Action ids affect explanation copy only; the command, mutation guard and
+# consent result are otherwise unchanged.
+run_step() {  # run_step "action-id" "description" cmd args...
+  local action="$1" desc="$2"; shift 2
   if $DRY_RUN; then plan_add "RUN  $*"; note "(dry-run: would run — $desc)"; return 0; fi
   mutate_guard "$desc" || return 1
   say ""
   say "  I'd like to run:  ${BOLD}$*${RESET}"
-  if confirm "  Run it now?"; then "$@"; else
+  if confirm "  Run it now?" "$action"; then "$@"; else
     warn "Skipped: $desc"
     return 1
   fi
@@ -533,7 +606,8 @@ secure_owned_file_mode() { # secure_owned_file_mode <file> <what-is-inside> -> 1
   local f="$1" what="$2"
   file_mode_is_open "$f" || return 0
   warn "$f can be read by other accounts on this machine — $what is inside it."
-  run_step "tighten $f to 0600 so only you can read $what" chmod 600 "$f" || true
+  run_step "security.owned_file.chmod_0600" \
+    "tighten $f to 0600 so only you can read $what" chmod 600 "$f" || true
   if $DRY_RUN; then return 0; fi     # run_step only recorded the plan; nothing changed yet
   if file_mode_is_open "$f"; then
     warn "$what is STILL readable by other accounts on this machine."
@@ -717,23 +791,31 @@ setup_lock_release() {
 }
 
 # Rung 2: a change to something YOU own — we print the exact command, you run it.
-print_and_wait() {  # print_and_wait "why" "command shown to user"
-  if $DRY_RUN; then plan_add "YOU RUN  $2  ($1)"; note "(dry-run: you would run the above)"; return 0; fi
-  mutate_guard "$1"
+print_and_wait() {  # print_and_wait "action-id" "why" "command shown to user"
+  local action="$1" why="$2" command="$3"
+  if $DRY_RUN; then plan_add "YOU RUN  $command  ($why)"; note "(dry-run: you would run the above)"; return 0; fi
+  mutate_guard "$why"
   say ""
   say "  This touches something you own, so you run it (copy-paste, e.g. in a"
   say "  second terminal):"
   say ""
-  printf '    %s%s%s\n' "$BOLD" "$2" "$RESET"
+  printf '    %s%s%s\n' "$BOLD" "$command" "$RESET"
   say ""
-  note "$1"
+  note "$why"
   local reply
-  if ! read -r -p "  Press Enter here once it's done (or 's' to skip): " reply; then
-    warn "No answer — treating this step as skipped."
-    return 1
-  fi
-  [ "$reply" = "s" ] && return 1
-  return 0
+  while true; do
+    if ! read -r -p "  Enter = I ran it; s = skip; i = explain; q = stop: " reply; then
+      warn "No answer — treating this step as skipped."
+      return 1
+    fi
+    case "$reply" in
+      '') return 0 ;;
+      [sS]) return 1 ;;
+      [iI]|\?) explain_prompt "$action" ;;
+      [qQ]) quit_run ;;
+      *) warn "Please press Enter only after running it, s to skip, i for an explanation, or q to stop." ;;
+    esac
+  done
 }
 
 # --reuse-only safety: refuse any mutation that isn't a pure reuse of existing state.
@@ -1004,6 +1086,496 @@ OS="$(uname -s)"   # Linux | Darwin
 # abort here under `set -u` on a path it never uses; the wizard would fail later
 # anyway if it genuinely needed a state dir, which is the correct place to notice.
 STATE_DIR="${XDG_CONFIG_HOME:-${HOME:-}/.config}/conduck"
+# ----------------------------------------------------------- explanations --
+
+# Small, reusable information panels for the interactive setup flow. The caller
+# decides when to offer them (normally the visible `i` affordance) and redirects
+# stdout to stderr when it is collecting an answer with command substitution.
+#
+# These panels explain ONE current decision. "Later" is deliberately about
+# persistence or a concrete inverse action, never a promise that Back, Ctrl-C, a
+# failed later step, or a re-run rolls the setup back. WHAT-IT-TOUCHES.md is the
+# detailed authority; this catalog is its concise, in-flow counterpart.
+explain_panel() { # explain_panel <about> <why> <does> [if-skipped] [later]
+  local about="$1" why="$2" does="$3"
+  local skipped="${4:-}" later="${5:-}"
+
+  say ""
+  say "  ${BOLD}About this step:${RESET} $about"
+  [ -z "$why" ] || say "  ${BOLD}Why:${RESET} $why"
+  [ -z "$does" ] || say "  ${BOLD}It does:${RESET} $does"
+  [ -z "$skipped" ] || say "  ${BOLD}If skipped:${RESET} $skipped"
+  [ -z "$later" ] || say "  ${BOLD}Later:${RESET} $later"
+  say ""
+}
+
+# Copy catalog for the bounded choices and consent gates in setup. IDs are
+# internal, stable spellings for prompt call sites; they are never user input.
+explain_action() { # explain_action <action-id>
+  local action_id="${1:-}"
+
+  case "$action_id" in
+    general)
+      explain_panel \
+        "Review the current setup question" \
+        "This choice controls only the action described immediately above it." \
+        "An explanation changes no answer and performs no action; the same question is shown again." \
+        "Saying No leaves this action undone." \
+        "No, Back, stop, and re-running do not undo actions you already approved."
+      ;;
+
+    nav.main|main-menu)
+      explain_panel \
+        "Choose what conduck-connect should do" \
+        "Setup pairs a gateway; the two checks answer narrower compatibility questions; a saved code pairs another device." \
+        "Only setup may offer host changes. Checks send live requests, and showing a saved code runs live verification." \
+        "Nothing starts until you choose an option." \
+        "Gateway, user-owned configuration, and network exposure changes still have their own preview or approval; connector bookkeeping stays inside the setup action you chose."
+      ;;
+
+    nav.gateway|gateway-selection)
+      explain_panel \
+        "Choose the gateway Conduck will talk to" \
+        "The gateway supplies the chat or full agent turn behind the Conduck client." \
+        "Reads the usual OpenClaw and Hermes locations, reports what it finds, and records only your explicit choice for this run." \
+        "Setup cannot continue until a gateway is chosen." \
+        "Returning here changes the wizard's route only; host changes you already approved stay in place."
+      ;;
+
+    nav.saved_profile)
+      explain_panel \
+        "Choose which saved gateway code to re-show" \
+        "Each non-secret profile records routing facts for one earlier successful setup." \
+        "Selects one profile for drift checks, secret re-derivation, live verification, and code output; this menu changes nothing." \
+        "No saved gateway is selected and no code is shown." \
+        "The profile is not rewritten, whichever one you choose."
+      ;;
+
+    check.continue_setup|nav.continue_after_check|continue-after-check)
+      explain_panel \
+        "Continue from a passing check into setup and pairing" \
+        "The check proved this address speaks the wire format Conduck needs; setup can now make it reachable over HTTPS and print a code." \
+        "Reuses the checked URL and authentication in memory, then starts the normal consented setup flow." \
+        "The passing check ends without making setup changes." \
+        "The token is not saved by the check; setup still verifies the final app-facing address."
+      ;;
+
+    gateway.custom.has_https|gateway.custom.address|custom-address)
+      explain_panel \
+        "Tell setup whether this server already has HTTPS" \
+        "Conduck accepts an HTTPS address; a loopback-only server still needs an exposure path." \
+        "Chooses whether to ask for an existing HTTPS URL or the server's local listening port." \
+        "Choosing No asks for the server's local port, then offers an HTTPS exposure path." \
+        "This choice changes no server configuration by itself."
+      ;;
+
+    gateway.custom.has_auth|gateway.custom.auth|gateway-auth)
+      explain_panel \
+        "Describe how this gateway authenticates clients" \
+        "Conduck must store an explicit bearer or keyless mode; a missing token is never silently treated as keyless." \
+        "Records the chosen auth mode for this run and asks for a hidden token only when bearer auth is selected." \
+        "Choosing keyless means anyone who can reach the address can use what the gateway permits." \
+        "Setup refuses to publish a keyless gateway unless the expert override was supplied."
+      ;;
+
+    gateway.custom.model|model-choice)
+      explain_panel \
+        "Choose the model name Conduck will send" \
+        "Some OpenAI-compatible servers require a model on every request; others choose their own default." \
+        "Stores the selected model in the pairing payload and sends it on later Conduck turns." \
+        "A blank value leaves model selection to the server." \
+        "This does not load, install, or change a model on the server."
+      ;;
+
+    gateway.custom.port)
+      explain_panel \
+        "Enter the local port where this server listens" \
+        "Setup needs the loopback address before it can create or describe an HTTPS route to the server." \
+        "Validates a whole port number from 1 to 65535 and keeps it in memory for this run; it does not open, close, or rebind the port." \
+        "No local target is available for exposure or verification." \
+        "The server keeps its existing port configuration."
+      ;;
+
+    gateway.custom.review)
+      explain_panel \
+        "Review the custom gateway details gathered so far" \
+        "The next steps use this address, auth mode, and optional model to build the app-facing connection." \
+        "Shows the resolved choices for review; it does not contact or reconfigure the server by itself." \
+        "Setup does not proceed with details you have not accepted." \
+        "Returning to an earlier choice changes the wizard route only; approved host changes remain."
+      ;;
+
+    gateway.openclaw.enable_chat|openclaw-chat-endpoint)
+      explain_panel \
+        "Enable OpenClaw's OpenAI-compatible chat endpoint" \
+        "Without this endpoint the gateway can look healthy while Conduck has no chat route to call." \
+        "Uses OpenClaw's own config command to set the chat-completions flag. A JSON5 config may be rewritten as plain JSON and lose comments." \
+        "Conduck will not connect through this route." \
+        "Set the flag back to false and restart OpenClaw to reverse this specific change."
+      ;;
+
+    gateway.openclaw.manual_enable_chat)
+      explain_panel \
+        "Enable OpenClaw's chat endpoint on a non-standard install" \
+        "Without this endpoint the gateway can look healthy while Conduck has no chat route to call." \
+        "Prints OpenClaw's exact config command for you to run, followed by a restart using the method appropriate for your install." \
+        "The endpoint stays off and later verification is expected to fail." \
+        "Enter only reports that you ran it. The setting persists until you set it back to false and restart."
+      ;;
+
+    gateway.hermes.accept_8645|hermes-proxy-port)
+      explain_panel \
+        "Continue with Hermes port 8645" \
+        "Port 8645 is the tool-less Hermes proxy, not the full-agent API server normally found on 8642." \
+        "Continues pairing a route that can chat but does not carry Hermes tools or skills." \
+        "Setup stops so you can correct API_SERVER_PORT first." \
+        "Changing to the full-agent port requires updating Hermes and re-running setup."
+      ;;
+
+    gateway.hermes.enable_api|hermes-api-server)
+      explain_panel \
+        "Enable the Hermes OpenAI API server" \
+        "Conduck needs Hermes's API-server route for full agent turns." \
+        "Appends the shown API_SERVER settings to ~/.hermes/.env, reuses an existing key or creates one if absent, then offers a restart." \
+        "The API server stays off and later verification is expected to fail." \
+        "Remove the dated conduck-connect block and restart Hermes to reverse this specific edit."
+      ;;
+
+    security.owned_file.chmod_0600|secret-file-mode)
+      explain_panel \
+        "Restrict a file that contains a gateway or file-lane secret" \
+        "Its current permissions let other accounts on this machine read the secret." \
+        "Runs the shown chmod 600 command; it changes file permissions, not file contents." \
+        "The secret remains readable by those accounts, and setup warns again." \
+        "The 0600 mode stays until you deliberately change it."
+      ;;
+
+    gateway.restart|gateway.openclaw.restart_chat|gateway.hermes.restart_api|file.openclaw.restart_tools|file.hermes.restart_config|service-restart)
+      explain_panel \
+        "Restart the gateway after an approved configuration change" \
+        "The running service may keep its old settings until it reloads them." \
+        "Restarts the named gateway service, which may be briefly unavailable while it comes back." \
+        "The file edit stays, but the live gateway may still use the old setting." \
+        "A restart does not undo or rewrite the configuration change."
+      ;;
+
+    gateway.hermes.manual_restart_api|file.hermes.manual_restart)
+      explain_panel \
+        "Restart Hermes using the service method for this machine" \
+        "The approved file edit does not affect the running API server until Hermes reloads it." \
+        "Prints a suggested restart command for you to run; conduck-connect does not run it on this path." \
+        "The file stays changed, but live Hermes may still use the old setting." \
+        "Enter only reports that you restarted it. A restart does not undo or rewrite the file edit."
+      ;;
+
+    file.openclaw.allow_tools|gateway.openclaw.file_policy|openclaw-file-policy)
+      explain_panel \
+        "Allow the OpenClaw agent to use Conduck's file lane" \
+        "A working WebDAV lane is not enough if OpenClaw's tool policy still denies file reading, writing, or PDF handling." \
+        "Shows the exact policy before and after, applies only the approved keys through OpenClaw's config command, then offers a restart." \
+        "Chat still works, but the agent may not read uploads or return files." \
+        "Restore the shown prior values and restart OpenClaw to reverse this policy edit."
+      ;;
+
+    file.openclaw.manual_tools)
+      explain_panel \
+        "Apply the OpenClaw file-tool policy on a non-standard install" \
+        "The agent needs the approved read, write, and PDF tool policy before Conduck's file lane is useful." \
+        "Prints the exact OpenClaw config commands for you to run, followed by a gateway restart using your install's method." \
+        "Chat still works, but the agent may not read uploads or return files." \
+        "Enter only reports that you completed the commands. Restore the shown prior values and restart to reverse the policy edit."
+      ;;
+
+    file.openclaw.keep_unready)
+      explain_panel \
+        "Continue with a file lane whose OpenClaw tool policy is not ready" \
+        "The byte transport can exist even while the agent is unable to read uploads or write returned files." \
+        "Keeps evaluating this lane without changing the OpenClaw policy; the later real agent test still has to pass before the lane reaches the code." \
+        "The optional lane is left out now; chat is unaffected." \
+        "Fix the policy and re-run setup. This choice does not undo earlier file-lane or gateway changes."
+      ;;
+
+    file.hermes.apply_config|gateway.hermes.file_alignment|hermes-file-alignment)
+      explain_panel \
+        "Align Hermes with Conduck's shared folder" \
+        "The agent and the file server must use the same folder, and the API-server scope must include file tools." \
+        "Applies the exact before and after for terminal.cwd and, only when needed, the API-server file toolset. If you staged recall removal in the preceding review, that same atomic edit removes only those shown recall entries too." \
+        "The byte transport may work while Hermes cannot open uploads or return outputs." \
+        "Restore the shown prior values and restart Hermes to reverse this edit."
+      ;;
+
+    gateway.hermes.remove_recall|gateway.hermes.recall|hermes-recall)
+      explain_panel \
+        "Remove Hermes recall from its API-server scope" \
+        "Conduck sends the full conversation each turn; Hermes recall can add hidden or duplicate context that Conduck did not send." \
+        "Removes only memory and session_search from the explicit list you were shown, then offers a restart." \
+        "Pairing can continue, but the API server may keep its own cross-chat recall." \
+        "Every client using this API server loses that recall; Hermes CLI and messaging memory stay. Put the shown entries back and restart to reverse it."
+      ;;
+
+    file.hermes.remove_recall)
+      explain_panel \
+        "Include Hermes recall removal in the combined file-readiness edit" \
+        "Conduck sends the full conversation each turn; Hermes recall can add hidden or duplicate context that Conduck did not send." \
+        "Stages removal of only memory and session_search in the combined Hermes review. It changes no file and restarts nothing at this step." \
+        "The later review leaves the API-server scope unchanged unless you approve its exact combined edit." \
+        "The next Apply question performs one atomic config edit and then offers the restart; every client using this API server is affected if you approve it."
+      ;;
+
+    file.openclaw.guidance|file.hermes.guidance|gateway.agent_guidance|agent-guidance)
+      explain_panel \
+        "Install Conduck file-transfer guidance for the agent" \
+        "The agent needs to know that uploads are already on disk and how to return a finished file to Conduck." \
+        "Adds or refreshes only the marked Conduck block in the selected agent context file; content outside the markers is untouched." \
+        "The transport may pass while the agent mishandles uploads or returns no downloadable file." \
+        "New agent sessions read the block. Delete the block including both markers to remove it."
+      ;;
+
+    exposure.choose|exposure-choice)
+      explain_panel \
+        "Choose how Conduck reaches this gateway over HTTPS" \
+        "The phone, tablet, Mac, and sometimes a standalone Watch must be able to reach the final address." \
+        "Compares private Tailscale, public Funnel, Cloudflare, and an HTTPS address you already operate. The menu itself changes nothing." \
+        "No reachable app-facing address is selected." \
+        "Back returns to gateway selection; configuration changes already approved stay in place."
+      ;;
+
+    exposure.scope|scope-classification)
+      explain_panel \
+        "Classify an existing HTTPS address as public or private" \
+        "The answer controls safety checks, especially the refusal to publish a keyless gateway." \
+        "Records whether the address works from the open internet or only inside your network or VPN; it does not change the address." \
+        "Setup cannot apply the correct keyless-access guard." \
+        "If unsure, public is the stricter classification and does not weaken protection."
+      ;;
+
+    exposure.tailscale.make_private|exposure.tailscale.private|tailscale-private)
+      explain_panel \
+        "Create or switch to a private Tailscale Serve address" \
+        "Conduck needs trusted HTTPS without exposing the gateway to the open internet." \
+        "Continues to the exact Tailscale Serve command and its own approval. If approved there, it maps a tailnet-only HTTPS port to the gateway's loopback port. Each Conduck device needs Tailscale; a Watch relies on its nearby iPhone." \
+        "The private address is not created or an existing public mapping is left as it is." \
+        "The exact off or prior-mapping command is shown if this run later needs exposure cleanup; unrelated host edits remain."
+      ;;
+
+    exposure.tailscale.make_public|exposure.tailscale.public|tailscale-public)
+      explain_panel \
+        "Create or switch to a public Tailscale Funnel address" \
+        "A public address lets Conduck connect without Tailscale on each device and lets a standalone Watch connect directly." \
+        "Continues to the exact Tailscale Funnel command and its own approval. If approved there, it maps a public HTTPS port to the gateway's loopback port. Anyone who finds the URL can reach the gateway; its token is the lock." \
+        "The gateway remains private or unreachable through this path." \
+        "Turn that Funnel port off, or restore the prior mapping shown by setup, to reverse this exposure only."
+      ;;
+
+    exposure.cleanup.stale_public|exposure.stale_public.close|stale-public-exposure)
+      explain_panel \
+        "Close an older public Funnel that still targets this service" \
+        "Choosing a private path is not private while another matching Funnel remains open on a different port." \
+        "Turns off only the named public mapping after you approve it; mappings for other services are left alone." \
+        "That older public address stays reachable." \
+        "This is intentional cleanup and is not recreated by setup's exposure rollback. Recreating it later requires a new explicit Funnel command."
+      ;;
+
+    exposure.cleanup.orphaned)
+      explain_panel \
+        "Resolve an exposure left by an interrupted earlier run" \
+        "The saved undo record says an earlier run may have left this exact Tailscale port mapped." \
+        "Re-reads live Tailscale state and, with your approval, applies only the recorded cleanup or prior private mapping for that port." \
+        "The mapping may stay reachable and the record remains for a later run." \
+        "This repairs the named exposure only; it does not restore configuration files, restarts, commands you ran, or intentional stale-Funnel cleanup."
+      ;;
+
+    exposure.tailscale.privileged_retry)
+      explain_panel \
+        "Retry the shown Tailscale command with operator or elevated rights" \
+        "Tailscale refused the first attempt, commonly because this account may not change Serve or Funnel mappings." \
+        "Prints the exact sudo, doas, or root command for you to run; conduck-connect does not elevate silently." \
+        "The requested mapping or cleanup remains unconfirmed." \
+        "Enter only reports that you ran the command. It does not execute it or undo earlier changes."
+      ;;
+
+    exposure.tailscale.apply)
+      explain_panel \
+        "Apply the Tailscale Serve or Funnel command shown above" \
+        "This is the step that turns the chosen HTTPS reachability into a live mapping." \
+        "Runs the exact displayed Tailscale command, then re-reads Tailscale status instead of assuming it worked." \
+        "No new mapping is confirmed; an existing mapping stays as reported above." \
+        "Setup records this exposure's exact prior state for bounded cleanup. It does not record or undo unrelated host changes."
+      ;;
+
+    exposure.rollback.failed_run)
+      explain_panel \
+        "Clean up Tailscale exposure changes from this failed run" \
+        "A setup code was not emitted, so a mapping opened or replaced during this run should not be left behind silently." \
+        "Runs only the listed exposure undo commands and verifies each affected port against live Tailscale state." \
+        "A public or private mapping from this run may remain live; the exact manual commands are printed again." \
+        "This cleanup is limited to recorded exposure mappings. Configuration edits, restarts, guidance blocks, and commands you ran stay in place."
+      ;;
+
+    exposure.cloudflare.gateway|exposure.cloudflare.manual|cloudflare-manual)
+      explain_panel \
+        "Add a Cloudflare Tunnel route for this service" \
+        "Cloudflare needs a hostname and ingress rule that forward to the local gateway or file-server port." \
+        "Prints the DNS/tunnel command for you to run. conduck-connect does not change Cloudflare configuration itself." \
+        "No Cloudflare hostname is connected to this service." \
+        "Enter only means you ran the command; it does not execute it or undo earlier changes."
+      ;;
+
+    file.cloudflare.route)
+      explain_panel \
+        "Add a Cloudflare Tunnel route for the file lane" \
+        "Attachments need their own hostname and ingress rule pointing to the local file-server port." \
+        "Prints the DNS/tunnel command for you to run. conduck-connect does not change Cloudflare configuration itself." \
+        "The file lane is omitted or remains unreachable through Cloudflare; chat can still work." \
+        "Enter only means you ran the command. It does not execute it or undo earlier changes."
+      ;;
+
+    exposure.own_https|own-https)
+      explain_panel \
+        "Use an HTTPS address you already operate" \
+        "Conduck requires encryption and a certificate the device already trusts." \
+        "Validates the address and certificate, then records its reach for the pairing code. It does not reconfigure your proxy or certificate." \
+        "Setup stops before pairing this address." \
+        "A self-signed certificate cannot be accepted by an override; fix HTTPS or choose another exposure path."
+      ;;
+
+    file.setup.enable|files.setup|file-lane)
+      explain_panel \
+        "Set up optional file transfer between Conduck and the agent" \
+        "The file lane carries uploads to a shared folder and makes completed agent files downloadable in Conduck." \
+        "May create or reuse a shared folder, a loopback WebDAV service, credential files, and a separate HTTPS mapping." \
+        "Chat still works, including content that fits inline, but the pairing code carries no file server." \
+        "The folder may also be the agent's workspace. Stop the service and inspect the folder before deleting anything."
+      ;;
+
+    file.address.skip)
+      explain_panel \
+        "Deliberately leave a working file lane out of this setup code" \
+        "A blank can mean you chose to omit file transfer, but it can also be a paste that did not land. This check prevents one stray Enter from silently discarding a lane that already passed its local tests." \
+        "Yes omits file transfer from this code and saved profile. It does not stop the file service, remove its folder, or undo a route you created." \
+        "No—or pressing Enter—returns to the address prompt so you can try again." \
+        "Adding the lane later requires re-running setup. Pressing q stops the run but leaves earlier approved changes in place."
+      ;;
+
+    file.folder.override|files.folder|shared-folder)
+      explain_panel \
+        "Choose the folder shared by Conduck and the agent" \
+        "Every uploaded attachment lands here, and every file the agent returns must be written here." \
+        "Records an absolute folder for the lane; a new lane may create it with private permissions, while an existing folder keeps its mode." \
+        "The default folder is used when one is shown, or file-lane setup cannot continue when no usable path exists." \
+        "This folder may contain your own or the agent's files. Back, Ctrl-C, and re-running do not delete it."
+      ;;
+
+    file.unit.repair_envfile|file.service.move_port|files.repair|file-lane-repair)
+      explain_panel \
+        "Repair a connector-owned file-server service" \
+        "The saved service definition is incomplete, unsafe to reuse, or conflicts with another connector-owned lane." \
+        "Rewrites only the named conduck-files service or moves it to the shown free loopback port, then verifies the live service." \
+        "File transfer stays unavailable or continues using the broken definition." \
+        "The connector-owned unit and credential remain until you stop and remove them explicitly."
+      ;;
+
+    file.exposure.make_public|files.expose_public|file-lane-public)
+      explain_panel \
+        "Expose the shared file lane to the public internet" \
+        "A public gateway needs a similarly reachable file lane for attachments to work away from your private network." \
+        "Continues to the exact public-exposure command and its own approval. If approved there, it publishes the file server's HTTPS route. Anyone who finds it can reach the login; the file credential is the lock." \
+        "The lane stays private or is omitted from the pairing code, while chat can still work." \
+        "This consent covers the file route only. Use the shown off or restore command to reverse that exposure."
+      ;;
+
+    file.exposure.keep_private)
+      explain_panel \
+        "Keep the file lane private when the gateway is public" \
+        "No free Funnel port is available, but the existing Tailscale-only file lane can still serve your own tailnet devices." \
+        "Keeps the current private mapping and includes that narrower file address in the pairing code; it creates no new public exposure." \
+        "The file lane is omitted from the code; public chat still works." \
+        "Attachments work only on Tailscale-connected devices. A standalone Watch away from its iPhone cannot reach this private lane."
+      ;;
+
+    file.service.enable_linger|files.systemd_linger|systemd-linger)
+      explain_panel \
+        "Keep the Linux file-server service running after logout and reboot" \
+        "A user service without lingering stops after that user's last session, so attachments later fail while chat still works." \
+        "Runs the shown loginctl enable-linger command; this is the setup flow's one sudo action it may run for you." \
+        "The file lane works only while that user has an active session and may not return after reboot." \
+        "Run loginctl disable-linger for that user to reverse this setting."
+      ;;
+
+    manual.command|manual-command)
+      explain_panel \
+        "Run a command that changes infrastructure you own" \
+        "conduck-connect leaves this command to you because it touches your gateway, tunnel, proxy, or service outside the connector-owned boundary." \
+        "Prints the exact command and waits. Pressing Enter only reports that you ran it; it does not execute or verify the command." \
+        "The command is not run, and the dependent setup step may fail or remain incomplete." \
+        "Skipping this command does not undo changes already approved."
+      ;;
+
+    check.server|check-server)
+      explain_panel \
+        "Check existing OpenAI-compatible software against the Conduck app" \
+        "This answers whether the current app can use the server's model list and chat replies as-is." \
+        "Changes no host configuration, but sends real model and chat requests that may use quota and appear in provider or server history." \
+        "No compatibility result is produced." \
+        "A pass is app compatibility, not the stricter adapter-contract grade."
+      ;;
+
+    check.adapter|check-adapter)
+      explain_panel \
+        "Grade software built specifically for Conduck" \
+        "A purpose-built adapter must satisfy stricter auth, response, model, and stream rules than generic OpenAI software." \
+        "Sends live positive and negative-auth requests. The optional files profile also writes and removes exact named probe artifacts." \
+        "No adapter-contract result is produced." \
+        "Use check-server instead for software not built for Conduck."
+      ;;
+
+    verify.live|live-verification)
+      explain_panel \
+        "Verify the final address before printing a setup code" \
+        "The code should point only to a route the Conduck app can actually use." \
+        "Sends a model-list request and a real chat turn, which may use provider quota or enter logs/history. A configured file lane also gets temporary authenticated probes and one real agent copy test." \
+        "No setup code is printed until the required checks pass; approved configuration changes stay in place." \
+        "Probe files are removed, or their exact names are printed when cleanup cannot be proved."
+      ;;
+
+    show_code.run|show-code)
+      explain_panel \
+        "Re-show a saved pairing code" \
+        "This is the fast path for pairing another device without walking through setup choices again." \
+        "Reads a non-secret saved profile, re-derives credentials from their real homes, checks for drift, and runs live verification." \
+        "No code is shown." \
+        "It changes no configuration and never rewrites the saved profile, but its live probes may use quota and temporary file artifacts."
+      ;;
+
+    verification.gateway_only|show_code.gateway_only|gateway-only-code)
+      explain_panel \
+        "Print a pairing code without the failing file lane" \
+        "A healthy gateway can still provide chat when optional file transfer is unavailable." \
+        "Drops the fileServer block from this code only; it does not delete the saved lane, its service, folder, or credential." \
+        "No code is printed until the file lane is fixed or you make this choice." \
+        "The saved profile keeps its file lane, so a later show-code run checks it again."
+      ;;
+
+    pairing.code|pairing-code)
+      explain_panel \
+        "Bring the verified gateway into the Conduck app" \
+        "The app needs the gateway address, explicit auth mode, and optional file lane without asking you to retype them." \
+        "Prints a QR and paste string containing the gateway token and, when present, the file credential. It also saves a 0600 routing-only profile with no secrets." \
+        "The app is not paired from this run." \
+        "Treat the code like a password. Anyone holding it has the access those credentials grant until you rotate them."
+      ;;
+
+    *)
+      explain_panel \
+        "Review the current setup action" \
+        "This choice controls only the step described immediately above the prompt." \
+        "Showing this explanation changes no answer and performs no action; the same prompt appears again." \
+        "Declining or stopping leaves this action undone." \
+        "No, Back, stop, and re-running do not undo actions you already approved."
+      return 0
+      ;;
+  esac
+}
 # ------------------------------------------------------------- gateway phase --
 
 GW_KIND=""         # openclaw | hermes | custom
@@ -1055,7 +1627,8 @@ detect_gateway() {
   say "    2) Hermes   $( [[ " ${found[*]-} " == *" hermes "* ]] && echo '(detected)' )"
   say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, your own adapter, …)"
   local choice
-  choice=$(require_choice "Choose 1-3" '^[123]$') || die "$NO_ANSWER"
+  choice=$(require_choice "Choose 1-3" '^[123]$' "nav.gateway") || die "$NO_ANSWER"
+  [ "$choice" = "q" ] && quit_run
   case "$choice" in
     1) GW_KIND="openclaw" ;;
     2) GW_KIND="hermes" ;;
@@ -1118,7 +1691,7 @@ _openclaw_prompt_secret() { # _openclaw_prompt_secret <ctx> <ask-prompt> <die-ms
     note "(dry-run: would prompt for the gateway credential)"
     return 0
   fi
-  GW_TOKEN=$(ask_secret "$ask")
+  GW_TOKEN=$(ask_secret "$ask" "stop; this credential is required")
   [ -n "$GW_TOKEN" ] || die "$diemsg"
 }
 
@@ -1221,7 +1794,7 @@ configure_openclaw() {
     warn "The OpenAI-compatible chat endpoint is OFF (it is off by default)."
     say  "  Without it the gateway looks healthy but no app can connect."
     if [ -f "$compose_dir/docker-compose.yml" ] || [ -f "$compose_dir/compose.yaml" ]; then
-      if run_step "enable the chat endpoint" \
+      if run_step "gateway.openclaw.enable_chat" "enable the chat endpoint" \
         docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
           dist/index.js config set --batch-json \
           '[{"path":"gateway.http.endpoints.chatCompletions.enabled","value":true}]'; then
@@ -1231,13 +1804,14 @@ configure_openclaw() {
         # walks straight into verification, so wait here too. HTTP-safe is FALSE
         # — this change IS the HTTP layer, so the epilogue must not promise it
         # cannot affect it. GW_LOCAL_PORT and GW_HEALTH_PATH are set just above.
-        if run_step "restart the gateway so the flag applies" \
+        if run_step "gateway.openclaw.restart_chat" "restart the gateway so the flag applies" \
           docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
           gw_note_restart_and_wait "chat-endpoint setting" false
         fi
       fi
     else
-      print_and_wait "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \
+      print_and_wait "gateway.openclaw.manual_enable_chat" \
+        "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \
         "openclaw config set gateway.http.endpoints.chatCompletions.enabled true" || true
     fi
     if ! $DRY_RUN; then
@@ -1279,7 +1853,7 @@ configure_hermes() {
       # reuse-only reuses what exists — it warns, never gates (a new die-by-default
       # prompt here would break "safe to point at a live gateway").
       note "(reuse-only: continuing with the existing config — if this is wrong, fix API_SERVER_PORT and re-run the wizard)"
-    elif ! confirm "  Continue with port 8645 anyway?"; then
+    elif ! confirm "  Continue with port 8645 anyway?" "gateway.hermes.accept_8645"; then
       die "Stopped — point API_SERVER_PORT in ~/.hermes/.env at the full-agent API server (default 8642), then re-run me."
     fi
   fi
@@ -1302,7 +1876,7 @@ configure_hermes() {
     say "    API_SERVER_PORT=$GW_LOCAL_PORT"
     if [ -n "$keyline" ]; then say "    API_SERVER_KEY=<freshly generated, not shown>"
     else say "    (keeping the API_SERVER_KEY already in your .env)"; fi
-    if confirm "  Append these now?"; then
+    if confirm "  Append these now?" "gateway.hermes.enable_api"; then
       [ -f "$envf" ] || ( umask 077; : > "$envf" )   # the key lands inside — never create it world-readable
       # No `|| true` here: a failed append (read-only fs, perms) must NOT report
       # "Written." and send the user on to a verify step that mis-diagnoses it.
@@ -1319,10 +1893,11 @@ configure_hermes() {
       # chmod fails, both live in secure_owned_file_mode.
       secure_owned_file_mode "$envf" "your API server key" || true
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
-        run_step "restart Hermes so the API server starts" \
+        run_step "gateway.hermes.restart_api" "restart Hermes so the API server starts" \
           systemctl --user restart hermes-gateway.service || true
       else
-        print_and_wait "Restart Hermes however it runs on this machine so the new API server settings load." \
+        print_and_wait "gateway.hermes.manual_restart_api" \
+          "Restart Hermes however it runs on this machine so the new API server settings load." \
           "systemctl --user restart hermes-gateway.service   # or your own restart method" || true
       fi
     else
@@ -1334,7 +1909,7 @@ configure_hermes() {
   if [ -n "$GW_TOKEN" ]; then ok "Read API_SERVER_KEY from ~/.hermes/.env (not shown)."
   elif $DRY_RUN; then note "(dry-run: would prompt for the Hermes API server key)"
   else
-    GW_TOKEN=$(ask_secret "Paste the Hermes API server key (hidden)")
+    GW_TOKEN=$(ask_secret "Paste the Hermes API server key (hidden)" "stop; Hermes requires a key")
     [ -n "$GW_TOKEN" ] || die "An API key is required for Hermes."
   fi
 
@@ -1505,46 +2080,110 @@ try:
 except Exception: pass' 2>/dev/null
 }
 
+# A bounded value prompt, unlike the free-form name/model/token prompts. `b` is
+# safe here because a custom-server answer has changed nothing yet; it restarts
+# this short answer group. The answer is assigned directly so q can exit the
+# parent shell (a command substitution would trap that exit in a subshell).
+ask_custom_gateway_port() { # sets GW_LOCAL_PORT; 0 value / 10 back / 1 EOF
+  local reply
+  while true; do
+    read -r -p "  Local port (e.g. 11434; Enter = no default; i = explain; b = restart these answers; q = stop): " reply \
+      || return 1
+    case "$reply" in
+      [iI]|\?) explain_prompt "gateway.custom.port"; continue ;;
+      [bB]) return 10 ;;
+      [qQ]) quit_run ;;
+      '') warn "A local setup needs a port. Enter its number, or press b to restart these answers and choose HTTPS." ;;
+      *[!0-9]*) warn "That's not a port number — digits only (e.g. 11434)." ;;
+      # Length-bound BEFORE the numeric test (6+ digits can't be a port): bash
+      # 3.2 errors out loudly on an integer comparison wider than intmax.
+      ??????*) warn "Ports go from 1 to 65535." ;;
+      *)
+        if [ "$reply" -ge 1 ] && [ "$reply" -le 65535 ]; then
+          GW_LOCAL_PORT="$reply"
+          return 0
+        fi
+        warn "Ports go from 1 to 65535."
+        ;;
+    esac
+  done
+}
+
+review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
+  local address auth model reply
+  if [ -n "$GW_URL" ]; then address="$GW_URL"
+  else address="http://127.0.0.1:$GW_LOCAL_PORT (local; HTTPS comes next)"; fi
+  if [ "$GW_AUTH" = "bearer" ]; then auth="Bearer token configured (hidden)"
+  else auth="No token — allowed only on a private path unless explicitly overridden"; fi
+  if [ -n "$GW_MODEL" ]; then model=$(safe_display "$GW_MODEL" 4096)
+  else model="Server/app default (no model fixed in the setup code)"; fi
+
+  say ""
+  say "  ${BOLD}Review this gateway${RESET}"
+  say "    Name:           $(safe_display "$GW_NAME" 200)"
+  say "    Address:        $(safe_display "$address" 4096)"
+  say "    Authentication: $auth"
+  say "    Model:          $model"
+  say ""
+  while true; do
+    read -r -p "  Enter = continue; b = re-enter these answers; i = explain; q = stop: " reply \
+      || die "$NO_ANSWER"
+    case "$reply" in
+      '') return 0 ;;
+      [bB]) return 10 ;;
+      [iI]|\?) explain_prompt "gateway.custom.review" ;;
+      [qQ]) quit_run ;;
+      *) warn "Press Enter to continue, b to re-enter, i for an explanation, or q to stop." ;;
+    esac
+  done
+}
+
 configure_generic() {
   head_ "Step 2 — your OpenAI-compatible server"
-  GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
-  GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
-  if confirm "  Does it already have an https:// URL?"; then
-    GW_LOCAL_PORT=""
-    GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
-    apply_gateway_url_normalization
-  else
-    while true; do
-      GW_LOCAL_PORT=$(ask "  Local port it listens on (e.g. 11434 for Ollama)" "")
-      [ -n "$GW_LOCAL_PORT" ] || die "Need the local port (or an https URL)."
-      case "$GW_LOCAL_PORT" in
-        *[!0-9]*) warn "That's not a port number — digits only (e.g. 11434)." ;;
-        # Length-bound BEFORE the numeric test (6+ digits can't be a port): bash
-        # 3.2 errors out loudly on an integer comparison wider than intmax.
-        ??????*) warn "Ports go from 1 to 65535." ;;
-        *) [ "$GW_LOCAL_PORT" -ge 1 ] && [ "$GW_LOCAL_PORT" -le 65535 ] && break
-           warn "Ports go from 1 to 65535." ;;
-      esac
-    done
-  fi
-  GW_HEALTH_PATH=""   # no portable health endpoint on arbitrary servers
-  if confirm "  Does it require a bearer token / API key?"; then
-    GW_AUTH="bearer"
-    if $DRY_RUN; then note "(dry-run: would prompt for the token)"; GW_TOKEN="<token>"
-    else GW_TOKEN=$(ask_secret "Paste it (hidden)"); [ -n "$GW_TOKEN" ] || die "Empty token."; fi
-  else
-    GW_AUTH="none"; GW_TOKEN=""
-    note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
-    note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
-  fi
-  say "  Some servers (Ollama, vLLM, LiteLLM without a default) need the app to"
-  say "  name a model in every request."
-  local model_default=""; $DRY_RUN || model_default=$(probe_single_model "$GW_LOCAL_PORT")
-  if [ -n "$model_default" ]; then
-    GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
-  else
-    GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
-  fi
+  while true; do
+    # Clear the whole draft before a correction, especially the hidden token.
+    GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
+    GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""
+
+    GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
+    GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
+    if confirm "  Does it already have an https:// URL?" "gateway.custom.has_https"; then
+      GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
+      apply_gateway_url_normalization
+    else
+      ask_custom_gateway_port
+      local port_rc=$?
+      if [ "$port_rc" = "10" ]; then
+        note "↩ Restarting the custom gateway answers. Nothing has been changed."
+        continue
+      fi
+      [ "$port_rc" = "0" ] || die "Need the local port (or an https URL)."
+    fi
+    GW_HEALTH_PATH=""   # no portable health endpoint on arbitrary servers
+    if confirm "  Does it require a bearer token / API key?" "gateway.custom.has_auth"; then
+      GW_AUTH="bearer"
+      if $DRY_RUN; then note "(dry-run: would prompt for the token)"; GW_TOKEN="<token>"
+      else GW_TOKEN=$(ask_secret "Paste it (hidden)" "stop; you said this gateway requires a token"); [ -n "$GW_TOKEN" ] || die "Empty token."; fi
+    else
+      GW_AUTH="none"; GW_TOKEN=""
+      note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
+      note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
+    fi
+    say "  Some servers (Ollama, vLLM, LiteLLM without a default) need the app to"
+    say "  name a model in every request."
+    local model_default=""; $DRY_RUN || model_default=$(probe_single_model "$GW_LOCAL_PORT")
+    if [ -n "$model_default" ]; then
+      GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
+    else
+      GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
+    fi
+
+    review_custom_gateway
+    local review_rc=$?
+    [ "$review_rc" = "0" ] && return 0
+    [ "$review_rc" = "10" ] || return "$review_rc"
+    say ""; note "↩ Re-entering the custom gateway answers. Nothing has been changed."
+  done
 }
 # ------------------------------------------------------------ exposure phase --
 
@@ -1941,7 +2580,7 @@ ts_priv_retry() { # ts_priv_retry <why> <bare-command>… -> 0 ran it, 1 decline
     retry="${retry:+$retry; }${priv:+$priv }$c"
   done
   [ -n "$priv" ] || why="$why This shell is not root and has neither sudo nor doas, so run it from a root shell."
-  print_and_wait "$why" "$retry"
+  print_and_wait "exposure.tailscale.privileged_retry" "$why" "$retry"
 }
 
 # Run a serve/funnel mapping, then CONFIRM it actually took (never trust Enter).
@@ -1977,7 +2616,7 @@ tailscale_expose() { # tailscale_expose <https-port> <local-port> <funnel:true/f
     plan_add "RUN  $cmd"; note "(dry-run: would run the above)"; return 0
   fi
   mutate_guard "expose port $httpsport via tailscale $verb" || return 1
-  if confirm "  Run '$cmd' now?"; then
+  if confirm "  Run '$cmd' now?" "exposure.tailscale.apply"; then
     # Snapshot only once the user has AGREED — a declined confirm must leave no
     # rollback record for a port we never touched. Memory AND disk, both BEFORE
     # the first mutating command below (the demote already changes the port), so
@@ -2028,7 +2667,7 @@ cleanup_exposures() {
   if entries_have_public_prior "${all[@]}"; then
     warn "The PUBLIC line above is NOT included — I never re-publish a port on your behalf."
   fi
-  if ! $REUSE_ONLY && confirm "  Run these cleanup commands now?"; then
+  if ! $REUSE_ONLY && confirm "  Run these cleanup commands now?" "exposure.rollback.failed_run"; then
     # Reverse order: the LAST mapping applied is undone first, so when two records
     # touch one port the earliest-recorded prior state is the one that survives.
     local i
@@ -2194,7 +2833,7 @@ sweep_stale_public_funnels() { # sweep_stale_public_funnels <local-port> <keep-p
       warn "(--reuse-only: leaving it as-is — re-run without --reuse-only to remove it.)"
       continue
     fi
-    if ! confirm "  Turn that public exposure off now?"; then
+    if ! confirm "  Turn that public exposure off now?" "exposure.cleanup.stale_public"; then
       warn "Leaving it live: this backend stays reachable at https://$host:$rport from the internet."
       continue
     fi
@@ -2314,7 +2953,7 @@ reconcile_orphaned_exposures() {
     warn "(--reuse-only: leaving it as-is — run the commands above, or re-run without --reuse-only.)"
     return 0
   fi
-  if ! confirm "  Close it now?"; then
+  if ! confirm "  Close it now?" "exposure.cleanup.orphaned"; then
     warn "Leaving it live. The commands above close it whenever you want."
     return 0
   fi
@@ -2444,7 +3083,7 @@ choose_exposure() {
   if $SETUP_FROM_CHECK; then
     say "  ${DIM}b) stop this setup (the completed check remains unchanged)${RESET}"
   else
-    say "  ${DIM}b) go back to the gateway choice${RESET}"
+    say "  ${DIM}b) go back to the gateway choice (earlier approved changes stay in place)${RESET}"
   fi
   say ""
   say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
@@ -2452,9 +3091,10 @@ choose_exposure() {
   say ""
   local back_word="goes back"
   $SETUP_FROM_CHECK && back_word="stops setup"
-  local choice; choice=$(require_choice "Choose 1-4 ('?' compares them in plain words, 'b' $back_word)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
+  local choice; choice=$(require_choice "Choose 1-4 ('i' compares them, 'b' $back_word)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
+  [ "$choice" = "q" ] && quit_run
   [[ "$choice" =~ ^[bB]$ ]] && return 10   # back/stop — no exposure change has happened yet
-  $DRY_RUN || note "From here I may apply changes to this machine; to change an earlier choice, stop (Ctrl-C) and re-run."
+  $DRY_RUN || note "From here I may apply changes to this machine. q/Ctrl-C stops; neither undoes an earlier approved change."
 
   case "$choice" in
     1|2)
@@ -2492,11 +3132,13 @@ choose_exposure() {
         if $funnel && [ "$everb" = "serve" ]; then
           warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
           warn "https://$host:$gw_https reachable from the public internet."
-          confirm "  Make it public?" || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
+          confirm "  Make it public?" "exposure.tailscale.make_public" \
+            || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
         elif ! $funnel && [ "$everb" = "funnel" ]; then
           warn "Port $gw_https is currently PUBLIC (Tailscale Funnel). Going private turns the"
           warn "public URL off — afterwards only devices on your tailnet reach this gateway."
-          confirm "  Make it private (turn the public URL off)?" || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
+          confirm "  Make it private (turn the public URL off)?" "exposure.tailscale.make_private" \
+            || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
         fi
       fi
       tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
@@ -2530,10 +3172,11 @@ choose_exposure() {
       if $REUSE_ONLY; then
         note "(reuse-only: assuming your gateway ingress rule already exists — I won't guide changes)"
       else
-        print_and_wait "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
+        print_and_wait "exposure.cloudflare.gateway" \
+          "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
           "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
       fi
-      local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "")
+      local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "" "stop this option without a hostname")
       case "$h" in http://*|https://*) h="${h#*://}" ;; esac   # tolerate a pasted URL — keep the host part
       while [ "${h%/}" != "$h" ]; do h="${h%/}"; done
       [ -n "$h" ] || die "No hostname given. This option needs a domain already added to your Cloudflare account; if you don't have one yet, re-run and pick Tailscale instead, or add a domain in Cloudflare first."
@@ -2582,7 +3225,8 @@ scope_choice() {
   note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
   say "    1) Public — reachable from the open internet"
   say "    2) Private — only my own network / VPN (Tailscale, home or office LAN)"
-  local c; c=$(require_choice "Is this address public or private? Choose 1-2 ('?' explains)" '^[12]$' explain_scope_choice) || die "$NO_ANSWER"
+  local c; c=$(require_choice "Is this address public or private? Choose 1-2 ('i' explains)" '^[12]$' explain_scope_choice) || die "$NO_ANSWER"
+  [ "$c" = "q" ] && quit_run
   if [ "$c" = "1" ]; then SCOPE="public"; else SCOPE="private"; fi
 }
 
@@ -3192,7 +3836,7 @@ ensure_existing_fs_envfile_linux() {
     warn "(reuse-only: not repairing the legacy unit; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Repair this connector-owned unit now?"; then
+  if ! confirm "  Repair this connector-owned unit now?" "file.unit.repair_envfile"; then
     note "Leaving the file lane out; chat is unaffected."
     fs_envfile_exposure_warning
     return 1
@@ -3422,7 +4066,7 @@ fs_report_linger_linux() {
     note "(reuse-only: changing nothing.) Turn it on yourself with:  ${priv:+$priv }loginctl enable-linger $u"
     return 0
   fi
-  run_step "enable linger so the file server survives logout and reboot" \
+  run_step "file.service.enable_linger" "enable linger so the file server survives logout and reboot" \
     ${privcmd[@]+"${privcmd[@]}"} loginctl enable-linger "$u" || true
   $DRY_RUN && return 0
   if fs_linger_enabled_linux; then
@@ -3731,7 +4375,7 @@ fs_inactive_unit_report() {
     note "(reuse-only: not moving the lane to another port — re-run without --reuse-only to do that.)"
     return 1
   fi
-  if ! confirm "  Move this file lane to a different free port and start it there?"; then
+  if ! confirm "  Move this file lane to a different free port and start it there?" "file.service.move_port"; then
     note "Leaving the file lane out of this setup code; chat is unaffected."
     return 1
   fi
@@ -4001,20 +4645,22 @@ fs_warn_quick_tunnel_url() {
 #
 # Blank-then-EOF ends the loop: ask_url returns nonzero on a closed stdin, which
 # this propagates so the caller's `|| die "$NO_ANSWER"` still fires.
-ask_fs_url() { # ask_fs_url <prompt> -> echoes the address, or "" for a skip
+#
+# This helper deliberately runs in the PARENT shell and returns its value through
+# ASK_FS_URL_RESULT. The confirmation accepts q, and `quit_run` must exit the real
+# setup process—not a command-substitution subshell that would turn q into an
+# empty successful URL and continue as though the operator deliberately skipped.
+ASK_FS_URL_RESULT=""
+ask_fs_url() { # ask_fs_url <prompt> -> sets ASK_FS_URL_RESULT; 1 on URL-prompt EOF
   local prompt="$1" u tries=0
+  ASK_FS_URL_RESULT=""
   while [ "$tries" -lt 3 ]; do
     tries=$((tries + 1))
-    u=$(ask_url "$prompt" "https://files.example.com" 1) || return 1
-    if [ -n "$u" ]; then printf '%s' "$u"; return 0; fi
-    # stderr, like every other human line in a prompt helper: this runs inside
-    # $( ), where anything on stdout would be captured AS THE ADDRESS. confirm
-    # gets the same redirect even though `read -p` already prompts on stderr —
-    # the helper's contract is "nothing but the address reaches stdout", and that
-    # must hold from reading this function, not from knowing what confirm does.
-    warn "No address was entered." >&2
-    confirm "  Leave file transfer OUT of this setup code?" >&2 && return 0
-    note "Let's try that address again." >&2
+    u=$(ask_url "$prompt" "https://files.example.com" 1 "review omitting file transfer") || return 1
+    if [ -n "$u" ]; then ASK_FS_URL_RESULT="$u"; return 0; fi
+    warn "No address was entered."
+    confirm "  Leave file transfer OUT of this setup code?" "file.address.skip" && return 0
+    note "Let's try that address again."
   done
   # BOUNDED, because --setup is not gated on an interactive terminal: a stdin
   # that keeps yielding empty lines (a pipe, `printf '\n\n\n' |`, a wedged paste)
@@ -4031,7 +4677,7 @@ ask_fs_url() { # ask_fs_url <prompt> -> echoes the address, or "" for a skip
 # Publication event → a SECOND explicit confirm on top of the menu choice.
 fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
-  if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?"; then
+  if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?" "file.exposure.make_public"; then
     FS_CRED=""; note "Leaving the file lane out — keeping your files off the public internet."
     fs_note_existing_mapping "$ehttps" "$everb"
     fs_lane_residue_note
@@ -4054,7 +4700,7 @@ fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> 
         # No Funnel port free — NOTHING was changed, the lane is still private. Don't
         # silently drop a working lane: offer to keep it private instead of losing it.
         warn "Couldn't make the file lane public — all three Funnel ports (443/8443/10000) are already in use by other services on this machine."
-        if confirm "  Keep the file lane PRIVATE instead (reachable on your Tailscale network)?"; then
+        if confirm "  Keep the file lane PRIVATE instead (reachable on your Tailscale network)?" "file.exposure.keep_private"; then
           FS_URL="https://$host:$ehttps"; FS_REACH="private"
           warn "Keeping the file lane private at $FS_URL."
           warn "Heads-up: the gateway is PUBLIC but this file lane stays Tailscale-only, so attachments work only on your Tailscale-connected devices — an Apple Watch used away from your iPhone won't reach them. Chat still works everywhere."
@@ -4120,7 +4766,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    1) Leave the file lane out — chat still works everywhere; no attachments"
       say "    2) Include it as-is  (advanced) — attachments only on your Tailscale devices"
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      [ "$c" = "q" ] && quit_run
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -4133,7 +4780,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat still works everywhere; no attachments"
     say "    3) Include it as-is  (advanced) — attachments only on your Tailscale devices;"
     say "       the file server itself stays private"
-    c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    [ "$c" = "q" ] && quit_run
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway."
@@ -4147,7 +4795,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    2) Keep it public anyway  (advanced) — the file server stays reachable"
       say "       from the whole internet, unlike the gateway"
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('?' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
+      [ "$c" = "q" ] && quit_run
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -4160,7 +4809,8 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat unaffected; no attachments"
     say "    3) Keep it public anyway  (advanced) — the file server stays reachable"
     say "       from the whole internet, unlike the gateway"
-    c=$(require_choice "Choose 1-3 ('?' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
+    [ "$c" = "q" ] && quit_run
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out."
@@ -4547,11 +5197,11 @@ openclaw_tool_policy_step() {
     else
       local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
       if [ -f "$compose_dir/docker-compose.yml" ] || [ -f "$compose_dir/compose.yaml" ]; then
-        if run_step "allow the agent's file tools in OpenClaw's tool policy" \
+        if run_step "file.openclaw.allow_tools" "allow the agent's file tools in OpenClaw's tool policy" \
           docker compose --project-directory "$compose_dir" run --rm --no-deps --entrypoint node openclaw-gateway \
             dist/index.js config set --batch-json "$ops"; then
           policy_saved=true
-          if run_step "restart the gateway so the policy applies" \
+          if run_step "file.openclaw.restart_tools" "restart the gateway so the policy applies" \
             docker compose --project-directory "$compose_dir" restart openclaw-gateway; then
             restart_done=true
             gw_note_restart_and_wait "tool-policy change" true
@@ -4563,7 +5213,8 @@ openclaw_tool_policy_step() {
         # One step covers both halves here, so its confirmation is the only signal
         # available for either — the same boot window follows an operator's own
         # restart, so the same wait follows it.
-        if print_and_wait "Not the standard Docker setup — apply the policy change with your install's CLI, then restart the gateway." \
+        if print_and_wait "file.openclaw.manual_tools" \
+          "Not the standard Docker setup — apply the policy change with your install's CLI, then restart the gateway." \
           "$joined"; then
           policy_saved=true
           restart_done=true
@@ -4601,7 +5252,7 @@ openclaw_tool_policy_step() {
     note "(keeping the file lane in this read-only pass; a real run asks)"
     return 0
   fi
-  if confirm "  Keep the file lane anyway (fix the policy later, then re-run me)?"; then
+  if confirm "  Keep the file lane anyway (fix the policy later, then re-run me)?" "file.openclaw.keep_unready"; then
     return 0
   fi
   return 1
@@ -4658,7 +5309,7 @@ install_conduck_tools_block() { # install_conduck_tools_block <workspace-host-pa
     say "  Your TOOLS.md exists — the block is appended (or refreshed in place between its"
     say "  markers); everything else in the file stays byte-identical."
   fi
-  if ! confirm "  Install/refresh the block?"; then
+  if ! confirm "  Install/refresh the block?" "file.openclaw.guidance"; then
     note "Skipped — the README's file-lane troubleshooting carries the same guidance for manual setup."
     return 0
   fi
@@ -4759,7 +5410,7 @@ setup_file_lane() {
   say "  How: a small password-protected file server (rclone WebDAV — a standard way"
   say "  to read and write files over the web) over the agent's working folder,"
   say "  shared the same way as the gateway."
-  if ! confirm "  Set it up?"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
+  if ! confirm "  Set it up?" "file.setup.enable"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
 
   # rclone FIRST, because asking is free: without it no lane can be built at all,
   # and changing a foreign gateway's tool policy (and restarting it) for a lane
@@ -4885,7 +5536,7 @@ setup_file_lane() {
       hermes)   workspace="$HOME/.hermes/files" ;;
       *)        workspace="$HOME/conduck-files" ;;
     esac
-    if [ "$GW_KIND" = "custom" ] || confirm "  Use a different folder than $workspace?"; then
+    if [ "$GW_KIND" = "custom" ] || confirm "  Use a different folder than $workspace?" "file.folder.override"; then
       while true; do
         local w; w=$(ask "  Absolute path to the agent's working folder" "$workspace")
         case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
@@ -5079,13 +5730,18 @@ setup_file_lane() {
       # confirm they made it (or say they already have one).
       if $REUSE_ONLY; then
         note "(reuse-only: assuming your file-lane ingress rule already exists)"
-        local h; h=$(ask_fs_url "The file-lane web address (blank to skip the file lane)") || die "$NO_ANSWER"
+        local h
+        ask_fs_url "The file-lane web address (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+        h="$ASK_FS_URL_RESULT"
         if [ -n "$h" ]; then FS_URL="$h"; FS_ROUTE_SELF_MANAGED=true; fs_warn_quick_tunnel_url
         else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
-      elif print_and_wait "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
+      elif print_and_wait "file.cloudflare.route" \
+        "Same dance as before: ingress rule + 'tunnel route dns' + restart cloudflared." \
         "cloudflared tunnel route dns <your-tunnel> files.YOURDOMAIN"; then
         FS_ROUTE_SELF_MANAGED=true
-        local h2; h2=$(ask_fs_url "The file-lane web address you configured (blank to skip the file lane)") || die "$NO_ANSWER"
+        local h2
+        ask_fs_url "The file-lane web address you configured (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+        h2="$ASK_FS_URL_RESULT"
         if [ -n "$h2" ]; then FS_URL="$h2"; fs_warn_quick_tunnel_url
         else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
       else FS_CRED=""; fs_lane_residue_note; fi
@@ -5096,7 +5752,9 @@ setup_file_lane() {
       say "  (a second server block, a subdomain, or another port)."
       note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
       note "Its certificate must be trusted the same way the gateway's is; the app applies one rule to both."
-      local h; h=$(ask_fs_url "The https:// web address that reaches it (blank to skip the file lane)") || die "$NO_ANSWER"
+      local h
+      ask_fs_url "The https:// web address that reaches it (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+      h="$ASK_FS_URL_RESULT"
       if [ -n "$h" ]; then
         FS_URL="$h"
         FS_ROUTE_SELF_MANAGED=true   # their own web server holds it; only they can take it back down
@@ -5979,10 +6637,11 @@ restart_hermes_for_config() {
   local restarted=1
   if [ "$OS" = "Linux" ] && have systemctl \
      && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
-    run_step "restart Hermes so the approved config change applies" \
+    run_step "file.hermes.restart_config" "restart Hermes so the approved config change applies" \
       systemctl --user restart hermes-gateway.service && restarted=0
   else
-    print_and_wait "Restart Hermes however it runs on this machine so the approved config change takes effect." \
+    print_and_wait "file.hermes.manual_restart" \
+      "Restart Hermes however it runs on this machine so the approved config change takes effect." \
       "systemctl --user restart hermes-gateway.service   # or your own restart method" && restarted=0
   fi
   # Hermes's API server is not listening the moment the restart command returns,
@@ -6103,7 +6762,7 @@ hermes_recall_remove_step() { # hermes_recall_remove_step <config> -> 0 when the
   say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
   say "  surfaces are untouched — but anything else talking to this same API server loses"
   say "  its memory too."
-  if ! confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+  if ! confirm "  Remove Hermes's recall tools from its API-server scope?" "gateway.hermes.remove_recall"; then
     note "Leaving it as it is."
     HERMES_RECALL_DECLINED=true
     return 1
@@ -6179,7 +6838,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
       say "  Only that one list changes. Every other toolset in it stays, and Hermes's other"
       say "  surfaces are untouched — but anything else talking to this same API server loses"
       say "  its memory too."
-      if confirm "  Remove Hermes's recall tools from its API-server scope?"; then
+      if confirm "  Remove Hermes's recall tools from its API-server scope?" "file.hermes.remove_recall"; then
         approved_scope="$HERMES_RECALL_SCOPE"
         # Re-read with the approval folded in, so the operator sees ONE
         # before→after for this file rather than two overlapping ones.
@@ -6238,7 +6897,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
     warn "(reuse-only: not changing Hermes config; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Apply exactly these Hermes changes?"; then
+  if ! confirm "  Apply exactly these Hermes changes?" "file.hermes.apply_config"; then
     note "Leaving the file lane out — chat is unaffected."
     if [ -n "$approved_scope" ]; then
       note "The API-server scope is unchanged too; nothing in this file was touched."
@@ -6373,7 +7032,7 @@ install_conduck_hermes_block() { # install_conduck_hermes_block <workspace>
     warn "(reuse-only: guidance is absent/stale and cannot be changed; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Install/refresh that Hermes guidance block?"; then
+  if ! confirm "  Install/refresh that Hermes guidance block?" "file.hermes.guidance"; then
     note "Leaving the file lane out — chat is unaffected."
     return 1
   fi
@@ -7089,7 +7748,7 @@ agent_file_lane_gate() {
     return 1
   fi
   if $SHOW_QR; then
-    if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+    if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)" "verification.gateway_only"; then
       FS_LANE_DROPPED_BY_CHECK=true
       drop_file_lane
       return 1
@@ -7235,7 +7894,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
         curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
         FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane
-      elif confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)"; then
+      elif confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)" "verification.gateway_only"; then
         curl_fs -X DELETE "$FS_URL/$probe" >/dev/null 2>&1 || true   # the PUT may have landed
         FS_LANE_DROPPED_BY_CHECK=true
         drop_file_lane
@@ -7503,7 +8162,7 @@ doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stder
   say "  Plain http:// is fine toward this machine (127.0.0.1/localhost) — test locally first," >&2
   say "  expose over HTTPS after." >&2
   while true; do
-    read -r -p "  URL (e.g. http://127.0.0.1:8080) > " reply || return 1   # EOF: caller dies
+    read -r -p "  URL (e.g. http://127.0.0.1:8080; Enter = no default) > " reply || return 1   # EOF: caller dies
     if url=$(doctor_accept_url "$reply"); then
       printf '  %s→ testing %s%s\n' "$DIM" "$url" "$RESET" >&2
       printf '%s' "$url"; return 0
@@ -9394,7 +10053,7 @@ run_doctor() {
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter if it has none)") \
+    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — this server has no token") \
       || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi
@@ -9851,7 +10510,7 @@ run_compat() {
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects (Enter for keyless — the app's explicit no-auth mode)") \
+    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode") \
       || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
       GW_AUTH="none"
@@ -11544,7 +12203,8 @@ show_qr_pick_profile() {
   local pick
   while true; do
     # {1,3} length-bounds the input so the numeric compare below can't overflow bash 3.2's intmax.
-    pick=$(require_choice "Which profile? Choose 1-$((i-1))" '^[0-9]{1,3}$') || die "$NO_ANSWER"
+    pick=$(require_choice "Which profile? Choose 1-$((i-1))" '^[0-9]{1,3}$' "nav.saved_profile") || die "$NO_ANSWER"
+    [ "$pick" = "q" ] && quit_run
     { [ "$pick" -ge 1 ] && [ "$pick" -le $((i-1)) ]; } 2>/dev/null && break
     warn "Please enter a number between 1 and $((i-1))."
   done
@@ -11795,7 +12455,7 @@ show_qr_recover_gateway_secret() {
       # Custom gateway: nothing on disk to read (by design — this tool never stores tokens).
       say ""
       note "Custom gateways have no config file I can read, and this tool deliberately never stores your token."
-      GW_TOKEN=$(ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)")
+      GW_TOKEN=$(ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" "stop; the saved profile requires a token")
       [ -n "$GW_TOKEN" ] || die "A token is required (the saved profile says auth=bearer). Re-run when you have it."
       ;;
   esac
@@ -11824,7 +12484,7 @@ show_qr_recover_file_lane() {
   else
     warn "The saved profile includes a file lane at $fsurl, but I can't recover its credential on this machine"
     warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
-    if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?"; then
+    if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?" "verification.gateway_only"; then
       note "Leaving the file lane out of this QR — re-run the wizard (bash conduck-connect.sh) to rebuild it."
       FS_URL=""; FS_CRED=""; FS_FOLDER=""
     else
@@ -12062,8 +12722,9 @@ run_setup() {
   if $REUSE_ONLY; then
     note "(reuse-only: I'll reuse what's set up and refuse configuration changes; live verification still sends requests and may write/delete a file probe)"
   fi
-  say "Every change asks first, and you see the exact command before it happens. No telemetry — nothing goes anywhere except your own gateway (to verify it). Ctrl-C any time."
-  note "Some commands I offer to run for you (you say yes or no to each); the rest you copy-paste and run yourself while I wait."
+  say "Gateway, service, and network changes ask first, and you see the exact command. No telemetry — verification talks only to your own gateway."
+  note "At bounded questions: i explains this step, q stops, and b appears only where going back is safe. Every prompt states what Enter does."
+  note "q or Ctrl-C stops the run; it does not undo an earlier change you approved. Exposure undo commands are preserved and printed if needed."
 
   # The single-instance gate, taken HERE because this is the one choke point both
   # entries pass through: the --setup dispatch below, and the check → setup handoff
@@ -12116,7 +12777,7 @@ run_setup() {
       choose_exposure && break
       local rc=$?
       [ "$rc" = "10" ] || break
-      say ""; note "↩ Back to the gateway choice."
+      say ""; note "↩ Back to the gateway choice. Earlier approved gateway changes stay in place; setup is not transactional."
     done
   fi
 
@@ -12159,7 +12820,7 @@ finish_successful_check() { # finish_successful_check <server|adapter>
   trap on_exit EXIT
 
   say ""
-  if ! confirm "  Would you like to continue with setup and pairing?"; then
+  if ! confirm "  Would you like to continue with setup and pairing?" "check.continue_setup"; then
     note "Check complete. No setup changes were made."
     exit 0
   fi

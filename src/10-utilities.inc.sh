@@ -212,7 +212,7 @@ choose_main_action() {
   say ""
   local choice regex='^([1-3]|[qQ])$'
   $have_saved && regex='^([1-4]|[qQ])$'
-  choice=$(require_choice "Choose an option" "$regex") || die "$NO_ANSWER"
+  choice=$(require_choice "Choose an option" "$regex" "nav.main") || die "$NO_ANSWER"
   case "$choice" in
     1) COMMAND="setup" ;;
     2) COMMAND="check-server" ;;
@@ -276,15 +276,68 @@ validate_cli() {
 PLAN=()
 plan_add() { PLAN+=("$*"); }
 
-confirm() {  # confirm "question" -> 0 yes / 1 no
-  local reply
-  read -r -p "$1 [y/N] " reply || return 1
-  case "$reply" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+# Explain one bounded prompt without changing its answer. Most callers pass an
+# action id that the explanation catalogue resolves; the few older/specialised
+# menus pass their existing help function instead. Keeping this indirection here
+# makes the prompt primitives usable in isolated tests and in partial-source
+# harnesses too: when the catalogue is not loaded, `i` still gives an honest
+# generic explanation rather than failing.
+explain_prompt() { # explain_prompt [action-id | help-function]
+  local help="${1:-}"
+  case "$help" in
+    ''|*[!a-zA-Z0-9_]*) ;;
+    *) if declare -F "$help" >/dev/null 2>&1; then "$help"; return 0; fi ;;
+  esac
+  if declare -F explain_action >/dev/null 2>&1; then
+    explain_action "${help:-general}"
+    return 0
+  fi
+  say ""
+  say "  ${BOLD}About this step${RESET}"
+  say "  This question controls the action described immediately above it."
+  say "  Answering No or skipping leaves that action undone; it does not undo"
+  say "  anything you approved earlier in this run."
+  say ""
 }
 
-ask() {  # ask "prompt" "default" -> echoes answer (free-form; default optional)
-  local reply
-  read -r -p "$1${2:+ [$2]}: " reply
+quit_run() { # stop cleanly; EXIT traps still report any exposure undo commands
+  say ""
+  note "Stopped here. No further setup actions will run."
+  note "This does not undo changes you already approved: config edits, restarts,"
+  note "services, folders, and commands stay in place."
+  note "If this run applied a tracked Tailscale exposure, its exact undo commands"
+  note "are printed below and kept for the next run. A Cloudflare or reverse-proxy"
+  note "command you ran remains yours to undo."
+  exit 0
+}
+
+confirm() {  # confirm "question" [action-id] [allow-back] -> 0 yes / 1 no / 10 back
+  local reply action="${2:-general}" allow_back="${3:-false}" controls
+  controls="Enter = No; i = explain; q = stop"
+  case "$allow_back" in true|1|yes) controls="Enter = No; i = explain; b = back; q = stop" ;; esac
+  while true; do
+    read -r -p "$1 [y/N] ($controls): " reply || return 1
+    case "$reply" in
+      [yY]|[yY][eE][sS]) return 0 ;;
+      ''|[nN]|[nN][oO]) return 1 ;;
+      [iI]|\?) explain_prompt "$action" ;;
+      [qQ]) quit_run ;;
+      [bB])
+        case "$allow_back" in true|1|yes) return 10 ;; esac
+        warn "Back is not available at this step; choose Yes, No, info, or stop."
+        ;;
+      *) warn "Please answer y or n, press Enter for No, i for an explanation, or q to stop." ;;
+    esac
+  done
+}
+
+ask() {  # ask "prompt" "default" [blank-meaning] -> echoes answer
+  local reply blank_meaning="${3:-leave blank}"
+  if [ -n "${2:-}" ]; then
+    read -r -p "$1 (Enter = $2): " reply
+  else
+    read -r -p "$1 (Enter = $blank_meaning): " reply
+  fi
   printf '%s' "${reply:-${2:-}}"
 }
 
@@ -305,9 +358,9 @@ ask_default() {  # ask_default "prompt" "default" -> echoes resolved value
 # keyless scheme, while EOF means nobody was asked at all. Callers that treat an
 # empty token as "keyless" MUST pair this with `|| die`, or a redirected run would
 # infer no-auth from a missing answer — the fail-closed-auth invariant.
-ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden); 1 on EOF
-  local reply rc=0
-  read -rs -p "  $1: " reply || rc=1
+ask_secret() {  # ask_secret "prompt" "empty-meaning" -> secret (hidden); 1 on EOF
+  local reply rc=0 empty_meaning="${2:-leave empty}"
+  read -rs -p "  $1 (Enter = $empty_meaning): " reply || rc=1
   printf '\n' >&2
   printf '%s' "$reply"
   return $rc
@@ -319,15 +372,22 @@ ask_secret() {  # ask_secret "prompt" -> echoes the secret (input hidden); 1 on 
 # would then silently decide a safety question. On EOF it RETURNS NONZERO rather
 # than calling die: a `die` inside $() kills only the subshell, so the parent
 # must be the one to stop (every caller pairs this with `|| die`).
-# Optional 3rd arg names a help function: answering `?` prints it and re-asks.
+# Optional 3rd arg names an action id or help function: answering `i` (or the
+# older `?` alias) prints it and re-asks. `q` is always recognised, even when the
+# caller's own regex does not list it. Because callers capture this function with
+# $(), it ECHOES the literal sentinel `q`; the parent caller must call quit_run.
 # Help is ADDITIVE only — it explains the same options in plain words, never
 # changes them (the canonical menu/prompt strings stay the single source).
 # The help function's stdout is redirected to stderr here, same $()-capture rule.
-require_choice() {  # require_choice "prompt" "regex" [help_fn] -> echoes the choice
+require_choice() {  # require_choice "prompt" "regex" [action-id | help-fn] -> choice | q
   local reply
   while true; do
-    read -r -p "  $1: " reply || return 1     # closed stdin — never spin the loop
-    if [ -n "${3:-}" ] && [ "$reply" = "?" ]; then "$3" >&2; continue; fi
+    read -r -p "  $1 (Enter = no default; i = explain; q = stop): " reply \
+      || return 1     # closed stdin — never spin the loop
+    case "$reply" in
+      [iI]|\?) explain_prompt "${3:-general}" >&2; continue ;;
+      [qQ]) printf 'q'; return 0 ;;
+    esac
     if [[ "$reply" =~ $2 ]]; then printf '%s' "$reply"; return 0; fi
     warn "Please enter one of the listed options." >&2
   done
@@ -339,11 +399,16 @@ NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask 
 # (or blank, when allow_blank=1, where leaving it out is a valid choice). Trims
 # whitespace, accepts a capitalised scheme, always shows an example. All human
 # output goes to stderr so $(...) captures only the URL.
-ask_url() {  # ask_url "prompt" "example" [allow_blank] -> echoes the URL (or "")
-  local prompt="$1" example="$2" allow_blank="${3:-0}" reply
+ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] -> URL or ""
+  local prompt="$1" example="$2" allow_blank="${3:-0}"
+  local blank_meaning="${4:-skip}" reply
   say "  $prompt" >&2
   while true; do
-    read -r -p "  https URL (e.g. $example) > " reply || return 1   # EOF: caller dies (see require_choice)
+    if [ "$allow_blank" = "1" ]; then
+      read -r -p "  https URL (e.g. $example; Enter = $blank_meaning) > " reply || return 1
+    else
+      read -r -p "  https URL (e.g. $example; Enter = no default) > " reply || return 1
+    fi
     reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
     while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done   # trailing / would make //v1/… requests
     if [ -z "$reply" ]; then
@@ -364,13 +429,15 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] -> echoes the URL (or ""
 
 # Rung 1 of the consent ladder: a single command we run for you, with consent.
 # In --dry-run it is only recorded; in --reuse-only it is refused (see mutate_guard).
-run_step() {  # run_step "description" cmd args...
-  local desc="$1"; shift
+# Action ids affect explanation copy only; the command, mutation guard and
+# consent result are otherwise unchanged.
+run_step() {  # run_step "action-id" "description" cmd args...
+  local action="$1" desc="$2"; shift 2
   if $DRY_RUN; then plan_add "RUN  $*"; note "(dry-run: would run — $desc)"; return 0; fi
   mutate_guard "$desc" || return 1
   say ""
   say "  I'd like to run:  ${BOLD}$*${RESET}"
-  if confirm "  Run it now?"; then "$@"; else
+  if confirm "  Run it now?" "$action"; then "$@"; else
     warn "Skipped: $desc"
     return 1
   fi
@@ -403,7 +470,8 @@ secure_owned_file_mode() { # secure_owned_file_mode <file> <what-is-inside> -> 1
   local f="$1" what="$2"
   file_mode_is_open "$f" || return 0
   warn "$f can be read by other accounts on this machine — $what is inside it."
-  run_step "tighten $f to 0600 so only you can read $what" chmod 600 "$f" || true
+  run_step "security.owned_file.chmod_0600" \
+    "tighten $f to 0600 so only you can read $what" chmod 600 "$f" || true
   if $DRY_RUN; then return 0; fi     # run_step only recorded the plan; nothing changed yet
   if file_mode_is_open "$f"; then
     warn "$what is STILL readable by other accounts on this machine."
@@ -587,23 +655,31 @@ setup_lock_release() {
 }
 
 # Rung 2: a change to something YOU own — we print the exact command, you run it.
-print_and_wait() {  # print_and_wait "why" "command shown to user"
-  if $DRY_RUN; then plan_add "YOU RUN  $2  ($1)"; note "(dry-run: you would run the above)"; return 0; fi
-  mutate_guard "$1"
+print_and_wait() {  # print_and_wait "action-id" "why" "command shown to user"
+  local action="$1" why="$2" command="$3"
+  if $DRY_RUN; then plan_add "YOU RUN  $command  ($why)"; note "(dry-run: you would run the above)"; return 0; fi
+  mutate_guard "$why"
   say ""
   say "  This touches something you own, so you run it (copy-paste, e.g. in a"
   say "  second terminal):"
   say ""
-  printf '    %s%s%s\n' "$BOLD" "$2" "$RESET"
+  printf '    %s%s%s\n' "$BOLD" "$command" "$RESET"
   say ""
-  note "$1"
+  note "$why"
   local reply
-  if ! read -r -p "  Press Enter here once it's done (or 's' to skip): " reply; then
-    warn "No answer — treating this step as skipped."
-    return 1
-  fi
-  [ "$reply" = "s" ] && return 1
-  return 0
+  while true; do
+    if ! read -r -p "  Enter = I ran it; s = skip; i = explain; q = stop: " reply; then
+      warn "No answer — treating this step as skipped."
+      return 1
+    fi
+    case "$reply" in
+      '') return 0 ;;
+      [sS]) return 1 ;;
+      [iI]|\?) explain_prompt "$action" ;;
+      [qQ]) quit_run ;;
+      *) warn "Please press Enter only after running it, s to skip, i for an explanation, or q to stop." ;;
+    esac
+  done
 }
 
 # --reuse-only safety: refuse any mutation that isn't a pure reuse of existing state.

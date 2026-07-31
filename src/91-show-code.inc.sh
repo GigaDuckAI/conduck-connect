@@ -76,7 +76,8 @@ show_qr_pick_profile() {
   local pick
   while true; do
     # {1,3} length-bounds the input so the numeric compare below can't overflow bash 3.2's intmax.
-    pick=$(require_choice "Which profile? Choose 1-$((i-1))" '^[0-9]{1,3}$') || die "$NO_ANSWER"
+    pick=$(require_choice "Which profile? Choose 1-$((i-1))" '^[0-9]{1,3}$' "nav.saved_profile") || die "$NO_ANSWER"
+    [ "$pick" = "q" ] && quit_run
     { [ "$pick" -ge 1 ] && [ "$pick" -le $((i-1)) ]; } 2>/dev/null && break
     warn "Please enter a number between 1 and $((i-1))."
   done
@@ -327,7 +328,7 @@ show_qr_recover_gateway_secret() {
       # Custom gateway: nothing on disk to read (by design — this tool never stores tokens).
       say ""
       note "Custom gateways have no config file I can read, and this tool deliberately never stores your token."
-      GW_TOKEN=$(ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)")
+      GW_TOKEN=$(ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" "stop; the saved profile requires a token")
       [ -n "$GW_TOKEN" ] || die "A token is required (the saved profile says auth=bearer). Re-run when you have it."
       ;;
   esac
@@ -356,7 +357,7 @@ show_qr_recover_file_lane() {
   else
     warn "The saved profile includes a file lane at $fsurl, but I can't recover its credential on this machine"
     warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
-    if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?"; then
+    if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?" "verification.gateway_only"; then
       note "Leaving the file lane out of this QR — re-run the wizard (bash conduck-connect.sh) to rebuild it."
       FS_URL=""; FS_CRED=""; FS_FOLDER=""
     else
