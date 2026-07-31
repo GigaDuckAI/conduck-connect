@@ -466,10 +466,10 @@ show_qr_recall_scope() {
   # emit, so the test is the SAME pair build_pairing_payload_json uses to decide
   # whether a fileServer block is carried at all. show_qr_recover_file_lane can
   # legitimately downgrade a saved file-lane profile to gateway-only when the
-  # credential is gone, and telling that operator to write `[web, file]` would
+  # credential is gone, and telling that operator to write `["web", "file"]` would
   # suggest a toolset their pairing no longer uses.
-  local suggested="[web]"
-  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="[web, file]"; fi
+  local suggested="$HERMES_API_SERVER_ADVICE"
+  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="$HERMES_API_SERVER_ADVICE_FILE"; fi
   hermes_recall_scope_step "$suggested" || true
 }
 

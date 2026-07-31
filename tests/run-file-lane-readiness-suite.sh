@@ -1429,6 +1429,46 @@ test_hermes_recall_classification() {
     "$HERMES_RECALL_STATE" "unknown"
 }
 
+# Whatever the wizard tells an operator to type by hand has to be a shape this
+# connector can read back on the next run. Both advice strings are fed to the
+# REAL analyzer verbatim rather than to a copy of them, so an advice string that
+# regresses to a bare flow sequence fails here instead of in a user's terminal —
+# where the refusal names the key and never the quoting, leaving them with a
+# config they typed exactly as instructed and no way to tell what is wrong.
+test_hermes_printed_advice_parses() {
+  local ws="$TMP/advice-workspace" cfg="$TMP/advice-config.yaml" qws
+  mkdir -p "$ws"
+  qws=$(python3 -c 'import json,os,sys; print(json.dumps(os.path.realpath(sys.argv[1])))' "$ws")
+
+  # The file-lane advice names `file`, so a config written exactly as printed is
+  # already lane-ready — no follow-up edit, which is the whole promise of the hint.
+  printf '%s\n' 'terminal:' "  cwd: $qws" \
+    'platform_toolsets:' "  api_server: $HERMES_API_SERVER_ADVICE_FILE" > "$cfg"
+  expect_eq "advice: the printed file-lane list re-checks ready" \
+    "$(analysis_status "$cfg" "$ws")" "ready"
+  expect_eq "advice: the printed file-lane list reads as recall-free" \
+    "$(recall_field "$cfg" recall)" "clear"
+
+  # The gateway-only advice deliberately omits `file`, so the analyzer must ask
+  # for that one concrete addition. `manual` here would mean an operator typed
+  # what we printed and still got "I cannot read this config's toolset".
+  printf '%s\n' 'terminal:' "  cwd: $qws" \
+    'platform_toolsets:' "  api_server: $HERMES_API_SERVER_ADVICE" > "$cfg"
+  expect_eq "advice: the printed gateway-only list is readable" \
+    "$(analysis_status "$cfg" "$ws")" "fix"
+  expect_eq "advice: the printed gateway-only list reads as recall-free" \
+    "$(recall_field "$cfg" recall)" "clear"
+
+  # The refusal this guards is syntactic, not about list length, so pin the
+  # quoting itself: a future edit dropping the quotes would still satisfy every
+  # assertion above only if the parser had also been loosened to accept it.
+  case "$HERMES_API_SERVER_ADVICE$HERMES_API_SERVER_ADVICE_FILE" in
+    *'"'*) pass "advice: both printed lists are JSON-quoted" ;;
+    *) fail "advice: both printed lists are JSON-quoted" \
+            "a bare flow sequence is refused by this connector's own scanner" ;;
+  esac
+}
+
 test_hermes_recall_edits() {
   local ws="$TMP/recall-ws" cfg="$TMP/recall-edit.yaml" real_ws
   mkdir -p "$ws"
@@ -1857,15 +1897,15 @@ test_hermes_recall_reach() {
   printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
   FS_URL="https://files.example.test"; FS_CRED="fixture-file-secret"
   run_post_recall_step
-  case "$out" in *"api_server: [web, file]"*)
-      pass "reach: a run carrying a file lane suggests [web, file]" ;;
-    *) fail "reach: a run carrying a file lane suggests [web, file]" "$out" ;; esac
+  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
+      pass "reach: a run carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" ;;
+    *) fail "reach: a run carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" "$out" ;; esac
   reset_recall_run
   FS_URL="https://files.example.test"; FS_CRED=""
   run_post_recall_step
-  case "$out" in *"api_server: [web, file]"*)
-      fail "reach: a lane the code will not carry falls back to [web]" "suggested an unused toolset" ;;
-    *) pass "reach: a lane the code will not carry falls back to [web]" ;; esac
+  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
+      fail "reach: a lane the code will not carry falls back to $HERMES_API_SERVER_ADVICE" "suggested an unused toolset" ;;
+    *) pass "reach: a lane the code will not carry falls back to $HERMES_API_SERVER_ADVICE" ;; esac
   FS_URL=""; FS_CRED=""
 
   # A run whose whole promise is that it changes nothing may report but never gate.
@@ -1933,9 +1973,9 @@ test_hermes_recall_reach() {
   expect_eq "reach: show-code reports a drifted scope" \
     "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
   expect_eq "reach: show-code never blocks the code" "$rc" "0"
-  case "$out" in *"api_server: [web]"*)
-      pass "reach: a gateway-only re-show suggests [web]" ;;
-    *) fail "reach: a gateway-only re-show suggests [web]" "$out" ;; esac
+  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE"*)
+      pass "reach: a gateway-only re-show suggests $HERMES_API_SERVER_ADVICE" ;;
+    *) fail "reach: a gateway-only re-show suggests $HERMES_API_SERVER_ADVICE" "$out" ;; esac
   if [ -e "$HOME/$cfg" ]; then
     fail "reach: show-code writes no Hermes config" "config.yaml was created"
   else
@@ -1953,18 +1993,18 @@ test_hermes_recall_reach() {
   FS_URL="https://files.example.test"
   FS_CRED="fixture-file-secret"
   out=$(show_qr_recall_scope 2>&1); rc=$?
-  case "$out" in *"api_server: [web, file]"*)
-      pass "reach: a re-show carrying a file lane suggests [web, file]" ;;
-    *) fail "reach: a re-show carrying a file lane suggests [web, file]" "$out" ;; esac
+  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
+      pass "reach: a re-show carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" ;;
+    *) fail "reach: a re-show carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" "$out" ;; esac
 
   reset_recall_run
   REUSE_ONLY=true
   FS_URL="https://files.example.test"
   FS_CRED=""
   out=$(show_qr_recall_scope 2>&1); rc=$?
-  case "$out" in *"api_server: [web, file]"*)
-      fail "reach: an unrecoverable lane falls back to [web]" "suggested a lane the QR will not carry" ;;
-    *) pass "reach: an unrecoverable lane falls back to [web]" ;; esac
+  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
+      fail "reach: an unrecoverable lane falls back to $HERMES_API_SERVER_ADVICE" "suggested a lane the QR will not carry" ;;
+    *) pass "reach: an unrecoverable lane falls back to $HERMES_API_SERVER_ADVICE" ;; esac
   FS_CRED="$saved_cred"
 
   reset_recall_run
@@ -3513,6 +3553,7 @@ test_tools_block_is_agent_readable
 test_hermes_config
 test_hermes_blank_and_comment_lines
 test_hermes_recall_classification
+test_hermes_printed_advice_parses
 test_hermes_recall_edits
 test_hermes_recall_operator_flow
 test_hermes_recall_file_lane

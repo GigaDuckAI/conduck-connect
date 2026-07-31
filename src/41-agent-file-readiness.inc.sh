@@ -35,6 +35,17 @@ HERMES_RECALL_DECLINED=false
 HERMES_ANALYSIS_STATUS=""
 HERMES_ANALYSIS_REASONS=()
 HERMES_ANALYSIS_CHANGES=()
+# The two lists the by-hand hint offers, JSON-quoted because that is the only
+# inline form the scanner above reads back: a bare flow sequence is refused as
+# "YAML syntax this connector will not guess at", and the refusal names the key,
+# not the quoting. Advising `[web, file]` therefore sent an operator to write the
+# exact line the next run would reject, with nothing on screen to explain it.
+# Quoted is also what hermes_config_analysis's own rewrite emits, so the shape we
+# tell people to type and the shape we type for them are now the same one.
+# Every caller shares these — 20-gateway and 91-show-code pick which of the two
+# to pass — so the form is defined once rather than re-spelled at each print.
+HERMES_API_SERVER_ADVICE='["web"]'
+HERMES_API_SERVER_ADVICE_FILE='["web", "file"]'
 
 hermes_residual_state_note() {
   [ "${GW_KIND:-}" = "hermes" ] || return 0
@@ -938,7 +949,7 @@ hermes_recall_report() {
 
 # What to change by hand, for every shape this connector will not rewrite.
 hermes_recall_manual_hint() { # hermes_recall_manual_hint <suggested-list>
-  local suggested="${1:-[web]}"
+  local suggested="${1:-$HERMES_API_SERVER_ADVICE}"
   case "$HERMES_RECALL_STATE" in
     clear) return 0 ;;
     in-scope)
@@ -1021,19 +1032,19 @@ hermes_recall_scope_step() { # hermes_recall_scope_step [suggested-list]
   [ "$HERMES_RECALL_STATE" = "clear" ] && return 0
   if $DRY_RUN; then
     note "(dry-run: a real run offers to remove those entries, or shows you the exact edit)"
-    hermes_recall_manual_hint "${1:-[web]}"
+    hermes_recall_manual_hint "${1:-$HERMES_API_SERVER_ADVICE}"
     return 0
   fi
   if $REUSE_ONLY; then
     warn "(reuse-only: not changing Hermes config)"
-    hermes_recall_manual_hint "${1:-[web]}"
+    hermes_recall_manual_hint "${1:-$HERMES_API_SERVER_ADVICE}"
     return 0
   fi
   if [ "$HERMES_RECALL_FIX" = "literal" ] && ! $HERMES_RECALL_DECLINED \
      && hermes_recall_remove_step "$cfg"; then
     return 0
   fi
-  hermes_recall_manual_hint "${1:-[web]}"
+  hermes_recall_manual_hint "${1:-$HERMES_API_SERVER_ADVICE}"
   return 1
 }
 
@@ -1050,7 +1061,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
   if [ "$HERMES_RECALL_STATE" != "clear" ]; then
     if [ "$HERMES_RECALL_FIX" != "literal" ] || $DRY_RUN || $REUSE_ONLY \
        || $HERMES_RECALL_DECLINED; then
-      hermes_recall_manual_hint "[web, file]"
+      hermes_recall_manual_hint "$HERMES_API_SERVER_ADVICE_FILE"
     elif [ "$status" = "fix" ] || [ "$status" = "ready" ]; then
       say ""
       say "  ${BOLD}platform_toolsets.api_server: $HERMES_RECALL_SCOPE -> $HERMES_RECALL_AFTER${RESET}"
@@ -1066,7 +1077,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
       else
         note "Leaving the API-server scope as it is."
         HERMES_RECALL_DECLINED=true
-        hermes_recall_manual_hint "[web, file]"
+        hermes_recall_manual_hint "$HERMES_API_SERVER_ADVICE_FILE"
       fi
     else
       # File readiness is already unprovable here, but the memory scope is a
@@ -1076,7 +1087,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
         hermes_analysis_read "$cfg" "$workspace" analyze
         status="$HERMES_ANALYSIS_STATUS"
       else
-        hermes_recall_manual_hint "[web, file]"
+        hermes_recall_manual_hint "$HERMES_API_SERVER_ADVICE_FILE"
       fi
     fi
   fi
@@ -1140,7 +1151,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
   fi
   if [ -n "$approved_scope" ] && [ "$HERMES_RECALL_STATE" != "clear" ]; then
     warn "The recall entries were removed but the scope still does not read as memory-free."
-    hermes_recall_manual_hint "[web, file]"
+    hermes_recall_manual_hint "$HERMES_API_SERVER_ADVICE_FILE"
   fi
   ok "Hermes config re-checked — file toolset + working folder are aligned."
   if ! restart_hermes_for_config; then

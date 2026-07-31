@@ -4,6 +4,22 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The wizard told you to write a Hermes config line it would then refuse to
+  read.** When it cannot make the `platform_toolsets.api_server` edit itself it
+  prints the list to write by hand, and printed it as a bare YAML flow sequence:
+  `api_server: [web, file]`. That is precisely the inline shape this connector's
+  scanner will not guess at, so an operator who typed it exactly as instructed,
+  restarted Hermes and re-ran was told `platform_toolsets.api_server uses YAML
+  syntax this connector will not guess at` — a refusal that names the key and
+  never the quoting, on a config they had just been handed verbatim. List length
+  had nothing to do with it; `[web]` failed the same way. The advice is now
+  JSON-quoted, `api_server: ["web", "file"]`, which is what this connector's own
+  canonical rewrite already writes into that same line, so the shape it tells you
+  to type and the shape it types for you are one shape. Both lists are defined
+  once and shared by every module that prints them, rather than re-spelled at each
+  of the twelve call sites, and a regression test now feeds each printed string
+  back through the real analyzer: the old advice fails that test with exactly the
+  status an affected user saw.
 - **The block that teaches your agent to use the file lane was installed
   unreadable, and the run reported success.** Both file-server unit writers set
   `umask 077` as a bare statement instead of scoping it, so the mask survived for

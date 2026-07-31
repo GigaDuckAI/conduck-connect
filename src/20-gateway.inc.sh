@@ -450,8 +450,8 @@ hermes_recall_post_file_lane_step() {
   $HERMES_RECALL_REPORTED && return 0
   # Suggest the scope the code being paired actually needs — the same (URL, cred)
   # pair the payload builder uses to decide whether a file lane rides at all.
-  local suggested="[web]"
-  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="[web, file]"; fi
+  local suggested="$HERMES_API_SERVER_ADVICE"
+  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="$HERMES_API_SERVER_ADVICE_FILE"; fi
   if [ "${GW_KIND:-}" = "hermes" ]; then
     hermes_recall_scope_step "$suggested" || true
   elif $CHECK_HANDOFF_LOCAL_HERMES; then
