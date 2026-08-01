@@ -63,6 +63,15 @@ explain_action() { # explain_action <action-id>
         "The profile is not rewritten, whichever one you choose."
       ;;
 
+    nav.custom_gateway_pick)
+      explain_panel \
+        "Choose whether this is a gateway you already set up, or a new one" \
+        "A gateway is filed under an id derived from its name, and that id also names its file-service and credential — so retyping a name inexactly would build a second gateway rather than change the first." \
+        "Selecting a listed gateway keeps its existing id and asks for its current address and token; choosing the last option starts a new gateway with a name not already in use." \
+        "No gateway is selected and setup cannot continue past this question." \
+        "Nothing is changed by choosing: a selected gateway's saved setup is only rewritten once this run verifies successfully."
+      ;;
+
     check.continue_setup|nav.continue_after_check|continue-after-check)
       explain_panel \
         "Continue from a passing check into setup and pairing" \
@@ -85,7 +94,7 @@ explain_action() { # explain_action <action-id>
       explain_panel \
         "Describe how this gateway authenticates clients" \
         "Conduck must store an explicit bearer or keyless mode; a missing token is never silently treated as keyless." \
-        "Records the chosen auth mode for this run and asks for a hidden token only when bearer auth is selected." \
+        "Takes the token at a hidden prompt that shows nothing as you type, so a paste is never echoed to the screen or left in scroll-back; an empty answer asks you to confirm keyless rather than assuming it." \
         "Choosing keyless means anyone who can reach the address can use what the gateway permits." \
         "Setup refuses to publish a keyless gateway unless the expert override was supplied."
       ;;

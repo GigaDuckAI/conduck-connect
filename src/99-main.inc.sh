@@ -3,17 +3,16 @@
 prepare_setup_from_check() {
   local checked_kind="$1" checked_url="$GW_URL" checked_path="" parsed=""
   SETUP_FROM_CHECK=true
+  SETUP_FROM_CHECK_KIND="$checked_kind"
   GW_KIND="custom"
   GW_HEALTH_PATH=""
   TRANSPORT=""
   SCOPE=""
 
-  if [ "$checked_kind" = "adapter" ]; then
-    GW_NAME=$(ask "  A short name for this adapter (shown in the app)" "My Conduck adapter")
-  else
-    GW_NAME=$(ask "  A short name for this server (shown in the app)" "My gateway")
-  fi
-  GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
+  # The name and id are NOT decided here — see resolve_setup_from_check_identity.
+  # This function runs before run_setup takes the single-instance lock, and
+  # choosing an identity means reading the saved profiles, file-lane units and
+  # credential files that a second run may be writing at that moment.
 
   # A server check grades ONE model path, and the handoff must pair EXACTLY that
   # path — deriving it a second time here is how a run that graded model X ends
@@ -73,6 +72,40 @@ print("%s\t%s" % (u.port or 80, u.path.rstrip("/")))' 2>/dev/null) \
   note "Reusing the checked address and authentication in memory; your token is not saved."
 }
 
+# The gateway identity for a check → setup handoff, asked under the setup lock.
+#
+# It runs the SAME selector and the same collision refusal as the gateway menu's
+# custom path, because the id derived here keys the same three things — the saved
+# setup, the file-lane service, and that service's credential — and a second copy
+# of the derivation is a second place for a typo to build a duplicate gateway.
+#
+# Everything the check PROVED stays untouched: the address, the auth mode, the
+# token in memory, and the graded model. Only the name and id are decided.
+resolve_setup_from_check_identity() {
+  local checked_model
+  while true; do
+    checked_model="$GW_MODEL"
+    GW_EDITING=false
+    if pick_existing_custom_gateway; then
+      GW_EDITING=true
+      # The picker restores the model this gateway used LAST time. The check just
+      # graded one specific model path and the handoff must pair exactly that one,
+      # so the checked value wins — an untested saved model would quietly replace
+      # the only one this run has evidence for.
+      GW_MODEL="$checked_model"
+      return 0
+    fi
+    if [ "$SETUP_FROM_CHECK_KIND" = "adapter" ]; then
+      GW_NAME=$(ask "  A short name for this adapter (shown in the app)" "My Conduck adapter")
+    else
+      GW_NAME=$(ask "  A short name for this server (shown in the app)" "My gateway")
+    fi
+    GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
+    gateway_id_is_taken "$GW_ID" || return 0
+    report_gateway_id_collision "$GW_ID"
+  done
+}
+
 apply_checked_path_prefix() {
   [ -n "${CHECKED_PATH_PREFIX:-}" ] || return 0
   case "$GW_URL" in
@@ -122,6 +155,9 @@ run_setup() {
   reconcile_orphaned_exposures
 
   if $SETUP_FROM_CHECK; then
+    # Under the lock, and before any port is picked or unit written: which saved
+    # gateway is this, or is it a new one?
+    resolve_setup_from_check_identity
     choose_exposure
     local exposure_rc=$?
     if [ "$exposure_rc" = "10" ]; then
@@ -136,7 +172,7 @@ run_setup() {
     # selects a gateway: the user always makes an explicit 1/2/3 choice.
     while true; do
       GW_KIND=""; GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
-      GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""
+      GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""; GW_EDITING=false
       detect_gateway
       case "$GW_KIND" in
         openclaw) configure_openclaw ;;

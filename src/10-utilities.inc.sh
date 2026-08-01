@@ -63,6 +63,10 @@ COMPAT=false
 CHECK_URL=""
 COMMAND=""         # menu | setup | check-server | check-adapter | show-code
 SETUP_FROM_CHECK=false
+# Which check handed off (server | adapter). Read only for prompt wording, and
+# held as state because the identity question it phrases is asked later than the
+# handoff — inside run_setup, under the single-instance lock.
+SETUP_FROM_CHECK_KIND=""
 CLI_ARG_COUNT=$#
 # Legacy compatibility (see the --generic arm below). SETUP_GATEWAY_HINT skips
 # gateway detection entirely; it is set ONLY by --generic and never by the new CLI.
@@ -311,6 +315,50 @@ quit_run() { # stop cleanly; EXIT traps still report any exposure undo commands
   exit 0
 }
 
+# Did a REJECTED answer look like a pasted credential rather than a typed one?
+# Shape only — length and character mix. It never tests for a known token prefix
+# and never stores, returns or echoes the value: the whole point is that the
+# string must not travel one step further than the terminal that already showed
+# it.
+#
+# Deliberately loose. A false positive costs three lines of advice; a false
+# negative leaves a live token in someone's scroll-back. It misses long
+# all-lowercase passphrases, anything under 16 characters, and anything
+# containing a space, and it fires on long hyphenated model ids — all acceptable
+# at prompts whose real answers are y, n, a small number, a URL, or Enter.
+# bash 3.2 only: `case` globs and ${#s}; no [[ =~ ]], no ${s,,}.
+looks_like_a_secret() { # looks_like_a_secret <answer>
+  local s="$1" lower
+  [ "${#s}" -ge 16 ] || return 1
+  # Lowercase BEFORE the scheme test, or HTTPS://Example1.com survives it and
+  # then trips the digit rule below.
+  lower=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in http://*|https://*) return 1 ;; esac   # an address is not a secret
+  case "$s" in *[[:space:]]*) return 1 ;; esac             # a sentence is not a paste
+  case "$s" in *[0-9]*) return 0 ;; esac
+  case "$s" in *[A-Z]*) case "$s" in *[a-z]*) return 0 ;; esac ;; esac
+  return 1
+}
+
+# Said once, by the prompt that just refused a credential-shaped answer. It must
+# never print the value back: the defect being reported is ONE copy of the token
+# on screen, and repeating it for clarity would make two. Everything goes to
+# stderr, so the prompts whose callers capture them with $() stay clean.
+#
+# The middle line turns on whether input is a terminal. Under a pipe `read` does
+# not echo, so "it is on your screen" would be false — and a warning that states
+# something the operator can see is untrue is how they learn to skip the next one.
+warn_answer_looked_like_a_secret() {
+  warn "That looked like a token or password, and this question is not where one goes." >&2
+  if [ -t 0 ]; then
+    warn "It was shown as you typed it, so it is in this terminal's scroll-back." >&2
+  else
+    warn "Assume this session may have recorded it." >&2
+  fi
+  warn "If it was real, rotate it. A secret is only ever asked for at a hidden prompt —" >&2
+  warn "one that shows nothing at all while you type." >&2
+}
+
 confirm() {  # confirm "question" [action-id] [allow-back] -> 0 yes / 1 no / 10 back
   local reply action="${2:-general}" allow_back="${3:-false}" controls
   controls="Enter = No; i = explain; q = stop"
@@ -326,7 +374,8 @@ confirm() {  # confirm "question" [action-id] [allow-back] -> 0 yes / 1 no / 10 
         case "$allow_back" in true|1|yes) return 10 ;; esac
         warn "Back is not available at this step; choose Yes, No, info, or stop."
         ;;
-      *) warn "Please answer y or n, press Enter for No, i for an explanation, or q to stop." ;;
+      *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
+         warn "Please answer y or n, press Enter for No, i for an explanation, or q to stop." ;;
     esac
   done
 }
@@ -389,6 +438,7 @@ require_choice() {  # require_choice "prompt" "regex" [action-id | help-fn] -> c
       [qQ]) printf 'q'; return 0 ;;
     esac
     if [[ "$reply" =~ $2 ]]; then printf '%s' "$reply"; return 0; fi
+    if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
     warn "Please enter one of the listed options." >&2
   done
 }
@@ -422,7 +472,8 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] -> URL o
     case "$reply" in
       https://?*) printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2; printf '%s' "$reply"; return 0 ;;
       http://*)   warn "That's http:// — Conduck requires https:// (encrypted). Try again." >&2 ;;
-      *)          warn "That has to start with https:// — for example $example. Try again." >&2 ;;
+      *)          if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
+                  warn "That has to start with https:// — for example $example. Try again." >&2 ;;
     esac
   done
 }
@@ -677,7 +728,8 @@ print_and_wait() {  # print_and_wait "action-id" "why" "command shown to user"
       [sS]) return 1 ;;
       [iI]|\?) explain_prompt "$action" ;;
       [qQ]) quit_run ;;
-      *) warn "Please press Enter only after running it, s to skip, i for an explanation, or q to stop." ;;
+      *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
+         warn "Please press Enter only after running it, s to skip, i for an explanation, or q to stop." ;;
     esac
   done
 }

@@ -1030,10 +1030,22 @@ explain_scope_choice() {
   say ""
 }
 
-# Ask whether the URL is publicly reachable. Safety-relevant (it gates the
-# keyless-public guard), so it takes an explicit 1/2 — no Enter default a typo
-# could fall into. Sets SCOPE.
+# Sets SCOPE. Reach we cannot derive is safety-relevant (it gates the keyless-public
+# guard), so it takes an explicit 1/2 — no Enter default a typo could fall into. A
+# recognised quick tunnel is not asked about at all: `cloudflared tunnel --url` has no
+# private variant, so its reach is a fact rather than a preference, and asking only
+# invites a "private" answer that switches the guard off for an address that is public
+# by construction. Menu option 3 sets the same precedent — a NAMED Cloudflare tunnel
+# hardcodes SCOPE="public" without asking. Consequence: a keyless gateway on a quick
+# tunnel now stops at keyless_public_guard, and --allow-keyless-public stays the one
+# deliberate override.
 scope_choice() {
+  if is_quick_tunnel_url "$GW_URL"; then
+    SCOPE="public"
+    ok "That is a Cloudflare quick tunnel, so this address is PUBLIC."
+    note "No need to ask — I'll apply the strict public checks."
+    return 0
+  fi
   note "Rule of thumb: if you could open this address from your phone on cellular (Wi-Fi off),"
   note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
   say "    1) Public — reachable from the open internet"
@@ -1121,9 +1133,14 @@ if nb > datetime.datetime.utcnow():
 }
 
 # Is this address a `cloudflared tunnel --url` quick tunnel? Matched on the host
-# only, lowercased, so a path or a port cannot smuggle the suffix past the test.
+# only, lowercased, so a path, a query, a fragment or a port cannot smuggle the
+# suffix past the test. The authority ends at the first /, ? or # — the same cut
+# show_qr_is_https_host makes in 91-show-code.inc.sh, and one rule both places must
+# agree on. Ending it at / alone would let https://host?a=1 and https://host#frag
+# escape the match: the callers in 40-file-lane and 80-pairing pass UNNORMALISED
+# URLs, so those two forms really do reach here.
 is_quick_tunnel_url() { # is_quick_tunnel_url <url>
-  local a; a="${1#*://}"; a="${a%%/*}"; a="${a%%:*}"
+  local a; a="${1#*://}"; a="${a%%[/?#]*}"; a="${a%%:*}"
   a=$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')
   case "$a" in *.trycloudflare.com) return 0 ;; esac
   return 1

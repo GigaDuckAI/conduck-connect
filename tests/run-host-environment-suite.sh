@@ -43,7 +43,8 @@ EX="$ROOT/src/30-exposure.inc.sh"
 FL="$ROOT/src/40-file-lane.inc.sh"
 SQ="$ROOT/src/91-show-code.inc.sh"
 MN="$ROOT/src/99-main.inc.sh"
-for f in "$UT" "$EX" "$FL" "$SQ" "$MN"; do
+GW="$ROOT/src/20-gateway.inc.sh"
+for f in "$UT" "$EX" "$FL" "$SQ" "$MN" "$GW"; do
   [ -f "$f" ] || { printf 'missing %s\n' "$f" >&2; exit 2; }
 done
 
@@ -75,6 +76,9 @@ lift "$FL" setup_file_lane fs_linger_enabled_linux fs_report_linger_linux
 # carries json_type + env_get. The bodies are the shipped ones either way.
 lift "$SQ" show_qr_profile_invalid show_qr_is_https_host show_qr_is_port show_qr_pick_profile
 lift "$UT" json_get
+# Gateway identity: which saved gateway a re-run is changing, and which ids are
+# already spoken for. These read the same $STATE_DIR the picker above does.
+lift "$GW" gateway_id_is_taken report_gateway_id_collision pick_existing_custom_gateway
 declare -F show_qr_validate_profile >/dev/null \
   || { printf 'show_qr_validate_profile did not come along with show_qr_profile_invalid\n' >&2; exit 2; }
 declare -F json_type >/dev/null \
@@ -1116,6 +1120,284 @@ test_show_code_picker_reason() {
     "$out" "picked=$sd/profile-custom-ok.json"
 }
 
+# ============================ custom-gateway identity (20-gateway, 91) ==
+# A custom gateway is filed under an id slugged from its display name, and that
+# id ALSO names its file-lane unit and the credential that unit reads. So the
+# name is not cosmetic and "is this name free?" is not one question about one
+# file — see gateway_id_is_taken below for the two ways an id is occupied while
+# no profile exists at all.
+
+write_gw_fixture() { # write_gw_fixture <state-dir> <id> <name> <model>
+  mkdir -p "$1"
+  cat > "$1/profile-$2.json" <<JSON
+{
+ "schemaVersion": 1,
+ "gateway": {
+  "id": "$2",
+  "kind": "custom",
+  "name": "$3",
+  "auth": "bearer",
+  "transport": "public",
+  "reach": "public",
+  "url": "https://old.trycloudflare.com",
+  "model": "$4"
+ },
+ "fileServer": null
+}
+JSON
+}
+
+# One reservation per run, with the other three absent, so a single test can name
+# WHICH artifact holds the id rather than proving only that something does.
+taken_out() { # taken_out <variant> <id-to-probe>
+  local home="$TMPD/taken-$1"
+  rm -rf "$home"; mkdir -p "$home/.config/conduck"
+  case "$1" in
+    profile) : > "$home/.config/conduck/profile-custom-thing.json" ;;
+    cred)    : > "$home/.config/conduck/fileserver-custom-thing.cred" ;;
+    env)     : > "$home/.config/conduck/fileserver-custom-thing.env" ;;
+    unit)
+      if [ "$(uname -s)" = "Linux" ]; then
+        mkdir -p "$home/.config/systemd/user"
+        : > "$home/.config/systemd/user/conduck-files-custom-thing.service"
+      else
+        mkdir -p "$home/Library/LaunchAgents"
+        : > "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-custom-thing.plist"
+      fi ;;
+  esac
+  (
+    HOME="$home"; STATE_DIR="$home/.config/conduck"; OS="$(uname -s)"
+    if gateway_id_is_taken "$2"; then printf 'taken'; else printf 'free'; fi
+  )
+}
+
+# The OS branch has to actually branch. Run on one platform only, the unit arm
+# above proves "some unit file reserves the id" and would pass just as happily if
+# the function ignored $OS and tested both paths — so each unit is also asserted
+# NOT to count on the other platform.
+taken_cross_out() { # taken_cross_out <os> <systemd|plist>
+  local home="$TMPD/taken-cross-$1-$2"
+  rm -rf "$home"; mkdir -p "$home/.config/conduck"
+  case "$2" in
+    systemd) mkdir -p "$home/.config/systemd/user"
+             : > "$home/.config/systemd/user/conduck-files-custom-thing.service" ;;
+    plist)   mkdir -p "$home/Library/LaunchAgents"
+             : > "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-custom-thing.plist" ;;
+  esac
+  (
+    HOME="$home"; STATE_DIR="$home/.config/conduck"; OS="$1"
+    if gateway_id_is_taken custom-thing; then printf 'taken'; else printf 'free'; fi
+  )
+}
+
+test_gateway_id_reservations() {
+  expect_eq "id reservation: nothing on disk leaves the id free" \
+    "$(taken_out none custom-thing)" "free"
+  expect_eq "id reservation: a saved setup holds its id" \
+    "$(taken_out profile custom-thing)" "taken"
+  # The three below are the load-bearing ones. A run that fails verification never
+  # reaches write_profile, but it HAS already minted the file-lane credential and
+  # written the unit — so the id is occupied by a live file server with no profile
+  # to show for it, and a later gateway that slugs onto it would adopt that
+  # server's port, unit and password believing it built them itself.
+  expect_eq "id reservation: an orphaned file credential holds its id" \
+    "$(taken_out cred custom-thing)" "taken"
+  expect_eq "id reservation: an orphaned file-lane env file holds its id" \
+    "$(taken_out env custom-thing)" "taken"
+  expect_eq "id reservation: an orphaned file-lane service holds its id" \
+    "$(taken_out unit custom-thing)" "taken"
+  # Neither over- nor under-claiming: a neighbour stays free, and an empty id is
+  # not a wildcard that matches everything.
+  expect_eq "id reservation: an unrelated id stays free" \
+    "$(taken_out profile custom-other)" "free"
+  expect_eq "id reservation: an empty id is never reported as taken" \
+    "$(taken_out profile '')" "free"
+  expect_eq "id reservation: a systemd unit holds the id on Linux" \
+    "$(taken_cross_out Linux systemd)" "taken"
+  expect_eq "id reservation: a LaunchAgent is not a reservation on Linux" \
+    "$(taken_cross_out Linux plist)" "free"
+  expect_eq "id reservation: a LaunchAgent holds the id on macOS" \
+    "$(taken_cross_out Darwin plist)" "taken"
+  expect_eq "id reservation: a systemd unit is not a reservation on macOS" \
+    "$(taken_cross_out Darwin systemd)" "free"
+}
+
+# GW_URL / GW_AUTH / GW_LOCAL_PORT carry sentinels in: the picker must restore an
+# identity and leave the CONNECTION facts alone. The saved address is deliberately
+# not reused — a quick tunnel's hostname is reassigned every time it restarts, so
+# the stored one is stale far more often than not — and the profile holds no token
+# by design, so auth has to be re-established either way.
+gw_pick_out() { # gw_pick_out <state-dir> <choice>
+  (
+    STATE_DIR="$1"; BOLD=""; RESET=""; DIM=""
+    OS="$(uname -s)"; NO_ANSWER="no answer"
+    say()  { printf '%s\n' "$*"; }
+    note() { printf 'note: %s\n' "$*"; }
+    ok()   { printf 'ok: %s\n' "$*"; }
+    bad()  { printf 'bad: %s\n' "$*"; }
+    warn() { printf 'warn: %s\n' "$*"; }
+    die()  { printf 'die: %s\n' "$*"; exit 9; }
+    quit_run() { printf 'quit\n'; exit 8; }
+    PICK="$2"
+    require_choice() { printf '%s' "$PICK"; }
+    GW_ID=""; GW_NAME=""; GW_MODEL=""
+    GW_URL="SENTINEL_URL"; GW_AUTH="SENTINEL_AUTH"; GW_LOCAL_PORT="SENTINEL_PORT"
+    local rc=0
+    pick_existing_custom_gateway || rc=$?
+    printf 'rc=%s id=[%s] name=[%s] model=[%s] url=[%s] auth=[%s] port=[%s]\n' \
+      "$rc" "$GW_ID" "$GW_NAME" "$GW_MODEL" "$GW_URL" "$GW_AUTH" "$GW_LOCAL_PORT"
+  ) 2>&1
+}
+
+test_custom_gateway_picker() {
+  local sd out
+
+  # Nothing saved: a first-ever run must be byte-for-byte what it always was —
+  # no list, no question, nothing set.
+  sd="$TMPD/gwpick-empty/conduck"; rm -rf "$TMPD/gwpick-empty"; mkdir -p "$sd"
+  out=$(gw_pick_out "$sd" 1)
+  expect_has "picker: an empty state dir falls through to the new-gateway flow" \
+    "$out" "rc=1 id=[] name=[] model=[]"
+  expect_lacks "picker: an empty state dir shows no list at all" \
+    "$out" "Custom gateways already set up"
+
+  # Two saved: both listed, plus the escape hatch as the last row.
+  sd="$TMPD/gwpick-two/conduck"; rm -rf "$TMPD/gwpick-two"
+  write_gw_fixture "$sd" custom-litellm "LiteLLM" "gpt-4o"
+  write_gw_fixture "$sd" custom-goose "Goose" ""
+  out=$(gw_pick_out "$sd" 1)
+  expect_has "picker: a saved gateway is offered by name" "$out" "1) Goose"
+  expect_has "picker: every saved gateway is offered" "$out" "2) LiteLLM"
+  expect_has "picker: a new gateway is always still reachable" \
+    "$out" "3) A different gateway"
+
+  # Choosing a listed gateway restores the IDENTITY only.
+  out=$(gw_pick_out "$sd" 2)
+  expect_has "picker: choosing a saved gateway restores its id and name" \
+    "$out" "rc=0 id=[custom-litellm] name=[LiteLLM] model=[gpt-4o]"
+  expect_has "picker: the saved address is NOT reused — it is asked again" \
+    "$out" "url=[SENTINEL_URL]"
+  expect_has "picker: the saved auth mode is NOT reused — no token is ever stored" \
+    "$out" "auth=[SENTINEL_AUTH]"
+  expect_has "picker: the saved local port is NOT reused" "$out" "port=[SENTINEL_PORT]"
+  expect_has "picker: choosing a saved gateway says which one it is changing" \
+    "$out" "Changing the saved gateway: LiteLLM"
+
+  # The last row is the new-gateway escape hatch and must set nothing.
+  out=$(gw_pick_out "$sd" 3)
+  expect_has "picker: the last row starts a new gateway with nothing carried over" \
+    "$out" "rc=1 id=[] name=[] model=[]"
+
+  # ONE saved profile must still be offered as a choice. show_qr_pick_profile
+  # legitimately auto-selects a lone profile because --show-code can only mean
+  # "re-show that one"; setup carries the opposite risk — silently adopting the
+  # only saved gateway would edit it when the operator came to add a second.
+  sd="$TMPD/gwpick-one/conduck"; rm -rf "$TMPD/gwpick-one"
+  write_gw_fixture "$sd" custom-solo "Solo" ""
+  out=$(gw_pick_out "$sd" 2)
+  expect_has "picker: a single saved gateway is still offered, never auto-selected" \
+    "$out" "2) A different gateway"
+  expect_has "picker: a single saved gateway can still be declined" \
+    "$out" "rc=1 id=[]"
+
+  # A profile this version cannot parse is NOT listed — a listed row must never
+  # dead-end — but the operator is told it exists, because its id stays reserved
+  # and an invisible reservation is an unexplainable refusal later.
+  sd="$TMPD/gwpick-future/conduck"; rm -rf "$TMPD/gwpick-future"
+  write_profile_fixture "$sd" "custom-future" 2
+  out=$(gw_pick_out "$sd" 1)
+  expect_has "picker: an unreadable saved gateway is counted for the operator" \
+    "$out" "can't read"
+  expect_has "picker: an unreadable saved gateway keeps its name reserved" \
+    "$out" "reserved"
+  expect_lacks "picker: an unreadable saved gateway is never offered as a choice" \
+    "$out" "1) "
+  expect_has "picker: an unreadable saved gateway still allows a genuinely new one" \
+    "$out" "rc=1 id=[]"
+
+  # Mixed readable and unreadable. The readable one must still be pickable — one
+  # unusable file cannot be allowed to hide the gateway beside it — and the escape
+  # row must be numbered past the LISTED rows only, never counting the hidden one,
+  # or the numbering the operator reads disagrees with the numbering that answers.
+  sd="$TMPD/gwpick-mixed/conduck"; rm -rf "$TMPD/gwpick-mixed"
+  write_gw_fixture "$sd" custom-alpha "Alpha" "m1"
+  write_profile_fixture "$sd" "custom-zulu" 2
+  out=$(gw_pick_out "$sd" 1)
+  expect_has "picker: a readable gateway beside an unreadable one is still offered" \
+    "$out" "1) Alpha"
+  expect_has "picker: the escape row is numbered past the listed rows only" \
+    "$out" "2) A different gateway"
+  expect_has "picker: the hidden gateway is counted beside the list" "$out" "1 more"
+  expect_has "picker: the readable gateway beside an unreadable one is selectable" \
+    "$out" "rc=0 id=[custom-alpha]"
+
+  # Corrupt, not merely from the future: unparseable JSON must take the same
+  # not-listed-but-reserved path rather than crashing the picker.
+  sd="$TMPD/gwpick-corrupt/conduck"; rm -rf "$TMPD/gwpick-corrupt"; mkdir -p "$sd"
+  printf '{"schemaVersion": 1, "gateway": {' > "$sd/profile-custom-broken.json"
+  out=$(gw_pick_out "$sd" 1)
+  expect_has "picker: a corrupt saved gateway is counted, not crashed on" \
+    "$out" "can't read"
+  expect_has "picker: a corrupt saved gateway still allows a genuinely new one" \
+    "$out" "rc=1 id=[]"
+}
+
+collide_out() { # collide_out <variant>
+  local dir="$TMPD/collide-$1/conduck"
+  rm -rf "$TMPD/collide-$1"; mkdir -p "$dir"
+  case "$1" in
+    named)      write_gw_fixture "$dir" custom-litellm "LiteLLM" "" ;;
+    unreadable) write_profile_fixture "$dir" "custom-litellm" 2 ;;
+    residue)    : > "$dir/fileserver-custom-litellm.cred" ;;
+  esac
+  (
+    STATE_DIR="$dir"; BOLD=""; RESET=""; DIM=""
+    say()  { printf '%s\n' "$*"; }
+    note() { printf 'note: %s\n' "$*"; }
+    bad()  { printf 'bad: %s\n' "$*"; }
+    report_gateway_id_collision custom-litellm
+  ) 2>&1
+}
+
+test_gateway_id_collision_message() {
+  local out
+  # A refusal the operator cannot act on is a dead end, so all three arms have to
+  # name the two ways forward. The name is not the identity — slug lowercases,
+  # folds punctuation and cuts at 32 characters — so two names that read as
+  # obviously different can land on one id, and the refusal is unintelligible
+  # unless it says which gateway already holds it.
+  out=$(collide_out named)
+  expect_has "collision: the gateway already holding the id is named" "$out" "LiteLLM"
+  expect_has "collision: the real consequence is stated — overwrite, not a second gateway" \
+    "$out" "would overwrite"
+  expect_has "collision: taking over the file server is named too" "$out" "file server"
+  expect_has "collision: both ways forward are offered" "$out" "different name"
+
+  # A setup file a NEWER conduck-connect wrote is hidden from the list, so this
+  # message is the ONLY place the operator learns why the name is refused.
+  out=$(collide_out unreadable)
+  expect_has "collision: an unreadable saved setup explains why it is not listed" \
+    "$out" "can't be read"
+  expect_has "collision: an unreadable saved setup is reserved, not overwritten" \
+    "$out" "reserved"
+  expect_has "collision: an unreadable saved setup still offers both ways forward" \
+    "$out" "different name"
+  # It must not read a display name out of a file it just called unreadable —
+  # that would tell the operator to look for a gateway in a list it is not in.
+  expect_lacks "collision: an unreadable saved setup invents no display name" \
+    "$out" "Fixture"
+
+  # Residue with no profile: the honest wording is "an unfinished run", not
+  # "a gateway you set up" — there is no saved gateway to point at.
+  out=$(collide_out residue)
+  expect_has "collision: leftover state from an unfinished run is named as such" \
+    "$out" "unfinished run"
+  expect_has "collision: the leftover file server is what would be adopted" \
+    "$out" "credential"
+  expect_has "collision: the residue arm still offers both ways forward" \
+    "$out" "different name"
+}
+
 # ================================== $STATE_DIR exposure wording (10-utils) ==
 # $STATE_DIR holds fileserver-<id>.cred/.env and profile-<id>.json. Group/other
 # READ leaks the listing — which gateways this user paired. Group/other WRITE is a
@@ -1208,6 +1490,9 @@ test_menu_saved_profile_usable
 test_menu_no_profile_at_all
 test_menu_unreadable_profile
 test_show_code_picker_reason
+test_gateway_id_reservations
+test_custom_gateway_picker
+test_gateway_id_collision_message
 test_state_dir_exposure_wording
 test_show_code_state_dir_wiring
 

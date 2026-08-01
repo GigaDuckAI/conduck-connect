@@ -9,6 +9,10 @@ GW_AUTH="bearer"   # bearer | none
 GW_TOKEN=""
 GW_MODEL=""        # optional explicit model (generic servers like vLLM/Ollama)
 GW_URL=""          # final https URL
+# True once this run is changing a gateway that already has a saved setup, which
+# freezes GW_ID: the name is display text from then on, and re-deriving an id
+# from an edited name is what creates a duplicate instead of an edit.
+GW_EDITING=false
 
 # A --check-server handoff pairs the ONE address the check graded, so its gateway
 # kind is "custom" no matter what answered — see prepare_setup_from_check. This
@@ -531,6 +535,209 @@ ask_custom_gateway_port() { # sets GW_LOCAL_PORT; 0 value / 10 back / 1 EOF
   done
 }
 
+# Does anything on this machine already answer to this gateway id? The id keys
+# THREE separate things — the saved profile, the file-lane unit, and the file
+# server's credential/env pair — so "is this name taken?" cannot be a single
+# profile test. Two ways an id is occupied without a profile existing:
+#
+#   - a run that failed verification never reaches write_profile, but HAS
+#     already written the credential and the unit. A later gateway that slugs
+#     onto the same id would adopt that live file server — its port, its unit
+#     and its password — believing it built them itself.
+#   - a profile this version cannot parse (one a newer conduck-connect wrote)
+#     is deliberately not offered in the picker, and must still hold its id, or
+#     hiding it becomes the thing that destroys it.
+gateway_id_is_taken() { # gateway_id_is_taken <id> -> 0 when something already owns it
+  local id="$1"
+  [ -n "$id" ] || return 1
+  [ -f "$STATE_DIR/profile-$id.json" ]    && return 0
+  [ -f "$STATE_DIR/fileserver-$id.cred" ] && return 0
+  [ -f "$STATE_DIR/fileserver-$id.env" ]  && return 0
+  if [ "$OS" = "Linux" ]; then
+    [ -f "$HOME/.config/systemd/user/conduck-files-$id.service" ] && return 0
+  else
+    [ -f "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$id.plist" ] && return 0
+  fi
+  return 1
+}
+
+# Say WHICH gateway a refused name collided with, and what the two ways out are.
+# The name is not the identity — `slug` lowercases, folds punctuation and cuts at
+# 32 characters — so two names an operator reads as obviously different can land
+# on one id, and the refusal is unintelligible without naming the occupant.
+report_gateway_id_collision() { # report_gateway_id_collision <id>
+  # Split, not one `local id=… pf=…$id…`: a mid-`local` self-reference is
+  # unbound under `set -u` (the same trap tls_connect_target documents).
+  local id="$1" pf="" n=""
+  pf="$STATE_DIR/profile-$id.json"
+  say ""
+  # Readable-or-not is decided by the SAME validator the picker lists with, not by
+  # whether a name happens to parse out. A profile from a newer conduck-connect
+  # still carries a readable name, so keying on the name would greet an unlisted
+  # setup as though the operator could see it in the list above.
+  if [ -f "$pf" ] && show_qr_validate_profile "$pf"; then
+    n=$(json_get "$pf" "gateway.name")
+    bad "That name belongs to a gateway you already set up: $(safe_display "${n:-$id}" 60)  (id: $id)"
+    say "  Setting it up again from here would overwrite that one's saved setup and take"
+    say "  over its file server — not add a second gateway."
+  elif [ -f "$pf" ]; then
+    bad "A saved gateway already uses the id '$id'."
+    say "  Its saved file can't be read by this version, so it isn't offered in the list"
+    say "  above — but the id stays reserved rather than being overwritten."
+  else
+    bad "An earlier, unfinished run already claimed the id '$id' on this machine."
+    say "  Its file server and credential are still here even though no setup code was"
+    say "  saved, so reusing the id would silently adopt them."
+  fi
+  note "Either pick that gateway from the list to change it, or give this one a different name."
+}
+
+# The custom gateways this machine has already set up. Without this list the only
+# way to reach an existing one is to retype its name so it slugs to the same id,
+# and a typo builds a SECOND gateway instead — its own unit, port, credential and
+# profile — while the first keeps running, untouched and unmentioned.
+#
+# Returns 0 with GW_ID/GW_NAME/GW_MODEL restored (change an existing gateway), or
+# 1 with nothing set (a new one). Corrupt and future-schema profiles are NOT
+# offered — show_qr_validate_profile is the same validator --show-code uses, so a
+# listed row can never dead-end a moment after it is chosen — but they are counted
+# out loud, because their ids stay reserved and an operator who cannot see them
+# cannot understand why a name is later refused.
+pick_existing_custom_gateway() { # 0 = editing (globals set) / 1 = new gateway
+  local pf cand=() hidden=0
+  for pf in "$STATE_DIR"/profile-custom-*.json; do
+    [ -e "$pf" ] || continue                 # no matches → the literal glob; skip it
+    if show_qr_validate_profile "$pf"; then cand+=("$pf"); else hidden=$((hidden+1)); fi
+  done
+  if [ ${#cand[@]} -eq 0 ]; then
+    [ "$hidden" = "0" ] && return 1          # nothing saved → today's flow, unchanged
+    say ""
+    note "This machine has $hidden saved gateway setup(s) this version can't read, so they aren't"
+    note "listed. They keep their names reserved; updating conduck-connect is what recovers them."
+    return 1
+  fi
+  say ""
+  say "  ${BOLD}Custom gateways already set up on this machine:${RESET}"
+  local i=1 n u
+  for pf in "${cand[@]}"; do
+    n=$(json_get "$pf" "gateway.name"); u=$(json_get "$pf" "gateway.url")
+    # safe_display on both: these come off disk as free text an earlier run
+    # accepted at a name prompt, and this is a terminal.
+    printf '    %d) %s — %s\n' "$i" "$(safe_display "${n:-?}" 60)" "$(safe_display "${u:-?}" 80)"
+    i=$((i+1))
+  done
+  printf '    %d) A different gateway — set up a new one\n' "$i"
+  [ "$hidden" = "0" ] || note "($hidden more can't be read by this version and aren't listed; their names stay reserved.)"
+  local pick
+  while true; do
+    # {1,3} length-bounds the input so the numeric compare can't overflow bash 3.2's intmax.
+    pick=$(require_choice "Which one? Choose 1-$i" '^[0-9]{1,3}$' "nav.custom_gateway_pick") \
+      || die "$NO_ANSWER"
+    [ "$pick" = "q" ] && quit_run
+    { [ "$pick" -ge 1 ] && [ "$pick" -le "$i" ]; } 2>/dev/null && break
+    warn "Please enter a number between 1 and $i."
+  done
+  [ "$pick" = "$i" ] && return 1
+  pf="${cand[$((pick-1))]}"
+  GW_ID=$(json_get "$pf" "gateway.id")
+  [ -n "$GW_ID" ] || return 1                # no id to hold on to → treat as new
+  GW_NAME=$(json_get "$pf" "gateway.name")
+  GW_MODEL=$(json_get "$pf" "gateway.model")
+  # The saved URL, local port and auth mode are deliberately NOT restored.
+  # The address because a quick tunnel's hostname is reassigned every time
+  # cloudflared restarts, so the saved one is dead far more often than not, and a
+  # Tailscale or Cloudflare address restored without its transport would enter the
+  # wrong exposure path. The auth mode because the profile holds no token by
+  # design, so bearer has to be re-established at the hidden prompt anyway.
+  ok "Changing the saved gateway: $(safe_display "${GW_NAME:-$GW_ID}" 60)  (id: $GW_ID)"
+  note "I'll ask for its address and token again — the address can have moved, and the"
+  note "token is never saved."
+  return 0
+}
+
+# Auth for a custom gateway, taken at ONE hidden prompt rather than a visible
+# [y/N] followed by a hidden one. A question whose own wording is "bearer token /
+# API key" invites a paste, and an echoing prompt shows what it receives: the
+# token was printed, refused as not-a-yes-or-no, and left in the terminal's
+# scroll-back — one line before the hidden prompt that would have taken it
+# safely. Asking for the secret directly gives the paste exactly one place to
+# land, and that place shows nothing.
+#
+# Keyless stays EXPLICIT, which is the fail-closed-auth invariant the app holds
+# too: an empty answer opens a question, never settles one, and only an
+# affirmative confirm sets auth=none. EOF is not an empty answer — ask_secret
+# returns nonzero for it, so a redirected run dies instead of reading "nobody
+# was there to answer" as "this gateway needs no token".
+ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
+  # A dry run must never solicit a real secret, so it takes the mode as a
+  # bounded choice instead. `<token>` is the same placeholder the rest of the
+  # dry-run path already carries; nothing is stored either way.
+  if $DRY_RUN; then
+    say "  Does this server require a token (API key) on every request?"
+    say "    1) Yes — it requires a token"
+    say "    2) No  — it is keyless"
+    local c; c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' "gateway.custom.has_auth") \
+      || die "$NO_ANSWER"
+    [ "$c" = "q" ] && quit_run
+    if [ "$c" = "1" ]; then
+      GW_AUTH="bearer"; GW_TOKEN="<token>"
+      note "(dry-run: a real run asks for the token at a hidden prompt)"
+    else
+      GW_AUTH="none"; GW_TOKEN=""
+      # The same two cautions the real run gives. A plan that silently omits them
+      # is how keyless looks free of consequence right up until it is applied.
+      note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
+      note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
+    fi
+    return 0
+  fi
+  while true; do
+    say "  If this server needs a token (API key), paste it now — nothing appears as you type."
+    GW_TOKEN=$(ask_secret "Token" "this server is keyless") || die "$NO_ANSWER"
+    # An all-whitespace answer is a fumbled paste, not a token and not a
+    # deliberate Enter. Letting it through mints a setup code the app parses and
+    # then refuses to save, which strands the operator a step later than here.
+    case "$GW_TOKEN" in
+      *[![:space:]]*) ;;
+      ?*) warn "That was only whitespace. Paste the token again, or press Enter for keyless."
+          GW_TOKEN=""; continue ;;
+    esac
+    if [ -n "$GW_TOKEN" ]; then
+      GW_AUTH="bearer"
+      ok "Token held for this run — it rides in the setup code and is never written to the saved profile."
+      return 0
+    fi
+    note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
+    note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
+    if confirm "  Confirm this server needs NO token?" "gateway.custom.has_auth"; then
+      GW_AUTH="none"; GW_TOKEN=""
+      return 0
+    fi
+    say ""; note "↩ Let's take the token again."
+  done
+}
+
+# The model of a gateway being CHANGED, as a bounded three-way choice rather than
+# a prompt with a default. `ask` and `ask_default` can return their default or a
+# typed value but never emptiness, so "keep the saved model" and "clear it and let
+# the server choose" would collapse onto the same keystroke — and a stale pinned
+# model 404s every turn without ever saying so.
+choose_saved_model() { # reads + rewrites GW_MODEL
+  say ""
+  say "  This gateway last used the model: $(safe_display "$GW_MODEL" 200)"
+  say "    1) Keep it"
+  say "    2) Use a different model name"
+  say "    3) Clear it — let the server pick"
+  local c; c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' "gateway.custom.model") \
+    || die "$NO_ANSWER"
+  [ "$c" = "q" ] && quit_run
+  case "$c" in
+    1) : ;;                                              # GW_MODEL already holds it
+    2) GW_MODEL=$(ask "  Model name" "" "let the server pick") ;;
+    3) GW_MODEL="" ;;
+  esac
+}
+
 review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
   local address auth model reply
   if [ -n "$GW_URL" ]; then address="$GW_URL"
@@ -541,8 +748,17 @@ review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
   else model="Server/app default (no model fixed in the setup code)"; fi
 
   say ""
-  say "  ${BOLD}Review this gateway${RESET}"
+  if $GW_EDITING; then
+    say "  ${BOLD}Review this gateway${RESET}  ${DIM}(updating a gateway you already set up)${RESET}"
+  else
+    say "  ${BOLD}Review this gateway${RESET}  ${DIM}(new — nothing on this machine uses this name yet)${RESET}"
+  fi
   say "    Name:           $(safe_display "$GW_NAME" 200)"
+  # The id, not the name, is what the saved setup, the file-lane service and its
+  # credential are filed under. Shown once, here, because it is derived from the
+  # name by a lossy rule (lowercased, punctuation folded, cut at 32 characters)
+  # and is otherwise invisible until two gateways quietly share one.
+  say "    Id:             $GW_ID"
   say "    Address:        $(safe_display "$address" 4096)"
   say "    Authentication: $auth"
   say "    Model:          $model"
@@ -567,8 +783,27 @@ configure_generic() {
     GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
     GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""
 
-    GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
-    GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
+    GW_EDITING=false
+    if pick_existing_custom_gateway; then GW_EDITING=true; fi
+
+    if $GW_EDITING; then
+      # The name is DISPLAY only from here on: re-slugging an edited name would
+      # mint a fresh id and rebuild the exact duplicate this picker exists to
+      # prevent — and then the one thing the operator came here to fix, a
+      # mistyped name, would be the one thing they cannot fix.
+      GW_NAME=$(ask "  A short name for it (shown in the app)" "$GW_NAME")
+    else
+      GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
+      GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
+      # A new gateway may never land on an occupied id. Warning and continuing is
+      # not enough: the review screen's default is Enter, the file lane adopts the
+      # occupant's credential before any profile is written, and write_profile
+      # replaces the file atomically at the end — by then all three are gone.
+      if gateway_id_is_taken "$GW_ID"; then
+        report_gateway_id_collision "$GW_ID"
+        continue
+      fi
+    fi
     if confirm "  Does it already have an https:// URL?" "gateway.custom.has_https"; then
       GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
       apply_gateway_url_normalization
@@ -582,22 +817,18 @@ configure_generic() {
       [ "$port_rc" = "0" ] || die "Need the local port (or an https URL)."
     fi
     GW_HEALTH_PATH=""   # no portable health endpoint on arbitrary servers
-    if confirm "  Does it require a bearer token / API key?" "gateway.custom.has_auth"; then
-      GW_AUTH="bearer"
-      if $DRY_RUN; then note "(dry-run: would prompt for the token)"; GW_TOKEN="<token>"
-      else GW_TOKEN=$(ask_secret "Paste it (hidden)" "stop; you said this gateway requires a token"); [ -n "$GW_TOKEN" ] || die "Empty token."; fi
+    ask_custom_gateway_auth
+    if $GW_EDITING && [ -n "$GW_MODEL" ]; then
+      choose_saved_model
     else
-      GW_AUTH="none"; GW_TOKEN=""
-      note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
-      note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
-    fi
-    say "  Some servers (Ollama, vLLM, LiteLLM without a default) need the app to"
-    say "  name a model in every request."
-    local model_default=""; $DRY_RUN || model_default=$(probe_single_model "$GW_LOCAL_PORT")
-    if [ -n "$model_default" ]; then
-      GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
-    else
-      GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
+      say "  Some servers (Ollama, vLLM, LiteLLM without a default) need the app to"
+      say "  name a model in every request."
+      local model_default=""; $DRY_RUN || model_default=$(probe_single_model "$GW_LOCAL_PORT")
+      if [ -n "$model_default" ]; then
+        GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
+      else
+        GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
+      fi
     fi
 
     review_custom_gateway

@@ -248,7 +248,8 @@ doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stder
     fi
     case "$reply" in
       [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." >&2 ;;
-      *) warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." >&2 ;;
+      *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
+         warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." >&2 ;;
     esac
   done
 }

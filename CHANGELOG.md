@@ -4,6 +4,59 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **A custom gateway's token is asked for at a hidden prompt, and nowhere else.**
+  Setup asked `Does it require a bearer token / API key? [y/N]` and only then, on
+  a yes, opened the hidden prompt that takes the secret safely. A question whose
+  own wording names the thing being requested invites the paste it is not built
+  to receive: the answer arrives at an echoing `read`, is printed, is refused as
+  not-a-yes-or-no, and stays in the terminal's scroll-back — five lines before
+  the code warns that over SSH scroll-back is exactly what survives. There is now
+  one prompt, it is hidden, and it is the token itself; an empty answer is a
+  question rather than a conclusion, so keyless still has to be confirmed out
+  loud and the fail-closed rule that a missing token is never read as "no token
+  required" is unchanged. Input that ends without an answer still stops the run
+  rather than inferring keyless from nobody being there. A dry run takes the mode
+  as a numbered choice and never solicits a real secret.
+- **A credential-shaped answer at any question that refuses it now says so.** The
+  prompts that reject input and ask again — yes/no, numbered menus, addresses, and
+  the press-Enter-when-done step — recognise an answer that looks pasted rather
+  than typed and name the exposure once: it was shown, it is in scroll-back, and
+  it should be rotated if it was real. The check is shape only, and the value is
+  never repeated back; the whole defect is one copy of a secret on screen, and
+  echoing it for clarity would make two.
+- **A quick tunnel is no longer asked whether it is public.** Exposure asked the
+  operator to classify an address the wizard can classify itself, and the answer
+  is not cosmetic: `private` is what switches off the refusal to publish a gateway
+  with no token. A `cloudflared tunnel --url` hostname has no private variant, so
+  the question could only ever add a way to get it wrong. It is now stated instead
+  of asked, exactly as a *named* Cloudflare tunnel already was. Reach that the
+  wizard genuinely cannot derive still takes an explicit 1/2 with no Enter default.
+  A keyless gateway on a quick tunnel now stops, and `--allow-keyless-public`
+  remains the one deliberate override.
+- **A quick-tunnel address carrying a query or fragment is recognised as one.**
+  The host test ended the address at the first `/` only, so
+  `https://x.trycloudflare.com?a=1` and `…#frag` fell through it — and the two
+  callers that pass an address exactly as the operator typed it, the file lane and
+  the pairing reminder, were the ones that lost the rotation warning. The
+  authority now ends at the first `/`, `?` or `#`, the same cut the profile
+  validator makes.
+- **Setting up a custom gateway again changes it instead of duplicating it.** A
+  gateway is filed under an id derived from its display name, and that id also
+  names its file-service and the credential that service reads. Nothing ever
+  looked a name up — a name that slugged differently by one character built a
+  second gateway with its own port, unit, credential and saved setup while the
+  first kept running, unmentioned; a name that slugged the *same* silently took
+  over an existing gateway's file server and then overwrote its saved setup.
+  Setup now lists the custom gateways already on the machine and asks which one
+  this is, and picking one freezes its id — the name becomes display text, so
+  correcting a typo corrects the name instead of creating the duplicate the list
+  exists to prevent. A new gateway may not land on an id already in use: setup
+  says which gateway holds it and offers the two ways forward. "In use" counts
+  more than a readable saved setup — a run that failed before saving still leaves
+  the service and credential behind, and a setup file a newer version wrote is not
+  offered in the list but keeps its name reserved rather than being overwritten by
+  the hiding. The address is always asked again rather than restored, because a
+  quick tunnel's hostname is reassigned every time it restarts.
 - **A 5xx on a keyless gateway is no longer reported as a server fault when the
   server is really asking for a credential.** Some servers mishandle a *missing*
   credential inside their own error path and answer 5xx where they mean 401.

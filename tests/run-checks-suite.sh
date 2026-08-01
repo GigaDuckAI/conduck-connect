@@ -965,10 +965,19 @@ run_cli_rejection_case() { # run_cli_rejection_case <table-row>
 
 run_direct_setup_case() {
   local name="direct-setup" rc=0
+  local home="$TMP/direct-setup-home" state="$TMP/direct-setup-state"
   # EOF intentionally stops at the first required local-port answer. Reaching
   # Step 2 proves --setup bypassed the welcome menu; no network request or
   # mutation occurs.
-  printf '3\n' | TERM=dumb bash "$SCRIPT" --setup --dry-run \
+  #
+  # HOME and XDG_CONFIG_HOME are isolated because Step 2 reads the state
+  # directory to offer the gateways already set up on this machine. Without it
+  # this case grades a different question on a developer laptop that has paired
+  # a gateway than on a clean runner, and the difference is invisible until the
+  # laptop is the thing that fails.
+  mkdir -p "$home" "$state"
+  printf '3\n' | env HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
+    bash "$SCRIPT" --setup --dry-run \
     > "$TMP/doctor.out" 2>&1 || rc=$?
   if [ "$rc" != "1" ]; then
     fail_case "$name" "runtime EOF exited $rc, expected 1"; return
@@ -1168,7 +1177,10 @@ run_custom_review_back_case() {
   local home="$TMP/custom-review-home" state="$TMP/custom-review-state"
   mkdir -p "$home" "$state"
   PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
-  pty_run 10 $'Wrong gateway\nn\n1111\nn\n\nb\nCorrected gateway\nn\n2222\nn\n\n\nq\n' \
+  # Per pass: name, n = no https URL, the port, 2 = keyless (the auth question is
+  # a numbered choice under --dry-run, which never solicits a real token), Enter
+  # = no model, then b / Enter at the review. A final q stops in Step 3.
+  pty_run 10 $'Wrong gateway\nn\n1111\n2\n\nb\nCorrected gateway\nn\n2222\n2\n\n\nq\n' \
     --generic --dry-run > "$TMP/doctor.out" 2>&1 || rc=$?
 
   review_count=$(grep -c 'Review this gateway' "$TMP/doctor.out")
@@ -3047,7 +3059,12 @@ run_check_continue_yes_case() {
   # Menu 2 → URL → yes → default name → b at exposure. The checked URL/token
   # must be reused, so there is no second gateway or auth question.
   input=$'2\nhttp://127.0.0.1:'"$PORT"$'\ny\n\nb\n'
-  PTY_ENV=(CONDUCK_TOKEN="$TOKEN")
+  # Isolated state: the handoff asks which saved gateway this is before exposure,
+  # so a machine with one paired would answer a list here instead of the name
+  # prompt this input assumes.
+  local home="$TMP/check-continue-home" state="$TMP/check-continue-state"
+  mkdir -p "$home" "$state"
+  PTY_ENV=(CONDUCK_TOKEN="$TOKEN" HOME="$home" XDG_CONFIG_HOME="$state")
   pty_run 30 "$input" > "$TMP/doctor.out" 2>&1 || rc=$?
   stop_fixture
   if [ "$rc" != "0" ] ||
@@ -3075,7 +3092,12 @@ run_long_model_handoff_case() {
   start_fixture require-long-model || {
     fail_case "$name" "fixture failed to start"; stop_fixture; return
   }
-  PTY_ENV=(CONDUCK_TOKEN="$TOKEN")
+  # Isolated state, same reason as check-pass-continue-setup: the handoff asks
+  # which saved gateway this is, and a machine with one paired would be shown a
+  # list where this input expects the name prompt.
+  local lm_home="$TMP/long-model-home" lm_state="$TMP/long-model-state"
+  mkdir -p "$lm_home" "$lm_state"
+  PTY_ENV=(CONDUCK_TOKEN="$TOKEN" HOME="$lm_home" XDG_CONFIG_HOME="$lm_state")
   pty_run 30 $'y\n\nb\n' --check-server "http://127.0.0.1:$PORT" \
     > "$TMP/doctor.out" 2>&1 || rc=$?
   stop_fixture
@@ -3110,9 +3132,14 @@ note() { :; }
 GW_URL="https://gateway.example.test"
 GW_AUTH="bearer"
 GW_TOKEN="secret"
-GW_NAME=""
+# The name and id are settled by resolve_setup_from_check_identity, which runs
+# later (under the setup lock) and is not part of this extraction. Standing them
+# up here keeps the payload a realistic one — a custom gateway with no name is a
+# code the app would reject — so the model assertion below grades the model
+# rather than a payload that was never viable.
+GW_NAME="My gateway"
 GW_KIND=""
-GW_ID=""
+GW_ID="custom-my-gateway"
 GW_MODEL=""
 GW_LOCAL_PORT=""
 GW_HEALTH_PATH=""
@@ -3136,6 +3163,315 @@ raise SystemExit(0 if p["gateway"].get("model") == os.environ["EXPECTED_MODEL"] 
 '; then
     fail_case "$name" "pairing JSON changed or truncated the long model id"; return
   fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Drive the PRODUCTION reach question with every consequence stubbed. No PTY on
+# purpose: the only prompt on this path is require_choice, and require_choice is
+# the tripwire — a harness that had to TYPE an answer could not tell "never
+# asked" from "asked and answered".
+#
+# The tripwire answers 2 = Private, which is the load-bearing detail. SCOPE can
+# then only come out "public" from the derived branch, never from an answer, so
+# a green quick-tunnel arm cannot pass vacuously: delete the branch and the arm
+# reports private, which is exactly the silent-downgrade this case exists for.
+# The marker goes to STDERR because require_choice runs inside $( ) — on stdout
+# it would BE the answer.
+# Args: <function-source> <gateway-url> <gw-auth> <allow-keyless-public>.
+run_scope_choice_isolated() {
+  env FUNCS="$1" GWU="$2" AUTH="$3" AKP="$4" bash -c '
+eval "$FUNCS"
+BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""
+NO_ANSWER="no answer"
+say()  { printf "%s\n" "$*"; }
+note() { printf "%s\n" "$*"; }
+ok()   { printf "OK %s\n" "$*"; }
+bad()  { printf "BAD %s\n" "$*"; }
+warn() { printf "WARN %s\n" "$*"; }
+die()  { printf "DIE %s\n" "$*"; exit 7; }
+quit_run()             { printf "SIDE_EFFECT quit\n"; exit 8; }
+explain_scope_choice() { printf "SIDE_EFFECT explain\n" >&2; }
+require_choice()       { printf "SIDE_EFFECT require_choice\n" >&2; printf "2\n"; }
+SCOPE=""
+GW_URL="$GWU"
+GW_AUTH="$AUTH"
+ALLOW_KEYLESS_PUBLIC="$AKP"
+scope_choice
+printf "SCOPE=%s\n" "$SCOPE"
+keyless_public_guard
+printf "REACHED_END\n"
+' 2>&1
+}
+
+# A `cloudflared tunnel --url` address is public by construction — there is no
+# private variant of one — so asking the operator to classify it does not gather
+# information, it only offers them a way to switch the keyless-public guard off
+# by answering wrongly. The wizard already knows the answer, and menu option 3
+# sets the precedent: a NAMED Cloudflare tunnel hardcodes SCOPE=public without
+# asking. Reach it CANNOT derive is still an explicit 1/2 with no Enter default.
+#
+# Two arms carry the regression weight. The ?query and #fragment arms are the
+# guard on the authority cut inside is_quick_tunnel_url: end the authority at /
+# alone and both URLs fall through to the question, which is the failure this
+# whole case is about, wearing a URL that looks fine. The near-miss host arm is
+# the other direction — it must STILL be asked, or the derivation has become a
+# substring match. It is the same literal used by the pairing-code case.
+run_scope_quick_tunnel_case() {
+  local name="quick-tunnel-reach-is-not-a-question" funcs scope_src out rc fn
+  local arm url auth akp scope asked exprc guard
+
+  # Truncated before the structural guards below, not after: those two fire on a
+  # stale artifact, and fail_case tails this file unconditionally.
+  : > "$TMP/doctor.out"
+
+  funcs=$(extract_funcs scope_choice is_quick_tunnel_url keyless_public_guard)
+  for fn in scope_choice is_quick_tunnel_url keyless_public_guard; do
+    if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
+      fail_case "$name" "could not extract $fn from the release artifact"; return
+    fi
+  done
+
+  # One host-matching rule, not two. scope_choice must ASK the shared predicate;
+  # a copy of the *.trycloudflare.com suffix inside scope_choice would drift from
+  # the one in is_quick_tunnel_url and the two answers would disagree.
+  scope_src=$(extract_funcs scope_choice)
+  if ! printf '%s\n' "$scope_src" | grep -qF 'is_quick_tunnel_url'; then
+    fail_case "$name" "scope_choice does not derive reach from the shared quick-tunnel predicate"; return
+  fi
+  if printf '%s\n' "$scope_src" | grep -qF 'trycloudflare'; then
+    fail_case "$name" "scope_choice matches the quick-tunnel host itself instead of calling the shared predicate"; return
+  fi
+
+  # arm|gateway-url|gw-auth|allow-keyless-public|expected SCOPE|asked|exit|guard: none · die · warn
+  local arms="quick-plain|https://x.trycloudflare.com|bearer|false|public|no|0|none
+quick-query|https://x.trycloudflare.com?a=1|bearer|false|public|no|0|none
+quick-fragment|https://x.trycloudflare.com#frag|bearer|false|public|no|0|none
+quick-uppercase|https://X.TryCloudflare.com|bearer|false|public|no|0|none
+near-miss-host|https://not-really.trycloudflare.com.example.test|bearer|false|private|yes|0|none
+ordinary-host|https://ai.example.com|bearer|false|private|yes|0|none
+quick-keyless-refused|https://x.trycloudflare.com|none|false|public|no|7|die
+quick-keyless-overridden|https://x.trycloudflare.com|none|true|public|no|0|warn"
+
+  while IFS='|' read -r arm url auth akp scope asked exprc guard; do
+    [ -n "$arm" ] || continue
+    rc=0
+    out=$(run_scope_choice_isolated "$funcs" "$url" "$auth" "$akp") || rc=$?
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+
+    if [ "$rc" != "$exprc" ]; then
+      fail_case "$name" "[$arm] exit $rc, expected $exprc"; return
+    fi
+    if ! printf '%s\n' "$out" | grep -qF "SCOPE=$scope"; then
+      fail_case "$name" "[$arm] reach came out as something other than $scope"; return
+    fi
+
+    # Two independent probes of the same fact, because either one alone could be
+    # defeated on its own: the prompt function was never entered, AND the choice
+    # the operator would have read was never printed.
+    if [ "$asked" = "no" ]; then
+      if printf '%s\n' "$out" | grep -qF 'SIDE_EFFECT require_choice'; then
+        fail_case "$name" "[$arm] an address the wizard can classify was put to the operator anyway"; return
+      fi
+      if printf '%s\n' "$out" | grep -qF '2) Private'; then
+        fail_case "$name" "[$arm] the public/private menu was printed for a derived answer"; return
+      fi
+      # …and it says why, or the operator reads an unexplained PUBLIC verdict.
+      if ! printf '%s\n' "$out" | grep -qiF 'quick tunnel' ||
+         ! printf '%s\n' "$out" | grep -qiF 'public'; then
+        fail_case "$name" "[$arm] reach was derived silently — the screen never named the quick tunnel or the verdict"; return
+      fi
+    else
+      if ! printf '%s\n' "$out" | grep -qF 'SIDE_EFFECT require_choice'; then
+        fail_case "$name" "[$arm] reach this wizard cannot know was decided without asking"; return
+      fi
+      if ! printf '%s\n' "$out" | grep -qF '2) Private'; then
+        fail_case "$name" "[$arm] the reach question stopped offering the two answers"; return
+      fi
+    fi
+
+    # A derived PUBLIC is worth nothing if it does not reach the guard it exists
+    # to arm. This is the consequence arm: refusal, not a warning the run ignores.
+    case "$guard" in
+      die)
+        if ! printf '%s\n' "$out" | grep -qF 'DIE Refusing to publish a keyless gateway.'; then
+          fail_case "$name" "[$arm] a keyless gateway on a public quick tunnel was not refused"; return
+        fi
+        if printf '%s\n' "$out" | grep -qF 'REACHED_END'; then
+          fail_case "$name" "[$arm] the run continued past the keyless refusal"; return
+        fi ;;
+      warn)
+        if printf '%s\n' "$out" | grep -qF 'DIE '; then
+          fail_case "$name" "[$arm] --allow-keyless-public no longer overrides the refusal"; return
+        fi
+        if ! printf '%s\n' "$out" | grep -qF 'allow-keyless-public' ||
+           ! printf '%s\n' "$out" | grep -qF 'REACHED_END'; then
+          fail_case "$name" "[$arm] the deliberate override ran without saying what it published"; return
+        fi ;;
+      none)
+        if printf '%s\n' "$out" | grep -qF 'DIE ' ||
+           ! printf '%s\n' "$out" | grep -qF 'REACHED_END'; then
+          fail_case "$name" "[$arm] a gateway with a token was stopped by the keyless guard"; return
+        fi ;;
+    esac
+  done <<ARMS
+$arms
+ARMS
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A credential pasted at a y/n prompt is already on screen; the only thing still
+# in the wizard's control is whether it makes a SECOND copy while explaining the
+# mistake. So the value must be named as a credential and never reprinted.
+#
+# The two transports are the whole design of this case. Under a PIPE `read` does
+# not echo, so the fixture token has no legitimate reason to appear at all and
+# any occurrence is one the script itself wrote — zero is the assertion. Under a
+# real terminal the line discipline echoes what is typed, so exactly ONE is the
+# honest floor and a second would be the script adding its own copy. Each
+# transport also pins the branch of the caution that belongs to it: the warning
+# must not tell a piped session the value is in its scroll-back.
+#
+# The fixture token is deliberately shaped, obviously fake, and never a real
+# provider key — this file is committed, and a realistic-looking secret in a test
+# is how a scanner alert becomes routine and gets ignored.
+run_secret_shape_case() {
+  local name="a-pasted-credential-is-named-at-the-prompt-that-refused-it"
+  local secret="sk-fixture-000000000000000000000000"
+  local funcs harness out rc fn hits tok_line caution_line
+  local want value
+
+  # Truncated before the extraction guards, which fail_case tails.
+  : > "$TMP/doctor.out"
+
+  funcs=$(extract_funcs looks_like_a_secret warn_answer_looked_like_a_secret confirm)
+  for fn in looks_like_a_secret warn_answer_looked_like_a_secret confirm; do
+    if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
+      fail_case "$name" "could not extract $fn from the release artifact"; return
+    fi
+  done
+
+  # One caution, written once and called from every prompt — not re-typed per
+  # prompt, where one copy quietly loses the rotate advice.
+  if ! printf '%s\n' "$funcs" | grep -qF 'warn_answer_looked_like_a_secret'; then
+    fail_case "$name" "confirm does not route a credential-shaped answer to the shared caution"; return
+  fi
+
+  harness='
+eval "$FUNCS"
+BOLD=""; DIM=""; RESET=""; YELLOW=""; RED=""; GREEN=""
+warn()           { printf "WARN %s\n" "$*"; }
+explain_prompt() { printf "SIDE_EFFECT explain %s\n" "$1"; }
+quit_run()       { printf "SIDE_EFFECT quit\n"; exit 8; }
+confirm "Fixture confirmation" "fixture.secret"
+printf "CONFIRM_RC=%s\n" "$?"
+'
+
+  # (a) Piped. Nothing echoes, so every occurrence of the token is the script.
+  rc=0
+  out=$(printf '%s\nn\n' "$secret" | env FUNCS="$funcs" bash -c "$harness" 2>&1) || rc=$?
+  printf -- '--- pasted secret, piped ---\n%s\n' "$out" >> "$TMP/doctor.out"
+
+  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'CONFIRM_RC=1'; then
+    fail_case "$name" "the piped prompt did not recover and take the following answer"; return
+  fi
+  hits=$(printf '%s\n' "$out" | grep -o -F -- "$secret" | wc -l | tr -d ' ')
+  if [ "$hits" != "0" ]; then
+    fail_case "$name" "the wizard reprinted the pasted credential $hits time(s) — the caution must never echo the value"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'looked like a token or password' ||
+     ! printf '%s\n' "$out" | grep -qF 'If it was real, rotate it.'; then
+    fail_case "$name" "a credential-shaped answer was refused without naming it as a credential"; return
+  fi
+  # The branch that belongs to a pipe. Telling a piped session the value is in its
+  # scroll-back states something the operator can see is untrue, which is how they
+  # learn to skip the next warning.
+  if ! printf '%s\n' "$out" | grep -qF 'Assume this session may have recorded it.' ||
+     printf '%s\n' "$out" | grep -qF 'It was shown as you typed it'; then
+    fail_case "$name" "the piped caution claimed a terminal echo that never happened"; return
+  fi
+
+  # (b) A real terminal. The tty echoes once; anything above one is the script.
+  rc=0
+  out=$(env -u CI TERM=dumb FUNCS="$funcs" \
+      python3 "$PTY_RUN" 10 "$secret"$'\nn\n' bash -c "$harness" 2>&1) || rc=$?
+  printf -- '--- pasted secret, real terminal ---\n%s\n' "$out" >> "$TMP/doctor.out"
+
+  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'CONFIRM_RC=1'; then
+    fail_case "$name" "the terminal prompt did not recover and take the following answer"; return
+  fi
+  hits=$(printf '%s\n' "$out" | grep -o -F -- "$secret" | wc -l | tr -d ' ')
+  if [ "$hits" != "1" ]; then
+    fail_case "$name" "the credential appears $hits time(s) on a real terminal; exactly 1 is the tty echo and any more is a copy the wizard added"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'looked like a token or password' ||
+     ! printf '%s\n' "$out" | grep -qF 'If it was real, rotate it.'; then
+    fail_case "$name" "a credential-shaped answer was refused without naming it as a credential"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'It was shown as you typed it' ||
+     printf '%s\n' "$out" | grep -qF 'Assume this session may have recorded it.'; then
+    fail_case "$name" "the terminal caution did not point at the scroll-back the value is actually in"; return
+  fi
+  # Ordering: the caution has to sit under the value it is about. Weaker than the
+  # count above — pty-run.py writes the whole input up front, so the echo lands
+  # early no matter what — but it still catches a caution emitted before the read.
+  tok_line=$(printf '%s\n' "$out" | grep -n -F -- "$secret" | head -1 | cut -d: -f1)
+  caution_line=$(printf '%s\n' "$out" | grep -n -F 'looked like a token or password' | head -1 | cut -d: -f1)
+  if [ -z "$tok_line" ] || [ -z "$caution_line" ] || [ "$caution_line" -le "$tok_line" ]; then
+    fail_case "$name" "the caution did not follow the answer it is about"; return
+  fi
+
+  # (c)+(d) The predicate itself. Shape only — length and character mix, never a
+  # known token prefix, because a prefix list only ever recognises the providers
+  # someone remembered to add.
+  #
+  # want|value
+  local arms="fire|$secret
+fire|a3f9c1e40b7d2856f04a9c3e71b58d26
+fire|ghp_16CharsAndMore123
+quiet|y
+quiet|yes please
+quiet|back
+quiet|11434
+quiet|https://ai.example.com:8443
+quiet|HTTPS://Example123.com/v1
+quiet|abcdef123456789
+fire|anthropic/claude-sonnet-4-5"
+
+  out=$(env FUNCS="$funcs" ARMS="$arms" bash -c '
+eval "$FUNCS"
+printf "%s\n" "$ARMS" | while IFS="|" read -r want value; do
+  [ -n "$want" ] || continue
+  if looks_like_a_secret "$value"; then got=fire; else got=quiet; fi
+  printf "PREDICATE %s|%s|%s\n" "$want" "$got" "$value"
+done
+' 2>&1)
+  printf -- '--- secret-shape predicate ---\n%s\n' "$out" >> "$TMP/doctor.out"
+
+  while IFS='|' read -r want value; do
+    [ -n "$want" ] || continue
+    if ! printf '%s\n' "$out" | grep -qF "PREDICATE $want|$want|$value"; then
+      fail_case "$name" "looks_like_a_secret should $want on '$value' and did not"; return
+    fi
+  done <<ARMS
+$arms
+ARMS
+
+  # The last arm above is a KNOWN false alarm, asserted deliberately rather than
+  # left to be discovered: a model id like anthropic/claude-sonnet-4-5 is long,
+  # spaceless and carries digits, so the shape rule fires on it. That is the
+  # accepted trade — a false alarm costs three lines of advice, a miss leaves a
+  # live token in someone's scroll-back. If a future change tightens the
+  # predicate, this arm is the one to update, on purpose, in the same commit —
+  # never by quietly deleting it.
+  # Non-vacuous: the uppercase URL arm is the case-insensitivity guard. Test the
+  # scheme before lowercasing and HTTPS://Example123.com/v1 survives it, then
+  # trips the digit rule and a plain address gets refused as a credential.
+  # The 15-character arm sits one character under the length floor: drop the floor
+  # and it fires, so the floor is really being measured and not assumed.
 
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -4284,6 +4620,14 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" prompt-controls-and-defaults "*) true ;; *) false ;; esac; then
   run_prompt_controls_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" quick-tunnel-reach-is-not-a-question "*) true ;; *) false ;; esac; then
+  run_scope_quick_tunnel_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" a-pasted-credential-is-named-at-the-prompt-that-refused-it "*) true ;; *) false ;; esac; then
+  run_secret_shape_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" custom-review-back-corrects-port "*) true ;; *) false ;; esac; then
