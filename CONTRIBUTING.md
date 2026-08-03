@@ -106,6 +106,20 @@ not a bug fix — it needs prior discussion in an issue.
 - **The vendored Nayuki QR block is third-party** (Project Nayuki, MIT) and
   stays **unmodified**. CI verifies it against a pinned checksum and asserts it
   imports only the Python standard library; a change there fails the build.
+- **No self-signed path, and no certificate pinning.** The connector will not set
+  a user up on a certificate their devices do not already trust. Two independent
+  reasons, and both are permanent: App Transport Security lets an Apple app make
+  certificate evaluation stricter and never looser, so the app refuses such a
+  gateway below its own code; and the pairing payload carries no certificate
+  field by design, because a setup code is entirely attacker-supplied — a pin is
+  something a human types into the app, never something a tool hands it. So the
+  "I already run my own HTTPS" answer is a **gate**, not a preference: it
+  verifies, and on failure it stops and names the three free routes to a trusted
+  certificate. There is no accept-anyway override, and one cannot be added. The
+  suite asserts the released artifact carries no pinning symbol and no
+  `selfsigned` transport, and that a saved profile naming either is filtered out
+  of the menu rather than offered and then failing — while requiring both
+  certificate-diagnosis helpers to survive, so a refusal is always explained.
 
 ## Protocol changes need prior discussion
 
