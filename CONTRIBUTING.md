@@ -171,7 +171,7 @@ the script.
 - **Bugs:** open a [GitHub issue](../../issues) using the bug form. Include the
   script version, your OS and shell, and the machine-summary line if a server or
   adapter check is involved.
-- **Questions and setup help:** the [Discord](https://discord.gg/HqVwTmM7) is
+- **Questions and setup help:** the [Discord](https://conduck.com/discord/) is
   usually faster.
 - **Security vulnerabilities:** never in a public issue. See
   [SECURITY.md](SECURITY.md) for how to report privately.
