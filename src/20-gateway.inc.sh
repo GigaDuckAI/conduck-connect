@@ -431,9 +431,9 @@ hermes_settings_match_url() { # hermes_settings_match_url <checked-url> -> 0 whe
 # A `local` shadows the global for the duration of the call only, so the step
 # sees the gateway it is being asked about while the run keeps pairing exactly
 # what it checked. The latches the step sets stay global, as they must.
-hermes_recall_checked_handoff_step() { # hermes_recall_checked_handoff_step <suggested-list>
+hermes_recall_checked_handoff_step() {
   local GW_KIND="hermes"
-  hermes_recall_scope_step "$1" || true
+  hermes_recall_scope_step || true
 }
 
 # The one place the API-server memory question is asked during setup, for every
@@ -455,12 +455,8 @@ hermes_recall_checked_handoff_step() { # hermes_recall_checked_handoff_step <sug
 # pairable, and refusing to pair it is the founder's call, not this step's.
 hermes_recall_post_file_lane_step() {
   $HERMES_RECALL_REPORTED && return 0
-  # Suggest the scope the code being paired actually needs — the same (URL, cred)
-  # pair the payload builder uses to decide whether a file lane rides at all.
-  local suggested="$HERMES_API_SERVER_ADVICE"
-  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="$HERMES_API_SERVER_ADVICE_FILE"; fi
   if [ "${GW_KIND:-}" = "hermes" ]; then
-    hermes_recall_scope_step "$suggested" || true
+    hermes_recall_scope_step || true
   elif $CHECK_HANDOFF_LOCAL_HERMES; then
     # Say why a Hermes finding is appearing on a gateway this run calls "custom",
     # and say exactly how strong the claim is. A settings match is not proof of
@@ -468,7 +464,7 @@ hermes_recall_post_file_lane_step() {
     say ""
     note "This address matches this machine's Hermes API-server settings — same bind address and port, and the check authenticated with the key in ~/.hermes/.env."
     note "That is a settings match, not proof of which process holds that port, so read what follows against your own install."
-    hermes_recall_checked_handoff_step "$suggested"
+    hermes_recall_checked_handoff_step
   fi
   return 0
 }

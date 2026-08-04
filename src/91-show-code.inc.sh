@@ -463,15 +463,7 @@ show_qr_check_live() {
 # with the wizard; a command whose whole promise is "changes no configuration"
 # must not grow a mutation prompt.
 show_qr_recall_scope() {
-  # The suggested replacement list has to match the code this run is about to
-  # emit, so the test is the SAME pair build_pairing_payload_json uses to decide
-  # whether a fileServer block is carried at all. show_qr_recover_file_lane can
-  # legitimately downgrade a saved file-lane profile to gateway-only when the
-  # credential is gone, and telling that operator to write `["web", "file"]` would
-  # suggest a toolset their pairing no longer uses.
-  local suggested="$HERMES_API_SERVER_ADVICE"
-  if [ -n "${FS_URL:-}" ] && [ -n "${FS_CRED:-}" ]; then suggested="$HERMES_API_SERVER_ADVICE_FILE"; fi
-  hermes_recall_scope_step "$suggested" || true
+  hermes_recall_scope_step || true
 }
 
 # Orchestrate the --show-code path: pick → load → secrets → live-match gate, then the

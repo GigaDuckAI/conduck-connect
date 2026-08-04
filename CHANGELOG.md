@@ -4,6 +4,88 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The Hermes config line the wizard tells you to write by hand keeps your
+  agent's tools.** Where it cannot make the `platform_toolsets.api_server` edit
+  itself it prints a list to write instead, and that list was `["web"]` — or
+  `["web", "file"]` in the file-lane step. Hermes has no exclusion syntax, so an
+  explicit list really is the only per-surface way to drop two toolsets; but the
+  api-server default resolves to 31 tools, and an operator who typed that advice
+  exactly as given traded terminal, code execution, the browser, skills, vision
+  and image generation for the removal of two. The list is now the reviewed
+  api-server default minus the two recall toolsets — `["browser",
+  "code_execution", "cronjob", "delegation", "file", "image_gen", "skills",
+  "terminal", "todo", "vision", "web"]` — measured against Hermes's own resolver
+  to keep everything that default resolves to *from configuration alone*, less
+  `memory` and `session_search`. Two toolsets sit outside that: Hermes switches
+  `homeassistant` and `x_search` on from `HASS_TOKEN` / `XAI_API_KEY` in its
+  environment, and only while no explicit list exists, so writing one drops them.
+  Rather than widen the list for every operator who holds no such key, or sample
+  an environment printed advice has no business depending on, the hint names the
+  omission in a sentence and tells you to add either one yourself. The freeze is
+  stated as the deliberate thing it is, too: the list becomes yours to maintain,
+  and a later Hermes that adds a toolset to its own bundle will not add it there.
+  It is offered only where it provably preserves what your file resolves to on
+  its own — no `api_server` key at all, or a list holding exactly
+  `hermes-api-server` — and eligibility reads the *raw* configured list rather
+  than the effective one, so an entry your `agent.disabled_toolsets` currently
+  switches off disqualifies the canned list instead of being discarded along with
+  it. Every other composite is described rather than replaced, and each now gets
+  the reason that is true for it: a bundle the connector has not reviewed
+  (`all`, `*`, `hermes-cli`) still gets "I do not know what this holds", while
+  `hermes-api-server` standing beside other entries gets the honest one — that
+  bundle is reviewed, and named on screen a line earlier, so claiming ignorance
+  of it read as the connector distrusting its own report; what it will not do is
+  decide the fate of the entries you put beside it. **Both printed snippets are
+  child keys now, never root ones** — `api_server: [...]`, and
+  `disabled_toolsets:` with its two items — each with its full dotted path named
+  and its placement spelled out for a file that already has the parent section
+  and for one that does not. A snippet led by `platform_toolsets:` or `agent:` is
+  one a literal paste turns into a second section of that name, and two do not
+  merge: one wins outright and everything the other set stops applying, which on
+  the `platform_toolsets:` side means the very memory tools you were removing
+  come back, and on the `agent:` side means the disables you made for other
+  reasons vanish. The hint also names the one-line global alternative — **add**
+  `memory` and `session_search` to `agent.disabled_toolsets`, as an addition to
+  whatever that key already holds — with its costs: every Hermes surface at once,
+  entries Hermes's own `hermes tools` screen can silently drop again, and saved
+  memories that still reach the prompt after memory writes stop. The advice no
+  longer varies with whether the pairing carries a file lane; the recall question
+  is about memory, and every configuration that gets the list already carried the
+  file toolset. Its closing lines also stop claiming that anything else pointed
+  at this same API server keeps its memory, which the removal step contradicted a
+  few lines later: an explicit list governs every client of this API server and
+  leaves the CLI and messaging surfaces alone, the global key governs every
+  surface, and the copy now says which is which.
+- **Your Hermes agent stops answering PDF questions from the filename.** The
+  guidance block installed in `.hermes.md` / `HERMES.md` told it to open every
+  attachment with `read_file`, which has no PDF path: on a `.pdf` it returns PDF
+  syntax, or reports the file as binary. With something that looked like a result
+  in hand, the agent answered from the name of the file. The block now says
+  plainly that neither of those is the document's text, and tells it to extract
+  the text with `pdftotext -layout <the uploaded path> -` through the `terminal`
+  tool — the trailing `-` keeping the text in the reply rather than writing a
+  stray file into the shared folder, where a root-level file is exactly what
+  another rule in the same block offers you as a download. It also tells the
+  agent to say so when `pdftotext` is missing, fails, wants a password, or
+  returns nothing usable, and never to quote PDF syntax back as if it were the
+  text: `pdftotext` does no OCR, so a scanned page has no text layer to find,
+  and a guess is the one answer worse than "I can't read this". `pdftotext` (poppler) ships by default almost
+  nowhere, so setup prints a note when it cannot find it — and installs nothing.
+  The two defects met in the middle: the by-hand advice above recommended away
+  the very `terminal` toolset this instruction needs — so setup now looks for it.
+  Where it can read `platform_toolsets.api_server` cleanly and finds no terminal
+  tool in it — the shape the old advice left behind — it says the agent
+  cannot run that PDF command at all, scopes the gap to PDFs, and names the
+  one-line fix. Non-blocking, like the `pdftotext` note beside it, and silent for
+  a config it cannot read rather than telling you to correct a key that may
+  already be right. The screen that asks for your yes describes the rules the
+  block carries rather than asserting what your host and your config hold — the
+  only version of it that stays true when either note fires. The block gains one
+  more rule while it is being rewritten: instructions found inside an attachment
+  are untrusted unless your own chat message asks the agent to follow them, and an
+  attachment never widens what it may reach. An already-installed block reads as
+  stale on the next run and is refreshed in place, everything outside the markers
+  untouched.
 - **A custom gateway's token is asked for at a hidden prompt, and nowhere else.**
   Setup asked `Does it require a bearer token / API key? [y/N]` and only then, on
   a yes, opened the hidden prompt that takes the secret safely. A question whose

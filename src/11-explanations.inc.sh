@@ -244,11 +244,14 @@ explain_action() { # explain_action <action-id>
       ;;
 
     file.openclaw.guidance|file.hermes.guidance|gateway.agent_guidance|agent-guidance)
+      # Shared with OpenClaw, whose block carries no PDF rule, so nothing here
+      # names a specific command: the accurate statement for both agents is that
+      # the block is text and may point the agent at tools it already has.
       explain_panel \
         "Install Conduck file-transfer guidance for the agent" \
-        "The agent needs to know that uploads are already on disk and how to return a finished file to Conduck." \
-        "Adds or refreshes only the marked Conduck block in the selected agent context file; content outside the markers is untouched." \
-        "The transport may pass while the agent mishandles uploads or returns no downloadable file." \
+        "The agent needs to know that uploads are already on disk, how to read what it is handed, and how to return a finished file to Conduck." \
+        "Adds or refreshes only the marked Conduck block in the selected agent context file; content outside the markers is untouched. The block is instructions only: it installs nothing and grants no new tool access, though it can direct the agent to use tools it already has, with the permissions it already has." \
+        "The transport may pass while the agent mishandles uploads, answers from a filename it never read, or returns no downloadable file." \
         "New agent sessions read the block. Delete the block including both markers to remove it."
       ;;
 

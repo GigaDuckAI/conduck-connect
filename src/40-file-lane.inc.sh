@@ -2186,6 +2186,41 @@ setup_file_lane() {
       hermes_residual_state_note
       FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0
     fi
+    # This step advertises PDF as a supported attachment type, and Hermes reads a
+    # PDF by running `pdftotext` — a Poppler tool a stock host does not carry. A
+    # working lane must not be read as "PDFs work", so the gap is named here,
+    # once, before the guidance block that relies on the tool.
+    #
+    # Advisory, never a gate: this is the wizard's shell, not the Hermes service
+    # environment, and the two can have different PATHs. Print only — no install,
+    # no sudo, and the lane's outcome is untouched either way.
+    if ! have pdftotext; then
+      note "I cannot find pdftotext in this shell. PDF files still transfer, but Hermes may not be able to read their text."
+      if [ "$OS" = "Darwin" ]; then
+        note "Homebrew carries it:  brew install poppler"
+      elif have apt-get; then
+        local pdf_priv; pdf_priv=$(priv_prefix); [ -n "$pdf_priv" ] && pdf_priv="$pdf_priv "
+        note "Debian/Ubuntu carry it:  ${pdf_priv}apt-get install -y poppler-utils"
+      else
+        # Poppler's package name varies enough across managers that guessing one
+        # would print a package that does not exist. Name the tool, not a command.
+        note "Install Poppler's pdftotext with this system's package manager."
+      fi
+    fi
+    # The same class of finding, one layer up: the block's PDF rule needs Hermes's
+    # own `terminal` toolset, and an explicit api_server list can leave it out —
+    # the shape an operator gets by following an older release of this wizard. The
+    # rule is then inert no matter what this host has installed, so say it here
+    # rather than let a green lane imply PDFs work.
+    #
+    # Advisory on the same terms as the note above: never a gate, and printed only
+    # for a config the analyzer read cleanly and found no terminal toolset in.
+    # HERMES_TERMINAL_TOOLSET is whatever hermes_file_readiness_step's last
+    # analysis read said, so it already reflects any edit approved in that step.
+    if [ "$HERMES_TERMINAL_TOOLSET" = "no" ]; then
+      note "This API server's toolset list has no terminal tool, so the agent cannot run that PDF command at all. Every other attachment type is unaffected."
+      note "To give it one, add terminal to platform_toolsets.api_server in ~/.hermes/config.yaml and restart Hermes."
+    fi
     if ! install_conduck_hermes_block "$workspace"; then
       hermes_residual_state_note
       FS_CRED=""; FS_URL=""; fs_lane_residue_note; return 0

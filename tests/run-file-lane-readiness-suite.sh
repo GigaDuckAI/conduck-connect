@@ -1143,6 +1143,25 @@ PY
     "$(analysis_status "$cfg" "$ws")" "manual"
 }
 
+# The two halves of the marker-delimited block that can each fail silently: the
+# EDIT (does it leave the rest of the operator's file alone, and does an older
+# block get refreshed at all?) and the CONTENT (is the agent actually told the
+# thing the block exists to tell it?). A botched edit to the block literal ships
+# to every new session with no other signal.
+guidance_slices() { # guidance_slices <file> <prefix-out> <suffix-out>
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+BEGIN, END = "<!-- conduck-connect:begin -->", "<!-- conduck-connect:end -->"
+text = open(sys.argv[1], encoding="utf-8").read()
+start, stop = text.index(BEGIN), text.index(END) + len(END)
+open(sys.argv[2], "w", encoding="utf-8").write(text[:start])
+open(sys.argv[3], "w", encoding="utf-8").write(text[stop:])
+PY
+}
+expect_block_says() { # expect_block_says <label> <file> <literal text>
+  if grep -Fq -- "$3" "$2"; then pass "$1"; else fail "$1" "the installed block does not say it"; fi
+}
+
 test_hermes_guidance() {
   local ws="$TMP/guidance" target state
   mkdir -p "$ws"
@@ -1155,6 +1174,69 @@ test_hermes_guidance() {
   state=$(hermes_guidance_edit "$target" check)
   expect_eq "Hermes guidance re-checks ready" "$state" "ready"
 
+  # What the agent is told. Every line below is a rule an agent broke in the
+  # field: `read_file` on a PDF returns PDF syntax or "binary", and an agent that
+  # treats either as the document answers from the filename instead.
+  expect_block_says "Hermes guidance names the uploaded path as already on disk" \
+    "$target" 'Use `read_file` on that path'
+  expect_block_says "Hermes guidance says read_file is not a PDF extractor" \
+    "$target" '`read_file` is not a PDF text extractor'
+  expect_block_says "Hermes guidance gives the PDF command with its stdout dash" \
+    "$target" 'pdftotext -layout <the exact uploaded path> -'
+  expect_block_says "Hermes guidance says why the dash is there" \
+    "$target" 'instead of writing a new file into this folder'
+  expect_block_says "Hermes guidance requires an honest failure report" \
+    "$target" 'say exactly that'
+  expect_block_says "Hermes guidance says pdftotext is not OCR" \
+    "$target" 'does not do OCR'
+  expect_block_says "Hermes guidance forbids answering from the filename" \
+    "$target" 'Never infer a document'
+  expect_block_says "Hermes guidance treats attachment instructions as untrusted" \
+    "$target" 'untrusted content'
+  # …and the two rules that were already there, which the PDF bullets sit between
+  # and above rather than replace.
+  expect_block_says "Hermes guidance keeps the return-a-file rule" \
+    "$target" 'finish writing it at the working-directory root'
+  expect_block_says "Hermes guidance keeps the MEDIA refusal" \
+    "$target" 'Do not use `MEDIA:`'
+  expect_eq "Hermes guidance installs exactly the seven rules" \
+    "$(grep -c '^- ' "$target")" "7"
+
+  # The upgrade path every existing install takes: the block already there is a
+  # valid one, just an older one. It has to be recognised as stale, refreshed in
+  # place, and it must not take the operator's own prose with it.
+  local stale="$TMP/guidance-stale" file
+  rm -rf "$stale"; mkdir -p "$stale"
+  file="$stale/HERMES.md"
+  {
+    printf '%s\n' '# Team agent notes' '' 'Keep this paragraph exactly as written.' ''
+    printf '%s\n' '<!-- conduck-connect:begin -->' \
+      '## Conduck chat attachments (managed by conduck-connect)' '' \
+      '- An older rule that this refresh replaces.' \
+      '<!-- conduck-connect:end -->'
+    printf '%s\n' '' 'And a closing paragraph that must survive too.'
+  } > "$file"
+  expect_eq "Hermes guidance target picks the stale file" \
+    "$(hermes_guidance_target "$stale")" "$file"
+  expect_eq "Hermes guidance detects an older block as stale" \
+    "$(hermes_guidance_edit "$file" check)" "stale"
+  guidance_slices "$file" "$stale/prefix.before" "$stale/suffix.before"
+  expect_eq "Hermes guidance refreshes a stale block" \
+    "$(hermes_guidance_edit "$file" apply)" "applied"
+  expect_eq "Hermes guidance re-checks ready after a refresh" \
+    "$(hermes_guidance_edit "$file" check)" "ready"
+  guidance_slices "$file" "$stale/prefix.after" "$stale/suffix.after"
+  if cmp -s "$stale/prefix.before" "$stale/prefix.after" \
+     && cmp -s "$stale/suffix.before" "$stale/suffix.after"; then
+    pass "Hermes guidance refresh preserves surrounding prose byte-for-byte"
+  else
+    fail "Hermes guidance refresh preserves surrounding prose byte-for-byte" "$(cat "$file")"
+  fi
+  expect_eq "Hermes guidance refresh drops the older rules" \
+    "$(grep -c 'An older rule' "$file")" "0"
+  expect_block_says "Hermes guidance refresh carries the PDF command in" \
+    "$file" 'pdftotext -layout <the exact uploaded path> -'
+
   local lower="$TMP/lower-context"
   mkdir -p "$lower"
   printf '%s\n' '# existing agent policy' > "$lower/AGENTS.md"
@@ -1163,6 +1245,115 @@ test_hermes_guidance() {
   printf '%s\n' '<!-- conduck-connect:begin -->' 'broken' > "$ws/.hermes.md"
   expect_eq "Malformed Hermes marker is refused" \
     "$(hermes_guidance_edit "$ws/.hermes.md" check)" "malformed"
+}
+
+# Each consent claim is a (prose phrase, installed-block phrase) pair: the screen
+# an operator reads before saying yes may only promise what the block goes on to
+# say. Both sides come from the real functions, so a prose edit that outruns the
+# block — or a block edit that outruns the prose — fails here.
+expect_consent_claim() { # expect_consent_claim <label> <transcript> <file> <prose> <block text>
+  case "$2" in
+    *"$4"*)
+      if grep -Fq -- "$5" "$3"; then pass "consent: $1"
+      else fail "consent: $1" "the prose promises it, the installed block does not say it"; fi ;;
+    *) fail "consent: $1" "the consent prose never mentions it" ;;
+  esac
+}
+
+test_hermes_guidance_consent() {
+  local ws="$TMP/guidance-consent" target="$TMP/guidance-consent/HERMES.md" out rc
+  reset_recall_run
+  rm -rf "$ws"; mkdir -p "$ws"
+
+  # The paraphrase is printed before the confirm, so a decline still shows it.
+  CONFIRM_ANSWER="n"
+  out=$(install_conduck_hermes_block "$ws" 2>&1); rc=$?
+  expect_eq "consent: a declined install leaves the file lane out" "$rc" "1"
+  if [ -e "$target" ]; then
+    fail "consent: a declined install writes nothing" "HERMES.md was created anyway"
+  else
+    pass "consent: a declined install writes nothing"
+  fi
+
+  # Nothing about a marker-delimited text block is self-evidently harmless, and
+  # this is the only screen that says what it does and does not do.
+  case "$out" in *"installs nothing"*) pass "consent: the block is described as instructions only" ;;
+    *) fail "consent: the block is described as instructions only" "$out" ;; esac
+  case "$out" in *"grants no new tool access"*) pass "consent: the block claims no new tool access" ;;
+    *) fail "consent: the block claims no new tool access" "$out" ;; esac
+  case "$out" in *"not a sandbox"*)
+      pass "consent: the permissions the command runs with are named" ;;
+    *) fail "consent: the permissions the command runs with are named" "$out" ;; esac
+
+  # Now install it for real and hold the prose against the file.
+  CONFIRM_ANSWER="y"
+  out=$(install_conduck_hermes_block "$ws" 2>&1); rc=$?
+  expect_eq "consent: an accepted install succeeds" "$rc" "0"
+  expect_eq "consent: an accepted install leaves the block ready" \
+    "$(hermes_guidance_edit "$target" check)" "ready"
+  expect_consent_claim "the read_file promise is what gets installed" "$out" "$target" \
+    "read_file" 'Use `read_file` on that path'
+  expect_consent_claim "the PDF route it promises is what gets installed" "$out" "$target" \
+    "pdftotext" 'pdftotext -layout <the exact uploaded path> -'
+  expect_consent_claim "the terminal tool it names is the one the block uses" "$out" "$target" \
+    "terminal tool" 'with the `terminal` tool'
+  expect_consent_claim "the honest-failure promise is what gets installed" "$out" "$target" \
+    "answering from the filename" 'say exactly that'
+  expect_consent_claim "the untrusted-attachment promise is what gets installed" "$out" "$target" \
+    "untrusted" 'untrusted content'
+  expect_consent_claim "the name-the-file promise is what gets installed" "$out" "$target" \
+    "plain reply text" 'state its exact filename in plain reply text'
+
+  # WHAT THIS SCREEN MAY NOT SAY. It describes the rules the block carries. It
+  # does not know whether pdftotext exists where Hermes runs, and it does not
+  # check whether the API-server scope has the terminal toolset — and a few lines
+  # above it the wizard may have just printed a note saying one of them is
+  # missing. A screen asserting either reads as a promise the run has verified,
+  # and contradicts the note directly above it on exactly the hosts where that
+  # note is the important part.
+  case "$out" in *"already-installed pdftotext"*)
+      fail "consent: pdftotext is not claimed to be installed" "$out" ;;
+    *) pass "consent: pdftotext is not claimed to be installed" ;; esac
+  case "$out" in *"terminal tool Hermes already has"*)
+      fail "consent: the terminal toolset is not claimed to be present" "$out" ;;
+    *) pass "consent: the terminal toolset is not claimed to be present" ;; esac
+  case "$out" in *"that pdftotext command does run"*)
+      pass "consent: the permissions sentence is conditional on the command running" ;;
+    *) fail "consent: the permissions sentence is conditional on the command running" "$out" ;; esac
+
+  # The rule stated as a property rather than as a list of forbidden phrases:
+  # this screen must read the same on a host with Poppler and a host without, and
+  # under a scope with the shell tool and one without. Anything host-dependent
+  # belongs in the advisory notes Step 4 prints, where it can be true or false on
+  # its own merits. One workspace for both probes — a decline writes nothing, so
+  # neither run can leave anything behind for the other to read.
+  local probe="$TMP/consent-probe" out_a out_b
+  rm -rf "$probe"; mkdir -p "$probe"
+  CONFIRM_ANSWER="n"
+  # The `(pattern)` case form is deliberate: bash 3.2 counts parentheses inside
+  # $( ), and a bare `pdftotext)` closes the substitution early.
+  out_a=$(
+    HERMES_TERMINAL_TOOLSET="no"
+    have() { case "$1" in (pdftotext) return 1 ;; (*) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    install_conduck_hermes_block "$probe" 2>&1
+  )
+  out_b=$(
+    HERMES_TERMINAL_TOOLSET="yes"
+    have() { case "$1" in (pdftotext) return 0 ;; (*) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    install_conduck_hermes_block "$probe" 2>&1
+  )
+  if [ -n "$out_a" ] && [ "$out_a" = "$out_b" ]; then
+    pass "consent: the screen says the same thing whatever this host and config have"
+  else
+    fail "consent: the screen says the same thing whatever this host and config have" \
+         "without=[$out_a] with=[$out_b]"
+  fi
+  if [ -e "$probe/HERMES.md" ]; then
+    fail "consent: the invariance probes wrote nothing" "a declined install created HERMES.md"
+  else
+    pass "consent: the invariance probes wrote nothing"
+  fi
+  CONFIRM_ANSWER="y"
 }
 
 # --- Hermes API-server recall scope -------------------------------------------
@@ -1182,6 +1373,387 @@ recall_items() { # <config> -> "memory,session_search," in file order
 }
 apply_status() { # <config> <workspace> <action> [approved-scope]
   hermes_config_analysis "$@" | awk -F '\t' '$1 == "status" { print $2; exit }'
+}
+terminal_field() { # <config> -> yes|no|unknown for the API-server scope's terminal toolset
+  hermes_config_analysis "$1" "" recall | awk -F '\t' '$1 == "terminal_toolset" { print $2; exit }'
+}
+
+# The toolsets Hermes's own API-server default resolves to once `memory` and
+# `session_search` are taken out. Written out HERE, never read from the constant
+# under test: a case that interpolates the value it is checking into both sides
+# proves only that the value equals itself, which is how a two-name list that
+# threw away nine toolsets survived every assertion in this file.
+EXPECTED_ADVICE_NAMES="browser code_execution cronjob delegation file image_gen skills terminal todo vision web"
+
+hint_advice_line() { # hint_advice_line <transcript> -> the offered api_server list, or ""
+  printf '%s\n' "$1" | sed -n 's/^ *api_server: //p' | head -1
+}
+
+# Everything the hint says about a bundle before it moves on to the global key —
+# which is where the reason for withholding a replacement list lives. Two bundles
+# refused for genuinely different reasons must not be handed the same paragraph.
+hint_bundle_reason() { # hint_bundle_reason <transcript> -> the reason paragraph
+  printf '%s\n' "$1" | sed -n '1,/Or switch them off everywhere at once/p'
+}
+
+advice_names_match() { # advice_names_match <json-list> <expected space-separated names>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    vals = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+if not isinstance(vals, list) or not all(isinstance(v, str) for v in vals):
+    raise SystemExit(1)
+# A duplicate is a defect, not a formatting choice: it is what a hand-merged
+# list looks like when two edits landed on the same line.
+if len(vals) != len(set(vals)):
+    raise SystemExit(1)
+raise SystemExit(0 if sorted(vals) == sorted(sys.argv[2].split()) else 1)
+PY
+}
+
+# The global key is the ONLY other mechanism Hermes offers, and every one of its
+# costs is load-bearing: "set" instead of "add" silently drops unrelated
+# disables, the `hermes tools` screen can undo the edit later, and saved memories
+# still reach the prompt afterwards. A hint that names the mechanism without its
+# costs is worse than one that stays quiet.
+expect_global_alternative() { # expect_global_alternative <label> <transcript>
+  local label="$1" out="$2"
+  case "$out" in *"add, never"*) pass "$label: the global alternative says ADD, never replace" ;;
+    *) fail "$label: the global alternative says ADD, never replace" "$out" ;; esac
+  # THE INVARIANT, and the one an assertion here can pin upside down: a snippet
+  # an operator is told to write may NEVER lead with a root-level key. `agent:`
+  # printed at the left margin and pasted as shown makes a SECOND top-level
+  # agent: section — go-yaml refuses the file, PyYAML keeps the last one — so the
+  # name, the disabled_tools and every disable already in the first section stop
+  # applying. That is exactly the loss the "add, never replace" sentence one line
+  # above the snippet promises will not happen. The same shape one key over left
+  # `platform_toolsets:` nested inside itself, which deletes
+  # platform_toolsets.api_server outright and hands back the wide default WITH
+  # memory. So the CHILD key is what gets printed, and neither root key may stand
+  # alone on a line at any indentation anywhere in the hint.
+  if [ "$(printf '%s\n' "$out" | grep -c '^ *agent:$')" = "0" ] \
+     && [ "$(printf '%s\n' "$out" | grep -c '^ *platform_toolsets:$')" = "0" ]; then
+    pass "$label: no printed line is a bare root-level key"
+  else
+    fail "$label: no printed line is a bare root-level key" "$out"
+  fi
+  if [ "$(printf '%s\n' "$out" | grep -c '^      disabled_toolsets:$')" = "1" ] \
+     && [ "$(printf '%s\n' "$out" | grep -c '^        - memory$')" = "1" ] \
+     && [ "$(printf '%s\n' "$out" | grep -c '^        - session_search$')" = "1" ]; then
+    pass "$label: the global alternative prints the child key and both names, indented"
+  else
+    fail "$label: the global alternative prints the child key and both names, indented" "$out"
+  fi
+  # Printing only the child key is half the fix; the other half is saying where
+  # it goes. Both cases have to be answered, because an operator whose file has
+  # no agent: section at all and an operator whose file already has a populated
+  # one need opposite actions, and "paste this" is wrong for one of them.
+  # ADD, spelled out as the operation on the existing value. The round trip below
+  # merges rather than overwrites because this word says to; the word and the
+  # simulation have to be pinned together or one can drift from the other.
+  case "$out" in *"append the two names"*)
+      pass "$label: the global alternative says what to do when the key exists" ;;
+    *) fail "$label: the global alternative says what to do when the key exists" "$out" ;; esac
+  case "$out" in *"no agent: section"*)
+      pass "$label: the global alternative says what to do when the section is missing" ;;
+    *) fail "$label: the global alternative says what to do when the section is missing" "$out" ;; esac
+  case "$out" in *"hermes tools"*) pass "$label: the global alternative names the TUI pruning footgun" ;;
+    *) fail "$label: the global alternative names the TUI pruning footgun" "$out" ;; esac
+  case "$out" in *"memories they saved earlier"*)
+      pass "$label: the global alternative does not overstate the removal" ;;
+    *) fail "$label: the global alternative does not overstate the removal" "$out" ;; esac
+}
+
+# Two mechanisms are offered on the same screen and they do NOT reach the same
+# thing, so the paragraph that says which is which is the only way an operator
+# can choose rather than take whichever one comes first. Both halves are
+# load-bearing and both are easy to lose in an edit: the per-surface key is not
+# per-CLIENT (everything pointed at that API server loses memory, not just
+# Conduck), and the global key is not per-surface at all.
+expect_reach_paragraph() { # expect_reach_paragraph <label> <transcript>
+  local label="$1" out="$2"
+  case "$out" in *"platform_toolsets.api_server changes this API server for"*)
+      pass "$label: the per-surface key's reach is stated" ;;
+    *) fail "$label: the per-surface key's reach is stated" "$out" ;; esac
+  case "$out" in *"every client that talks to it"*)
+      pass "$label: the per-surface key is not sold as Conduck-only" ;;
+    *) fail "$label: the per-surface key is not sold as Conduck-only" "$out" ;; esac
+  case "$out" in *"agent.disabled_toolsets changes every surface at once"*)
+      pass "$label: the global key's reach is stated" ;;
+    *) fail "$label: the global key's reach is stated" "$out" ;; esac
+}
+
+# Wherever the frozen list is offered, the operator also has to be told what it
+# costs — the list stops tracking Hermes's own default from that moment — and
+# what the alternative is. A recommendation printed without either is the same
+# defect one indirection later.
+expect_snapshot_recommendation() { # expect_snapshot_recommendation <label> <transcript>
+  local label="$1" out="$2" line
+  line=$(hint_advice_line "$out")
+  if [ -z "$line" ]; then
+    fail "$label: the frozen replacement list is printed" "the transcript offers no api_server list"
+  elif advice_names_match "$line" "$EXPECTED_ADVICE_NAMES"; then
+    pass "$label: the frozen replacement list is printed"
+  else
+    fail "$label: the frozen replacement list is printed" "got '$line'"
+  fi
+  case "$out" in *"will not add it here"*)
+      pass "$label: the list's compatibility freeze is stated" ;;
+    *) fail "$label: the list's compatibility freeze is stated" "$out" ;; esac
+  # The opposite operation to the global key's, and the round trip below replaces
+  # rather than merges because this word says to. An operator who reads "add"
+  # here keeps the bundle name beside the eleven and removes nothing.
+  case "$out" in *"it replaces"*)
+      pass "$label: the list is named as a replacement, not an addition" ;;
+    *) fail "$label: the list is named as a replacement, not an addition" "$out" ;; esac
+  # A frozen list cannot preserve what Hermes never reads from this file.
+  # `homeassistant` and `x_search` are switched on from HASS_TOKEN / XAI_API_KEY
+  # in the branch Hermes takes when NO explicit list is written, so writing one
+  # drops them — and both names are absent from the list on purpose, because
+  # adding them would widen the scope for everyone who has no such key. The two
+  # names are written out here rather than read from the source: an operator who
+  # runs Home Assistant has to see the word, not a variable that expands to it.
+  case "$out" in *homeassistant*) pass "$label: the env-gated omission names homeassistant" ;;
+    *) fail "$label: the env-gated omission names homeassistant" "$out" ;; esac
+  case "$out" in *x_search*) pass "$label: the env-gated omission names x_search" ;;
+    *) fail "$label: the env-gated omission names x_search" "$out" ;; esac
+  case "$out" in *"switches them on from its environment"*)
+      pass "$label: the env-gated omission says why those two are missing" ;;
+    *) fail "$label: the env-gated omission says why those two are missing" "$out" ;; esac
+  expect_global_alternative "$label" "$out"
+  expect_reach_paragraph "$label" "$out"
+}
+
+expect_no_snapshot_recommendation() { # expect_no_snapshot_recommendation <label> <transcript>
+  local label="$1" line
+  line=$(hint_advice_line "$2")
+  if [ -z "$line" ]; then
+    pass "$label: no replacement list is printed"
+  else
+    fail "$label: no replacement list is printed" "offered '$line'"
+  fi
+}
+
+# --- following the hint, rather than reading it -------------------------------
+# Every other assertion in this file reads the hint's WORDS. This one obeys them.
+# The snippet is lifted out of a real transcript, the section it belongs under is
+# read out of that same transcript's prose, the edit is made the way the prose
+# says to make it, and the result goes back through the real analyzer.
+#
+# The gap it closes is not hypothetical. A hint that names the wrong parent — or
+# stops naming one — passes every string assertion above and still leaves an
+# operator with no platform_toolsets.api_server key at all, which is Hermes's
+# wide default WITH memory, on a screen that told them they had just removed it.
+#
+# Nothing here is located by the value under test: the snippet is found by its
+# indentation (prose is printed at two spaces, snippets deeper), and the parent
+# it is checked against is passed in by the caller as the key Hermes actually
+# reads. A helper that went looking for "platform_toolsets" in the transcript
+# would find the mistake and then agree with it.
+apply_printed_hint() { # apply_printed_hint <transcript-file> <in> <out> <parent> <leaf> <replace|append>
+  python3 - "$@" <<'PY'
+import json, re, sys
+
+transcript = open(sys.argv[1], encoding="utf-8").read()
+src = open(sys.argv[2], encoding="utf-8").read()
+out_path = sys.argv[3]
+want_parent, want_leaf, mode = sys.argv[4], sys.argv[5], sys.argv[6]
+
+transcript = re.sub(r"\x1b\[[0-9;]*m", "", transcript)
+lines = transcript.split("\n")
+
+
+def bail(msg):
+    print(msg)
+    raise SystemExit(2)
+
+
+def flatten(chunk):
+    return " ".join(" ".join(chunk).split())
+
+
+# 1. The snippet, found structurally. Prose is printed at two spaces and a
+#    snippet is indented past it, which is the only thing that makes one visible
+#    as something to copy.
+blocks, cur = [], []
+for i, ln in enumerate(lines):
+    if ln.strip() and len(ln) - len(ln.lstrip(" ")) >= 4:
+        cur.append((i, ln))
+    else:
+        if cur:
+            blocks.append(cur)
+        cur = []
+if cur:
+    blocks.append(cur)
+
+chosen = None
+for blk in blocks:
+    base = min(len(ln) - len(ln.lstrip(" ")) for _, ln in blk)
+    body = [ln[base:] for _, ln in blk]
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):(.*)$", body[0])
+    if m and m.group(1) == want_leaf:
+        chosen = (blk[0][0], body)
+        break
+if chosen is None:
+    bail("no printed snippet whose top key is %r" % want_leaf)
+block_at, body = chosen
+
+# 2. Where the hint says to put it, taken from the hint. Sentences wrap across
+#    printed lines, so the prose is flattened first, and only the prose ABOVE the
+#    snippet counts: an operator reads downward, and a placement instruction that
+#    arrives after the thing to place has already been pasted somewhere.
+above = flatten([ln for ln in lines[:block_at] if len(ln) - len(ln.lstrip(" ")) < 4])
+found = re.findall(r"under (?:a|the) ([A-Za-z_][A-Za-z0-9_]*): line", above)
+if not found:
+    bail("the hint never says which section the snippet goes under")
+placement = found[-1]
+if placement != want_parent:
+    bail("the hint places it under %r, not %r" % (placement, want_parent))
+
+# 3. …and the same section named again as a full dotted path, so the sentence an
+#    operator greps for and the sentence they follow cannot drift apart.
+dotted = set(
+    p for p, l in re.findall(r"\b([a-z_][A-Za-z0-9_]*)\.([a-z_][A-Za-z0-9_]*)\b",
+                             flatten(lines))
+    if l == want_leaf)
+if not dotted:
+    bail("the hint never names the full %s.%s path" % (want_parent, want_leaf))
+if dotted != {want_parent}:
+    bail("the hint names %s as the path parent, not %r" % (sorted(dotted), want_parent))
+
+# 4. What the snippet sets: one inline list, or a key with items under it.
+#    Anything else is a snippet nobody could apply by hand either.
+head = re.match(r"^%s:\s*(.*)$" % re.escape(want_leaf), body[0])
+rest = head.group(1).strip()
+if rest:
+    try:
+        values = json.loads(rest)
+    except Exception:
+        bail("the snippet's value is not readable JSON: %r" % rest)
+else:
+    values = []
+    for ln in body[1:]:
+        m = re.match(r"^\s*-\s+(.*)$", ln)
+        if not m:
+            bail("the snippet has a line an operator could not apply: %r" % ln)
+        values.append(m.group(1).strip().strip('"'))
+if not isinstance(values, list) or not values:
+    bail("the snippet does not set a non-empty list")
+
+
+def render(vals):
+    return "  %s: [%s]" % (want_leaf, ", ".join(json.dumps(v) for v in vals))
+
+
+# 5. Apply it exactly as the prose describes: into the section if the file has
+#    one, and as a new section only if it has none.
+cfg = src.split("\n")
+if cfg and cfg[-1] == "":
+    cfg.pop()
+parent_at = None
+for i, ln in enumerate(cfg):
+    if re.match(r"^%s:\s*$" % re.escape(placement), ln):
+        parent_at = i
+        break
+
+if parent_at is None:
+    cfg.append("%s:" % placement)
+    cfg.append(render(values))
+else:
+    end = len(cfg)
+    for i in range(parent_at + 1, len(cfg)):
+        if cfg[i].strip() and not cfg[i].startswith(" "):
+            end = i
+            break
+    child_at, child_end = None, None
+    for i in range(parent_at + 1, end):
+        m = re.match(r"^  ([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", cfg[i])
+        if m and m.group(1) == want_leaf:
+            child_at = i
+            child_end = i + 1
+            while child_end < end and (
+                    cfg[child_end].startswith("    ") or not cfg[child_end].strip()):
+                child_end += 1
+            break
+    if child_at is None:
+        cfg.insert(parent_at + 1, render(values))
+    elif mode == "replace":
+        # "it replaces that key and anything currently listed under it"
+        cfg[child_at:child_end] = [render(values)]
+    else:
+        # "append the two names to the entries it holds"
+        held = re.match(r"^  %s:\s*(.*)$" % re.escape(want_leaf), cfg[child_at]).group(1).strip()
+        try:
+            existing = json.loads(held) if held else []
+        except Exception:
+            bail("the fixture's existing %s is not an inline list" % want_leaf)
+        merged = list(existing) + [v for v in values if v not in existing]
+        cfg[child_at:child_end] = [render(merged)]
+
+open(out_path, "w", encoding="utf-8").write("\n".join(cfg) + "\n")
+PY
+}
+
+ROUND_TRIP_AFTER="" # the file the last hint_round_trip produced, for extra checks
+
+hint_round_trip() { # hint_round_trip <label> <parent> <leaf> <replace|append> <config line…>
+  local label="$1" parent="$2" leaf="$3" mode="$4"; shift 4
+  local dir="$TMP/hint-round-trip" before after tr why line missing=""
+  mkdir -p "$dir"
+  before="$dir/before.yaml"; after="$dir/after.yaml"; tr="$dir/hint.txt"
+  ROUND_TRIP_AFTER="$after"
+  rm -f "$after"
+  printf '%s\n' "$@" > "$before"
+
+  # A round trip that starts from a clean config would pass without the hint
+  # doing anything at all, so the starting point is asserted to be one the wizard
+  # actually prints this hint for.
+  if [ "$(recall_field "$before" recall)" = "clear" ]; then
+    fail "$label: the starting config is one the hint gets printed for" "it already reads clear"
+    return
+  fi
+  hermes_recall_read "$before"
+  hermes_recall_manual_hint > "$tr" 2>&1
+  if ! why=$(apply_printed_hint "$tr" "$before" "$after" "$parent" "$leaf" "$mode"); then
+    fail "$label: the printed hint can be followed" "${why:-it could not be applied}"
+    return
+  fi
+  pass "$label: the printed hint can be followed"
+
+  # The one thing the hint promises.
+  expect_eq "$label: following the printed hint clears the recall scope" \
+    "$(recall_field "$after" recall)" "clear"
+  # And the thing the previous release's advice quietly took away. `terminal` is
+  # the toolset the guidance block's PDF rule needs, so its survival is checked
+  # on the file the operator is actually left holding.
+  expect_eq "$label: the applied config still carries the terminal toolset" \
+    "$(terminal_field "$after")" "yes"
+  # Exactly one section, however the file started. Two is the duplicate-root-key
+  # defect: they do not merge, one wins, and the other one's keys stop applying.
+  expect_eq "$label: the file ends with exactly one $parent section" \
+    "$(grep -c "^$parent:" "$after")" "1"
+  # Every other line the operator had is still there, exactly once — "once"
+  # because a duplicated root key is one of the two ways this goes wrong, and a
+  # file that grew a second section passes a "still present" check. The key being
+  # edited is exempt, and so is any block-list item: the fixtures below put those
+  # only under the key being replaced, so a skipped `    - ` line is one this edit
+  # is allowed to consume.
+  while IFS= read -r line; do
+    case "$line" in
+      "  $leaf:"*) continue ;;
+      "    -"*) continue ;;
+      "") continue ;;
+    esac
+    [ "$(grep -Fxc -- "$line" "$after")" = "1" ] || missing="$missing [$line]"
+  done < "$before"
+  if [ -z "$missing" ]; then
+    pass "$label: every other line of the operator's file survives, once"
+  else
+    fail "$label: every other line of the operator's file survives, once" \
+         "lost or duplicated:$missing"
+  fi
 }
 
 # Every latch module 41 keeps is per-RUN, so each flow case has to start from a
@@ -1433,43 +2005,345 @@ test_hermes_recall_classification() {
 }
 
 # Whatever the wizard tells an operator to type by hand has to be a shape this
-# connector can read back on the next run. Both advice strings are fed to the
-# REAL analyzer verbatim rather than to a copy of them, so an advice string that
-# regresses to a bare flow sequence fails here instead of in a user's terminal —
-# where the refusal names the key and never the quoting, leaving them with a
-# config they typed exactly as instructed and no way to tell what is wrong.
+# connector can read back on the next run, and it has to leave them the agent
+# they had. The advice string is fed to the REAL analyzer verbatim rather than to
+# a copy of it, so an advice string that regresses to a bare flow sequence fails
+# here instead of in a user's terminal — where the refusal names the key and
+# never the quoting, leaving them with a config they typed exactly as instructed
+# and no way to tell what is wrong.
 test_hermes_printed_advice_parses() {
   local ws="$TMP/advice-workspace" cfg="$TMP/advice-config.yaml" qws
   mkdir -p "$ws"
   qws=$(python3 -c 'import json,os,sys; print(json.dumps(os.path.realpath(sys.argv[1])))' "$ws")
 
-  # The file-lane advice names `file`, so a config written exactly as printed is
-  # already lane-ready — no follow-up edit, which is the whole promise of the hint.
-  printf '%s\n' 'terminal:' "  cwd: $qws" \
-    'platform_toolsets:' "  api_server: $HERMES_API_SERVER_ADVICE_FILE" > "$cfg"
-  expect_eq "advice: the printed file-lane list re-checks ready" \
-    "$(analysis_status "$cfg" "$ws")" "ready"
-  expect_eq "advice: the printed file-lane list reads as recall-free" \
-    "$(recall_field "$cfg" recall)" "clear"
-
-  # The gateway-only advice deliberately omits `file`, so the analyzer must ask
-  # for that one concrete addition. `manual` here would mean an operator typed
-  # what we printed and still got "I cannot read this config's toolset".
+  # The advice carries `file`, so a config written exactly as printed is already
+  # lane-ready — no follow-up edit, which is the whole promise of the hint.
   printf '%s\n' 'terminal:' "  cwd: $qws" \
     'platform_toolsets:' "  api_server: $HERMES_API_SERVER_ADVICE" > "$cfg"
-  expect_eq "advice: the printed gateway-only list is readable" \
-    "$(analysis_status "$cfg" "$ws")" "fix"
-  expect_eq "advice: the printed gateway-only list reads as recall-free" \
+  expect_eq "advice: the printed list re-checks ready" \
+    "$(analysis_status "$cfg" "$ws")" "ready"
+  expect_eq "advice: the printed list reads as recall-free" \
     "$(recall_field "$cfg" recall)" "clear"
+
+  # DEFECT REGRESSION. The hint offered two of the toolsets Hermes's API-server
+  # default resolves to, so an operator who typed what we printed traded
+  # terminal, browser, skills, vision and five more for the removal of two recall
+  # tools. The eleven names are hard-coded in EXPECTED_ADVICE_NAMES above, and the
+  # comparison is a SET comparison: the ORDER of the printed list is a formatting
+  # choice, its MEMBERSHIP is the contract.
+  if advice_names_match "$HERMES_API_SERVER_ADVICE" "$EXPECTED_ADVICE_NAMES"; then
+    pass "advice: the printed list is Hermes's API-server default minus recall"
+  else
+    fail "advice: the printed list is Hermes's API-server default minus recall" \
+         "got $HERMES_API_SERVER_ADVICE"
+  fi
+  expect_eq "advice: the printed list names no recall toolset" \
+    "$(printf '%s\n' "$HERMES_API_SERVER_ADVICE" | grep -cE '"(memory|session_search)"')" "0"
+
+  # ONE list, not a gateway-only variant and a file-lane variant. The recall
+  # question is about memory: every state that prints this list already resolves
+  # to a bundle carrying `file`, and what this run's own pairing happens to use
+  # says nothing about what the operator's other API-server clients need. A
+  # second constant is that split growing back.
+  expect_eq "advice: there is exactly one printed advice list" \
+    "$(grep -rl 'HERMES_API_SERVER_ADVICE_FILE' "$ROOT/src" 2>/dev/null | wc -l | tr -d ' ')" "0"
 
   # The refusal this guards is syntactic, not about list length, so pin the
   # quoting itself: a future edit dropping the quotes would still satisfy every
   # assertion above only if the parser had also been loosened to accept it.
-  case "$HERMES_API_SERVER_ADVICE$HERMES_API_SERVER_ADVICE_FILE" in
-    *'"'*) pass "advice: both printed lists are JSON-quoted" ;;
-    *) fail "advice: both printed lists are JSON-quoted" \
+  case "$HERMES_API_SERVER_ADVICE" in
+    *'"'*) pass "advice: the printed list is JSON-quoted" ;;
+    *) fail "advice: the printed list is JSON-quoted" \
             "a bare flow sequence is refused by this connector's own scanner" ;;
   esac
+}
+
+# The frozen list is only semantics-preserving where the configuration it
+# replaces resolves to Hermes's own API-server default and nothing else. That
+# eligibility is a property of the RAW configured value, not of the effective
+# toolset the classifier works with, and it is the whole difference between
+# offering a safe replacement and deleting an operator's choices for them.
+test_hermes_recall_snapshot_gate() {
+  local cfg="$TMP/snapshot-config.yaml" out
+
+  # A fresh Hermes names no api_server toolset at all: there is no explicit list
+  # to preserve, so the snapshot can only add information.
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$cfg"
+  expect_eq "snapshot: an absent api_server key is eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "yes"
+  hermes_recall_read "$cfg"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_snapshot_recommendation "snapshot: the wide default" "$out"
+
+  # The one bundle whose expansion this connector has reviewed.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$cfg"
+  expect_eq "snapshot: the reviewed default bundle alone is eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "yes"
+  hermes_recall_read "$cfg"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_snapshot_recommendation "snapshot: the reviewed bundle" "$out"
+
+  # Bundles this connector cannot enumerate. Printing eleven names here would
+  # quietly delete whatever else they carry, so the hint has to say it does not
+  # know rather than guess.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["all"]' > "$cfg"
+  expect_eq "snapshot: a wildcard bundle is not eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "no"
+  hermes_recall_read "$cfg"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_no_snapshot_recommendation "snapshot: a wildcard bundle" "$out"
+  case "$out" in *"I do not know what this particular bundle holds"*)
+      pass "snapshot: a wildcard bundle is named as one this connector cannot expand" ;;
+    *) fail "snapshot: a wildcard bundle is named as one this connector cannot expand" "$out" ;; esac
+  expect_global_alternative "snapshot: a wildcard bundle" "$out"
+
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["hermes-cli"]' > "$cfg"
+  expect_eq "snapshot: another platform's bundle is not eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "no"
+  hermes_recall_read "$cfg"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_no_snapshot_recommendation "snapshot: another platform's bundle" "$out"
+  case "$out" in *"I do not know what this particular bundle holds"*)
+      pass "snapshot: another platform's bundle is named as one this connector cannot expand" ;;
+    *) fail "snapshot: another platform's bundle is named as one this connector cannot expand" "$out" ;; esac
+  local unreviewed_reason; unreviewed_reason=$(hint_bundle_reason "$out")
+  expect_reach_paragraph "snapshot: another platform's bundle" "$out"
+
+  # THE OTHER DIRECTION OF THE SAME GATE. Everything above proves the frozen list
+  # is withheld where printing it would DROP toolsets. This proves it is withheld
+  # where printing it would ADD them: a hand-written list is a set of choices, and
+  # eleven names under it would hand this operator browser, terminal, skills and
+  # six more they never asked for — the same defect as a two-name list, pointing
+  # the other way, and just as invisible without a case aimed at it.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$cfg"
+  expect_eq "snapshot: a hand-written list is not eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "no"
+  hermes_recall_read "$cfg"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_no_snapshot_recommendation "snapshot: a hand-written list" "$out"
+  case "$out" in *"take memory and session_search out of the"*)
+      pass "snapshot: a hand-written list is told to lose two names, not to gain nine" ;;
+    *) fail "snapshot: a hand-written list is told to lose two names, not to gain nine" "$out" ;; esac
+  # The names in the frozen list must not reach this screen by any other route
+  # either — an operator reading `browser` here would take it as an instruction.
+  case "$out" in *browser*|*code_execution*|*image_gen*)
+      fail "snapshot: a hand-written list is offered no extra toolsets" "$out" ;;
+    *) pass "snapshot: a hand-written list is offered no extra toolsets" ;; esac
+  expect_reach_paragraph "snapshot: a hand-written list" "$out"
+
+  # THE REVIEWED BUNDLE, STANDING BESIDE SOMETHING ELSE. The list is still
+  # withheld — a replacement would have to decide what becomes of `video` — but
+  # "I do not know what this bundle holds" is FALSE here, and the report one line
+  # above has just named that exact bundle on screen. An operator who can see the
+  # connector name a thing and then claim not to know it stops believing the rest
+  # of the screen.
+  printf '%s\n' 'platform_toolsets:' \
+    '  api_server: ["hermes-api-server", "video"]' > "$cfg"
+  expect_eq "snapshot: the reviewed bundle beside another entry is not eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "no"
+  hermes_recall_read "$cfg"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_no_snapshot_recommendation "snapshot: the reviewed bundle beside another entry" "$out"
+  case "$out" in *"I do not know what this particular bundle holds"*)
+      fail "snapshot: a bundle this connector reviewed is not called unknown" "$out" ;;
+    *) pass "snapshot: a bundle this connector reviewed is not called unknown" ;; esac
+  case "$out" in *"deliberate choices of yours to carry across"*)
+      pass "snapshot: the true reason names the entries beside the bundle" ;;
+    *) fail "snapshot: the true reason names the entries beside the bundle" "$out" ;; esac
+  local reviewed_reason; reviewed_reason=$(hint_bundle_reason "$out")
+  expect_reach_paragraph "snapshot: the reviewed bundle beside another entry" "$out"
+  # Two different situations, two different explanations. Equal strings here
+  # would mean one of the two screens is telling an operator something untrue
+  # about their own config.
+  if [ -n "$reviewed_reason" ] && [ -n "$unreviewed_reason" ] \
+     && [ "$reviewed_reason" != "$unreviewed_reason" ]; then
+    pass "snapshot: a reviewed and an unreviewed bundle are refused for different reasons"
+  else
+    fail "snapshot: a reviewed and an unreviewed bundle are refused for different reasons" \
+         "reviewed='$reviewed_reason' unreviewed='$unreviewed_reason'"
+  fi
+
+  # RAW vs EFFECTIVE, the case the whole gate exists for. The effective toolset
+  # here is just the reviewed bundle — `video` is disabled globally — so a gate
+  # computed from the effective list would call this eligible and permanently
+  # throw away a dormant choice the operator made deliberately.
+  printf '%s\n' 'agent:' '  disabled_toolsets: ["video"]' \
+    'platform_toolsets:' '  api_server: ["hermes-api-server", "video"]' > "$cfg"
+  expect_eq "snapshot: a dormant extra entry is not eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "no"
+  hermes_recall_read "$cfg"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_no_snapshot_recommendation "snapshot: a dormant extra entry" "$out"
+  # …and the control that keeps the case above from passing by coincidence: the
+  # SAME global disable, with the extra entry taken out of the api_server list,
+  # is eligible again. So it is the raw list that decides, not the presence of
+  # agent.disabled_toolsets and not the classification either shape lands in.
+  printf '%s\n' 'agent:' '  disabled_toolsets: ["video"]' \
+    'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$cfg"
+  expect_eq "snapshot: the same disable without the extra entry stays eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "yes"
+  expect_eq "snapshot: both dormant-entry shapes classify identically" \
+    "$(recall_field "$cfg" recall)" "in-scope"
+
+  # A duplicated bundle name is still not the bundle alone.
+  printf '%s\n' 'platform_toolsets:' \
+    '  api_server: ["hermes-api-server", "hermes-api-server"]' > "$cfg"
+  expect_eq "snapshot: a duplicated bundle name is not eligible" \
+    "$(recall_field "$cfg" recall_snapshot)" "no"
+
+  # The flag is a shell global and a single run reads more than one config. A
+  # stale "yes" would offer a canned replacement list for a file this connector
+  # never managed to examine — the exact fail-open the "no" default guards
+  # against. An unreadable config emits no snapshot fact at all, so only the
+  # per-read re-arm can answer for it.
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$cfg"
+  hermes_recall_read "$cfg"
+  expect_eq "snapshot: an eligible config arms the flag" "$HERMES_RECALL_SNAPSHOT" "yes"
+  ln -sf "$TMP/snapshot-nowhere.yaml" "$TMP/snapshot-link.yaml"
+  hermes_recall_read "$TMP/snapshot-link.yaml"
+  expect_eq "snapshot: an unreadable config re-arms the flag" "$HERMES_RECALL_SNAPSHOT" "no"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_no_snapshot_recommendation "snapshot: an unreadable config" "$out"
+  case "$out" in *"I cannot"*) pass "snapshot: an unreadable config says so instead of guessing" ;;
+    *) fail "snapshot: an unreadable config says so instead of guessing" "$out" ;; esac
+  # Even here — the one screen with no list and no bundle to describe — the
+  # operator is choosing between two keys, so the paragraph that tells them what
+  # each one reaches has to survive.
+  expect_reach_paragraph "snapshot: an unreadable config" "$out"
+
+  # The same stale-global hazard on the branch that CAN print a list: eligible
+  # config first, unexpandable bundle second. The answer has to follow the second
+  # config, not the first one this process happened to read.
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$cfg"
+  hermes_recall_read "$cfg"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["all"]' > "$cfg"
+  hermes_recall_read "$cfg"
+  expect_eq "snapshot: a second, ineligible config disarms the flag" \
+    "$HERMES_RECALL_SNAPSHOT" "no"
+  out=$(hermes_recall_manual_hint 2>&1)
+  expect_no_snapshot_recommendation "snapshot: an ineligible config read second" "$out"
+}
+
+# The hint is an INSTRUCTION, and the only way to test an instruction is to carry
+# it out. Both snippets, and for each of them the two files an operator can be
+# sitting in front of: one that already has the section, and one that does not.
+#
+# The measured defect this exists for: the hint printed the parent key as the
+# first line of the snippet, so an operator who pasted it exactly got
+# `platform_toolsets` nested inside `platform_toolsets` (no api_server key left
+# at all, Hermes back on its wide default WITH memory, and the next connector run
+# calling its own advice unreadable) or a second root section that silently
+# switched off every other platform they had configured. Every string assertion
+# in this file passed throughout.
+test_hermes_hint_round_trip() {
+  # 1. The wide default, in a file that already configures OTHER platforms. The
+  #    cli and discord lists are the ones a duplicated root key destroys.
+  hint_round_trip "round trip: the wide default, section present" \
+    platform_toolsets api_server replace \
+    'agent:' '  name: house-agent' \
+    'platform_toolsets:' '  cli: ["hermes-cli"]' '  discord: ["hermes-discord"]' \
+    'terminal:' '  cwd: "/srv/agent"'
+  expect_eq "round trip: the other platforms keep their own lists" \
+    "$(grep -c 'hermes-discord' "$ROUND_TRIP_AFTER")" "1"
+
+  # 2. The same default in a file with no platform_toolsets: section anywhere —
+  #    the case where the operator has to create one, and the only case where a
+  #    left-margin key is the right answer.
+  hint_round_trip "round trip: the wide default, no section yet" \
+    platform_toolsets api_server replace \
+    'agent:' '  name: house-agent' 'terminal:' '  cwd: "/srv/agent"'
+
+  # 3. The reviewed bundle, inline, beside a sibling platform.
+  hint_round_trip "round trip: the reviewed bundle, inline" \
+    platform_toolsets api_server replace \
+    'platform_toolsets:' '  api_server: ["hermes-api-server"]' '  cli: ["hermes-cli"]'
+
+  # 4. The same bundle written as a BLOCK list, where "replace that one line" is
+  #    two lines and the sibling below it must not be swallowed with them.
+  hint_round_trip "round trip: the reviewed bundle, block list" \
+    platform_toolsets api_server replace \
+    'platform_toolsets:' '  api_server:' '    - hermes-api-server' '  cli: ["hermes-cli"]'
+
+  # 5. The global alternative, into an agent: section that already holds things.
+  #    This is the file the old snippet emptied: a second agent: block kept only
+  #    what it declared itself.
+  hint_round_trip "round trip: the global key, section populated" \
+    agent disabled_toolsets append \
+    'agent:' '  name: house-agent' '  disabled_toolsets: ["video"]' \
+    '  disabled_tools: ["exec"]' \
+    'platform_toolsets:' '  cli: ["hermes-cli"]'
+  expect_eq "round trip: the disable the operator already had survives" \
+    "$(grep -c '"video"' "$ROUND_TRIP_AFTER")" "1"
+  expect_eq "round trip: the global key gains both recall names" \
+    "$(grep -c 'session_search' "$ROUND_TRIP_AFTER")" "1"
+
+  # 6. …and the same key in a file with no agent: section at all.
+  hint_round_trip "round trip: the global key, no section yet" \
+    agent disabled_toolsets append \
+    'platform_toolsets:' '  cli: ["hermes-cli"]'
+}
+
+# `terminal` is the toolset the installed guidance block's PDF rule runs on, and
+# an explicit api_server list can leave it out — which is exactly the shape a
+# `["web", "file"]` config sits in, and that config is what an operator gets by
+# following a release of this wizard that advises it. The answers here are
+# graded against Hermes's own resolution, not
+# against the classifier's internals: a list that names no carrier of `terminal`
+# cannot run one, an absent key gets Hermes's default bundle which does, and a
+# bundle this connector has never enumerated is an open question rather than a
+# refusal.
+test_hermes_terminal_toolset() {
+  local cfg="$TMP/terminal-config.yaml" ws="$TMP/terminal-ws"
+  mkdir -p "$ws"
+
+  # The reproduction: the literal list an older release of this wizard printed.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "file"]' > "$cfg"
+  expect_eq "terminal: a list with no shell tool answers no" "$(terminal_field "$cfg")" "no"
+  # The same read through the action the file lane actually uses. A fact emitted
+  # only on the recall path would be silently absent where it is consumed.
+  expect_eq "terminal: the analyze action answers too" \
+    "$(hermes_config_analysis "$cfg" "$ws" analyze \
+       | awk -F '\t' '$1 == "terminal_toolset" { print $2; exit }')" "no"
+
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "terminal"]' > "$cfg"
+  expect_eq "terminal: a list naming it answers yes" "$(terminal_field "$cfg")" "yes"
+
+  # An unwritten key is Hermes's own default bundle, and the review that produced
+  # the frozen replacement list found `terminal` in it.
+  printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$cfg"
+  expect_eq "terminal: an absent api_server key answers yes" "$(terminal_field "$cfg")" "yes"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$cfg"
+  expect_eq "terminal: the reviewed bundle answers yes" "$(terminal_field "$cfg")" "yes"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["all"]' > "$cfg"
+  expect_eq "terminal: a wildcard answers yes" "$(terminal_field "$cfg")" "yes"
+
+  # A bundle for another platform is not enumerated here, so the honest answer is
+  # that this connector cannot tell — and an advisory that only prints on "no"
+  # then stays quiet rather than accusing a config it never expanded.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["hermes-discord", "web"]' > "$cfg"
+  expect_eq "terminal: an unenumerated bundle answers unknown" \
+    "$(terminal_field "$cfg")" "unknown"
+  printf '%s\n' 'platform_toolsets: &a' '  api_server: ["web"]' > "$cfg"
+  expect_eq "terminal: a config this parser refuses answers unknown" \
+    "$(terminal_field "$cfg")" "unknown"
+
+  # A global disable reaches this surface like any other, so a list that names
+  # the toolset while the file switches it off everywhere is still a no.
+  printf '%s\n' 'agent:' '  disabled_toolsets: ["terminal"]' \
+    'platform_toolsets:' '  api_server: ["web", "terminal"]' > "$cfg"
+  expect_eq "terminal: a global disable outranks the list" "$(terminal_field "$cfg")" "no"
+
+  # The shell global behind the advisory note. Its default is "unknown", NOT the
+  # fail-closed "no" used for the snapshot flag: only "no" prints anything, and a
+  # config this run could not read must not produce a note telling an operator to
+  # fix a key that may already be right.
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "file"]' > "$cfg"
+  hermes_recall_read "$cfg"
+  expect_eq "terminal: a readable config arms the global" "$HERMES_TERMINAL_TOOLSET" "no"
+  ln -sf "$TMP/terminal-nowhere.yaml" "$TMP/terminal-link.yaml"
+  hermes_recall_read "$TMP/terminal-link.yaml"
+  expect_eq "terminal: an unreadable config re-arms the global to unknown" \
+    "$HERMES_TERMINAL_TOOLSET" "unknown"
 }
 
 test_hermes_recall_edits() {
@@ -1607,6 +2481,9 @@ test_hermes_recall_operator_flow() {
     "$(grep -c 'hermes-api-server' "$HOME/$cfg")" "1"
   case "$out" in *"[confirm]"*) fail "recall step: a bundle is not offered as an edit" "asked anyway" ;;
     *) pass "recall step: a bundle is not offered as an edit" ;; esac
+  # Describing it is not enough: the operator is left holding a by-hand edit, so
+  # the step owes them the replacement list and what choosing it costs.
+  expect_snapshot_recommendation "recall step: a bundle" "$out"
 
   reset_recall_run
   CONFIRM_ANSWER="y"
@@ -1617,6 +2494,7 @@ test_hermes_recall_operator_flow() {
     *) fail "recall step: the wide default is named as the default" "$out" ;; esac
   case "$out" in *"[confirm]"*) fail "recall step: the wide default is not offered as an edit" "asked anyway" ;;
     *) pass "recall step: the wide default is not offered as an edit" ;; esac
+  expect_snapshot_recommendation "recall step: the wide default" "$out"
 
   # A run whose whole promise is that it changes nothing may report but never gate.
   reset_recall_run
@@ -1715,6 +2593,9 @@ test_hermes_recall_file_lane() {
   expect_eq "recall lane: a bundle config still gets its lane" "$rc" "0"
   expect_eq "recall lane: a bundle config keeps its bundle" \
     "$(grep -c 'hermes-api-server' "$HOME/.hermes/config.yaml")" "1"
+  # The lane describes the bundle rather than rewriting it, so this is the one
+  # screen that has to carry the by-hand replacement and its costs.
+  expect_snapshot_recommendation "recall lane: a bundle config" "$out"
 
   # A no is a no for the whole run. Asking again at the next Hermes step would
   # read as nagging, not as consent.
@@ -1775,6 +2656,7 @@ test_hermes_recall_reach() {
   local saved_token="${GW_TOKEN:-}" saved_port="${GW_LOCAL_PORT:-}"
   local saved_health="${GW_HEALTH_PATH:-}" saved_fs="${FS_URL:-}"
   local out rc body src n_live n_recall n_verify n_lane n_dry cfg=".hermes/config.yaml"
+  local with_lane without_lane
   local ws="$TMP/reach-ws"
   mkdir -p "$ws"
 
@@ -1894,22 +2776,28 @@ test_hermes_recall_reach() {
   case "$out" in *"[confirm]"*) fail "reach: a clean scope asks nothing" "prompted anyway" ;;
     *) pass "reach: a clean scope asks nothing" ;; esac
 
-  # The suggested replacement list follows the code this run will actually emit,
-  # exactly as the --show-code re-emit does.
+  # The replacement list is a fact about Hermes's own API-server default, not
+  # about this run's pairing. Whether a file lane rides — the (FS_URL, FS_CRED)
+  # pair build_pairing_payload_json tests — cannot narrow what the operator's
+  # OTHER clients of that same API server are left with, so both shapes have to
+  # print the same list, and it has to be the hard-coded one.
   reset_recall_run
   printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
   FS_URL="https://files.example.test"; FS_CRED="fixture-file-secret"
   run_post_recall_step
-  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
-      pass "reach: a run carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" ;;
-    *) fail "reach: a run carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" "$out" ;; esac
+  with_lane=$(hint_advice_line "$out")
   reset_recall_run
   FS_URL="https://files.example.test"; FS_CRED=""
   run_post_recall_step
-  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
-      fail "reach: a lane the code will not carry falls back to $HERMES_API_SERVER_ADVICE" "suggested an unused toolset" ;;
-    *) pass "reach: a lane the code will not carry falls back to $HERMES_API_SERVER_ADVICE" ;; esac
+  without_lane=$(hint_advice_line "$out")
   FS_URL=""; FS_CRED=""
+  if advice_names_match "$with_lane" "$EXPECTED_ADVICE_NAMES" \
+     && [ "$without_lane" = "$with_lane" ]; then
+    pass "reach: the printed list is the same with and without a file lane"
+  else
+    fail "reach: the printed list is the same with and without a file lane" \
+         "with='$with_lane' without='$without_lane'"
+  fi
 
   # A run whose whole promise is that it changes nothing may report but never gate.
   reset_recall_run
@@ -1944,7 +2832,7 @@ test_hermes_recall_reach() {
   # a support ticket from a user who cannot pair a working gateway.
   expect_eq "reach: both setup call sites are explicitly non-blocking" \
     "$(declare -f hermes_recall_post_file_lane_step hermes_recall_checked_handoff_step \
-       | grep -c 'hermes_recall_scope_step .* || true')" "2"
+       | grep -c 'hermes_recall_scope_step || true')" "2"
   expect_eq "reach: neither setup call site can die" \
     "$(declare -f hermes_recall_post_file_lane_step hermes_recall_checked_handoff_step \
        | grep -c '\bdie\b')" "0"
@@ -1976,9 +2864,7 @@ test_hermes_recall_reach() {
   expect_eq "reach: show-code reports a drifted scope" \
     "$(printf '%s' "$out" | grep -c 'Hermes memory scope')" "1"
   expect_eq "reach: show-code never blocks the code" "$rc" "0"
-  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE"*)
-      pass "reach: a gateway-only re-show suggests $HERMES_API_SERVER_ADVICE" ;;
-    *) fail "reach: a gateway-only re-show suggests $HERMES_API_SERVER_ADVICE" "$out" ;; esac
+  expect_snapshot_recommendation "reach: a gateway-only re-show" "$out"
   if [ -e "$HOME/$cfg" ]; then
     fail "reach: show-code writes no Hermes config" "config.yaml was created"
   else
@@ -1986,29 +2872,32 @@ test_hermes_recall_reach() {
   fi
 
   # show_qr_recover_file_lane can legitimately downgrade a saved lane to
-  # gateway-only, so the suggested list follows the code actually being emitted.
-  # The test is the SAME (FS_URL && FS_CRED) pair build_pairing_payload_json uses:
-  # a recovered URL whose credential is gone carries no fileServer block, so
-  # suggesting `file` there would name a toolset the pairing does not use.
+  # gateway-only, and that downgrade is about THIS pairing's fileServer block. It
+  # says nothing about the toolsets the operator's API server should keep, so the
+  # printed list must not move with it — same list either way, and the same one
+  # the setup path prints.
   local saved_cred="${FS_CRED:-}"
   reset_recall_run
   REUSE_ONLY=true
   FS_URL="https://files.example.test"
   FS_CRED="fixture-file-secret"
   out=$(show_qr_recall_scope 2>&1); rc=$?
-  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
-      pass "reach: a re-show carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" ;;
-    *) fail "reach: a re-show carrying a file lane suggests $HERMES_API_SERVER_ADVICE_FILE" "$out" ;; esac
+  with_lane=$(hint_advice_line "$out")
 
   reset_recall_run
   REUSE_ONLY=true
   FS_URL="https://files.example.test"
   FS_CRED=""
   out=$(show_qr_recall_scope 2>&1); rc=$?
-  case "$out" in *"api_server: $HERMES_API_SERVER_ADVICE_FILE"*)
-      fail "reach: an unrecoverable lane falls back to $HERMES_API_SERVER_ADVICE" "suggested a lane the QR will not carry" ;;
-    *) pass "reach: an unrecoverable lane falls back to $HERMES_API_SERVER_ADVICE" ;; esac
+  without_lane=$(hint_advice_line "$out")
   FS_CRED="$saved_cred"
+  if advice_names_match "$with_lane" "$EXPECTED_ADVICE_NAMES" \
+     && [ "$without_lane" = "$with_lane" ]; then
+    pass "reach: the re-show prints the same list with and without a file lane"
+  else
+    fail "reach: the re-show prints the same list with and without a file lane" \
+         "with='$with_lane' without='$without_lane'"
+  fi
 
   reset_recall_run
   GW_KIND="openclaw"
@@ -3743,12 +4632,182 @@ test_missing_rclone_continues() {
   HOME="$saved_home"
 }
 
+# Pinned as source, not behavior: reaching this note in a live run needs a built
+# lane and a real Hermes install, but the two properties that matter are readable
+# here. The guidance block tells the agent to run `pdftotext`, and a host without
+# Poppler has no such command — so the gap is named. It is ADVISORY: the wizard's
+# shell is not the Hermes service environment, and a lane that works must never be
+# refused over a tool this run cannot see. Nothing is installed and nothing runs.
+test_pdftotext_note_is_advisory() {
+  local src n_ready n_pdf n_install executed
+  src=$(sed -n '/^setup_file_lane()/,/^}/p' "$ROOT/src/40-file-lane.inc.sh")
+  expect_eq "pdftotext note: the availability probe appears once" \
+    "$(printf '%s\n' "$src" | grep -c 'have pdftotext')" "1"
+
+  # Every mention is a comment or something printed — never a command that runs,
+  # a prompt, or a gate. A `confirm`, `run_step` or `return 1` here would turn a
+  # missing package on the wizard's PATH into a refused file lane.
+  executed=$(printf '%s\n' "$src" | grep -E 'pdftotext|[Pp]oppler' \
+             | grep -cvE '^ *(#|note |if ! have pdftotext; then$)')
+  expect_eq "pdftotext note: the tool is only ever named in printed advice" "$executed" "0"
+
+  # Both routes an operator can actually follow, and the generic line for hosts
+  # where guessing a package name would print one that does not exist.
+  case "$src" in *"brew install poppler"*) pass "pdftotext note: names the macOS package" ;;
+    *) fail "pdftotext note: names the macOS package" "no brew line" ;; esac
+  case "$src" in *"poppler-utils"*) pass "pdftotext note: names the Debian package" ;;
+    *) fail "pdftotext note: names the Debian package" "no apt line" ;; esac
+
+  # Placement: after readiness is settled (so a lane that already failed does not
+  # collect an irrelevant package note) and before the guidance block that tells
+  # the agent to use the tool.
+  n_ready=$(printf '%s\n' "$src" | grep -n 'hermes_file_readiness_step' | head -1 | cut -d: -f1)
+  n_pdf=$(printf '%s\n' "$src" | grep -n 'have pdftotext' | head -1 | cut -d: -f1)
+  n_install=$(printf '%s\n' "$src" | grep -n 'install_conduck_hermes_block' | head -1 | cut -d: -f1)
+  if [ -n "$n_ready" ] && [ -n "$n_pdf" ] && [ -n "$n_install" ] \
+     && [ "$n_pdf" -gt "$n_ready" ] && [ "$n_pdf" -lt "$n_install" ]; then
+    pass "pdftotext note: comes after readiness and before the guidance block"
+  else
+    fail "pdftotext note: comes after readiness and before the guidance block" \
+      "ready=$n_ready pdf=$n_pdf install=$n_install"
+  fi
+}
+
+# The Hermes arm of Step 4, actually executed. Everything the pdftotext note and
+# the terminal-toolset note can get wrong lives BETWEEN a readiness step that
+# passed and a guidance block that has not been installed yet, and both notes sit
+# on the one path this suite never ran: every other setup_file_lane case here is
+# GW_KIND=openclaw, so a `return` added among those notes would drop the file
+# lane for every Hermes user with the suite green.
+#
+# Real functions: setup_file_lane, hermes_file_readiness_step (with the real
+# analyzer reading a real config file), install_conduck_hermes_block. Stubbed:
+# only the things that would touch this machine — an existing unit, its liveness
+# probe, and the address prompt.
+hermes_lane_run() { # hermes_lane_run <have|missing pdftotext> <pre-armed answer> <api_server list>
+  local pdf="$1" armed="$2" list="$3"
+  (
+    HOME="$TMP/hermes-lane-home"; rm -rf "$HOME"
+    mkdir -p "$HOME/.hermes" "$HOME/hermes-files" "$HOME/state"
+    STATE_DIR="$HOME/state"; STATE_DIR_EXPOSURE_REPORTED=false
+    GW_KIND="hermes"; GW_ID="hermes"; OS="Linux"
+    TRANSPORT="public"; SCOPE="private"
+    DRY_RUN=false; REUSE_ONLY=false
+    CONFIRM_ANSWER="y"
+    FS_CRED=""; FS_URL=""; FS_FOLDER=""; FS_LOCAL_PORT=""; FS_UNIT=""
+    FS_LANE_PREPARED=false; FS_UNIT_CREATED_THIS_RUN=false
+    FS_ROUTE_SELF_MANAGED=false; FS_RESIDUE_REPORTED=false
+    FS_CRED_LEGACY_ARGV=false
+    HERMES_RECALL_REPORTED=false; HERMES_RECALL_DECLINED=false
+    HERMES_RESIDUAL_REPORTED=false
+    HERMES_SCOPE_CHANGED_THIS_RUN=false; HERMES_CONFIG_CHANGED_THIS_RUN=false
+    HERMES_GUIDANCE_CHANGED_THIS_RUN=false
+    # Deliberately WRONG going in. The note may only ever speak for the config
+    # this run just read; a value left over from an earlier read is how an
+    # operator gets told about somebody else's file.
+    HERMES_TERMINAL_TOOLSET="$armed"
+    local real; real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/hermes-files")
+    printf '%s\n' 'terminal:' "  cwd: \"$real\"" \
+      'platform_toolsets:' "  api_server: $list" > "$HOME/.hermes/config.yaml"
+    PDF_WANT="$pdf"
+    have() {
+      case "$1" in
+        pdftotext) [ "$PDF_WANT" = "have" ] ;;
+        # Poppler's package name is guessed from the package manager; an apt-get
+        # that is absent here keeps the fixture off this machine's own tooling.
+        apt-get) return 1 ;;
+        rclone|systemctl|loginctl) return 0 ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    existing_fs_config() {
+      FS_FOLDER="$HOME/hermes-files"; FS_LOCAL_PORT=5006
+      FS_CRED="fixture-file-secret"
+      FS_UNIT="$HOME/.config/systemd/user/conduck-files-hermes.service"
+      return 0
+    }
+    fs_unit_state() { printf 'active'; }
+    ensure_existing_fs_envfile_linux() { return 0; }
+    fs_report_linger_linux() { :; }
+    fs_local_service_ready() { return 0; }
+    ask_fs_url() { ASK_FS_URL_RESULT="https://files.example.test"; return 0; }
+    rc=0
+    setup_file_lane || rc=$?
+    # The lane's own outcome, in one line: a note that turned into a gate shows
+    # up here as a dropped credential, a dropped address, or a block that never
+    # got installed.
+    printf 'LANE rc=%s cred=%s url=%s block=%s\n' "$rc" "${FS_CRED:+set}" "${FS_URL:+set}" \
+      "$([ -f "$HOME/hermes-files/HERMES.md" ] && printf installed || printf missing)"
+  ) 2>&1
+}
+
+expect_lane_survived() { # expect_lane_survived <label> <transcript>
+  case "$2" in *"LANE rc=0 cred=set url=set block=installed"*)
+      pass "$1: the file lane is unaffected" ;;
+    *) fail "$1: the file lane is unaffected" "$2" ;; esac
+}
+
+test_hermes_lane_pdf_notes() {
+  local saved_home="$HOME" out
+
+  # A host with no Poppler and a scope with no shell tool: BOTH notes are true at
+  # once, and neither may cost the operator the lane.
+  out=$(hermes_lane_run missing yes '["web", "file"]')
+  expect_lane_survived "lane notes: nothing installed, no terminal toolset" "$out"
+  case "$out" in *"I cannot find pdftotext in this shell"*)
+      pass "lane notes: a missing pdftotext is reported" ;;
+    *) fail "lane notes: a missing pdftotext is reported" "$out" ;; esac
+  case "$out" in *"has no terminal tool"*)
+      pass "lane notes: a scope with no terminal toolset is reported" ;;
+    *) fail "lane notes: a scope with no terminal toolset is reported" "$out" ;; esac
+  # Reported WITH its blast radius and its remedy, or it is just an alarm.
+  case "$out" in *"Every other attachment type is unaffected"*)
+      pass "lane notes: the terminal note scopes the damage to PDFs" ;;
+    *) fail "lane notes: the terminal note scopes the damage to PDFs" "$out" ;; esac
+  case "$out" in *"add terminal to platform_toolsets.api_server"*)
+      pass "lane notes: the terminal note names the concrete remedy" ;;
+    *) fail "lane notes: the terminal note names the concrete remedy" "$out" ;; esac
+
+  # Same host, a scope that does carry the shell tool. The pre-armed "no" is what
+  # the note would fire on if it were reading a stale global instead of this run.
+  out=$(hermes_lane_run missing no '["web", "file", "terminal"]')
+  expect_lane_survived "lane notes: nothing installed, terminal toolset present" "$out"
+  case "$out" in *"I cannot find pdftotext in this shell"*)
+      pass "lane notes: the pdftotext note still fires on its own" ;;
+    *) fail "lane notes: the pdftotext note still fires on its own" "$out" ;; esac
+  case "$out" in *"has no terminal tool"*)
+      fail "lane notes: a scope that has the tool gets no note" "$out" ;;
+    *) pass "lane notes: a scope that has the tool gets no note" ;; esac
+
+  # A bundle resolves to the toolset without naming it, so silence is the right
+  # answer — and the pre-armed "no" proves the silence is a fresh read, not luck.
+  out=$(hermes_lane_run have no '["hermes-api-server"]')
+  expect_lane_survived "lane notes: a bundle scope" "$out"
+  case "$out" in *"has no terminal tool"*)
+      fail "lane notes: a bundle that carries the tool gets no note" "$out" ;;
+    *) pass "lane notes: a bundle that carries the tool gets no note" ;; esac
+  case "$out" in *"I cannot find pdftotext"*|*[Pp]oppler*)
+      fail "lane notes: a host that has pdftotext gets no install note" "$out" ;;
+    *) pass "lane notes: a host that has pdftotext gets no install note" ;; esac
+
+  # And the fully-equipped case, where the whole Hermes arm must print neither.
+  out=$(hermes_lane_run have unknown '["web", "file", "terminal"]')
+  expect_lane_survived "lane notes: nothing missing" "$out"
+  case "$out" in *"I cannot find pdftotext"*|*"has no terminal tool"*)
+      fail "lane notes: nothing missing means nothing reported" "$out" ;;
+    *) pass "lane notes: nothing missing means nothing reported" ;; esac
+
+  HOME="$saved_home"
+}
+
 printf 'file-lane readiness regressions — source modules + loopback fixtures\n'
 test_gateway_restart_wait
 test_restart_timing_note
 test_restart_note_names_the_right_change
 test_tool_policy_restart_handoff
 test_missing_rclone_continues
+test_pdftotext_note_is_advisory
+test_hermes_lane_pdf_notes
 test_port_allocation
 test_duplicate_per_gateway_port
 test_prebound_port
@@ -3762,12 +4821,16 @@ test_hermes_config
 test_hermes_blank_and_comment_lines
 test_hermes_recall_classification
 test_hermes_printed_advice_parses
+test_hermes_recall_snapshot_gate
+test_hermes_hint_round_trip
+test_hermes_terminal_toolset
 test_hermes_recall_edits
 test_hermes_recall_operator_flow
 test_hermes_recall_file_lane
 test_hermes_recall_reach
 test_hermes_checked_handoff
 test_hermes_guidance
+test_hermes_guidance_consent
 test_local_service_gate
 test_reply_candidate_parity
 test_agent_sentinel
