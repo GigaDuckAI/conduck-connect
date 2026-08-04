@@ -942,13 +942,30 @@ test_hermes_config() {
 
   printf '%s\n' \
     'agent:' \
-    '  disabled_tools:' \
-    '  - read_file' \
+    '  disabled_toolsets:' \
+    '  - file' \
     'terminal:' \
     "  cwd: \"$ws\"" \
     > "$cfg"
   expect_eq "Hermes indentless global file disable fails closed" \
     "$(analysis_status "$cfg" "$ws")" "manual"
+
+  # The toolset is Hermes's granularity floor: nothing in its configuration
+  # disables an individual tool, and a key spelled `disabled_tools` has no reader
+  # at all. Refusing a lane over one would cost a user file transfer for a line
+  # Hermes never reads. Same indentless shape as the sibling above, which proves
+  # the real key still fails closed there — so this pair separates "the parser
+  # sees it" from "the connector acts on it".
+  printf '%s\n' \
+    'agent:' \
+    '  disabled_tools:' \
+    '  - read_file' \
+    '  - write_file' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    > "$cfg"
+  expect_eq "Hermes ignores a disabled_tools key Hermes itself ignores" \
+    "$(analysis_status "$cfg" "$ws")" "ready"
 
   printf '%s\n' \
     'agent:' \
@@ -1086,11 +1103,26 @@ test_hermes_config() {
     'terminal:' \
     "  cwd: \"$ws\"" \
     'agent:' \
-    '  disabled_tools:' \
-    '    - read_file' \
+    '  disabled_toolsets:' \
+    '    - file' \
     > "$cfg"
   expect_eq "Hermes global file disable is not silently widened" \
     "$(analysis_status "$cfg" "$ws")" "manual"
+
+  # The realistic shape of the mistake: an inert `disabled_tools` sitting beside a
+  # real `disabled_toolsets` that blocks nothing. The lane must survive on the
+  # strength of the key that has a reader, and must not be dragged down by its
+  # neighbour — including when that neighbour names the very file tools the lane
+  # depends on.
+  printf '%s\n' \
+    'terminal:' \
+    "  cwd: \"$ws\"" \
+    'agent:' \
+    '  disabled_toolsets: ["spotify"]' \
+    '  disabled_tools: ["read_file", "write_file"]' \
+    > "$cfg"
+  expect_eq "Hermes ignores disabled_tools beside a real disabled_toolsets" \
+    "$(analysis_status "$cfg" "$ws")" "ready"
 
   local hash_ws="$TMP/hermes # workspace" qws
   mkdir -p "$hash_ws"

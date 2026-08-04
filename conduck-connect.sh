@@ -6956,15 +6956,21 @@ elif pst in ("AMBIG", "FLOW"):
 # authoritative, so its file tools are there. The live sentinel still proves the
 # installed version rather than trusting that default on faith.
 
+# The toolset is Hermes's granularity floor: `agent.disabled_toolsets` is read on
+# every surface, and nothing in the configuration disables an individual tool. A
+# key spelled `agent.disabled_tools` is therefore inert — no reader anywhere — so
+# reading one here could only ever refuse a file lane over a line Hermes itself
+# ignores, and refuse it for the whole run, since a global-disable finding is
+# `manual`. Only the key with a reader is inspected.
 if not recall_only:
-    for key, blocked in (("disabled_toolsets", {"file", "hermes-api-server"}),
-                         ("disabled_tools", {"read_file", "write_file"})):
-        st, vals, meta = sequence("agent", key, allow_null=True)
-        if st == "OK" and blocked.intersection(vals):
-            manual.append("agent.%s globally disables %s; removing it would broaden other Hermes platforms" %
-                          (key, ", ".join(sorted(blocked.intersection(vals)))))
-        elif st in ("AMBIG", "FLOW"):
-            manual.append("agent.%s uses YAML syntax this connector will not guess at" % key)
+    st, vals, _meta = sequence("agent", "disabled_toolsets", allow_null=True)
+    if st == "OK":
+        blocked = {"file", "hermes-api-server"}.intersection(vals)
+        if blocked:
+            manual.append("agent.disabled_toolsets globally disables %s; removing it would broaden other Hermes platforms" %
+                          ", ".join(sorted(blocked)))
+    elif st in ("AMBIG", "FLOW"):
+        manual.append("agent.disabled_toolsets uses YAML syntax this connector will not guess at")
 
 if manual:
     print("status\tmanual")

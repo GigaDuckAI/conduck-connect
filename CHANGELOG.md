@@ -86,6 +86,16 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   attachment never widens what it may reach. An already-installed block reads as
   stale on the next run and is refreshed in place, everything outside the markers
   untouched.
+- **A Hermes config carrying an `agent.disabled_tools` key no longer costs you
+  file transfer.** The readiness check inspected that key for `read_file` and
+  `write_file` and, on a hit, refused the whole optional file lane for the run.
+  Hermes has no reader for it: the toolset is its granularity floor, nothing in
+  its configuration disables an individual tool, and the key has never existed in
+  any release — so the only thing that check could ever do was decline a lane over
+  a line Hermes itself ignores, for anyone who wrote one by hand or carried one in
+  from another tool. The near-miss spelling is what made it plausible;
+  `agent.disabled_toolsets`, one letter longer, is real, is read on every surface,
+  and is still inspected exactly as before.
 - **A custom gateway's token is asked for at a hidden prompt, and nowhere else.**
   Setup asked `Does it require a bearer token / API key? [y/N]` and only then, on
   a yes, opened the hidden prompt that takes the secret safely. A question whose
