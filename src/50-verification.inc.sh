@@ -387,6 +387,28 @@ gw_5xx_credential_note() { # reads GW_AUTH / GW_URL / MODELS_CURL_RC / MODELS_HT
   note "Re-run setup, say this gateway DOES need a bearer token, and give it the expected one."
 }
 
+# What BOTH file-lane gates do when gateway verification has already failed, held
+# in one place so the two cannot drift into saying different things about the
+# same situation. Every caller runs it BEFORE its request, never after: once any
+# gateway check has failed, emit_payload hands out no code at all, so each later
+# question is answered into a run that discards it — and this particular one
+# would first spend a real, billable, up-to-five-minute agent turn to get there.
+# A probe could still have told the operator something on a run whose failure was
+# narrow (a local health route down while the public one answers, say), but that
+# same proof runs by itself on the re-run they now have to do anyway, so buying
+# it here means paying for a turn twice.
+# The proof is CLEARED rather than marked "unproved": unproved is what a sentinel
+# that ran and fell short earns, and this one never ran.
+# No hermes_residual_state_note call — drop_file_lane makes it on the way through,
+# and the note self-guards against being said twice.
+skip_agent_file_probe_after_failed_gateway() {
+  note "The gateway checks above failed, so this run emits no setup code either way — I'm not"
+  note "spending an agent turn on the file lane. Fix the gateway, then re-run me."
+  FS_AGENT_PROOF=""
+  FS_LANE_DROPPED_BY_CHECK=true
+  drop_file_lane
+}
+
 # The custom half of the same gate, answering a different question. For OpenClaw
 # and Hermes this wizard configured the agent itself, so a failed sentinel means
 # something IT set up is wrong and the lane comes out — the operator can fix the
@@ -397,15 +419,9 @@ gw_5xx_credential_note() { # reads GW_AUTH / GW_URL / MODELS_CURL_RC / MODELS_HT
 # ships an unusable exposed lane on its own nor deletes a working one it merely
 # failed to measure.
 custom_agent_file_lane_gate() {
-  # The guard comes BEFORE the request, not after it. Once any gateway check has
-  # failed, emit_payload hands out no code at all, so every later question is
-  # answered into a run that discards it — and this particular one would first
-  # spend a real, billable, up-to-five-minute agent turn to get there.
+  # Ahead of the request, never after it — see the helper for why.
   if $VERIFY_FAILED; then
-    note "The gateway checks above failed, so this run emits no setup code either way — I'm not"
-    note "spending an agent turn on the file lane. Fix the gateway, then re-run me."
-    FS_LANE_DROPPED_BY_CHECK=true
-    drop_file_lane
+    skip_agent_file_probe_after_failed_gateway
     return 1
   fi
 
@@ -585,6 +601,17 @@ agent_file_lane_gate() {
     *) return 0 ;;
   esac
 
+  # After the case so `custom` keeps its own dispatch and an unrecognised kind
+  # keeps its no-op; ahead of the request for the reason the helper carries. The
+  # wizard configured the agent itself on these two paths, which is the argument
+  # for measuring anyway — and it loses to the same arithmetic: no code comes out
+  # of this run regardless, and the re-run the operator now owes has to spend the
+  # turn again, so measuring here buys one answer for the price of two.
+  if $VERIFY_FAILED; then
+    skip_agent_file_probe_after_failed_gateway
+    return 1
+  fi
+
   say "  Asking $agent_name to read and copy a randomized sentinel with its file tools (up to 5 minutes)…"
   if agent_file_probe; then
     FS_AGENT_PROOF="proved"
@@ -599,15 +626,12 @@ agent_file_lane_gate() {
   # was rather than on which command is running.
   agent_file_lane_cause_notes "$agent_name" "$config_hint"
   fix_hint=$(agent_file_lane_fix_hint "$agent_name" "$config_hint")
-  # A gateway-only code is a real offer only while the GATEWAY itself passed. Once any
-  # gateway check has failed, emit_payload hands out no code at all — so asking here
-  # would promise one and then exit 1 anyway, over a fault this file lane cannot fix.
-  if $SHOW_QR && $VERIFY_FAILED; then
-    note "The gateway checks above failed too, so no code is emitted either way — fix the gateway first, then re-run --show-code."
-    FS_LANE_DROPPED_BY_CHECK=true
-    drop_file_lane
-    return 1
-  fi
+  # A gateway-only code is a real offer only while the GATEWAY itself passed — and
+  # by here it did. The entry guard returns on a failed gateway before the probe
+  # runs, and nothing between it and this line can set VERIFY_FAILED (only check()
+  # and verify_all's own branches do, and neither is reachable from the probe), so
+  # the one way to arrive here is a green gateway with a red file lane. That is
+  # precisely the case the offer is for.
   if $SHOW_QR; then
     if confirm "Show a gateway-only code anyway? (your saved profile keeps its file lane)" "verification.gateway_only"; then
       FS_LANE_DROPPED_BY_CHECK=true

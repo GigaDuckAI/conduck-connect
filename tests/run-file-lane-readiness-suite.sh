@@ -3683,7 +3683,7 @@ raise SystemExit(0 if generic and not tooled and guards
 
   # The custom gate does not hard-drop like OpenClaw/Hermes: a plain model server
   # is EXPECTED to fail this, so the operator decides — and the default is out.
-  # The same WebDAV fixture stays up across all four cases below: a reply-first
+  # The same WebDAV fixture stays up until it is explicitly stopped: a reply-first
   # failure keeps its sentinel registry armed for the EXIT recheck, and that
   # recheck can only be proven against the server that served it.
   local lane_url="$FS_URL"
@@ -3731,6 +3731,57 @@ raise SystemExit(0 if generic and not tooled and guards
   else
     fail "a failed gateway skips the custom sentinel entirely" "an agent turn was spent anyway"
   fi
+
+  # …and the same arithmetic on the kinds this wizard configured itself. They
+  # reach the gate through a different arm of the case, so each is asserted
+  # separately: a guard that sat inside the `custom` branch alone would leave
+  # exactly the two paths that ALSO applied host edits paying for a turn whose
+  # answer the run discards. Redirected to a file rather than captured in `$(…)`
+  # — a command substitution would run the gate in a subshell and throw away
+  # every state assignment the checks below are about.
+  local doomed_kind doomed_out doomed_rc
+  doomed_out="$TMP/doomed-gate.out"
+  for doomed_kind in openclaw hermes; do
+    GW_KIND="$doomed_kind"
+    VERIFY_FAILED=true
+    # "y" rather than the suite default of "n": a guard that ASKED instead of
+    # returning must not be able to reach the same end state by way of a decline
+    # that happens to drop the lane too. What the answer is doesn't matter once
+    # the transcript is checked for the prompt marker below — this only removes
+    # the accidental agreement.
+    CONFIRM_ANSWER="y"
+    FS_URL="$lane_url"; FS_CRED="$password"
+    FS_AGENT_PROOF="unproved"
+    FS_LANE_DROPPED_BY_CHECK=false
+    LAST_AGENT_PAYLOAD=""
+    doomed_rc=0
+    agent_file_lane_gate > "$doomed_out" 2>&1 || doomed_rc=$?
+    if [ "$doomed_rc" = "0" ]; then
+      fail "a failed gateway skips the $doomed_kind sentinel entirely" "gate unexpectedly passed"
+    elif [ -n "$LAST_AGENT_PAYLOAD" ]; then
+      fail "a failed gateway skips the $doomed_kind sentinel entirely" "an agent turn was spent anyway"
+    elif [ -n "$FS_URL" ] || [ -n "$FS_CRED" ]; then
+      fail "a failed gateway skips the $doomed_kind sentinel entirely" "the lane survived into the payload"
+    elif ! $FS_LANE_DROPPED_BY_CHECK; then
+      fail "a failed gateway skips the $doomed_kind sentinel entirely" "the drop was not recorded as a check's doing"
+    elif [ -n "$FS_AGENT_PROOF" ]; then
+      # Cleared, not "unproved": unproved is a verdict on a sentinel that ran.
+      fail "a failed gateway skips the $doomed_kind sentinel entirely" \
+        "a sentinel that never ran was graded '$FS_AGENT_PROOF'"
+    elif grep -q 'Asking' "$doomed_out"; then
+      fail "a failed gateway skips the $doomed_kind sentinel entirely" \
+        "announced a request it never made"
+    elif grep -q '\[confirm\]' "$doomed_out"; then
+      # A run that emits no code has nothing to offer a choice about, so the
+      # guard returns rather than asking.
+      fail "a failed gateway skips the $doomed_kind sentinel entirely" \
+        "asked the operator a question this run cannot act on"
+    else
+      pass "a failed gateway skips the $doomed_kind sentinel entirely"
+    fi
+  done
+  rm -f "$doomed_out"
+
   VERIFY_FAILED=false
   CONFIRM_ANSWER="n"
   FS_URL="$lane_url"; FS_CRED="$password"

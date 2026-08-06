@@ -4,6 +4,18 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **A run whose gateway has already failed stops spending a five-minute agent
+  turn to learn nothing.** The last verification step asks your actual agent to
+  read a randomized file and write it back — a real chat turn against your own
+  paid model, budgeted at five minutes. Once any gateway check has failed, no
+  setup code comes out of the run at all, so that turn buys an answer the run
+  then discards, and the re-run you now owe has to spend it again. A custom
+  gateway already checked first; OpenClaw and Hermes ran the turn anyway, and
+  then pointed you at your file lane when the gateway was what died. All three
+  kinds check first now, out of one shared routine so their wording cannot
+  drift, and say plainly that the turn was skipped and why. The agent proof is
+  left blank rather than marked unproved: unproved is a verdict a sentinel that
+  ran and fell short earns, and this one never ran.
 - **The Hermes memory question stops reading like a required file-transfer
   repair.** It is a separate concern that happens to share one config line with
   the file lane, so it is asked in the same place for the same reason — one edit,
