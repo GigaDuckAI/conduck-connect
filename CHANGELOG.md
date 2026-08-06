@@ -4,6 +4,48 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The Hermes memory question stops reading like a required file-transfer
+  repair.** It is a separate concern that happens to share one config line with
+  the file lane, so it is asked in the same place for the same reason — one edit,
+  one restart, one question per run — but on screen it inherited the "Step 4 —
+  agent file lane" heading and, on the stock config a fresh Hermes ships, dumped
+  roughly 45 lines of by-hand YAML surgery nobody had asked for, on runs that had
+  declined the file lane outright. The finding now carries its own heading that
+  says it is not part of the file lane, states plainly that removing Hermes's
+  recall is required for neither file transfer nor chat, and puts the by-hand
+  instructions behind one question — *Show what to check or change by hand?* —
+  asked once per run and answered `n` by default. `--dry-run`, `--reuse-only` and
+  `--show-code` still print everything with no prompt, as those modes promise.
+  Nothing about when or how often the question is asked, what gets edited, or how
+  many times Hermes is restarted has changed.
+- **"Toolset" is defined, once, before the Hermes path leans on it.** The word
+  carries nearly every sentence in that path and appeared 28 times without ever
+  being explained. The first Hermes screen of every run now glosses it in one
+  parenthesis — a named group of tools Hermes hands an agent, `file` being the
+  one that gives a surface its file read/write tools, `memory` and
+  `session_search` being the recall this check is about — and it is deliberately
+  modest: naming `file` grants the tools and proves nothing about reaching the
+  shared folder, which is what the readiness check and the live sentinel are for.
+- **You are told what `terminal.cwd` reaches before you approve writing it.** It
+  is read from the root of `config.yaml`, not from the API server's own section,
+  so it is the working folder for every Hermes surface that reads that key — not
+  only the one Conduck talks to. The wizard already priced the reach of the
+  recall keys it merely *suggests*; the key it actually *writes* had no such
+  line. The toolset list beside it gets its own, narrower statement, and a change
+  whose reach cannot be named falls through to the wider one rather than to
+  silence.
+- **A failed agent file turn points at what actually failed.** One hint —
+  *fix Hermes file tools/terminal.cwd* — covered eight distinct outcomes,
+  including the one where the agent read the sentinel, wrote a byte-identical
+  copy, and only omitted the filename from its reply: keys this same run had
+  applied and re-checked ninety seconds earlier. The probe now carries a failure
+  *category* beside its message, and the diagnosis branches on that category
+  rather than on matching its own prose. A reply-only failure says the file
+  access passed and points at the answer; a transport or staging failure no
+  longer claims the transport worked; and where one turn genuinely cannot tell
+  the causes apart, the model answering is *listed* as one of them — it is named
+  nowhere else on screen, and a model that never calls a tool produces exactly
+  that result — never asserted as the observed cause.
 - **The Hermes config line the wizard tells you to write by hand keeps your
   agent's tools.** Where it cannot make the `platform_toolsets.api_server` edit
   itself it prints a list to write instead, and that list was `["web"]` — or

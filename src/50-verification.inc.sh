@@ -8,6 +8,15 @@ VERIFY_FAILED=false
 # deletion of a working lane.
 FS_LANE_DROPPED_BY_CHECK=false
 
+# Did a real agent turn prove the agent can USE the shared folder — read a file
+# out of it and write one back? Transport and agent access are two independent
+# halves, and only this one is a capability the operator can act on. Three states,
+# because "we asked and it failed" and "nobody asked" are both NOT proof but read
+# differently: "proved" · "unproved" (a sentinel ran and did not pass) · "" (none
+# ran). emit_payload reads it so the final screen cannot show a green capability
+# nothing measured.
+FS_AGENT_PROOF=""
+
 check() { # check "label" <command...>  (command's exit code decides)
   local label="$1"; shift
   if "$@" >/dev/null 2>&1; then ok "$label"; else bad "$label"; VERIFY_FAILED=true; return 1; fi
@@ -378,25 +387,218 @@ gw_5xx_credential_note() { # reads GW_AUTH / GW_URL / MODELS_CURL_RC / MODELS_HT
   note "Re-run setup, say this gateway DOES need a bearer token, and give it the expected one."
 }
 
+# The custom half of the same gate, answering a different question. For OpenClaw
+# and Hermes this wizard configured the agent itself, so a failed sentinel means
+# something IT set up is wrong and the lane comes out — the operator can fix the
+# named thing and re-run. A custom gateway is any OpenAI-compatible server: a
+# plain model server has no file tools at all and cannot pass this, which is a
+# fact about that software rather than a fault anyone can repair. So the failure
+# is reported without a verdict, and the operator decides — this wizard neither
+# ships an unusable exposed lane on its own nor deletes a working one it merely
+# failed to measure.
+custom_agent_file_lane_gate() {
+  # The guard comes BEFORE the request, not after it. Once any gateway check has
+  # failed, emit_payload hands out no code at all, so every later question is
+  # answered into a run that discards it — and this particular one would first
+  # spend a real, billable, up-to-five-minute agent turn to get there.
+  if $VERIFY_FAILED; then
+    note "The gateway checks above failed, so this run emits no setup code either way — I'm not"
+    note "spending an agent turn on the file lane. Fix the gateway, then re-run me."
+    FS_LANE_DROPPED_BY_CHECK=true
+    drop_file_lane
+    return 1
+  fi
+
+  say "  Asking your agent to copy a randomized sentinel file with whatever file tools it has (up to 5 minutes)…"
+  if agent_file_probe; then
+    FS_AGENT_PROOF="proved"
+    ok "agent file lane: your agent read the sentinel, wrote it back byte-identically, and named it in its reply"
+    # The boundary is said where the proof lands, so it reads as scope rather than
+    # as doubt. The sentinel is a small text file: passing it proves this agent can
+    # reach the shared folder in both directions, and nothing about whether it can
+    # make sense of any particular format once it gets there.
+    note "That is proof for plain bytes through this folder. Whether the agent can READ a given"
+    note "format — a PDF, a spreadsheet — depends on the tools it has, not on this lane."
+    return 0
+  fi
+
+  FS_AGENT_PROOF="unproved"
+  # Reported with warn, never `bad`: for the most common custom gateway this
+  # outcome is the correct answer, and a red ✗ over an expected result teaches the
+  # operator to distrust the checks that ARE about their mistakes.
+  # The headline names the SENTINEL, not the agent, because the agent is only one
+  # of the things that can fail here: a WebDAV refusal and a mktemp that failed on
+  # this machine both reach this line, and neither is a finding about anything the
+  # operator's agent did.
+  warn "The file-lane sentinel did not pass: $AGENT_FILE_PROBE_REASON"
+  # Branched on the failure CATEGORY, through the same routine the OpenClaw/Hermes
+  # gate uses — a second, flat paragraph here is exactly how the custom path ends
+  # up telling an operator whose file server refused the probe that the transport
+  # passed and their agent failed, when no agent was ever contacted.
+  # Called with NO config hint: this wizard configures nothing agent-side on a
+  # gateway it did not set up, so there is no key it applied to point at.
+  agent_file_lane_cause_notes "your agent" ""
+  # The decisive fact for the choice below, and the operator cannot discover it
+  # from anywhere else: the payload carries an address and a credential and has no
+  # field for a caveat, so a kept lane arrives in the app looking fully working.
+  note "Conduck cannot be told about this: the setup code carries only the address and the"
+  note "credential, so the app will show file transfer as enabled either way."
+  if confirm "  Include the file server in the setup code anyway?" "file.agent.unproved"; then
+    note "Keeping it. This run's screen marks it as unproved; the app cannot."
+    return 0
+  fi
+  # The service and the ROUTE are two different things and drop_file_lane treats
+  # them differently: rclone keeps serving, while rollback_fs_exposures undoes the
+  # HTTPS exposure this run applied for the lane. Saying only "left exactly as it
+  # is" reads as a promise about both, one line before the rollback tears the
+  # route down on screen.
+  note "Leaving file transfer out of this setup code — chat is unaffected. The file service, its"
+  note "folder, and its contents keep running untouched; the only thing undone is an HTTPS route"
+  note "this run opened for the lane, which is closed again rather than left reachable."
+  FS_LANE_DROPPED_BY_CHECK=true
+  drop_file_lane
+  return 1
+}
+
+# The model is not named anywhere else on this screen, and on the Hermes path it
+# is usually not named at all: configure_hermes asks for no model, so the
+# gateway's own configured default answers. Naming what actually replied is what
+# turns "it may be the model" into something an operator can go and check.
+# GW_MODEL is whatever a server or an operator typed, so it goes through
+# safe_display like every other foreign string that reaches this terminal.
+agent_probe_model_label() { # agent_probe_model_label <agent-name>
+  if [ -n "${GW_MODEL:-}" ]; then
+    printf 'the model this run asks for, %s' "$(safe_display "$GW_MODEL" 60)"
+  else
+    printf "%s's own default model — this run names none, exactly as the app does" "$1"
+  fi
+}
+
+# "What to fix", chosen by the probe's failure CATEGORY. One string for every
+# outcome pointed at ~/.hermes/config.yaml even for failures that had nothing to
+# do with it — most sharply the one where the agent read the file, wrote a
+# byte-identical copy, and only its REPLY fell short, ninety seconds after this
+# same run applied and re-checked exactly those keys.
+agent_file_lane_fix_hint() { # agent_file_lane_fix_hint <agent-name> <config-hint>
+  case "$AGENT_FILE_PROBE_REASON_KIND" in
+    reply-naming)    printf '%s' "how $1 answers — its file access already passed" ;;
+    visibility)      printf '%s' "the file server, not $1 — it did write the file" ;;
+    turn)            printf '%s' "whatever made that request fail" ;;
+    transport)       printf '%s' "the file server this run set up" ;;
+    harness|cleanup) printf '%s' "this machine's temp-file and file-server access" ;;
+    # output-boundary, unsupported, and any kind a later change adds without
+    # teaching this function about it: the configuration is the honest default,
+    # and it is what the wider note below already frames as a possibility rather
+    # than a verdict.
+    *)               printf '%s' "$2" ;;
+  esac
+}
+
+# What that failure does and does not say. The flat version claimed "the WebDAV
+# transport worked, but the agent did not complete the file turn" for every
+# outcome — false for a transport refusal, false for a staging failure this
+# script caused, and misleading for a turn that never got as far as a file.
+# <config-hint> is EMPTY on the custom path, and that is a real distinction rather
+# than a missing argument: this wizard configures nothing agent-side on a gateway
+# it did not set up, so every clause crediting keys "this run applied and
+# re-checked" would describe work that never happened. Each branch drops that
+# clause rather than printing a sentence with a hole in it.
+agent_file_lane_cause_notes() { # agent_file_lane_cause_notes <agent-name> [config-hint]
+  local agent="$1" cfg_hint="${2:-}" model
+  model=$(agent_probe_model_label "$agent")
+  case "$AGENT_FILE_PROBE_REASON_KIND" in
+    harness|cleanup)
+      note "That is this script's own probe housekeeping on THIS machine, not a finding about"
+      note "$agent: nothing was measured about its file tools either way." ;;
+    transport)
+      note "The file server refused a request, so $agent was never asked to do anything. This is"
+      if [ -n "$cfg_hint" ]; then
+        note "the WebDAV lane between this script and the shared folder — not the agent, and not"
+        note "$cfg_hint."
+      else
+        note "the WebDAV lane between this script and the shared folder — not the agent, and not"
+        note "anything about the file tools it has."
+      fi ;;
+    turn)
+      note "The chat request failed before any file work could be graded, so this says nothing"
+      note "about $agent's file tools. The gateway checks above are the ones about the request." ;;
+    reply-naming)
+      note "The transport worked and so did $agent's file access: it read the sentinel and wrote a"
+      note "byte-identical copy. Only the last step is missing — Conduck finds a returned file by"
+      note "the filename in the reply TEXT, and this reply did not carry one."
+      if [ -n "$cfg_hint" ]; then
+        note "So this is about the answer, not about $cfg_hint, which this run already aligned and"
+        note "re-checked. Where to look: $model, and the Conduck guidance block that tells the agent"
+        note "to state the exact filename in plain text."
+      else
+        note "So this is about the answer, not about the folder or the file server."
+        note "Where to look: $model."
+        note "This wizard installs no guidance on a gateway it did not configure, so \"name the"
+        note "file you wrote, in plain text\" is a rule you add on your side."
+      fi ;;
+    visibility)
+      note "The transport worked and $agent did finish writing before it replied — the file simply"
+      note "never became visible through the file server in time. Look at the file server and the"
+      if [ -n "$cfg_hint" ]; then
+        note "folder it serves, not at $cfg_hint."
+      else
+        note "folder it serves, not at the agent."
+      fi ;;
+    *)
+      # output-boundary and anything unclassified. Causes, never a diagnosis: one
+      # probe cannot tell these apart, and naming one would send an operator to
+      # fix something that was never wrong. The model is LISTED because a
+      # tool-less model manufactures exactly this result and is named nowhere
+      # else on screen — it is never asserted as the observed cause.
+      note "The transport worked, but $agent did not finish the file turn. One failed turn cannot"
+      note "say which of these it was:"
+      if [ -n "$cfg_hint" ]; then
+        note "  - $cfg_hint — this run applied and re-checked it, so it is the less likely half"
+        note "  - $model may not call tools at all; a chat-only model behind an agent gateway"
+        note "    produces exactly this result"
+      else
+        # The plain model server leads the list only where nothing was configured:
+        # it is the commonest custom gateway by far, and it is the one cause that
+        # means nothing on the operator's host is broken at all.
+        note "  - a plain model server (Ollama, LiteLLM, vLLM and the like) has no file tools at"
+        note "    all and cannot pass this — nothing on your host is wrong"
+        note "  - $model may not call tools even where the server has them; a chat-only model"
+        note "    behind an agent gateway produces exactly this result"
+      fi
+      note "  - the agent may write somewhere other than the folder you named, or see a different"
+      note "    filesystem than this machine does — a container, another account, another box"
+      note "  - what it wrote may not match byte for byte, or may not be a plain file at that name"
+      note "  - the turn may simply have failed this once" ;;
+  esac
+}
+
 agent_file_lane_gate() {
-  local agent_name fix_hint
+  local agent_name fix_hint config_hint
   case "$GW_KIND" in
     openclaw)
       agent_name="OpenClaw"
-      fix_hint="OpenClaw's workspace/tool policy" ;;
+      config_hint="OpenClaw's workspace/tool policy" ;;
     hermes)
       agent_name="Hermes"
-      fix_hint="Hermes file tools/terminal.cwd" ;;
+      config_hint="Hermes's file toolset and terminal.cwd" ;;
+    custom) custom_agent_file_lane_gate; return ;;
     *) return 0 ;;
   esac
 
   say "  Asking $agent_name to read and copy a randomized sentinel with its file tools (up to 5 minutes)…"
   if agent_file_probe; then
+    FS_AGENT_PROOF="proved"
     ok "$agent_name agent file lane: tool read + byte-identical write + reply discovery all green"
     return 0
   fi
 
+  FS_AGENT_PROOF="unproved"
   bad "$agent_name agent file lane failed: $AGENT_FILE_PROBE_REASON"
+  # Before every branch below, including the --show-code `die`: what to do next is
+  # the same question on all of them, and the answer depends on which failure this
+  # was rather than on which command is running.
+  agent_file_lane_cause_notes "$agent_name" "$config_hint"
+  fix_hint=$(agent_file_lane_fix_hint "$agent_name" "$config_hint")
   # A gateway-only code is a real offer only while the GATEWAY itself passed. Once any
   # gateway check has failed, emit_payload hands out no code at all — so asking here
   # would promise one and then exit 1 anyway, over a fault this file lane cannot fix.
@@ -414,7 +616,6 @@ agent_file_lane_gate() {
     fi
     die "Stopped before emitting a new code. Any separately approved host edits from this run remain in place; fix $fix_hint, then re-run --show-code."
   fi
-  note "The WebDAV transport worked, but $agent_name itself did not complete the file turn."
   note "Leaving file transfer out of this setup code; fix $fix_hint, then re-run setup."
   hermes_residual_state_note
   FS_LANE_DROPPED_BY_CHECK=true
@@ -424,6 +625,10 @@ agent_file_lane_gate() {
 
 verify_all() {
   head_ "Step 5 — verify (real requests, before you touch your phone)"
+  # Proof belongs to THIS run's measurements. Cleared here rather than only at
+  # declaration so a second verify_all in one process — a re-check, a test, a
+  # future menu loop — can never inherit a green claim from an earlier lane.
+  FS_AGENT_PROOF=""
 
   # Local health first (when the gateway has a health endpoint).
   # "Is it up locally?" — any HTTP answer below 500 counts (this request carries
@@ -593,10 +798,11 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
     fi
     rm -f "$tmp"
 
+    # Every kind goes through the gate; the gate's own case is the one place that
+    # decides which agent proof each kind can offer. A second copy of that routing
+    # here is how a newly supported kind ends up silently ungated again.
     if $transport_ok && [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
-      case "$GW_KIND" in
-        openclaw|hermes) agent_file_lane_gate || true ;;
-      esac
+      agent_file_lane_gate || true
     fi
   fi
 }

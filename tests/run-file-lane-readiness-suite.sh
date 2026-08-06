@@ -1504,6 +1504,39 @@ expect_global_alternative() { # expect_global_alternative <label> <transcript>
 # load-bearing and both are easy to lose in an edit: the per-surface key is not
 # per-CLIENT (everything pointed at that API server loses memory, not just
 # Conduck), and the global key is not per-surface at all.
+# "This step changed nothing" as a measurement rather than as a grep for one
+# line that happened to survive. A digest catches a rewrite that kept the line
+# being asserted on, which is exactly what a bundle or wide-default screen must
+# never do.
+config_digest() { # config_digest <file> -> a stable digest, or "" when absent
+  [ -f "$1" ] || { printf ''; return 0; }
+  python3 - "$1" <<'PY' 2>/dev/null
+import hashlib, sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+}
+
+# The SHAPE of what a screen asked, not merely whether it asked. "No [confirm]
+# anywhere" was a usable proxy for "offers no edit" only while this path had a
+# single kind of question; now that the by-hand instructions sit behind a
+# read-only disclosure, that count passes both for a screen that asks nothing and
+# for one that grew a second, mutating prompt. So the count AND the action id are
+# pinned together.
+expect_confirm_shape() { # expect_confirm_shape <label> <transcript> <expected-action-id>
+  local label="$1" out="$2" want="$3" n
+  n=$(printf '%s\n' "$out" | grep -c '^\[confirm\] ')
+  if [ "$n" = "1" ]; then
+    pass "$label: exactly one question is asked"
+  else
+    fail "$label: exactly one question is asked" "got $n"
+  fi
+  if [ "$(printf '%s\n' "$out" | grep -c "action=$want\$")" = "1" ]; then
+    pass "$label: the question asked is $want"
+  else
+    fail "$label: the question asked is $want" "$out"
+  fi
+}
+
 expect_reach_paragraph() { # expect_reach_paragraph <label> <transcript>
   local label="$1" out="$2"
   case "$out" in *"platform_toolsets.api_server changes this API server for"*)
@@ -1793,6 +1826,7 @@ hint_round_trip() { # hint_round_trip <label> <parent> <leaf> <replace|append> <
 reset_recall_run() {
   HERMES_RECALL_REPORTED=false
   HERMES_RECALL_DECLINED=false
+  HERMES_RECALL_MANUAL_OFFERED=false
   HERMES_SCOPE_CHANGED_THIS_RUN=false
   HERMES_CONFIG_CHANGED_THIS_RUN=false
   HERMES_GUIDANCE_CHANGED_THIS_RUN=false
@@ -2474,21 +2508,173 @@ test_hermes_recall_edits() {
   fi
 }
 
+# "toolset" carries nearly every sentence on the Hermes path and Hermes's own
+# docs are the only other place it is defined. The gloss is load-bearing, so it
+# is pinned the way the rest of this screen is: printed once, on the first Hermes
+# screen of the run, whichever route reached it — including the all-clear one,
+# which still uses the word.
+test_hermes_toolset_gloss() {
+  local saved_home="$HOME" out cfg=".hermes/config.yaml"
+  # hermes_recall_report sets the run-long latch in the CALLER's shell, so its
+  # transcript cannot be taken through a command substitution: the subshell would
+  # swallow the very latch the last case here is about.
+  report_once() { hermes_recall_report > "$TMP/gloss.out" 2>&1; out=$(cat "$TMP/gloss.out"); }
+
+  reset_recall_run
+  recall_home "gloss"
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
+  hermes_recall_read "$HOME/$cfg"
+  report_once
+  expect_eq "gloss: the word is defined exactly once" \
+    "$(printf '%s\n' "$out" | grep -c "is Hermes's name for a named group of tools")" "1"
+  case "$out" in *"file"*) pass "gloss: the definition names the file toolset" ;;
+    *) fail "gloss: the definition names the file toolset" "$out" ;; esac
+  # Recall is BOTH names in this connector's vocabulary. A gloss that defined
+  # only `memory` would leave an operator fixing half of it.
+  case "$out" in *session_search*) pass "gloss: recall is defined as both names" ;;
+    *) fail "gloss: recall is defined as both names" "$out" ;; esac
+  # The heading has to say this is not the file-lane question, because on the
+  # commonest route it prints under the file-lane banner.
+  case "$out" in *"not part of the file lane"*)
+      pass "gloss: the memory screen names itself as separate from the file lane" ;;
+    *) fail "gloss: the memory screen names itself as separate from the file lane" "$out" ;; esac
+  case "$out" in *"not required for file transfer"*)
+      pass "gloss: the screen says the removal is not needed for file transfer" ;;
+    *) fail "gloss: the screen says the removal is not needed for file transfer" "$out" ;; esac
+
+  # An all-clear screen still says "toolset", so it still owes the definition.
+  reset_recall_run
+  printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "file"]' > "$HOME/$cfg"
+  hermes_recall_read "$HOME/$cfg"
+  report_once
+  expect_eq "gloss: a clean scope defines the word too" \
+    "$(printf '%s\n' "$out" | grep -c "is Hermes's name for a named group of tools")" "1"
+
+  # …and the run-long latch covers the gloss as well: a second reach prints
+  # nothing at all, so the word cannot be re-defined mid-run.
+  report_once
+  expect_eq "gloss: a second reach repeats nothing" "$out" ""
+
+  unset -f report_once
+  HOME="$saved_home"
+}
+
+# What the approved Hermes edit REACHES, and the fact that it is driven by the
+# analyzer's change kinds rather than by matching the sentence printed above it.
+# The three shapes are genuinely different screens: a cwd-only edit has no
+# "toolset list beside it" to talk about, and a toolset-only edit must not warn
+# about a root key it is not writing.
+test_hermes_change_reach_note() {
+  local saved_home="$HOME" ws out real_ws cfg=".hermes/config.yaml"
+
+  reset_recall_run
+  recall_home "reach-note"
+  ws="$TMP/reach-note-ws"; mkdir -p "$ws"
+  real_ws=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$ws")
+
+  # cwd only: the file toolset is already there.
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web", "file"]' > "$HOME/$cfg"
+  hermes_analysis_read "$HOME/$cfg" "$ws" analyze
+  out=$(hermes_change_reach_note 2>&1)
+  case "$out" in *"terminal.cwd reaches further"*)
+      pass "reach note: a cwd change states the root-key reach" ;;
+    *) fail "reach note: a cwd change states the root-key reach" "$out" ;; esac
+  case "$out" in *"The toolset list is this API server's own"*)
+      fail "reach note: a cwd-only change does not describe a toolset edit" "$out" ;;
+    *) pass "reach note: a cwd-only change does not describe a toolset edit" ;; esac
+
+  # toolset only: cwd already matches the shared folder.
+  printf '%s\n' 'terminal:' "  cwd: \"$real_ws\"" \
+    'platform_toolsets:' '  api_server: ["web"]' > "$HOME/$cfg"
+  hermes_analysis_read "$HOME/$cfg" "$ws" analyze
+  out=$(hermes_change_reach_note 2>&1)
+  case "$out" in *"The toolset list is this API server's own"*)
+      pass "reach note: a toolset change states the per-surface reach" ;;
+    *) fail "reach note: a toolset change states the per-surface reach" "$out" ;; esac
+  case "$out" in *"terminal.cwd reaches further"*)
+      fail "reach note: a toolset-only change does not warn about a key it will not write" "$out" ;;
+    *) pass "reach note: a toolset-only change does not warn about a key it will not write" ;; esac
+
+  # Both, which is the shape a fresh Hermes install actually lands in.
+  printf '%s\n' 'terminal:' '  cwd: "/nope"' \
+    'platform_toolsets:' '  api_server: ["web"]' > "$HOME/$cfg"
+  hermes_analysis_read "$HOME/$cfg" "$ws" analyze
+  out=$(hermes_change_reach_note 2>&1)
+  case "$out" in *"terminal.cwd reaches further"*)
+      pass "reach note: a combined edit states the root-key reach" ;;
+    *) fail "reach note: a combined edit states the root-key reach" "$out" ;; esac
+  case "$out" in *"The toolset list is this API server's own"*)
+      pass "reach note: a combined edit states the per-surface reach too" ;;
+    *) fail "reach note: a combined edit states the per-surface reach too" "$out" ;; esac
+  # The reach must never be claimed for surfaces this parser cannot see. It reads
+  # one key at the root of one file; naming the CLI or cron agents would be a
+  # claim about software behaviour it has not measured.
+  case "$out" in *" CLI"*|*cron*)
+      fail "reach note: no unmeasured Hermes surface is named" "$out" ;;
+    *) pass "reach note: no unmeasured Hermes surface is named" ;; esac
+
+  # THE FAIL-OPEN GUARD. A change whose kind is missing or unrecognised must fall
+  # through to the widest honest statement, never to silence — approving a change
+  # whose reach could not be named as though it were narrow is the failure this
+  # whole mechanism exists to prevent.
+  HERMES_ANALYSIS_CHANGES=("terminal.cwd: (absent) -> \"/srv\"")
+  HERMES_ANALYSIS_CHANGE_KINDS=()
+  out=$(hermes_change_reach_note 2>&1)
+  case "$out" in *"terminal.cwd reaches further"*)
+      pass "reach note: a change with no kind gets the widest statement" ;;
+    *) fail "reach note: a change with no kind gets the widest statement" "$out" ;; esac
+  HERMES_ANALYSIS_CHANGES=("something new: a -> b")
+  HERMES_ANALYSIS_CHANGE_KINDS=("brand-new-kind")
+  out=$(hermes_change_reach_note 2>&1)
+  case "$out" in *"terminal.cwd reaches further"*)
+      pass "reach note: an unrecognised kind gets the widest statement" ;;
+    *) fail "reach note: an unrecognised kind gets the widest statement" "$out" ;; esac
+  case "$out" in *"The toolset list is this API server's own"*)
+      fail "reach note: an unrecognised kind claims no narrow reach" "$out" ;;
+    *) pass "reach note: an unrecognised kind claims no narrow reach" ;; esac
+
+  HERMES_ANALYSIS_CHANGES=(); HERMES_ANALYSIS_CHANGE_KINDS=()
+  HOME="$saved_home"
+}
+
 test_hermes_recall_operator_flow() {
-  local saved_home="$HOME" out rc cfg
+  local saved_home="$HOME" out rc cfg digest_before
   cfg=".hermes/config.yaml"
 
   reset_recall_run
   recall_home "flow"
   printf '%s\n' 'platform_toolsets:' '  api_server: ["web", "memory"]' > "$HOME/$cfg"
-  CONFIRM_ANSWER="n"
+  # Two answers, because the step now asks two questions on this path: no to the
+  # removal, then yes to seeing the by-hand instructions. A flat CONFIRM_ANSWER=n
+  # would decline both and leave the "hands back the manual edit" assertion
+  # passing on the skip note alone — green for the wrong reason.
+  CONFIRM_SCRIPT="n:y"
   out=$(hermes_recall_scope_step 2>&1); rc=$?
   expect_eq "recall step: a declined removal returns nonzero" "$rc" "1"
   case "$out" in *memory*) pass "recall step: a declined removal names the finding" ;;
     *) fail "recall step: a declined removal names the finding" "$out" ;; esac
-  case "$out" in *config.yaml*) pass "recall step: a declined removal hands back the manual edit" ;;
+  case "$out" in *"take memory and session_search out of the"*)
+      pass "recall step: a declined removal hands back the manual edit" ;;
     *) fail "recall step: a declined removal hands back the manual edit" "$out" ;; esac
   expect_eq "recall step: a declined removal changed nothing" \
+    "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
+
+  # …and the other answer to the same second question: declining the disclosure
+  # prints no YAML at all. Without this case the door could be wired shut and
+  # every assertion above would still pass.
+  reset_recall_run
+  CONFIRM_ANSWER="n"
+  out=$(hermes_recall_scope_step 2>&1); rc=$?
+  expect_eq "recall step: a declined disclosure still returns nonzero" "$rc" "1"
+  case "$out" in *"Hermes memory scope"*)
+      pass "recall step: a declined disclosure keeps the finding on screen" ;;
+    *) fail "recall step: a declined disclosure keeps the finding on screen" "$out" ;; esac
+  case "$out" in *"take memory and session_search out of the"*)
+      fail "recall step: a declined disclosure prints no by-hand steps" "$out" ;;
+    *) pass "recall step: a declined disclosure prints no by-hand steps" ;; esac
+  expect_no_snapshot_recommendation "recall step: a declined disclosure" "$out"
+  expect_eq "recall step: a declined disclosure changed nothing" \
     "$(grep -c 'api_server: \["web", "memory"\]' "$HOME/$cfg")" "1"
 
   reset_recall_run
@@ -2507,12 +2693,24 @@ test_hermes_recall_operator_flow() {
   reset_recall_run
   CONFIRM_ANSWER="y"
   printf '%s\n' 'platform_toolsets:' '  api_server: ["hermes-api-server"]' > "$HOME/$cfg"
+  digest_before=$(config_digest "$HOME/$cfg")
   out=$(hermes_recall_scope_step 2>&1); rc=$?
   expect_eq "recall step: a bundle returns nonzero" "$rc" "1"
   expect_eq "recall step: a bundle is never rewritten" \
     "$(grep -c 'hermes-api-server' "$HOME/$cfg")" "1"
-  case "$out" in *"[confirm]"*) fail "recall step: a bundle is not offered as an edit" "asked anyway" ;;
-    *) pass "recall step: a bundle is not offered as an edit" ;; esac
+  # A bundle is described, never rewritten — so the ONE question this screen may
+  # ask is the read-only disclosure, and it must be that one. Counting "no
+  # [confirm] at all" stopped meaning that the moment the by-hand instructions
+  # went behind a door: it would pass for a screen that asked nothing AND for one
+  # that grew a second, mutating prompt. So the shape is pinned instead — exactly
+  # one confirmation, and it is the read-only one — plus the file is proven
+  # byte-identical across the step, which is the claim the old assertion was
+  # really making.
+  expect_confirm_shape "recall step: a bundle" "$out" "gateway.hermes.show_recall_manual"
+  expect_eq "recall step: a bundle is not offered as an edit" \
+    "$(printf '%s' "$out" | grep -c 'action=gateway.hermes.remove_recall')" "0"
+  expect_eq "recall step: a bundle leaves the file byte-identical" \
+    "$(config_digest "$HOME/$cfg")" "$digest_before"
   # Describing it is not enough: the operator is left holding a by-hand edit, so
   # the step owes them the replacement list and what choosing it costs.
   expect_snapshot_recommendation "recall step: a bundle" "$out"
@@ -2520,12 +2718,16 @@ test_hermes_recall_operator_flow() {
   reset_recall_run
   CONFIRM_ANSWER="y"
   printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
+  digest_before=$(config_digest "$HOME/$cfg")
   out=$(hermes_recall_scope_step 2>&1); rc=$?
   expect_eq "recall step: the wide default returns nonzero" "$rc" "1"
   case "$out" in *"default bundle"*) pass "recall step: the wide default is named as the default" ;;
     *) fail "recall step: the wide default is named as the default" "$out" ;; esac
-  case "$out" in *"[confirm]"*) fail "recall step: the wide default is not offered as an edit" "asked anyway" ;;
-    *) pass "recall step: the wide default is not offered as an edit" ;; esac
+  expect_confirm_shape "recall step: the wide default" "$out" "gateway.hermes.show_recall_manual"
+  expect_eq "recall step: the wide default is not offered as an edit" \
+    "$(printf '%s' "$out" | grep -c 'action=gateway.hermes.remove_recall')" "0"
+  expect_eq "recall step: the wide default leaves the file byte-identical" \
+    "$(config_digest "$HOME/$cfg")" "$digest_before"
   expect_snapshot_recommendation "recall step: the wide default" "$out"
 
   # A run whose whole promise is that it changes nothing may report but never gate.
@@ -2816,9 +3018,16 @@ test_hermes_recall_reach() {
   reset_recall_run
   printf '%s\n' 'terminal:' '  cwd: "/tmp"' > "$HOME/$cfg"
   FS_URL="https://files.example.test"; FS_CRED="fixture-file-secret"
+  # A wide default is a shape this connector will not rewrite, so the by-hand
+  # instructions — and with them the list under test — are behind the read-only
+  # disclosure. This case is about WHICH list gets printed, so it has to open
+  # that door; reset_recall_run's default "n" would leave both sides empty and
+  # the comparison would pass on two blanks.
+  CONFIRM_ANSWER="y"
   run_post_recall_step
   with_lane=$(hint_advice_line "$out")
   reset_recall_run
+  CONFIRM_ANSWER="y"
   FS_URL="https://files.example.test"; FS_CRED=""
   run_post_recall_step
   without_lane=$(hint_advice_line "$out")
@@ -3238,6 +3447,146 @@ doctor_chat_request() {
   return 0
 }
 
+# One hint covered eight failures, and for at least one of them it pointed the
+# wrong way: an agent that read the sentinel and wrote a byte-identical copy, and
+# only failed to name the file in its reply, was sent to the same config keys
+# this run had applied and re-checked ninety seconds earlier.
+#
+# Graded on the CATEGORY, never on the reason text. That is the whole design
+# claim, so it is also what these cases exercise: the reason string is left empty
+# throughout and every branch still has to answer correctly.
+test_agent_file_lane_reason_branching() {
+  local saved_kind="${GW_KIND:-}" saved_model="${GW_MODEL:-}" k out hint
+  local seen="" dup=""
+
+  # Every kind must produce a hint, and the ones this run can distinguish must
+  # not collapse onto the configuration answer.
+  GW_MODEL=""
+  for k in reply-naming visibility turn transport harness cleanup output-boundary unsupported; do
+    AGENT_FILE_PROBE_REASON_KIND="$k"
+    hint=$(agent_file_lane_fix_hint "Hermes" "Hermes's file toolset and terminal.cwd")
+    [ -n "$hint" ] || fail "reason branch: $k has a fix hint" "empty"
+  done
+
+  AGENT_FILE_PROBE_REASON_KIND="reply-naming"
+  hint=$(agent_file_lane_fix_hint "Hermes" "Hermes's file toolset and terminal.cwd")
+  case "$hint" in *terminal.cwd*|*toolset*)
+      fail "reason branch: a reply-only failure is not blamed on the config" "$hint" ;;
+    *) pass "reason branch: a reply-only failure is not blamed on the config" ;; esac
+  out=$(agent_file_lane_cause_notes "Hermes" "Hermes's file toolset and terminal.cwd" 2>&1)
+  case "$out" in *"file access"*)
+      pass "reason branch: a reply-only failure credits the file access that passed" ;;
+    *) fail "reason branch: a reply-only failure credits the file access that passed" "$out" ;; esac
+
+  # The kinds where the transport is what FAILED must not repeat the old claim
+  # that the transport worked.
+  for k in transport harness cleanup turn; do
+    AGENT_FILE_PROBE_REASON_KIND="$k"
+    out=$(agent_file_lane_cause_notes "Hermes" "Hermes's file toolset and terminal.cwd" 2>&1)
+    case "$out" in *"The transport worked"*)
+        fail "reason branch: $k does not claim the transport worked" "$out" ;;
+      *) pass "reason branch: $k does not claim the transport worked" ;; esac
+  done
+
+  # The ambiguous one. It may LIST the model — that possibility is invisible
+  # otherwise, because nothing on this screen ever names the model — and it may
+  # never assert it, so the configuration has to stay on the list beside it.
+  AGENT_FILE_PROBE_REASON_KIND="output-boundary"
+  out=$(agent_file_lane_cause_notes "Hermes" "Hermes's file toolset and terminal.cwd" 2>&1)
+  case "$out" in *"cannot"*) pass "reason branch: the ambiguous case says it cannot tell" ;;
+    *) fail "reason branch: the ambiguous case says it cannot tell" "$out" ;; esac
+  case "$out" in *"may not call tools at all"*)
+      pass "reason branch: the ambiguous case lists the model as a possibility" ;;
+    *) fail "reason branch: the ambiguous case lists the model as a possibility" "$out" ;; esac
+  case "$out" in *"terminal.cwd"*)
+      pass "reason branch: the ambiguous case still lists the configuration" ;;
+    *) fail "reason branch: the ambiguous case still lists the configuration" "$out" ;; esac
+
+  # The model is named, because "it may be the model" is not checkable otherwise.
+  # Hermes normally has no model configured, so the no-model wording is the one
+  # most operators actually see.
+  GW_MODEL=""
+  case "$(agent_probe_model_label "Hermes")" in *"own default model"*)
+      pass "reason branch: an unnamed model is described as the gateway's default" ;;
+    *) fail "reason branch: an unnamed model is described as the gateway's default" \
+            "$(agent_probe_model_label "Hermes")" ;; esac
+  GW_MODEL="mixtral-8x7b"
+  case "$(agent_probe_model_label "Hermes")" in *mixtral-8x7b*)
+      pass "reason branch: a configured model is named" ;;
+    *) fail "reason branch: a configured model is named" "$(agent_probe_model_label "Hermes")" ;; esac
+  # A model id is a foreign string that reaches the terminal, so it goes through
+  # the same sanitiser as every other one.
+  expect_eq "reason branch: the model label is sanitised" \
+    "$(declare -f agent_probe_model_label | grep -c 'safe_display')" "1"
+
+  # OpenClaw and Hermes do not share a configuration, so the same kind has to
+  # produce a different answer for each. One hint for both is how an OpenClaw
+  # user gets sent to ~/.hermes.
+  AGENT_FILE_PROBE_REASON_KIND="output-boundary"
+  seen=$(agent_file_lane_fix_hint "OpenClaw" "OpenClaw's workspace/tool policy")
+  dup=$(agent_file_lane_fix_hint "Hermes" "Hermes's file toolset and terminal.cwd")
+  if [ "$seen" != "$dup" ]; then
+    pass "reason branch: the two agents get their own configuration answer"
+  else
+    fail "reason branch: the two agents get their own configuration answer" "both said '$seen'"
+  fi
+
+  # The custom path calls this same routine with NO config hint, because this
+  # wizard configures nothing agent-side on a gateway it did not set up. Every
+  # branch has to answer without one, and the two ways that goes wrong are both
+  # pinned: a sentence left with a hole where the hint used to be, and a clause
+  # crediting keys "this run applied and re-checked" when it applied none.
+  for k in reply-naming visibility turn transport harness cleanup output-boundary unsupported; do
+    AGENT_FILE_PROBE_REASON_KIND="$k"
+    out=$(agent_file_lane_cause_notes "your agent" "" 2>&1)
+    [ -n "$out" ] || fail "custom cause notes: $k says something" "empty"
+    case "$out" in *"not about ."*|*"not at ."*|*"- ."*|*"this run applied and re-checked"*)
+        fail "custom cause notes: $k claims no configuration this wizard never wrote" "$out" ;;
+      *) pass "custom cause notes: $k claims no configuration this wizard never wrote" ;; esac
+  done
+
+  # The kinds where the file server, the chat request, or this script's own
+  # staging is what failed must not claim the transport worked — that claim, made
+  # flatly for all seven kinds, is the defect this branching exists to remove.
+  for k in transport harness cleanup turn; do
+    AGENT_FILE_PROBE_REASON_KIND="$k"
+    out=$(agent_file_lane_cause_notes "your agent" "" 2>&1)
+    case "$out" in *"The transport worked"*)
+        fail "custom cause notes: $k does not claim the transport worked" "$out" ;;
+      *) pass "custom cause notes: $k does not claim the transport worked" ;; esac
+  done
+
+  # The sharpest wrong answer the flat paragraph gave: the agent provably read the
+  # sentinel and wrote a byte-identical copy, and was told its server may have no
+  # file tools at all.
+  AGENT_FILE_PROBE_REASON_KIND="reply-naming"
+  out=$(agent_file_lane_cause_notes "your agent" "" 2>&1)
+  case "$out" in *"file access"*)
+      pass "custom cause notes: a reply-only failure credits the file access that passed" ;;
+    *) fail "custom cause notes: a reply-only failure credits the file access that passed" "$out" ;; esac
+  case "$out" in *"no file tools"*)
+      fail "custom cause notes: a reply-only failure does not suggest missing file tools" "$out" ;;
+    *) pass "custom cause notes: a reply-only failure does not suggest missing file tools" ;; esac
+
+  # …and the genuinely ambiguous one keeps the answer that is correct for the
+  # commonest custom gateway, which is that nothing on the host is wrong.
+  AGENT_FILE_PROBE_REASON_KIND="output-boundary"
+  out=$(agent_file_lane_cause_notes "your agent" "" 2>&1)
+  case "$out" in *"has no file tools at"*)
+      pass "custom cause notes: the ambiguous case names a plain model server" ;;
+    *) fail "custom cause notes: the ambiguous case names a plain model server" "$out" ;; esac
+
+  # The routing itself, because the defect is a SECOND copy of the paragraph
+  # rather than a wrong string in the first: a custom gate that grew its own flat
+  # block would satisfy every case above and still tell an operator whose file
+  # server refused the probe that their agent is what failed.
+  expect_eq "custom gate: the cause paragraph comes from the shared category routine" \
+    "$(declare -f custom_agent_file_lane_gate | grep -c 'agent_file_lane_cause_notes')" "1"
+
+  GW_KIND="$saved_kind"; GW_MODEL="$saved_model"
+  AGENT_FILE_PROBE_REASON_KIND=""
+}
+
 test_agent_sentinel() {
   local served="$TMP/agent-sentinel" password="sentinel-secret" token="adapter-secret"
   local openclaw_payload uploaded_secret
@@ -3298,6 +3647,97 @@ raise SystemExit(0 if "model" not in d and "Use read_file to read" in t and "Use
   else
     fail "Hermes sentinel matches tools and app default-model request" "wrong tool names or invented model"
   fi
+
+  # A custom gateway is any OpenAI-compatible server, so the sentinel names no
+  # tool at all. Before this, custom returned success without asking anything.
+  # A model IS named here, unlike the two cases above: the app sends the model the
+  # operator paired, and an Ollama/vLLM/LiteLLM box refuses a request without one.
+  GW_KIND="custom"
+  GW_MODEL="fixture-echo"
+  if agent_file_probe; then
+    pass "custom agent byte sentinel"
+  else
+    fail "custom agent byte sentinel" "$AGENT_FILE_PROBE_REASON"
+  fi
+  # The tool-directed phrasings are asserted absent by their exact wire spelling.
+  # "read"/"write" as bare words cannot be the test: they are ordinary English and
+  # also OpenClaw's tool names, so their absence would be unprovable either way.
+  if printf '%s' "$LAST_AGENT_PAYLOAD" | python3 -c '
+import json, sys
+d=json.load(sys.stdin); t=d["messages"][0]["content"]
+generic = "using whatever file tools you have" in t
+tooled = ("Use read to" in t or "Use read_file to" in t
+          or "Use write " in t or "Use write_file " in t)
+guards = ("Finish the write before replying." in t
+          and "Do not reconstruct or guess the file contents." in t)
+raise SystemExit(0 if generic and not tooled and guards
+                 and d.get("model") == "fixture-echo" else 1)
+'; then
+    pass "custom sentinel is tool-agnostic, keeps both false-green guards, and uses the paired model"
+  else
+    fail "custom sentinel is tool-agnostic, keeps both false-green guards, and uses the paired model" \
+      "tool names, a missing guard clause, or the wrong model"
+  fi
+  GW_MODEL=""
+  stop_adapter
+
+  # The custom gate does not hard-drop like OpenClaw/Hermes: a plain model server
+  # is EXPECTED to fail this, so the operator decides — and the default is out.
+  # The same WebDAV fixture stays up across all four cases below: a reply-first
+  # failure keeps its sentinel registry armed for the EXIT recheck, and that
+  # recheck can only be proven against the server that served it.
+  local lane_url="$FS_URL"
+  start_adapter files-no-write "$served" "$token" || {
+    fail "unproved custom lane defaults to being left out" "adapter fixture failed to start"; stop_webdav; return; }
+  GW_URL="http://127.0.0.1:$READY_PORT"
+  VERIFY_FAILED=false
+  CONFIRM_ANSWER="n"
+  if custom_agent_file_lane_gate; then
+    fail "unproved custom lane defaults to being left out" "gate unexpectedly passed"
+  elif [ -z "$FS_URL" ] && [ -z "$FS_CRED" ] && [ "$FS_AGENT_PROOF" = "unproved" ]; then
+    pass "unproved custom lane defaults to being left out"
+  else
+    fail "unproved custom lane defaults to being left out" "fileServer state survived the decline"
+  fi
+  expect_true "declined custom lane still proves its sentinel cleanup" \
+    agent_file_probe_cleanup_backstop true
+  stop_adapter
+
+  FS_URL="$lane_url"; FS_CRED="$password"
+  start_adapter files-no-write "$served" "$token" || {
+    fail "unproved custom lane can be kept on purpose" "adapter fixture failed to start"; stop_webdav; return; }
+  GW_URL="http://127.0.0.1:$READY_PORT"
+  CONFIRM_ANSWER="y"
+  if custom_agent_file_lane_gate && [ -n "$FS_URL" ] && [ -n "$FS_CRED" ] \
+     && [ "$FS_AGENT_PROOF" = "unproved" ]; then
+    pass "unproved custom lane can be kept on purpose, still marked unproved"
+  else
+    fail "unproved custom lane can be kept on purpose, still marked unproved" \
+      "an explicit yes did not keep the lane, or it was marked proved"
+  fi
+  expect_true "kept custom lane still proves its sentinel cleanup" \
+    agent_file_probe_cleanup_backstop true
+  stop_adapter
+
+  # A doomed run must not spend a real five-minute agent turn to learn nothing:
+  # emit_payload prints no code at all once a gateway check has failed.
+  VERIFY_FAILED=true
+  FS_URL="$lane_url"; FS_CRED="$password"
+  LAST_AGENT_PAYLOAD=""
+  if custom_agent_file_lane_gate; then
+    fail "a failed gateway skips the custom sentinel entirely" "gate unexpectedly passed"
+  elif [ -z "$LAST_AGENT_PAYLOAD" ] && [ -z "$FS_URL" ]; then
+    pass "a failed gateway skips the custom sentinel entirely"
+  else
+    fail "a failed gateway skips the custom sentinel entirely" "an agent turn was spent anyway"
+  fi
+  VERIFY_FAILED=false
+  CONFIRM_ANSWER="n"
+  FS_URL="$lane_url"; FS_CRED="$password"
+  GW_KIND="openclaw"
+  start_adapter files-good "$served" "$token" || {
+    fail "agent sentinel continues after custom cases" "adapter fixture failed to start"; stop_webdav; return; }
+  GW_URL="http://127.0.0.1:$READY_PORT"
   if find "$served" -mindepth 1 -print -quit | grep -q .; then
     fail "agent sentinel exact cleanup" "probe artifacts remain"
   else
@@ -3592,6 +4032,62 @@ test_show_code_live_folder() {
   fi
 }
 
+# ============== the final screen may not spend a ✓ on an unmeasured half =====
+#
+# The measured bug: the pairing screen printed a green "File transfer" line
+# whenever a file server rode in the code, including for gateways whose agent was
+# never asked to touch the folder — the operator read a transport result as a
+# capability. The summary is lifted rather than restated so a wording change in
+# the shipped file is what this case grades. src/80-pairing.inc.sh is not sourced
+# whole: emit_payload's module drags in the payload/QR globals this minimal
+# runtime deliberately replaces.
+eval "$(sed -n '/^pairing_capability_summary()/,/^}/p' "$ROOT/src/80-pairing.inc.sh")"
+declare -F pairing_capability_summary >/dev/null \
+  || { echo "could not lift pairing_capability_summary out of src/80-pairing.inc.sh" >&2; exit 2; }
+
+test_pairing_capability_summary() {
+  local out
+  FS_URL="https://files.example.test"; FS_CRED="secret"; FS_AGENT_PROOF="proved"
+  out=$(pairing_capability_summary)
+  case "$out" in *"✓ File transfer — attachments via https://files.example.test"*)
+      pass "a proved lane keeps its green capability line" ;;
+    *) fail "a proved lane keeps its green capability line" "$out" ;; esac
+
+  # The one that used to lie. Both non-proof states share a line, because the
+  # summary states the OUTCOME and never depends on why — and "we asked and could
+  # not prove it" and "nobody asked" are the same thing to the person scanning it.
+  local state
+  for state in "unproved" ""; do
+    FS_AGENT_PROOF="$state"
+    out=$(pairing_capability_summary)
+    case "$out" in *"✓ File transfer"*)
+        fail "an unproved lane ('${state:-none}') spends no ✓ on agent access" "$out"; continue ;;
+    esac
+    case "$out" in *"NOT proved able to use them"*)
+        pass "an unproved lane ('${state:-none}') spends no ✓ on agent access" ;;
+      *) fail "an unproved lane ('${state:-none}') spends no ✓ on agent access" "$out" ;; esac
+  done
+
+  # …and it still says the address, because a lane the operator chose to keep is
+  # in the code and they have to know what got published.
+  FS_AGENT_PROOF="unproved"
+  out=$(pairing_capability_summary)
+  case "$out" in *"https://files.example.test"*)
+      pass "an unproved lane still names the address it published" ;;
+    *) fail "an unproved lane still names the address it published" "$out" ;; esac
+  # The app cannot be told, so the screen must say so — this is the only place
+  # the difference between the two halves can ever reach the operator.
+  case "$out" in *"shows file transfer as enabled either way"*)
+      pass "an unproved lane says the app cannot record the caveat" ;;
+    *) fail "an unproved lane says the app cannot record the caveat" "$out" ;; esac
+
+  FS_URL=""; FS_CRED=""; FS_AGENT_PROOF=""
+  out=$(pairing_capability_summary)
+  case "$out" in *"File transfer is NOT included"*)
+      pass "no lane still reports itself as not included" ;;
+    *) fail "no lane still reports itself as not included" "$out" ;; esac
+}
+
 # ========================================= the served root, resolved + gated ==
 #
 # The measured bug: the wizard accepted a symlink as the shared folder, wrote it
@@ -3601,6 +4097,38 @@ test_show_code_live_folder() {
 # refuse the same one, and must record the RESOLVED path so the target cannot be
 # swapped under a running server.
 real_path_of() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+# ================== the no-default folder prompt, driven for real ============
+#
+# The measured bug: a custom gateway was handed an INVENTED default folder
+# ($HOME/conduck-files) that had nothing to do with the operator's agent, and the
+# override branch short-circuited past `confirm`, so the panel explaining what the
+# folder IS was unreachable for exactly those operators. This drives the real
+# helper — not the queue stub the flow cases use — because its whole job is the
+# three answers `ask` cannot handle: a blank, an `i`, and a closed stdin.
+test_shared_folder_prompt() {
+  local out rc=0
+  out=$(printf '%s\n' "" "relative/path" "/srv/agent-files" | fs_ask_shared_folder 2>/dev/null)
+  expect_eq "folder prompt refuses a blank and a relative path, then takes the absolute one" \
+    "$out" "/srv/agent-files"
+
+  # The affordance `ask` never had. Without it the file.folder.override panel is
+  # dead code for the one gateway kind with no default to fall back on.
+  explain_prompt() { printf 'EXPLAINED %s\n' "$1"; }
+  out=$(printf '%s\n' "i" "/srv/agent-files" | fs_ask_shared_folder 2>&1)
+  case "$out" in *"EXPLAINED file.folder.override"*)
+      pass "folder prompt reaches the shared-folder explanation" ;;
+    *) fail "folder prompt reaches the shared-folder explanation" "$out" ;; esac
+  unset -f explain_prompt
+
+  # Handed BACK, never acted on: quit_run inside the caller's $( ) would stop the
+  # subshell and let the run continue past a stop the operator asked for.
+  out=$(printf 'q\n' | fs_ask_shared_folder 2>/dev/null)
+  expect_eq "folder prompt hands 'q' back to the caller" "$out" "q"
+
+  fs_ask_shared_folder </dev/null >/dev/null 2>&1 || rc=$?
+  expect_eq "folder prompt reports a closed stdin instead of spinning" "$rc" "1"
+}
 
 test_shared_folder_gate() {
   reset_fake_home "folder-gate"
@@ -3660,6 +4188,23 @@ new_lane_run() { # new_lane_run <fs_local_service_ready rc> <folder answer…>
       printf '[ask] %s\n' "$1" >&2
       printf '%s' "$reply"
     }
+    # A custom gateway has no folder default, so its prompt is its own reader
+    # rather than `ask` (see fs_ask_shared_folder). Serve it from the SAME queue
+    # and mirror the one behavior these cases depend on — a blank is refused and
+    # the next answer is read. An exhausted queue reports EOF exactly as the real
+    # helper does, so a case that supplies too few answers stops instead of
+    # spinning a loop forever.
+    fs_ask_shared_folder() {
+      local reply=""
+      while [ -s "$ASK_QUEUE" ]; do
+        reply=$(head -n 1 "$ASK_QUEUE")
+        sed '1d' "$ASK_QUEUE" > "$ASK_QUEUE.rest" && mv "$ASK_QUEUE.rest" "$ASK_QUEUE"
+        printf '[folder-ask] %s\n' "$reply" >&2
+        if [ -n "$reply" ]; then printf '%s' "$reply"; return 0; fi
+        printf '[folder-ask] blank refused\n' >&2
+      done
+      return 1
+    }
     ask_url() { printf '%s' "${URL_ANSWER:-}"; }
     have() { case "$1" in rclone|systemctl|loginctl) return 0 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
     systemctl() { return 0; }
@@ -3714,6 +4259,33 @@ test_new_lane_folder_recording() {
   case "$out" in *"systemctl --user disable --now conduck-files-custom.service"*)
       pass "new lane: its teardown commands are handed over" ;;
     *) fail "new lane: its teardown commands are handed over" "$out" ;; esac
+
+  # A custom gateway gets NO Enter-accepted default, and a path that is not on
+  # this machine is refused rather than created: the operator is naming a folder
+  # their agent ALREADY uses, so a missing one is a typo or a path the agent will
+  # never look in. Answers: blank (refused), a nonexistent path (refused), then
+  # the real folder.
+  rm -rf "$home"; mkdir -p "$home/workspace"
+  out=$(new_lane_run 0 "" "$home/not-created-yet" "$home/workspace")
+  case "$out" in *"blank refused"*)
+      pass "new lane: a blank folder answer is refused, not resolved to a default" ;;
+    *) fail "new lane: a blank folder answer is refused, not resolved to a default" "$out" ;; esac
+  case "$out" in *"$home/not-created-yet does not exist on this machine"*)
+      pass "new lane: a folder that is not on this machine is refused" ;;
+    *) fail "new lane: a folder that is not on this machine is refused" "$out" ;; esac
+  if [ -d "$home/not-created-yet" ]; then
+    fail "new lane: the refused folder is not created behind the operator's back" "it was created"
+  else
+    pass "new lane: the refused folder is not created behind the operator's back"
+  fi
+  case "$out" in *"FOLDER=$(real_path_of "$home/workspace")"*)
+      pass "new lane: the answered folder is what gets recorded" ;;
+    *) fail "new lane: the answered folder is what gets recorded" "$out" ;; esac
+  # The invented default this whole case exists to remove. Matched with the $HOME
+  # prefix on purpose: the unit is legitimately named conduck-files-custom.service.
+  case "$out" in *"$home/conduck-files"*)
+      fail "new lane: no invented folder default survives anywhere" "$out" ;;
+    *) pass "new lane: no invented folder default survives anywhere" ;; esac
 }
 
 # ========================= a blank file-lane address is confirmed, not assumed ===
@@ -4731,6 +5303,7 @@ hermes_lane_run() { # hermes_lane_run <have|missing pdftotext> <pre-armed answer
     FS_ROUTE_SELF_MANAGED=false; FS_RESIDUE_REPORTED=false
     FS_CRED_LEGACY_ARGV=false
     HERMES_RECALL_REPORTED=false; HERMES_RECALL_DECLINED=false
+    HERMES_RECALL_MANUAL_OFFERED=false
     HERMES_RESIDUAL_REPORTED=false
     HERMES_SCOPE_CHANGED_THIS_RUN=false; HERMES_CONFIG_CHANGED_THIS_RUN=false
     HERMES_GUIDANCE_CHANGED_THIS_RUN=false
@@ -4857,6 +5430,8 @@ test_hermes_recall_snapshot_gate
 test_hermes_hint_round_trip
 test_hermes_terminal_toolset
 test_hermes_recall_edits
+test_hermes_toolset_gloss
+test_hermes_change_reach_note
 test_hermes_recall_operator_flow
 test_hermes_recall_file_lane
 test_hermes_recall_reach
@@ -4865,10 +5440,13 @@ test_hermes_guidance
 test_hermes_guidance_consent
 test_local_service_gate
 test_reply_candidate_parity
+test_agent_file_lane_reason_branching
 test_agent_sentinel
 test_agent_deadlines_and_cleanup
 test_request_credential_controls
 test_show_code_live_folder
+test_pairing_capability_summary
+test_shared_folder_prompt
 test_shared_folder_gate
 test_new_lane_folder_recording
 test_file_lane_blank_address_confirm

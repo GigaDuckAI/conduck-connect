@@ -2049,7 +2049,7 @@ run_emit_payload_isolated() {
   FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" GW_KIND_IN="${4:-custom}" \
   OS_IN="${5:-Darwin}" FS_UNIT_IN="${6:-}" LINGER_IN="${7:-on}" \
   GW_URL_IN="${8:-https://gw.example.test}" VF_IN="${9:-false}" \
-  GW_PORT_IN="${10:-}" bash -c '
+  GW_PORT_IN="${10:-}" FS_PROOF_IN="${11:-proved}" bash -c '
 eval "$FUNCS"
 say()   { printf "%s\n" "$*"; }
 warn()  { printf "WARNLINE %s\n" "$*"; }
@@ -2086,6 +2086,10 @@ CHECKED_PATH_PREFIX=""
 TRANSPORT="public"
 FS_URL="$FS_URL_IN"
 FS_CRED="$FS_CRED_IN"
+# Whether a real agent turn proved the agent can USE the shared folder. Defaults
+# to "proved" so every case that is about something else — warnings, tunnels,
+# lingering — keeps grading the fully-verified lane it always did.
+FS_AGENT_PROOF="$FS_PROOF_IN"
 emit_payload
 '
 }
@@ -2109,9 +2113,15 @@ run_pairing_warning_case() {
   local name="pairing-warning-states-what-the-code-is"
   local emit out_files out_bare block_files block_bare
 
-  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
-    fail_case "$name" "could not extract emit_payload from the release artifact"; return
+  # pairing_capability_summary comes along because emit_payload CALLS it: the
+  # "This code carries:" block lives there so the file-lane suite can drive its
+  # states directly, and an emit extracted without it would run with that block
+  # silently missing — every assertion about it would then pass vacuously.
+  emit=$(extract_funcs emit_payload pairing_capability_summary \
+           build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
+     || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
+    fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
   fi
 
   out_files=$(run_emit_payload_isolated "$emit" \
@@ -2196,6 +2206,32 @@ run_pairing_warning_case() {
     fail_case "$name" "a run WITHOUT a file lane claimed the code carries file transfer"; return
   fi
 
+  # FACT 8 — the ✓ is spent on the AGENT half, not on the transport. A lane whose
+  # agent turn was never passed still rides in the code (the operator can choose
+  # to keep it), and the payload has no field for a caveat — so this screen is the
+  # only place the difference can ever be stated. A green line there is the wizard
+  # certifying a capability nothing measured, read days later on a phone as "the
+  # tool said it works". The address must still appear: they have to know what got
+  # published either way.
+  local out_unproved
+  out_unproved=$(run_emit_payload_isolated "$emit" \
+    "https://files.example.test:8443" "probe-file-credential" custom Darwin "" on \
+    "https://gw.example.test" false "" "unproved") \
+    || { printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
+         fail_case "$name" "emit_payload failed to run with an unproved file lane"; return; }
+  if printf '%s\n' "$out_unproved" | grep -qiE '^OKLINE .*file transfer'; then
+    printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
+    fail_case "$name" "a lane whose agent access was never proved still got a green file-transfer line"; return
+  fi
+  if ! printf '%s\n' "$out_unproved" | grep -qiE '^WARNLINE .*(not proved|could not be proved|untested|not tested)'; then
+    printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
+    fail_case "$name" "an unproved file lane is in the code and the screen does not say so"; return
+  fi
+  if ! printf '%s\n' "$out_unproved" | grep -qF 'https://files.example.test:8443'; then
+    printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
+    fail_case "$name" "an unproved file lane rides in the code without naming the address it published"; return
+  fi
+
   # Control: the exact regression FACT 6 exists for — an emit whose file-lane
   # guard is gone, so it promises a shared folder on a run that has no lane. If
   # the check above cannot catch that, it is decoration and this case must fail
@@ -2229,9 +2265,15 @@ run_pairing_check_suggestion_case() {
   local name="pairing-adapter-suggestion-names-its-outcome"
   local emit out_custom out_openclaw flat_custom flat_openclaw
 
-  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
-    fail_case "$name" "could not extract emit_payload from the release artifact"; return
+  # pairing_capability_summary comes along because emit_payload CALLS it: the
+  # "This code carries:" block lives there so the file-lane suite can drive its
+  # states directly, and an emit extracted without it would run with that block
+  # silently missing — every assertion about it would then pass vacuously.
+  emit=$(extract_funcs emit_payload pairing_capability_summary \
+           build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
+     || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
+    fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
   fi
 
   out_custom=$(run_emit_payload_isolated "$emit" "" "" custom) \
@@ -2453,9 +2495,15 @@ run_pairing_quick_tunnel_reminder_case() {
   local emit out flat arm
   local qt='https://random-words-1234.trycloudflare.com'
   local qtf='https://files-9876.trycloudflare.com'
-  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
-    fail_case "$name" "could not extract emit_payload from the release artifact"; return
+  # pairing_capability_summary comes along because emit_payload CALLS it: the
+  # "This code carries:" block lives there so the file-lane suite can drive its
+  # states directly, and an emit extracted without it would run with that block
+  # silently missing — every assertion about it would then pass vacuously.
+  emit=$(extract_funcs emit_payload pairing_capability_summary \
+           build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
+  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
+     || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
+    fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
   fi
   # The shared predicate, not a local re-implementation — the whole point of the near-miss arm.
   if ! printf '%s\n' "$emit" | grep -qF 'is_quick_tunnel_url()'; then

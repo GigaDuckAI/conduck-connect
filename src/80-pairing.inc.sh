@@ -108,6 +108,44 @@ print(json.dumps(p, separators=(",", ":")))
 PY
 }
 
+# What this code actually carries, in one place, immediately before it is shown.
+# EVERY route that drops the file lane converges here — a confirmed skip at the
+# address prompt, a live probe that failed, an agent gate that could not be
+# proved — so this states the outcome without depending on WHY, and without the
+# operator having to reconstruct it from warnings that have scrolled away.
+# It earns its lines because the mistake is expensive and one-directional: the
+# code gets scanned, and adding a lane afterwards means re-running setup, since
+# --show-code can only re-emit a lane the profile already holds.
+# Same condition build_pairing_payload_json uses to attach fileServer, so this
+# summary cannot disagree with the code it describes.
+#
+# The file lane splits into TWO claims because it is two independent things: a
+# server that moves bytes, and an agent that can use what arrives. A ✓ is spent
+# only when a real agent turn proved the second — read the folder, write a file
+# back, name it in the reply. Without that proof the line still says what IS in
+# the code, and stops there: the payload has no field for a caveat, so this
+# screen is the only place the difference can ever be stated, and a ✓ the
+# operator later discovers was a guess is read on the phone, days later, as
+# "the tool said it works".
+# Its own function so the regression suite can drive all three outcomes; nothing
+# here reads anything emit_payload computes.
+pairing_capability_summary() {
+  say "  ${BOLD}This code carries:${RESET}"
+  ok "Chat with your gateway"
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+    if [ "$FS_AGENT_PROOF" = "proved" ]; then
+      ok "File transfer — attachments via $FS_URL"
+    else
+      warn "File server — attachments via $FS_URL, but your agent was NOT proved able to use them."
+      note "Uploads reach that folder. Whether the agent reads them, and returns files through it,"
+      note "is the half this run could not establish — the app shows file transfer as enabled either way."
+    fi
+  else
+    warn "File transfer is NOT included — attachments stay inline-only."
+    note "To add it later, re-run setup and give the file lane an address."
+  fi
+}
+
 emit_payload() {
   head_ "Step 6 — pair with the Conduck app"
   if $VERIFY_FAILED; then
@@ -156,24 +194,7 @@ emit_payload() {
   local pairing="conduck-setup:v${PAYLOAD_VERSION}:$encoded"
 
   say ""
-  # What this code actually carries, in one place, immediately before it is shown.
-  # EVERY route that drops the file lane converges here — a confirmed skip at the
-  # address prompt, a live probe that failed, an agent gate that could not be
-  # proved — so this states the outcome without depending on WHY, and without the
-  # operator having to reconstruct it from warnings that have scrolled away.
-  # It earns its line because the mistake is expensive and one-directional: the
-  # code gets scanned, and adding a lane afterwards means re-running setup, since
-  # --show-code can only re-emit a lane the profile already holds.
-  # Same condition build_pairing_payload_json uses to attach fileServer, so this
-  # summary cannot disagree with the code it describes.
-  say "  ${BOLD}This code carries:${RESET}"
-  ok "Chat with your gateway"
-  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
-    ok "File transfer — attachments via $FS_URL"
-  else
-    warn "File transfer is NOT included — attachments stay inline-only."
-    note "To add it later, re-run setup and give the file lane an address."
-  fi
+  pairing_capability_summary
   say ""
   # The file-lane clause must ride the SAME condition build_pairing_payload_json uses to
   # attach fileServer — warning about a shared folder that isn't in this code is a lie the

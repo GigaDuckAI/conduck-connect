@@ -42,9 +42,20 @@ HERMES_RECALL_REPORTED=false
 # A no to the removal is a no for the whole run. Asking the same question again
 # at the next Hermes step would read as nagging, not as consent.
 HERMES_RECALL_DECLINED=false
+# The by-hand YAML repair is OFFERED once per run, never printed unasked. It runs
+# to ~45 lines of imperative surgery, and on a stock install — the config a fresh
+# Hermes ships — there is nothing this connector can safely edit, so those lines
+# used to arrive with no question in front of them, under a heading about file
+# transfer, on a run that may have declined the file lane outright.
+HERMES_RECALL_MANUAL_OFFERED=false
 HERMES_ANALYSIS_STATUS=""
 HERMES_ANALYSIS_REASONS=()
 HERMES_ANALYSIS_CHANGES=()
+# One entry per HERMES_ANALYSIS_CHANGES entry, in the same order: `cwd` or
+# `toolset`. The two keys do NOT reach equally far and the before→after cannot
+# show that, so the consent copy has to know which is which — from a fact the
+# analyzer emits, never from matching the sentence it printed beside it.
+HERMES_ANALYSIS_CHANGE_KINDS=()
 # The one replacement list the by-hand hint offers: the toolsets Hermes's own
 # API-server default resolves to FROM CONFIGURATION ALONE, with `memory` and
 # `session_search` taken out and nothing else dropped. Every name in it is
@@ -873,7 +884,15 @@ if not changes:
     sys.exit(0)
 if action not in ("apply", "apply-recall"):
     print("status\tfix")
-    for _, change in changes: print("change\t" + change)
+    # The kind rides beside the text, one per change and in the same order, so
+    # the shell can say what each change REACHES without matching its own prose.
+    # terminal.cwd is read from the ROOT of this file and is not an API-server
+    # setting at all; the toolset list is. A caller that had to tell them apart
+    # by string-matching the sentence would start pointing the wrong way the
+    # first time anyone reworded it, with nothing to catch that.
+    for kind, change in changes:
+        print("change_kind\t" + kind)
+        print("change\t" + change)
     sys.exit(0)
 
 def ensure_terminal(src):
@@ -1000,6 +1019,10 @@ hermes_analysis_read() { # hermes_analysis_read <config> <workspace> <action> [a
   local tab line
   tab=$(printf '\t')
   HERMES_ANALYSIS_STATUS=""; HERMES_ANALYSIS_REASONS=(); HERMES_ANALYSIS_CHANGES=()
+  # Re-armed on every read for the same reason HERMES_RECALL_SNAPSHOT is: one run
+  # reads more than one config, and a kind list left over from an earlier read
+  # would describe the reach of somebody else's change.
+  HERMES_ANALYSIS_CHANGE_KINDS=()
   HERMES_RECALL_STATE="unknown"; HERMES_RECALL_FIX="none"
   HERMES_RECALL_ITEMS=(); HERMES_RECALL_SCOPE=""; HERMES_RECALL_AFTER=""
   HERMES_RECALL_SNAPSHOT="no"
@@ -1008,6 +1031,7 @@ hermes_analysis_read() { # hermes_analysis_read <config> <workspace> <action> [a
     case "$line" in
       "status$tab"*)       HERMES_ANALYSIS_STATUS="${line#status$tab}" ;;
       "reason$tab"*)       HERMES_ANALYSIS_REASONS+=("${line#reason$tab}") ;;
+      "change_kind$tab"*)  HERMES_ANALYSIS_CHANGE_KINDS+=("${line#change_kind$tab}") ;;
       "change$tab"*)       HERMES_ANALYSIS_CHANGES+=("${line#change$tab}") ;;
       "recall$tab"*)       HERMES_RECALL_STATE="${line#recall$tab}" ;;
       "recall_fix$tab"*)   HERMES_RECALL_FIX="${line#recall_fix$tab}" ;;
@@ -1031,7 +1055,26 @@ hermes_recall_report() {
   local items
   items=$(safe_display "$(printf '%s' "${HERMES_RECALL_ITEMS[*]-}")" 120)
   say ""
-  say "  ${BOLD}Hermes memory scope${RESET} — will this gateway remember what Conduck never sent it?"
+  # Its own labelled topic. This block is reached from the optional file lane,
+  # from the post-file-lane step, and from --show-code — so on the commonest
+  # route it prints under the "Step 4 — agent file lane" banner while having
+  # nothing to do with file transfer, and it prints there even for a run that
+  # declined the lane. The heading says which question this is rather than
+  # letting the banner above it answer for it. The words "Hermes memory scope"
+  # stay exactly as they were: that is what this screen is called.
+  say "  ${BOLD}Hermes memory scope${RESET} — a check of its own, not part of the file lane."
+  say "  Will this gateway remember things Conduck never sent it?"
+  # The word the whole Hermes path turns on, glossed once, where it is first
+  # used. It is Hermes's own vocabulary, it carries nearly every sentence below,
+  # and nothing else on screen ever says what it means. Deliberately modest about
+  # what naming `file` buys: it hands that surface the tools, and proves nothing
+  # about reaching the shared folder — that is what the readiness check and the
+  # live sentinel are for. `session_search` is named beside `memory` because both
+  # are what this connector means by recall, and fixing one without the other
+  # fixes nothing.
+  say "  (A ${BOLD}toolset${RESET} is Hermes's name for a named group of tools it hands an agent. ${BOLD}file${RESET} is"
+  say "  the one that gives a surface its file read/write tools; ${BOLD}memory${RESET} and ${BOLD}session_search${RESET}"
+  say "  are Hermes's recall, and they are what this check is about.)"
   case "$HERMES_RECALL_STATE" in
     clear)
       ok "Nothing in this API-server toolset gives Hermes a memory of its own — the conversation stays Conduck's."
@@ -1056,6 +1099,12 @@ hermes_recall_report() {
   say "  No connection check can see this, here or in --check-server: a remembering gateway"
   say "  passes them all. Test it yourself — tell it something in one conversation, then ask"
   say "  for it in a brand-new one. If it answers, the gateway is keeping its own history."
+  # Said here rather than in the offer below, so it reaches the dry-run and
+  # reuse-only screens too. Scoped to the recall removal on purpose: a blanket
+  # "nothing here is required" would read as covering the `file` toolset this
+  # same screen has just defined, which IS required for file transfer.
+  say "  Removing Hermes's recall is not required for file transfer, and not required for chat:"
+  say "  files move and the agent answers either way. It changes only what the gateway keeps."
   return 0
 }
 
@@ -1214,6 +1263,36 @@ hermes_recall_manual_hint() {
   return 0
 }
 
+# The by-hand repair, behind a door. The finding above is genuinely news and
+# stays visible; this is up to ~45 lines of imperative YAML surgery, and on every
+# branch this connector will not edit for you it used to arrive with no question
+# in front of it — under a heading about file transfer, on a run that may have
+# declined the file lane outright.
+#
+# Offered once per run, for the same reason the removal is asked once: this
+# connector reads one config, and every route into it — the optional file lane,
+# the post-file-lane step, a --check-server handoff — is asking about that same
+# file. A second offer is the same question again, which reads as nagging rather
+# than as consent.
+#
+# NOT worded "show the exact YAML". On an unreviewed bundle, or YAML this parser
+# will not guess at, the hint deliberately refuses to print a replacement and
+# describes what to look for instead — so promising exact steps would be a
+# promise the next screen does not keep.
+hermes_recall_manual_offer() {
+  $HERMES_RECALL_MANUAL_OFFERED && return 0
+  HERMES_RECALL_MANUAL_OFFERED=true
+  if confirm "  Show what to check or change by hand?" "gateway.hermes.show_recall_manual"; then
+    hermes_recall_manual_hint
+    return 0
+  fi
+  # "Skipped the manual instructions", never "nothing changed": one call site is
+  # reached AFTER an approved edit that landed and then failed its re-check, so a
+  # blanket no-change claim would be false exactly where it matters most.
+  note "Skipped the manual instructions. The setting is platform_toolsets.api_server in ~/.hermes/config.yaml — re-run me whenever you want them."
+  return 0
+}
+
 # The one edit offered here, and only in its plainest form: named entries in an
 # explicit list. A bundle name, an unwritten key, or anything this parser cannot
 # read is described instead of rewritten — deleting a bundle would take a whole
@@ -1238,6 +1317,12 @@ hermes_recall_remove_step() { # hermes_recall_remove_step <config> -> 0 when the
     | awk -F '\t' '$1=="status"{print $2; exit}')
   if [ "$status" != "applied" ]; then
     warn "That edit could not be applied safely, so nothing was changed."
+    # The commonest reason is that config.yaml no longer matches the exact list
+    # the before→after was bound to — the apply refuses rather than overwrite.
+    # Everything this run holds about the scope is then a reading of the OLD
+    # file, including the by-hand steps offered next, so say so instead of
+    # letting them read as advice about the file that is there now.
+    note "If the file changed since the before→after above, what I know about it is now stale — re-run me to read it fresh."
     return 1
   fi
   HERMES_SCOPE_CHANGED_THIS_RUN=true
@@ -1280,8 +1365,54 @@ hermes_recall_scope_step() {
      && hermes_recall_remove_step "$cfg"; then
     return 0
   fi
-  hermes_recall_manual_hint
+  hermes_recall_manual_offer
   return 1
+}
+
+# What the edit about to be approved REACHES — said BEFORE the yes, because the
+# before→after cannot show it. The two keys are not equally scoped and the
+# difference is the whole of it: platform_toolsets.api_server is this API
+# server's own list, while terminal.cwd is read from the ROOT of config.yaml and
+# is not an API-server setting at all, so it moves the working folder for every
+# Hermes surface that reads it. This connector already spends three lines pricing
+# the reach of the recall keys it merely SUGGESTS; the key it actually WRITES had
+# no such line.
+#
+# Only what the parser proves is claimed. It reads that key at the root; it does
+# not know which of Hermes's surfaces consult it, so none are enumerated — an
+# invented list of surfaces would be a worse failure than the silence it replaced.
+#
+# Driven by the analyzer's change kinds, never by matching the sentence printed
+# above. A kind this function does not recognise, or a change with no kind beside
+# it, falls through to the WIDEST honest statement rather than to silence: a
+# change whose reach cannot be named must never be approved as if it were narrow.
+hermes_change_reach_note() {
+  local k c cwd=false toolset=false unknown=false n_kind=0 n_change=0
+  for k in ${HERMES_ANALYSIS_CHANGE_KINDS[@]+"${HERMES_ANALYSIS_CHANGE_KINDS[@]}"}; do
+    n_kind=$((n_kind + 1))
+    case "$k" in
+      cwd) cwd=true ;;
+      toolset) toolset=true ;;
+      *) unknown=true ;;
+    esac
+  done
+  for c in ${HERMES_ANALYSIS_CHANGES[@]+"${HERMES_ANALYSIS_CHANGES[@]}"}; do
+    n_change=$((n_change + 1))
+  done
+  [ "$n_kind" = "$n_change" ] || unknown=true
+  if $toolset && ! $unknown; then
+    say "  Those two lines do not reach equally far. The toolset list is this API server's own:"
+    say "  it changes what THIS server's agent can do, for every client that talks to it, and"
+    say "  leaves Hermes's other surfaces alone."
+  fi
+  if $cwd || $unknown; then
+    say "  ${BOLD}terminal.cwd reaches further than this API server.${RESET} It is read from the root of"
+    say "  config.yaml, not from this server's own section, so it is the working folder for every"
+    say "  Hermes surface that reads that key — not only the one Conduck talks to. The value it"
+    say "  replaces is in the before→after above; if something else you run depends on that"
+    say "  folder, note it now."
+  fi
+  return 0
 }
 
 hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
@@ -1295,9 +1426,13 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
   # to a user who ends up declining the optional file lane.
   hermes_recall_report
   if [ "$HERMES_RECALL_STATE" != "clear" ]; then
-    if [ "$HERMES_RECALL_FIX" != "literal" ] || $DRY_RUN || $REUSE_ONLY \
-       || $HERMES_RECALL_DECLINED; then
+    if $DRY_RUN || $REUSE_ONLY; then
+      # Both modes are contractually prompt-free — they report everything a real
+      # run would do and ask nothing — so the by-hand steps print in full rather
+      # than behind a question there is no way to answer.
       hermes_recall_manual_hint
+    elif [ "$HERMES_RECALL_FIX" != "literal" ] || $HERMES_RECALL_DECLINED; then
+      hermes_recall_manual_offer
     elif [ "$status" = "fix" ] || [ "$status" = "ready" ]; then
       say ""
       say "  ${BOLD}platform_toolsets.api_server: $HERMES_RECALL_SCOPE -> $HERMES_RECALL_AFTER${RESET}"
@@ -1313,7 +1448,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
       else
         note "Leaving the API-server scope as it is."
         HERMES_RECALL_DECLINED=true
-        hermes_recall_manual_hint
+        hermes_recall_manual_offer
       fi
     else
       # File readiness is already unprovable here, but the memory scope is a
@@ -1323,7 +1458,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
         hermes_analysis_read "$cfg" "$workspace" analyze
         status="$HERMES_ANALYSIS_STATUS"
       else
-        hermes_recall_manual_hint
+        hermes_recall_manual_offer
       fi
     fi
   fi
@@ -1354,6 +1489,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
   say "  Only the API-server's toolset list and this working-folder path are in scope;"
   say "  no terminal, web, or messaging-platform permissions are added, and nothing but"
   say "  the entries shown above is taken away."
+  hermes_change_reach_note
   if $DRY_RUN; then
     for c in "${HERMES_ANALYSIS_CHANGES[@]}"; do plan_add "EDIT $cfg — $c"; done
     note "(dry-run: a real run asks before editing Hermes config)"
@@ -1387,7 +1523,7 @@ hermes_file_readiness_step() { # hermes_file_readiness_step <workspace>
   fi
   if [ -n "$approved_scope" ] && [ "$HERMES_RECALL_STATE" != "clear" ]; then
     warn "The recall entries were removed but the scope still does not read as memory-free."
-    hermes_recall_manual_hint
+    hermes_recall_manual_offer
   fi
   ok "Hermes config re-checked — file toolset + working folder are aligned."
   if ! restart_hermes_for_config; then
@@ -1533,6 +1669,14 @@ install_conduck_hermes_block() { # install_conduck_hermes_block <workspace>
 }
 
 AGENT_FILE_PROBE_REASON=""
+# The same failure, as a CATEGORY the verification step can branch on. One hint
+# for every outcome sent operators to ~/.hermes/config.yaml over failures that
+# had nothing to do with it — including the one where the agent read and wrote
+# the file correctly and only its reply fell short. Categorising the prose by
+# substring instead would be a defect dressed as a fix: that prose is user-facing
+# copy, and the day it is reworded the hint starts pointing the wrong way with
+# nothing anywhere to catch it.
+AGENT_FILE_PROBE_REASON_KIND=""
 AGENT_PROBE_ACTIVE=false
 AGENT_PROBE_TAG=""
 AGENT_PROBE_DIRKEY=""
@@ -1786,10 +1930,34 @@ agent_file_wait_for_output() { # agent_file_wait_for_output <expected> <download
   done
 }
 
+# Reason and category set together, always, so the two cannot drift apart. The
+# categories, and exactly what each one asserts:
+#   harness          this script could not stage its own probe on THIS machine.
+#                    Says nothing about the gateway or the agent.
+#   transport        the WebDAV file server refused a request. The agent was
+#                    never asked to do anything.
+#   turn             the chat request itself failed. No file work was graded.
+#   output-boundary  the agent replied without a byte-identical regular output
+#                    file at the shared root. THE ambiguous one: no file tools,
+#                    another folder, another filesystem, wrong bytes, something
+#                    that is not a plain file — or a model that never called a
+#                    tool. One probe cannot tell those apart.
+#   visibility       the output DID exist before the reply and never became
+#                    visible through WebDAV. Not a late write: creation is proven.
+#   reply-naming     the bytes were right and the reply did not name the file.
+#                    File access WORKED; only the answer fell short.
+#   cleanup          the probe's own sentinel could not be proven removed.
+#   unsupported      no verified probe exists for this gateway kind.
+agent_probe_fail() { # agent_probe_fail <kind> <reason>
+  AGENT_FILE_PROBE_REASON_KIND="$1"
+  AGENT_FILE_PROBE_REASON="$2"
+}
+
 agent_file_probe() {
   AGENT_FILE_PROBE_REASON=""
+  AGENT_FILE_PROBE_REASON_KIND=""
   if $AGENT_PROBE_ACTIVE && ! agent_file_probe_cleanup_backstop true; then
-    AGENT_FILE_PROBE_REASON="a prior sentinel's exact cleanup is still unproven"
+    agent_probe_fail cleanup "a prior sentinel's exact cleanup is still unproven"
     return 1
   fi
   local tag secret dirkey inputkey outputkey tmp outtmp code content payload model reply
@@ -1800,14 +1968,21 @@ agent_file_probe() {
       agent_name="OpenClaw"; read_tool="read"; write_tool="write" ;;
     hermes)
       agent_name="Hermes"; read_tool="read_file"; write_tool="write_file" ;;
+    custom)
+      # No tool vocabulary is knowable here — a custom gateway is any
+      # OpenAI-compatible server — so the task below names the OUTCOME and leaves
+      # the mechanism to the agent, the same tool-agnostic shape the doctor's
+      # --files sentinel uses. Software with no file tools then simply fails,
+      # which is the finding about that software rather than a gap in this probe.
+      agent_name="the agent"; read_tool=""; write_tool="" ;;
     *)
-      AGENT_FILE_PROBE_REASON="this gateway has no verified agent file-tool probe"
+      agent_probe_fail unsupported "this gateway has no verified agent file-tool probe"
       return 1 ;;
   esac
   tag=$(python3 -c 'import secrets; print(secrets.token_hex(8))' 2>/dev/null) || {
-    AGENT_FILE_PROBE_REASON="could not generate a sentinel nonce"; return 1; }
+    agent_probe_fail harness "could not generate a sentinel nonce"; return 1; }
   secret=$(python3 -c 'import secrets; print(secrets.token_hex(24))' 2>/dev/null) || {
-    AGENT_FILE_PROBE_REASON="could not generate sentinel content"; return 1; }
+    agent_probe_fail harness "could not generate sentinel content"; return 1; }
   dirkey="conduck-connect-agent-$tag"
   inputkey="$dirkey/input-$tag.txt"
   outputkey="output-$tag.txt"
@@ -1816,10 +1991,10 @@ agent_file_probe() {
   # from it and synthesize a passing output without reading the input file.
   content="CONDUCK-AGENT-FILE-SENTINEL-$secret"
   tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-agent-probe.XXXXXX" 2>/dev/null) || {
-    AGENT_FILE_PROBE_REASON="could not stage the sentinel"; return 1; }
+    agent_probe_fail harness "could not stage the sentinel"; return 1; }
   outtmp=$(mktemp "${TMPDIR:-/tmp}/conduck-agent-output.XXXXXX" 2>/dev/null) || {
     rm -f "$tmp"
-    AGENT_FILE_PROBE_REASON="could not stage the sentinel download"; return 1; }
+    agent_probe_fail harness "could not stage the sentinel download"; return 1; }
   printf '%s\n' "$content" > "$tmp"
 
   # Register every exact remote/local target before the first request can
@@ -1851,7 +2026,7 @@ agent_file_probe() {
   code=$(curl_fs_with_timeout "$request_timeout" -o /dev/null -w '%{http_code}' \
     "$FS_URL/$outputkey" 2>/dev/null || true)
   case "$code" in 404) ;; *)
-    AGENT_FILE_PROBE_REASON="the randomized output name was not provably free (HTTP ${code:-000})"
+    agent_probe_fail transport "the randomized output name was not provably free (HTTP ${code:-000})"
     agent_probe_abandon_registry
     return 1 ;;
   esac
@@ -1872,7 +2047,7 @@ agent_file_probe() {
         case "$code" in
           2??) AGENT_PROBE_DIR_VERIFY_METHOD="get" ;;
           *)
-            AGENT_FILE_PROBE_REASON="the temporary WebDAV directory could not be observed for cleanup proof"
+            agent_probe_fail cleanup "the temporary WebDAV directory could not be observed for cleanup proof"
             agent_file_probe_cleanup_backstop || true
             return 1 ;;
         esac ;;
@@ -1887,7 +2062,7 @@ agent_file_probe() {
   code=$(curl_fs -T "$tmp" -o /dev/null -w '%{http_code}' "$FS_URL/$inputkey" 2>/dev/null || true)
   case "$code" in 2??) ;;
     *)
-      AGENT_FILE_PROBE_REASON="could not place the agent sentinel through WebDAV (HTTP ${code:-000})"
+      agent_probe_fail transport "could not place the agent sentinel through WebDAV (HTTP ${code:-000})"
       agent_file_probe_cleanup_backstop || true
       return 1 ;;
   esac
@@ -1901,12 +2076,25 @@ agent_file_probe() {
     AF_READ="$read_tool" AF_WRITE="$write_tool" python3 - <<'PY' 2>/dev/null
 import json, os
 e = os.environ
-task = (
-    "Use %s to read the exact uploaded file path listed below. Use %s "
-    "to copy its bytes unchanged into a new file named %s at the ROOT of your working "
-    "directory. Finish the write before replying. Do not reconstruct or guess the "
-    "file contents. Then reply with one short sentence containing the exact output "
-    "filename." % (e["AF_READ"], e["AF_WRITE"], e["AF_OUTPUT"]))
+if e["AF_READ"] and e["AF_WRITE"]:
+    task = (
+        "Use %s to read the exact uploaded file path listed below. Use %s "
+        "to copy its bytes unchanged into a new file named %s at the ROOT of your working "
+        "directory. Finish the write before replying. Do not reconstruct or guess the "
+        "file contents. Then reply with one short sentence containing the exact output "
+        "filename." % (e["AF_READ"], e["AF_WRITE"], e["AF_OUTPUT"]))
+else:
+    # Same demand, no tool names: a custom gateway's file tools are whatever its
+    # author chose to call them, so naming one would fail agents that are working.
+    # Both anti-false-green clauses are kept verbatim — "finish before replying"
+    # is what the reply-boundary snapshot measures, and "do not reconstruct" is
+    # what stops a tool-less model from writing a plausible file it invented.
+    task = (
+        "Copy the exact uploaded file listed below into a new file named %s at the ROOT of "
+        "your working directory, byte for byte, using whatever file tools you have. Finish "
+        "the write before replying. Do not reconstruct or guess the file contents. Then "
+        "reply with one short sentence containing the exact output filename."
+        % e["AF_OUTPUT"])
 ref = (
     "The following file(s) are in your working directory — use them for this request. "
     "Each input lives under its conversation folder at the path shown:\n"
@@ -1924,13 +2112,17 @@ print(json.dumps(p))
 PY
   )
   if [ -z "$payload" ]; then
-    AGENT_FILE_PROBE_REASON="could not build the agent sentinel request"
+    agent_probe_fail harness "could not build the agent sentinel request"
   else
     AGENT_PROBE_LATE_RISK=true
     if ! agent_file_chat_eval "$payload"; then
-      AGENT_FILE_PROBE_REASON="the $agent_name file turn failed: $CCE_REASON"
+      agent_probe_fail turn "$agent_name's file turn failed: $CCE_REASON"
     elif ! agent_output_local_snapshot "$FS_FOLDER" "$outputkey" "$tmp"; then
-      AGENT_FILE_PROBE_REASON="$agent_name replied before a byte-identical regular output file existed in the guarded shared root"
+      # `output-boundary`, not "no write": this arm also covers wrong bytes, a
+      # symlink or non-regular file at that name, and a write into some other
+      # root. What it proves is only that nothing correct was there when the
+      # reply landed — which of the causes it was, one probe cannot say.
+      agent_probe_fail output-boundary "$agent_name replied before a byte-identical regular output file existed in the guarded shared root"
       # This is cleanup-only. A later file can never turn the result green, but
       # watching the exact key for the existing five-second window lets us remove
       # common reply-first/background writes before returning.
@@ -1946,9 +2138,12 @@ except Exception: pass' 2>/dev/null)
       # at the reply boundary above; these retries can prove visibility only.
       agent_file_wait_for_output "$tmp" "$outtmp" && bytes_ok=true
       if ! $bytes_ok; then
-        AGENT_FILE_PROBE_REASON="$agent_name created the output before replying, but it did not become byte-identically visible through WebDAV within five seconds"
+        # `visibility`, never "late write": the snapshot above already proved the
+        # file existed BEFORE the reply, so the agent did its part on time and
+        # what failed is the path between the folder and the file server.
+        agent_probe_fail visibility "$agent_name created the output before replying, but it did not become byte-identically visible through WebDAV within five seconds"
       elif ! agent_reply_names_output "$reply" "$outputkey" "$inputkey"; then
-        AGENT_FILE_PROBE_REASON="the output bytes were correct, but the reply did not name the randomized output file for Conduck to discover"
+        agent_probe_fail reply-naming "the output bytes were correct, but the reply did not name the randomized output file for Conduck to discover"
       fi
     fi
   fi
@@ -1956,7 +2151,10 @@ except Exception: pass' 2>/dev/null)
   # Exact nonce names only. A successful DELETE is not proof: follow each file
   # delete with an authenticated GET that must answer 404.
   if ! agent_file_probe_cleanup_backstop; then
-    [ -n "$AGENT_FILE_PROBE_REASON" ] || AGENT_FILE_PROBE_REASON="sentinel cleanup could not be proven"
+    # Only when nothing earlier already failed — an earlier reason is the more
+    # specific finding, and the kind has to follow the reason it belongs to.
+    [ -n "$AGENT_FILE_PROBE_REASON" ] \
+      || agent_probe_fail cleanup "sentinel cleanup could not be proven"
     return 1
   fi
   [ -z "$AGENT_FILE_PROBE_REASON" ]

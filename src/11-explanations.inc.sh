@@ -234,6 +234,21 @@ explain_action() { # explain_action <action-id>
         "Every client using this API server loses that recall; Hermes CLI and messaging memory stay. Put the shown entries back and restart to reverse it."
       ;;
 
+    gateway.hermes.show_recall_manual)
+      # Deliberately NOT shaped like the removal panel above it. This question
+      # changes nothing at all — it only decides whether a long set of by-hand
+      # YAML instructions is printed — and a panel that described it in the
+      # language of an action would teach the operator to fear a `y` that is
+      # free. What it prints depends on the shape of the config: an exact
+      # replacement list where one can be proven safe, otherwise what to look for.
+      explain_panel \
+        "Print the by-hand instructions for narrowing Hermes's memory scope" \
+        "Where this script cannot make the edit safely, the fix is yours to make, and the instructions run long enough to be worth asking about first." \
+        "Prints text only: what to change in ~/.hermes/config.yaml, the exact replacement list where one can be proven not to drop toolsets you configured, and what the global alternative costs. It writes nothing, restarts nothing, and changes no file." \
+        "Nothing happens and nothing changes; the finding above stays on screen and pairing continues either way." \
+        "Nothing to reverse — no file is touched. Re-run this script whenever you want the instructions."
+      ;;
+
     file.hermes.remove_recall)
       explain_panel \
         "Include Hermes recall removal in the combined file-readiness edit" \
@@ -382,12 +397,35 @@ explain_action() { # explain_action <action-id>
       ;;
 
     file.folder.override|files.folder|shared-folder)
+      # This panel now answers TWO prompts, and they differ on the one thing an
+      # operator reading it is about to do. OpenClaw and Hermes offer a default the
+      # wizard knows and may create; every other gateway offers none and refuses a
+      # path that is not already on this machine, because only the agent's own
+      # folder can be the right answer there. A panel that promised creation would
+      # be read by exactly the operator the refusal then bounces.
       explain_panel \
         "Choose the folder shared by Conduck and the agent" \
-        "Every uploaded attachment lands here, and every file the agent returns must be written here." \
-        "Records an absolute folder for the lane; a new lane may create it with private permissions, while an existing folder keeps its mode." \
-        "The default folder is used when one is shown, or file-lane setup cannot continue when no usable path exists." \
-        "This folder may contain your own or the agent's files. Back, Ctrl-C, and re-running do not delete it."
+        "Every uploaded attachment lands here, and every file the agent returns must be written here, so it has to be the folder your agent itself reads and writes." \
+        "Records an absolute folder for the lane. On OpenClaw and Hermes, whose working folder this wizard knows, a new lane may create it with private permissions. On any other gateway the path must already exist on this machine and is refused if it does not; an existing folder keeps its own mode either way." \
+        "The default folder is used where one is shown. Where none is — any gateway other than OpenClaw and Hermes — there is nothing to fall back on, so a blank answer is refused and the question is asked again." \
+        "This folder may contain your own or the agent's files. Back, Ctrl-C, and re-running do not delete it. At the no-default prompt, q stops the run and leaves earlier approved changes in place."
+      ;;
+
+    file.agent.unproved)
+      # The panel is one string for seven failure categories, so it names none of
+      # them and points at the screen that does. Asserting "the agent did not read
+      # the test file" here would be false for the categories where no agent was
+      # ever contacted — a file server that refused the probe, a chat request that
+      # never returned, a temp file this script could not stage.
+      # "No" is described as what it actually runs: drop_file_lane rolls back the
+      # HTTPS exposure this run applied for the lane. A blanket "nothing you
+      # approved is touched" is read one line before the rollback prints.
+      explain_panel \
+        "Include a file server the agent did not prove it can use" \
+        "Bytes moved through the folder, but the sentinel that proves your agent can USE it did not pass — which is what a server with no file tools always does, and also what a wrong folder, a container, one failed turn, or a probe the file server itself refused looks like. The screen you came from names which step fell short." \
+        "Yes puts the file server in this setup code; the code has no field for a caveat, so Conduck will show file transfer as enabled. No leaves it out of the code and closes an HTTPS route this run opened for the lane, so nothing stays reachable for a lane the code does not carry." \
+        "Attachments stay inline-only in Conduck. The file service, its folder, and its contents keep running untouched; a route this run opened for the lane is switched off again, and a mapping it replaced is put back." \
+        "Either answer leaves the running file server exactly as it is. Adding the lane to a code afterwards means re-running setup."
       ;;
 
     file.unit.repair_envfile|file.service.move_port|files.repair|file-lane-repair)

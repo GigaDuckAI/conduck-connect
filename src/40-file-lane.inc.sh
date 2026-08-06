@@ -256,6 +256,30 @@ fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
   note "credential files — and write into them."
 }
 
+# The folder prompt for a gateway whose working folder this wizard cannot know.
+# `ask` is not merely unhelpful here, it is unusable: it resolves a blank answer
+# to its default, and a prompt with NO default would then read a stray Enter — or
+# a closed stdin — as an answer, which is the whole defect this prompt exists to
+# remove. It also carries no `i`, so the panel that says what this folder IS has
+# never been reachable for the one operator who has to supply the path cold.
+# $()-captured by its caller, so every human-facing line goes to stderr and only
+# the path reaches stdout. `q` is handed BACK rather than acted on: quit_run
+# inside a command substitution would stop the subshell and let the run continue.
+fs_ask_shared_folder() { # -> absolute path | 'q' on stdout; 1 on a closed stdin
+  local reply
+  while true; do
+    read -r -p "  Absolute path to the folder your agent reads and writes (no default; i = explain; q = stop): " reply \
+      || return 1     # closed stdin — never spin a loop nobody is there to answer
+    case "$reply" in
+      [iI]|\?) explain_prompt "file.folder.override" >&2; continue ;;
+      [qQ]) printf 'q'; return 0 ;;
+      /*) printf '%s' "$reply"; return 0 ;;
+      "") warn "This gateway has no default folder — only you know where your agent reads and writes." >&2 ;;
+      *)  warn "Please give an absolute path (starting with /)." >&2 ;;
+    esac
+  done
+}
+
 fs_systemd_envfile_path() { # fs_systemd_envfile_path <absolute literal path>
   # EnvironmentFile= is not ExecStart=: systemd passes the entire right-hand
   # side to its path/specifier parser and does NOT unquote it. Adding shell-like
@@ -2128,17 +2152,48 @@ setup_file_lane() {
       FS_CRED=""; return 0
     fi
     ok "Reserved loopback port $FS_LOCAL_PORT for this gateway's file lane."
+    # A default here is a claim about where the AGENT reads and writes, and this
+    # wizard can only make that claim for the two gateways it configures itself.
+    # A custom gateway is any OpenAI-compatible server at all — a plain model
+    # server with no filesystem of its own, an agent in a container, another
+    # account, a worker on another box — so an invented path would be a folder the
+    # agent never looks in, offered behind an Enter and then certified by a lane
+    # that only ever proves bytes moved. Custom therefore gets NO default: the
+    # operator names the folder, because only they know where their agent lives.
     case "$GW_KIND" in
       openclaw) workspace="$HOME/.openclaw/workspace" ;;
       hermes)   workspace="$HOME/.hermes/files" ;;
-      *)        workspace="$HOME/conduck-files" ;;
+      *)        workspace="" ;;
     esac
-    if [ "$GW_KIND" = "custom" ] || confirm "  Use a different folder than $workspace?" "file.folder.override"; then
+    # No default means there is nothing to confirm keeping, so the confirm is
+    # skipped rather than answered — and the explanation it carries moves onto the
+    # prompt itself (fs_ask_shared_folder's `i`), which is where an operator with
+    # no default to fall back on actually needs it.
+    if [ -z "$workspace" ] || confirm "  Use a different folder than $workspace?" "file.folder.override"; then
       while true; do
-        local w; w=$(ask "  Absolute path to the agent's working folder" "$workspace")
+        local w
+        if [ -n "$workspace" ]; then
+          w=$(ask "  Absolute path to the agent's working folder" "$workspace")
+        else
+          w=$(fs_ask_shared_folder) || die "$NO_ANSWER"
+          [ "$w" = "q" ] && quit_run
+        fi
         case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
         if ! fs_resolve_shared_folder "$w"; then
           fs_folder_refusal_warn "$w"
+          continue
+        fi
+        # Only for the no-default gateways, and only because the question is a
+        # different one there. OpenClaw and Hermes are asked for a folder the
+        # wizard is helping to SET UP, so creating it is part of the job; a custom
+        # operator is naming a folder their agent ALREADY uses, so a path that is
+        # not on this machine is a typo or a path the agent will never see. Left to
+        # run, it becomes an empty folder nothing writes to, served by a lane that
+        # proves only that bytes moved — the exact false green this step removes.
+        if [ -z "$workspace" ] && [ ! -d "$FS_FOLDER_RESOLVED" ]; then
+          warn "$w does not exist on this machine."
+          note "This has to be the folder your agent ALREADY reads and writes. Create it and point your"
+          note "agent at it first, or give me the path it uses today."
           continue
         fi
         [ "$FS_FOLDER_RESOLVED" != "$w" ] \
