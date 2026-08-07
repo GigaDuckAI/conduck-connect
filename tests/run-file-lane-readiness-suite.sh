@@ -5298,11 +5298,22 @@ test_tool_policy_restart_handoff() {
 # cases hold that line from both ends: what the verdict claims, and what the
 # write actually contains.
 #
-# The other half is case. OpenClaw matches allow/deny entries CASE-INSENSITIVELY
-# (docs.openclaw.ai → gateway/config-tools), so a comparison here that did not
-# would read deny ["Write"] as harmless, add permissions around a denial still in
-# force, and restart the gateway for nothing. Every mixed-case arm below is a
-# config that behaves identically to its lowercase twin, asserted as such.
+# The other half is matching. OpenClaw matches entries in allow, alsoAllow and
+# deny alike CASE-INSENSITIVELY and with `*` wildcards (docs.openclaw.ai →
+# gateway/config-tools), and group:fs stands for read/write/edit/apply_patch
+# wherever it appears. A read that applied any of those rules on one side only
+# gets the answer wrong in both directions: it would call deny ["Write"]
+# harmless, and it would call allow ["*"] — every tool permitted — a policy
+# missing read and write, then offer to "fix" a config that was already right.
+# Every mixed-case, wildcard and group:fs arm below is a config that behaves
+# identically to the spelling it is equivalent to, asserted as such.
+#
+# The last of it is what this read may CLAIM. A green verdict points at the live
+# file test that actually proves the lane, so it may only point there when that
+# test is coming — never under --dry-run, which stops before it. And a profile
+# name outside the four OpenClaw documents is graded neither green nor broken,
+# because it is neither: see the unknown-profile cases for why both alternatives
+# cost the operator something real.
 #
 # Driven through openclaw_tools_analysis where the verdict is the subject, and
 # through the REAL openclaw_tool_policy_step where the operator's screen and the
@@ -5395,7 +5406,7 @@ policy_step_facts() { # policy_step_facts <config-json> → "rc=… prompts=… 
 }
 
 test_tool_policy_verdict() {
-  local saved_home="$HOME" saved_confirm="$CONFIRM_ANSWER" out cfg fixture facts probe want
+  local saved_home="$HOME" saved_confirm="$CONFIRM_ANSWER" out cfg fixture facts probe want mixed plain
   # Deterministic regardless of what ran before: the arms that reach a prompt at
   # all are the ones asserting a decline, and they set their own answer.
   CONFIRM_ANSWER="n"
@@ -5425,6 +5436,28 @@ test_tool_policy_verdict() {
   case "$out" in *"The live file test later will confirm file access"*)
       pass "tool policy verdict: the green screen points at the live test that proves it" ;;
     *) fail "tool policy verdict: the green screen points at the live test that proves it" "$out" ;; esac
+
+  # ---- policies this step must refuse to rewrite ----------------------------
+  # Both are cases where the ONLY safe edit is none. An empty tools.allow is not
+  # an allowlist two entries short: adding to it would create an authoritative
+  # allowlist where the base profile had been in force, revoking every tool that
+  # profile granted — which the fix banner's "everything else keeps its current
+  # policy" promise would not cover. A list holding a non-string is one this read
+  # cannot reproduce, and since every rewrite writes a WHOLE list back, the
+  # dropped entry would be gone from the operator's file for good, with the
+  # before/after on screen — their only offered rollback — not matching it.
+  # Both must reach `manual` (say it, change nothing) and propose no operation.
+  for refuse_case in \
+    'empty allowlist|{"tools": {"profile": "coding", "allow": []}}' \
+    'a deny entry that is not a tool name|{"tools": {"deny": ["write", {"x": 1}, "exec"]}}' \
+    'an allow entry that is not a tool name|{"tools": {"allow": ["read", 5]}}'; do
+    refuse_label=${refuse_case%%|*}
+    refuse_cfg=${refuse_case#*|}
+    expect_eq "tool policy: $refuse_label is left to the operator" \
+      "$(policy_field status 2 "$refuse_cfg")" "manual"
+    expect_eq "tool policy: $refuse_label proposes no operation" \
+      "$(policy_ops_summary "$refuse_cfg")" ""
+  done
 
   # ---- nothing emitted anywhere names the pdf tool --------------------------
   # Machine records and operator screen together, over every branch that emits
@@ -5499,6 +5532,167 @@ test_tool_policy_verdict() {
     "tools.alsoAllow=READ,write"
   expect_eq "mixed case: a WRI* deny is the human's call, exactly as wri* is" \
     "$(policy_field status 2 '{"tools": {"deny": ["WRI*"]}}')" "manual"
+
+  # ---- wildcards, which OpenClaw honours on every list, not only deny -------
+  # allow ["*"] is the strongest possible yes to read and write. Matched by plain
+  # equality it read as a policy omitting both, and the operator of a gateway
+  # that permitted every tool was told their policy "would break agent file
+  # transfer" and offered a config write plus a gateway restart that changed
+  # nothing — and, on a decline, lost the whole file lane.
+  for cfg in \
+    '{"tools": {"allow": ["*"]}}' \
+    '{"tools": {"allow": ["re*", "wr*"]}}' \
+    '{"tools": {"allow": ["group:*"]}}' \
+    '{"tools": {"profile": "minimal", "alsoAllow": ["*"]}}'
+  do
+    # Anti-vacuity first: an arm that stopped reaching ok would make every
+    # assertion under it pass by asserting the absence of things no branch
+    # emitted.
+    expect_eq "a wildcard that covers the file tools really reaches ok — $cfg" \
+      "$(policy_field status 2 "$cfg")" "ok"
+    expect_eq "a wildcard that covers the file tools proposes no operation at all — $cfg" \
+      "$(policy_ops_summary "$cfg")" ""
+    facts=$(policy_step_facts "$cfg")
+    expect_eq "wildcard allow: nothing proposed, nothing asked, nothing restarted, lane kept — $cfg" \
+      "$facts" "rc=0 prompts=0 steps=0 waits=0 epoch=none"
+    out=$(cat "$POLICY_STEP_OUT")
+    case "$out" in *"would break agent file transfer"*)
+        fail "wildcard allow is not called a policy that breaks file transfer — $cfg" "$out" ;;
+      *) pass "wildcard allow is not called a policy that breaks file transfer — $cfg" ;; esac
+  done
+  # A wildcard that reaches NEITHER file tool is still a policy missing them, so
+  # honouring wildcards must not turn into ignoring the allowlist.
+  expect_eq "an allowlist whose wildcards miss the file tools still gains read and write" \
+    "$(policy_ops_summary '{"tools": {"allow": ["ex*"]}}')" "tools.allow=ex*,read,write"
+
+  # ---- group:fs means the same thing in alsoAllow as it does in allow -------
+  # It expands to read/write/edit/apply_patch wherever it appears. The allow
+  # branch read it that way and the alsoAllow branch did not, so an operator who
+  # had already granted both file tools over a minimal profile was told "the
+  # active profile lacks read, write" and offered a write that added what was
+  # there.
+  expect_eq "group:fs in allow really reaches ok — the verdict the alsoAllow arm is compared to" \
+    "$(policy_field status 2 '{"tools": {"profile": "minimal", "allow": ["group:fs"]}}')" "ok"
+  expect_eq "group:fs in alsoAllow over a minimal profile reaches the same verdict as in allow" \
+    "$(policy_field status 2 '{"tools": {"profile": "minimal", "alsoAllow": ["group:fs"]}}')" \
+    "$(policy_field status 2 '{"tools": {"profile": "minimal", "allow": ["group:fs"]}}')"
+  expect_eq "group:fs in alsoAllow over a minimal profile proposes no operation at all" \
+    "$(policy_ops_summary '{"tools": {"profile": "minimal", "alsoAllow": ["group:fs"]}}')" ""
+  facts=$(policy_step_facts '{"tools": {"profile": "minimal", "alsoAllow": ["group:fs"]}}')
+  expect_eq "group:fs in alsoAllow: nothing proposed, nothing asked, nothing restarted, lane kept" \
+    "$facts" "rc=0 prompts=0 steps=0 waits=0 epoch=none"
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"would break agent file transfer"*)
+      fail "group:fs in alsoAllow is not called a policy that breaks file transfer" "$out" ;;
+    *) pass "group:fs in alsoAllow is not called a policy that breaks file transfer" ;; esac
+  # …and Group:FS is the same grant there too, because these entries ignore case.
+  expect_eq "a Group:FS in alsoAllow covers read and write exactly as group:fs does" \
+    "$(policy_field status 2 '{"tools": {"profile": "messaging", "alsoAllow": ["Group:FS"]}}')" "ok"
+  # An alsoAllow that covers only ONE of the two still needs the other, so
+  # reading group:fs must not turn into waving the whole branch through.
+  expect_eq "an alsoAllow naming only read over a minimal profile still gains write" \
+    "$(policy_ops_summary '{"tools": {"profile": "minimal", "alsoAllow": ["read"]}}')" \
+    "tools.alsoAllow=read,write"
+
+  # ---- profile names, matched the way the entries are ----------------------
+  # OpenClaw's docs list minimal/coding/messaging/full in lowercase and say
+  # nothing about case, so this read normalises and treats "Minimal" as minimal.
+  # Matched case-sensitively, every one of these fell past the minimal/messaging
+  # test into the branch coding and full take, and a profile that grants
+  # session_status alone was reported as file-tool settings that "look ready".
+  for probe in \
+    'Minimal|minimal' \
+    'MESSAGING|messaging' \
+    'Coding|coding' \
+    'Full|full'
+  do
+    mixed="${probe%%|*}"; plain="${probe#*|}"
+    case "$plain" in
+      minimal|messaging) want="fix" ;;
+      *)                 want="ok" ;;
+    esac
+    # Anti-vacuity: the lowercase twin has to reach the status this pair is
+    # about, or the two comparisons below are two identical nothings.
+    expect_eq "profile $plain really reaches $want" \
+      "$(policy_field status 2 "{\"tools\": {\"profile\": \"$plain\"}}")" "$want"
+    expect_eq "profile $mixed reaches the same verdict as $plain" \
+      "$(policy_field status 2 "{\"tools\": {\"profile\": \"$mixed\"}}")" \
+      "$(policy_field status 2 "{\"tools\": {\"profile\": \"$plain\"}}")"
+    expect_eq "profile $mixed proposes exactly what $plain proposes" \
+      "$(policy_ops_summary "{\"tools\": {\"profile\": \"$mixed\"}}")" \
+      "$(policy_ops_summary "{\"tools\": {\"profile\": \"$plain\"}}")"
+  done
+
+  # ---- a profile name that is none of the four -----------------------------
+  # PINNED DELIBERATELY. Do not "helpfully" turn this back into a green: this
+  # read has no way to know which tools an undocumented profile grants. Grading
+  # it ready certifies tools nothing here looked at; grading it broken offers a
+  # repair for a policy that may be perfectly fine, and the operator who declines
+  # that repair loses the entire file lane. So the verdict says what was seen,
+  # proposes nothing, asks nothing, and leaves the lane alone — the live file
+  # test is what settles it. Before the pdf tool left this routine, an
+  # unrecognised profile reached the fix branch by accident; afterwards it
+  # reached a confident green, which is the worse of the two.
+  expect_eq "an undocumented profile is graded neither ready nor broken" \
+    "$(policy_field status 2 '{"tools": {"profile": "toolsmith"}}')" "unknown"
+  expect_eq "an undocumented profile proposes no operation at all" \
+    "$(policy_ops_summary '{"tools": {"profile": "toolsmith"}}')" ""
+  facts=$(policy_step_facts '{"tools": {"profile": "toolsmith"}}')
+  expect_eq "an undocumented profile: nothing proposed, nothing asked, nothing restarted, lane kept" \
+    "$facts" "rc=0 prompts=0 steps=0 waits=0 epoch=none"
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"would break agent file transfer"*)
+      fail "an undocumented profile is not called a policy that breaks file transfer" "$out" ;;
+    *) pass "an undocumented profile is not called a policy that breaks file transfer" ;; esac
+  case "$out" in *"look ready"*)
+      fail "an undocumented profile is not called ready either" "$out" ;;
+    *) pass "an undocumented profile is not called ready either" ;; esac
+  case "$out" in *"can't tell which file tools it grants"*)
+      pass "an undocumented profile names what this read could not establish" ;;
+    *) fail "an undocumented profile names what this read could not establish" "$out" ;; esac
+  case "$out" in *"file lane is kept"*)
+      pass "an undocumented profile says the lane is kept" ;;
+    *) fail "an undocumented profile says the lane is kept" "$out" ;; esac
+  # An alsoAllow that already covers both tools settles the question whatever the
+  # profile grants, so that is ok, not unknown.
+  expect_eq "an undocumented profile with group:fs in alsoAllow is settled, not unknown" \
+    "$(policy_field status 2 '{"tools": {"profile": "toolsmith", "alsoAllow": ["group:fs"]}}')" "ok"
+  # …and a deny that blocks the lane still wins: an unreadable profile name must
+  # never bury a fix the operator does need.
+  expect_eq "an undocumented profile beside a group:fs deny still gets the deny fix" \
+    "$(policy_ops_summary '{"tools": {"profile": "toolsmith", "deny": ["group:fs"]}}')" \
+    "tools.deny=edit,apply_patch"
+
+  # ---- what the green verdict may promise ----------------------------------
+  # --dry-run exits at print_plan, before verify_all, so the live file test never
+  # runs in that mode; README documents it as the mode that stops and sends
+  # nothing. Promising that test there is a promise the mode cannot keep, on the
+  # one screen a user is most likely to read as proof.
+  facts=$(DRY_RUN=true; policy_step_facts '{"tools": {"profile": "coding"}}')
+  expect_eq "dry-run: the green verdict is reached with nothing proposed or asked" \
+    "$facts" "rc=0 prompts=0 steps=0 waits=0 epoch=none"
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"file-tool settings look ready"*)
+      pass "dry-run: the green verdict is really the one being read" ;;
+    *) fail "dry-run: the green verdict is really the one being read" "$out" ;; esac
+  case "$out" in *"The live file test later will confirm file access"*)
+      fail "dry-run: the verdict does not promise a live test this mode never runs" "$out" ;;
+    *) pass "dry-run: the verdict does not promise a live test this mode never runs" ;; esac
+  case "$out" in *"stops before the live file test"*)
+      pass "dry-run: the verdict says the proof is not coming in this pass" ;;
+    *) fail "dry-run: the verdict says the proof is not coming in this pass" "$out" ;; esac
+  # The same sentence under an undocumented profile, which ends on it too.
+  out=$(DRY_RUN=true; policy_step_facts '{"tools": {"profile": "toolsmith"}}' >/dev/null; cat "$POLICY_STEP_OUT")
+  case "$out" in *"The live file test later will confirm file access"*)
+      fail "dry-run: the unknown-profile verdict promises no live test either" "$out" ;;
+    *) pass "dry-run: the unknown-profile verdict promises no live test either" ;; esac
+  # …and a real run still points at it, which is the whole reason the sentence
+  # exists — asserted beside its dry-run twin so neither can drift alone.
+  policy_step_facts '{"tools": {"profile": "coding"}}' > /dev/null
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"The live file test later will confirm file access"*)
+      pass "a real run still points at the live test that proves it" ;;
+    *) fail "a real run still points at the live test that proves it" "$out" ;; esac
 
   # ---- the write can never contradict itself -------------------------------
   # OpenClaw resolves deny-versus-allow by denying, so a config naming one tool

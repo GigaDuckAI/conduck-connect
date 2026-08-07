@@ -4,6 +4,65 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **Two policies this check used to rewrite are now left to you, because the only
+  safe edit to either was none.** An empty `tools.allow` was read as an allowlist
+  two entries short, and the offered repair wrote `["read", "write"]` into it —
+  which turns an empty list into a real allowlist and revokes every tool the base
+  profile had been granting, directly under a banner promising that everything
+  else keeps its current policy. And a policy list holding anything that is not a
+  tool name — a nested object, a number — had that entry silently dropped when the
+  list was read, so the rewrite wrote it out of your config for good, while the
+  before/after on screen, the one rollback you are offered, showed a "before" that
+  did not match your file. Both now stop and say what they found, change nothing,
+  and leave the decision with you.
+
+- **A policy that allows every tool stops being reported as one that breaks file
+  transfer.** OpenClaw matches the entries in `tools.allow` and `tools.alsoAllow`
+  case-insensitively and with `*` wildcards, exactly as it does the entries in
+  `tools.deny` — and this check honoured the wildcards on the deny side only. So
+  `{"tools": {"allow": ["*"]}}`, a policy that permits every tool your gateway
+  has, was read as one *omitting* the file tools: it printed *This tool policy
+  would break agent file transfer: tools.allow omits read, write*, offered to
+  append two tools that were already permitted, and would have restarted your
+  gateway to apply a difference that was none. Decline that repair and the whole
+  file lane left your setup code — the worst outcome of the three, and the one
+  the wording pushed you toward. `["*"]`, `["re*", "wr*"]` and `["group:*"]` now
+  all reach the green verdict with nothing proposed and nothing asked. An
+  allowlist whose wildcards genuinely miss `read` and `write` still gains them.
+- **`group:fs` means the same thing in `alsoAllow` as it does in `allow`.** It is
+  OpenClaw's name for `read`, `write`, `edit` and `apply_patch` wherever it
+  appears, and this check understood that in one list and not in the other.
+  Someone who had written `{"tools": {"profile": "minimal", "alsoAllow":
+  ["group:fs"]}}` — the documented way to add the file tools back on top of a
+  locked-down profile — was told *the active profile lacks read, write* and
+  offered a write that would have added what was already there. Both lists are
+  read the same way now, a mixed-case `Group:FS` included. An `alsoAllow` that
+  covers only one of the two tools still gains the other.
+- **Profile names are read the way the rest of the policy is, and a name the
+  wizard does not recognise is no longer graded at all.** `{"tools": {"profile":
+  "Minimal"}}` was matched case-sensitively, missed the `minimal` test, and came
+  out the far end as *OpenClaw's file-tool settings look ready (read/write
+  allowed, profile: Minimal)* — a confident green for a profile that grants
+  `session_status` and nothing else. `Minimal`, `MESSAGING`, `Coding` and `Full`
+  now behave exactly as their lowercase spellings do. A profile name that is none
+  of the four OpenClaw documents gets the only answer that is true: the wizard
+  says it cannot tell which file tools that profile grants, changes nothing, asks
+  nothing, and keeps your file lane — the live file test later in the run is what
+  settles it. Calling such a config ready would certify tools nothing looked at;
+  calling it broken would offer a repair for a policy that may be perfectly fine,
+  and cost you the lane if you declined it. A `tools.deny` that really does block
+  the lane is still found and still repaired, whatever the profile is called.
+- **`--dry-run` stops promising a test it never runs.** A dry run prints the plan
+  and exits before a single request is sent, but the green tool-policy verdict
+  still ended on *The live file test later will confirm file access.* In that mode
+  it now says the pass stops before that test instead. A real run points at it
+  exactly as before.
+- **`SECURITY.md` stops describing OpenClaw's PDF story as one a path hint
+  solves.** The agent-guidance block it documents carries that hint and nothing
+  else: the wizard never switches OpenClaw's `pdf` tool on, never grades it, and
+  no longer mentions it anywhere in the tool-policy check. Native PDF reading on
+  OpenClaw is your own call, and the README's file-lane troubleshooting lists
+  what it takes.
 - **The wizard stops switching OpenClaw's `pdf` tool on.** Its tool-policy check
   used to add `pdf` beside `read` and `write` and then report the result as
   *file-transfer-ready (read/write allowed, pdf on)*. Measured against a live

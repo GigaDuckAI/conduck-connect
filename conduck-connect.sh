@@ -5220,23 +5220,34 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
 
 # Read tools.{profile,allow,alsoAllow,deny} from openclaw.json (JSON5-tolerant)
 # and print a machine-readable verdict:
-#   status<TAB><ok|none|fix|manual|unreadable><TAB><reason>
+#   status<TAB><ok|none|unknown|fix|manual|unreadable><TAB><reason>
 #   change<TAB><key>: <before> → <after>          (fix only, one per key)
 #   cmd<TAB><manual `openclaw config set …` line>  (fix only, one per key)
 #   ops<TAB><config set --batch-json payload>      (fix only)
 # Encodes only DOC-VERIFIED semantics (docs.openclaw.ai → gateway/config-tools,
-# re-read August 2026): deny wins; allow/deny entries match CASE-INSENSITIVELY
-# and support wildcards; group:fs = read/write/edit/apply_patch; allow and
-# alsoAllow are mutually exclusive per scope. The fix is the MINIMUM relaxation:
-# read/write on, edit/apply_patch/exec untouched — group:fs in deny is REPLACED
-# by its mutating members, never just dropped.
+# re-read August 2026): deny wins; entries in allow, alsoAllow and deny alike
+# match CASE-INSENSITIVELY and support `*` wildcards ("Global tool allow/deny
+# policy (deny wins). Case-insensitive, supports * wildcards.", with alsoAllow
+# named there as allow's interchangeable form); group:fs =
+# read/write/edit/apply_patch; allow and alsoAllow are mutually exclusive per
+# scope. The fix is the MINIMUM relaxation: read/write on, edit/apply_patch/exec
+# untouched — group:fs in deny is REPLACED by its mutating members, never just
+# dropped.
 #
-# Case-insensitive is OpenClaw's rule, so it is this routine's rule too, at every
-# comparison without exception. A single case-sensitive one is enough to break
-# the whole read: deny ["Write"] would look harmless, permissions would be added
-# around a denial still in force, the gateway would be restarted for nothing, and
-# the re-read would call its own output green. Comparisons therefore run over a
-# lowercased copy; what gets WRITTEN keeps the operator's own spelling.
+# All three matching rules therefore apply on BOTH sides of the policy, never
+# only where a bug happened to be fixed first. A plain-equality read of the allow
+# side called allow ["*"] — a policy that permits every tool — a policy omitting
+# read and write, and offered to "fix" it; a case-sensitive read of the deny side
+# would call deny ["Write"] harmless, add permissions around a denial still in
+# force, restart the gateway for nothing and then grade its own output green.
+# Comparisons run over lowercased copies; what gets WRITTEN keeps the operator's
+# own spelling.
+#
+# PROFILE NAMES are lowercased for matching too, which the docs neither require
+# nor forbid: they list minimal/coding/messaging/full in lowercase and say
+# nothing about case. Normalising is the direction whose worst case is harmless —
+# reading "Minimal" as minimal can at most propose two tools the agent may
+# already hold, while the reverse silently grades an unreadable name.
 #
 # The verdict concerns exactly two tools, because two are what the lane runs on:
 # read opens what Conduck uploads, write produces the files that come back as
@@ -5305,18 +5316,32 @@ if not isinstance(tools, dict):
          "no tools block in openclaw.json — the default policy leaves the agent's file tools on")
     sys.exit(0)
 
+# Keys whose list held something other than a string. Every rewrite below writes
+# a WHOLE list back, so an entry this read dropped would be dropped from the
+# operator's file for good — and the before/after on screen, which is the only
+# rollback they are offered, would not match what the file actually said.
+lossy = []
+
 def arr(key):
     v = tools.get(key)
     if isinstance(v, list):
-        return [x for x in v if isinstance(x, str)]
+        strs = [x for x in v if isinstance(x, str)]
+        if len(strs) != len(v):
+            lossy.append("tools." + key)
+        return strs
     return None
 
-profile = tools.get("profile") if isinstance(tools.get("profile"), str) else None
+profile_raw = tools.get("profile") if isinstance(tools.get("profile"), str) else None
 allow, also, deny = arr("allow"), arr("alsoAllow"), arr("deny")
 # The whole of what this step concerns itself with: the two tools the file lane
 # cannot work without. Every other entry in the policy is the operator's own
 # decision and is neither read for a verdict nor written to.
 targets = ("read", "write")
+# OpenClaw's own tool-group table: group:fs is exactly these four tool ids.
+FS_GROUP = ("read", "write", "edit", "apply_patch")
+# Every profile OpenClaw documents. A name outside this set grants tools this
+# read has no way to enumerate — see the `unknown` verdict below.
+PROFILES = ("minimal", "coding", "messaging", "full")
 
 # OpenClaw matches these entries case-insensitively, so every comparison below
 # is made against lowercased copies — never against the raw list, which stays
@@ -5325,6 +5350,36 @@ def lower_all(xs):
     return [x.lower() for x in (xs or [])]
 
 deny_low = lower_all(deny)
+# The profile is matched lowercased for the same reason (see the header note on
+# why normalising is the safe direction); the raw spelling is kept for display.
+profile = profile_raw.lower() if profile_raw is not None else None
+
+def is_pattern(entry):
+    return any(ch in entry for ch in "*?[")
+
+def display(s):
+    # A profile name is operator text from their own config on its way to a
+    # terminal. Drop anything unprintable — a stray ANSI escape would repaint
+    # this transcript — and bound it; a real profile name is one short word.
+    return "".join(c if c.isprintable() else " " for c in s)[:64]
+
+def granted(entries, tool):
+    # Does an allow-side list (tools.allow or tools.alsoAllow) grant <tool>?
+    # All three of OpenClaw's documented matching rules, the same three the deny
+    # side reads by: case-insensitive, `*` wildcards, and group:fs standing for
+    # its members. Plain equality here is what reported allow ["*"] — a policy
+    # that permits every tool — as one omitting read and write.
+    for e in (entries or []):
+        low = e.lower()
+        if low == tool:
+            return True
+        if low == "group:fs" and tool in FS_GROUP:
+            return True
+        if is_pattern(low) and (
+                fnmatch.fnmatchcase(tool, low)
+                or (tool in FS_GROUP and fnmatch.fnmatchcase("group:fs", low))):
+            return True
+    return False
 
 # An invalid config (both allow + alsoAllow) must never be auto-edited into a
 # different invalid config — surface it instead.
@@ -5334,12 +5389,33 @@ if allow is not None and also is not None:
          "rejects that combination; reconcile the two by hand first")
     sys.exit(0)
 
+# A list this read could not reproduce must never be rewritten from it.
+if lossy:
+    emit("status", "manual",
+         "%s holds entries that are not tool names, which this read cannot reproduce — "
+         "rewriting the list would drop them; reconcile them by hand first"
+         % " and ".join(lossy))
+    sys.exit(0)
+
+# An EMPTY allowlist is not an allowlist two entries short. Adding read/write to
+# it produces an authoritative allowlist where the base profile had been in
+# force, revoking every tool that profile granted — the one edit this step can
+# make that its own "everything else keeps its current policy" promise would not
+# cover. Whether OpenClaw reads [] as "allow nothing" or ignores it entirely,
+# the operator has to say which they meant.
+if allow is not None and not allow:
+    emit("status", "manual",
+         "tools.allow is an empty list — adding to it would turn it into an allowlist "
+         "that blocks every tool it omits, so it is not a change this step can make for "
+         "you; name the tools you want in it, or remove the key, by hand")
+    sys.exit(0)
+
 # A wildcard deny (e.g. "wri*", "*") that reaches read or write is a deliberate,
 # broad operator choice — flag it for the human, never auto-rewrite it. Matching
 # is case-insensitive both ways: fnmatchcase over an already-lowercase name and a
 # lowercased pattern, so "WRI*" is caught exactly as "wri*" is.
 wild = [e for e in (deny or [])
-        if any(ch in e for ch in "*?[")
+        if is_pattern(e)
         and (any(fnmatch.fnmatchcase(t, e.lower()) for t in targets)
              or fnmatch.fnmatchcase("group:fs", e.lower()))]
 if wild:
@@ -5371,29 +5447,50 @@ if any(e in ("group:fs",) + targets for e in deny_low):
             new_deny.append(e)
     changes["tools.deny"] = (deny, new_deny)
 
+profile_unreadable = False
+
 if allow is not None:
-    # A non-empty allowlist blocks everything omitted; group:fs inside it
-    # already covers read/write. (alsoAllow is invalid alongside allow, so the
-    # additions go HERE.)
-    allow_low = lower_all(allow)
-    missing = [t for t in targets
-               if t not in allow_low and "group:fs" not in allow_low]
+    # A non-empty allowlist blocks everything omitted, and it is authoritative:
+    # the base profile is applied before it, so nothing the profile grants
+    # survives an allowlist that omits it. The profile is therefore not consulted
+    # on this branch. (alsoAllow is invalid alongside allow, so additions go HERE.)
+    missing = [t for t in targets if not granted(allow, t)]
     if missing:
         changes["tools.allow"] = (allow, allow + missing)
         added["tools.allow"] = missing
 else:
-    # Only a profile that may ship WITHOUT the fs tools needs anything added.
-    # coding, full, and an unset profile all carry read and write already.
-    ensure = list(targets) if profile in ("minimal", "messaging") else []
+    # No allowlist: the base profile decides what the agent starts with and
+    # alsoAllow adds on top of it — so an alsoAllow that already covers read and
+    # write settles the question whatever the profile grants, group:fs included.
     base = also or []
-    base_low = lower_all(base)
-    add = [t for t in ensure if t not in base_low]
-    if add:
-        changes["tools.alsoAllow"] = (also, base + add)
-        added["tools.alsoAllow"] = add
+    if not all(granted(base, t) for t in targets):
+        if profile is not None and profile not in PROFILES:
+            # Nothing truthful can be said about a profile whose name is not one
+            # of the four. Reported below, and only when nothing else in this
+            # policy needs saying — a deny that blocks the lane still wins.
+            profile_unreadable = True
+        else:
+            # Only a profile that may ship WITHOUT the fs tools needs anything
+            # added. coding, full, and an unset profile all carry read and write.
+            ensure = list(targets) if profile in ("minimal", "messaging") else []
+            add = [t for t in ensure if not granted(base, t)]
+            if add:
+                changes["tools.alsoAllow"] = (also, base + add)
+                added["tools.alsoAllow"] = add
 
 if not changes:
-    detail = "profile: %s" % profile if profile else "no profile set"
+    if profile_unreadable:
+        # Neither green nor an alarm, because neither is true. Grading this ok
+        # would certify tools nothing here looked at; grading it fix would
+        # propose a repair for a policy that may be perfectly fine, and a
+        # declined repair costs the operator the whole file lane. Saying what
+        # was actually seen costs nothing and leaves the lane alone.
+        emit("status", "unknown",
+             'tools.profile is "%s", which is not one of the profiles OpenClaw '
+             "documents (minimal, coding, messaging, full), so this read can't tell "
+             "which file tools it grants" % display(profile_raw))
+        sys.exit(0)
+    detail = "profile: %s" % profile_raw if profile_raw else "no profile set"
     # Only what this read established. Whether the agent can make sense of any
     # given FORMAT once it holds the bytes turns on tools, a model, and a
     # provider that none of this looked at, so the verdict stops at the two
@@ -5553,6 +5650,21 @@ gw_note_restart_and_wait() { # gw_note_restart_and_wait [<what> [<http-safe>]]
   return 0
 }
 
+# The one sentence a config read is allowed to end on, and the reason it changes
+# under --dry-run: the live file test in Step 5 is what actually proves the agent
+# can use this lane, and a dry run exits at print_plan before verify_all is ever
+# reached (README documents the mode as one that stops and sends nothing). A test
+# this mode never runs must not be promised — that is the same overstatement the
+# rest of this step exists to avoid, in the one place a user is most likely to
+# believe it. Kept in one function because two verdicts end on it.
+openclaw_policy_live_test_note() {
+  if $DRY_RUN; then
+    note "(dry-run: this pass stops before the live file test, so nothing here is checked against a running agent)"
+  else
+    note "The live file test later will confirm file access."
+  fi
+}
+
 # Check OpenClaw's tool policy for the file lane; offer the exact fix through
 # the same config-set + restart machinery as the Step-2 endpoint enable.
 # Returns 0 = lane proceeds, 1 = user chose to drop the lane. Declining the FIX
@@ -5586,10 +5698,20 @@ openclaw_tool_policy_step() {
       # Step 5 is what actually proves the agent can use this lane, and it runs
       # in this same session. Pointing at it keeps a green config read from being
       # taken for the proof that follows it.
-      ok "OpenClaw's file-tool settings look ready ($reason). The live file test later will confirm file access."
+      ok "OpenClaw's file-tool settings look ready ($reason)."
+      openclaw_policy_live_test_note
       return 0 ;;
     none)
       ok "$reason."
+      return 0 ;;
+    unknown)
+      # A profile name this read cannot interpret. Described, never graded: the
+      # lane is untouched, nothing is proposed and nothing is asked, because the
+      # only two alternatives are a green claim about tools nobody looked at and
+      # a false alarm whose declined fix would cost the operator the whole lane.
+      note "$reason."
+      note "Nothing is changed here, and the file lane is kept either way."
+      openclaw_policy_live_test_note
       return 0 ;;
     unreadable|"")
       warn "Could not read the tool policy ($reason) — continuing, but if attachments later"
@@ -5646,13 +5768,24 @@ openclaw_tool_policy_step() {
       # wrong file) and verification below never exercises agent tools.
       # awk -F'\t', not sed \t — BSD sed treats \t as a literal 't'.
       local recheck; recheck=$(openclaw_tools_analysis "$cfg" | awk -F '\t' '$1=="status"{print $2; exit}')
-      if [ "$recheck" = "ok" ]; then
-        ok "Tool policy re-checked — openclaw.json is file-transfer-ready."
+      # `unknown` counts as repaired alongside `ok`: the change this run made is
+      # in the file, and an unrecognised profile name is not something re-reading
+      # the same file can settle. Only `fix` and `manual` mean the block is still
+      # there, so only they may say the change didn't take.
+      if [ "$recheck" = "ok" ] || [ "$recheck" = "unknown" ]; then
+        if [ "$recheck" = "ok" ]; then
+          ok "Tool policy re-checked — openclaw.json is file-transfer-ready."
+        else
+          ok "Tool policy re-checked — the change is saved in openclaw.json."
+        fi
         # The re-read proves the FILE, so a policy the running gateway never
         # reloaded may not say what the config now says.
         if ! $restart_done; then
           warn "The gateway was not restarted, so it is still running with its old policy."
           note "Restart it when you can; until then the agent still can't open the files Conduck uploads."
+        fi
+        if [ "$recheck" = "unknown" ]; then
+          openclaw_policy_live_test_note
         fi
         return 0
       fi
