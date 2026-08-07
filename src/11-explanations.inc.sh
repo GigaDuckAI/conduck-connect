@@ -192,7 +192,7 @@ explain_action() { # explain_action <action-id>
     file.openclaw.allow_tools|gateway.openclaw.file_policy|openclaw-file-policy)
       explain_panel \
         "Allow the OpenClaw agent to use Conduck's file lane" \
-        "A working WebDAV lane is not enough if OpenClaw's tool policy still denies file reading, writing, or PDF handling." \
+        "A working WebDAV lane is not enough if OpenClaw's tool policy still denies the agent file reading and writing." \
         "Shows the exact policy before and after, applies only the approved keys through OpenClaw's config command, then offers a restart." \
         "Chat still works, but the agent may not read uploads or return files." \
         "Restore the shown prior values and restart OpenClaw to reverse this policy edit."
@@ -201,7 +201,7 @@ explain_action() { # explain_action <action-id>
     file.openclaw.manual_tools)
       explain_panel \
         "Apply the OpenClaw file-tool policy on a non-standard install" \
-        "The agent needs the approved read, write, and PDF tool policy before Conduck's file lane is useful." \
+        "The agent needs read and write in its tool policy before Conduck's file lane is useful." \
         "Prints the exact OpenClaw config commands for you to run, followed by a gateway restart using your install's method." \
         "Chat still works, but the agent may not read uploads or return files." \
         "Enter only reports that you completed the commands. Restore the shown prior values and restart to reverse the policy edit."

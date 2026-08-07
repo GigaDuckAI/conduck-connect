@@ -1332,7 +1332,7 @@ explain_action() { # explain_action <action-id>
     file.openclaw.allow_tools|gateway.openclaw.file_policy|openclaw-file-policy)
       explain_panel \
         "Allow the OpenClaw agent to use Conduck's file lane" \
-        "A working WebDAV lane is not enough if OpenClaw's tool policy still denies file reading, writing, or PDF handling." \
+        "A working WebDAV lane is not enough if OpenClaw's tool policy still denies the agent file reading and writing." \
         "Shows the exact policy before and after, applies only the approved keys through OpenClaw's config command, then offers a restart." \
         "Chat still works, but the agent may not read uploads or return files." \
         "Restore the shown prior values and restart OpenClaw to reverse this policy edit."
@@ -1341,7 +1341,7 @@ explain_action() { # explain_action <action-id>
     file.openclaw.manual_tools)
       explain_panel \
         "Apply the OpenClaw file-tool policy on a non-standard install" \
-        "The agent needs the approved read, write, and PDF tool policy before Conduck's file lane is useful." \
+        "The agent needs read and write in its tool policy before Conduck's file lane is useful." \
         "Prints the exact OpenClaw config commands for you to run, followed by a gateway restart using your install's method." \
         "Chat still works, but the agent may not read uploads or return files." \
         "Enter only reports that you completed the commands. Restore the shown prior values and restart to reverse the policy edit."
@@ -5192,20 +5192,31 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
 
 # --- OpenClaw agent-side readiness (tool policy + TOOLS.md guidance) ----------
 # A green file-lane test proves only that Conduck can STORE bytes — never that
-# the AGENT may read or return them. Four gateway-side traps break attachments
+# the AGENT may read or return them. Three gateway-side traps break attachments
 # silently even with every transport check green (all verified live, July 2026):
 #   1. tools.deny containing group:fs (a common hardening move) — the agent
 #      can't open a single uploaded file;
-#   2. the pdf tool isn't in the "coding" profile — PDFs get read as raw bytes
-#      and answered with plausible nonsense;
-#   3. output files need `write` — without it there are no download chips;
-#   4. MEDIA:-style reply directives are STRIPPED on the OpenAI-compatible
+#   2. output files need `write` — without it there are no download chips;
+#   3. MEDIA:-style reply directives are STRIPPED on the OpenAI-compatible
 #      endpoint — the agent "sends" a file that never arrives.
-# 1-3 are config → openclaw_tool_policy_step checks and offers the exact fix.
-# 4 is agent behavior → install_conduck_tools_block teaches it (TOOLS.md),
+# 1-2 are config → openclaw_tool_policy_step checks and offers the exact fix.
+# 3 is agent behavior → install_conduck_tools_block teaches it (TOOLS.md),
 # scoped to Conduck turns so messaging channels (where MEDIA: is correct) are
 # untouched. Neither is detectable app-side (the app deliberately has no
 # capability probe), which is why the wizard is where this lives.
+#
+# READING a PDF is a different problem, and deliberately not this step's
+# business. The pdf tool is absent from the "coding" profile, and switching it on
+# from here was measured against a live box: every call failed with "Unknown
+# model: <slug>", because the tool needs its own model at agents.defaults.pdfModel
+# and the common BYO shape (an OpenRouter-routed OpenAI model) does not resolve
+# there. The correct answers came from a clawpdf binary the container carries
+# whatever the tool policy says, plus the image tool that lives in the base
+# profile — an image-only scanned PDF scored the same 8 of 8 facts with the tool
+# on and with it off, and hallucinated nothing either way. So the write bought
+# two failing tool calls per PDF request and a user-visible "tool failed" line on
+# an otherwise correct reply. Turning the tool on stays the operator's own call;
+# the README's file-lane troubleshooting lists the three things it needs.
 
 # Read tools.{profile,allow,alsoAllow,deny} from openclaw.json (JSON5-tolerant)
 # and print a machine-readable verdict:
@@ -5213,11 +5224,24 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
 #   change<TAB><key>: <before> → <after>          (fix only, one per key)
 #   cmd<TAB><manual `openclaw config set …` line>  (fix only, one per key)
 #   ops<TAB><config set --batch-json payload>      (fix only)
-# Encodes only DOC-VERIFIED semantics (docs.openclaw.ai, July 2026): deny wins;
-# group:fs = read/write/edit/apply_patch; allow and alsoAllow are mutually
-# exclusive per scope; pdf is absent from the coding profile. The fix is the
-# MINIMUM relaxation: read/write (+pdf) on, edit/apply_patch/exec untouched —
-# group:fs in deny is REPLACED by its mutating members, never just dropped.
+# Encodes only DOC-VERIFIED semantics (docs.openclaw.ai → gateway/config-tools,
+# re-read August 2026): deny wins; allow/deny entries match CASE-INSENSITIVELY
+# and support wildcards; group:fs = read/write/edit/apply_patch; allow and
+# alsoAllow are mutually exclusive per scope. The fix is the MINIMUM relaxation:
+# read/write on, edit/apply_patch/exec untouched — group:fs in deny is REPLACED
+# by its mutating members, never just dropped.
+#
+# Case-insensitive is OpenClaw's rule, so it is this routine's rule too, at every
+# comparison without exception. A single case-sensitive one is enough to break
+# the whole read: deny ["Write"] would look harmless, permissions would be added
+# around a denial still in force, the gateway would be restarted for nothing, and
+# the re-read would call its own output green. Comparisons therefore run over a
+# lowercased copy; what gets WRITTEN keeps the operator's own spelling.
+#
+# The verdict concerns exactly two tools, because two are what the lane runs on:
+# read opens what Conduck uploads, write produces the files that come back as
+# download chips. Nothing else in the policy is proposed, added, or claimed —
+# see the note above for why the pdf tool is not this step's business.
 openclaw_tools_analysis() { # openclaw_tools_analysis <config-path>
   python3 - "$1" <<'PY'
 import json, sys, fnmatch
@@ -5289,7 +5313,18 @@ def arr(key):
 
 profile = tools.get("profile") if isinstance(tools.get("profile"), str) else None
 allow, also, deny = arr("allow"), arr("alsoAllow"), arr("deny")
-targets = ("read", "write", "pdf")
+# The whole of what this step concerns itself with: the two tools the file lane
+# cannot work without. Every other entry in the policy is the operator's own
+# decision and is neither read for a verdict nor written to.
+targets = ("read", "write")
+
+# OpenClaw matches these entries case-insensitively, so every comparison below
+# is made against lowercased copies — never against the raw list, which stays
+# untouched so a rewrite writes the operator's own spelling back.
+def lower_all(xs):
+    return [x.lower() for x in (xs or [])]
+
+deny_low = lower_all(deny)
 
 # An invalid config (both allow + alsoAllow) must never be auto-edited into a
 # different invalid config — surface it instead.
@@ -5299,8 +5334,10 @@ if allow is not None and also is not None:
          "rejects that combination; reconcile the two by hand first")
     sys.exit(0)
 
-# A wildcard deny (e.g. "wri*", "*") that matches a file tool is a deliberate,
-# broad operator choice — flag it for the human, never auto-rewrite it.
+# A wildcard deny (e.g. "wri*", "*") that reaches read or write is a deliberate,
+# broad operator choice — flag it for the human, never auto-rewrite it. Matching
+# is case-insensitive both ways: fnmatchcase over an already-lowercase name and a
+# lowercased pattern, so "WRI*" is caught exactly as "wri*" is.
 wild = [e for e in (deny or [])
         if any(ch in e for ch in "*?[")
         and (any(fnmatch.fnmatchcase(t, e.lower()) for t in targets)
@@ -5313,17 +5350,22 @@ if wild:
     sys.exit(0)
 
 changes = {}   # key -> (before-or-None, after)
+added = {}     # key -> [tools THIS run adds], kept as the branch produced them.
+               # Re-deriving them from the before/after pair would mean redoing
+               # the case comparison that made them, in a second place.
 
-if deny and any(e in ("group:fs", "read", "write") for e in deny):
+if any(e in ("group:fs",) + targets for e in deny_low):
     new_deny = []
     for e in deny:
-        if e == "group:fs":
+        low = e.lower()
+        if low == "group:fs":
             # Replace with its MUTATING members: read/write freed, the rest of
-            # the group's denial preserved.
+            # the group's denial preserved. A member the operator already denied
+            # under any spelling is left as they wrote it, not duplicated.
             for m in ("edit", "apply_patch"):
-                if m not in deny and m not in new_deny:
+                if m not in deny_low and m not in lower_all(new_deny):
                     new_deny.append(m)
-        elif e in ("read", "write"):
+        elif low in targets:
             continue
         else:
             new_deny.append(e)
@@ -5333,36 +5375,39 @@ if allow is not None:
     # A non-empty allowlist blocks everything omitted; group:fs inside it
     # already covers read/write. (alsoAllow is invalid alongside allow, so the
     # additions go HERE.)
+    allow_low = lower_all(allow)
     missing = [t for t in targets
-               if t not in allow and not ("group:fs" in allow and t in ("read", "write"))]
+               if t not in allow_low and "group:fs" not in allow_low]
     if missing:
         changes["tools.allow"] = (allow, allow + missing)
+        added["tools.allow"] = missing
 else:
-    ensure = ["pdf"]                      # not in the coding profile
-    if profile in ("minimal", "messaging"):
-        ensure = ["read", "write", "pdf"]  # base profile may lack fs entirely
-    elif profile == "full":
-        ensure = []                        # full already includes everything
+    # Only a profile that may ship WITHOUT the fs tools needs anything added.
+    # coding, full, and an unset profile all carry read and write already.
+    ensure = list(targets) if profile in ("minimal", "messaging") else []
     base = also or []
-    add = [t for t in ensure if t not in base]
+    base_low = lower_all(base)
+    add = [t for t in ensure if t not in base_low]
     if add:
         changes["tools.alsoAllow"] = (also, base + add)
+        added["tools.alsoAllow"] = add
 
 if not changes:
     detail = "profile: %s" % profile if profile else "no profile set"
-    emit("status", "ok", "read/write allowed, pdf on (%s)" % detail)
+    # Only what this read established. Whether the agent can make sense of any
+    # given FORMAT once it holds the bytes turns on tools, a model, and a
+    # provider that none of this looked at, so the verdict stops at the two
+    # tools the lane itself runs on.
+    emit("status", "ok", "read/write allowed, %s" % detail)
     sys.exit(0)
 
 bits = []
 if "tools.deny" in changes:
     bits.append("tools.deny blocks the agent's read/write file tools")
 if "tools.allow" in changes:
-    bits.append("tools.allow omits " + ", ".join(
-        t for t in targets if t in changes["tools.allow"][1] and t not in changes["tools.allow"][0]))
+    bits.append("tools.allow omits " + ", ".join(added["tools.allow"]))
 if "tools.alsoAllow" in changes:
-    bits.append("the active profile lacks " + ", ".join(
-        t for t in changes["tools.alsoAllow"][1]
-        if t not in (changes["tools.alsoAllow"][0] or [])))
+    bits.append("the active profile lacks " + ", ".join(added["tools.alsoAllow"]))
 emit("status", "fix", "; ".join(bits))
 
 ops = []
@@ -5537,7 +5582,11 @@ openclaw_tool_policy_step() {
 
   case "$status" in
     ok)
-      ok "Tool policy is file-transfer-ready ($reason)."
+      # A verdict read off the config file, and said as one: the live sentinel in
+      # Step 5 is what actually proves the agent can use this lane, and it runs
+      # in this same session. Pointing at it keeps a green config read from being
+      # taken for the proof that follows it.
+      ok "OpenClaw's file-tool settings look ready ($reason). The live file test later will confirm file access."
       return 0 ;;
     none)
       ok "$reason."
@@ -8775,6 +8824,25 @@ skip_agent_file_probe_after_failed_gateway() {
   drop_file_lane
 }
 
+# What a green sentinel does NOT prove, held in one place because both gates earn
+# the identical proof and a second copy is how the two drift into promising
+# different things about it. The sentinel is a small text file: passing it shows
+# this agent can reach the shared folder in both directions, and nothing about
+# whether it can make sense of any particular format once it gets there. Said
+# where the proof lands so it reads as the scope of a pass rather than as doubt
+# about one — and said on every gateway kind, the two whose tool policy this run
+# just wrote included: a policy edit is exactly what makes the unproved half
+# easiest to mistake for a proved one.
+#
+# Three things are named, not one, because a tool the agent HOLDS is not enough:
+# measured live, OpenClaw's pdf tool was present and permitted and still failed
+# every call, because the model behind it did not resolve. Tools, model, and
+# provider each have to be right, and none of them is what this lane carries.
+agent_file_proof_scope_note() {
+  note "That proves the file lane works. Understanding a PDF or spreadsheet is"
+  note "separate — it depends on the gateway's tools, model, and provider."
+}
+
 # The custom half of the same gate, answering a different question. For OpenClaw
 # and Hermes this wizard configured the agent itself, so a failed sentinel means
 # something IT set up is wrong and the lane comes out — the operator can fix the
@@ -8795,12 +8863,7 @@ custom_agent_file_lane_gate() {
   if agent_file_probe; then
     FS_AGENT_PROOF="proved"
     ok "agent file lane: your agent read the sentinel, wrote it back byte-identically, and named it in its reply"
-    # The boundary is said where the proof lands, so it reads as scope rather than
-    # as doubt. The sentinel is a small text file: passing it proves this agent can
-    # reach the shared folder in both directions, and nothing about whether it can
-    # make sense of any particular format once it gets there.
-    note "That is proof for plain bytes through this folder. Whether the agent can READ a given"
-    note "format — a PDF, a spreadsheet — depends on the tools it has, not on this lane."
+    agent_file_proof_scope_note
     return 0
   fi
 
@@ -8982,6 +9045,7 @@ agent_file_lane_gate() {
   if agent_file_probe; then
     FS_AGENT_PROOF="proved"
     ok "$agent_name agent file lane: tool read + byte-identical write + reply discovery all green"
+    agent_file_proof_scope_note
     return 0
   fi
 

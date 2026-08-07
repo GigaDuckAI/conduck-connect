@@ -409,6 +409,25 @@ skip_agent_file_probe_after_failed_gateway() {
   drop_file_lane
 }
 
+# What a green sentinel does NOT prove, held in one place because both gates earn
+# the identical proof and a second copy is how the two drift into promising
+# different things about it. The sentinel is a small text file: passing it shows
+# this agent can reach the shared folder in both directions, and nothing about
+# whether it can make sense of any particular format once it gets there. Said
+# where the proof lands so it reads as the scope of a pass rather than as doubt
+# about one — and said on every gateway kind, the two whose tool policy this run
+# just wrote included: a policy edit is exactly what makes the unproved half
+# easiest to mistake for a proved one.
+#
+# Three things are named, not one, because a tool the agent HOLDS is not enough:
+# measured live, OpenClaw's pdf tool was present and permitted and still failed
+# every call, because the model behind it did not resolve. Tools, model, and
+# provider each have to be right, and none of them is what this lane carries.
+agent_file_proof_scope_note() {
+  note "That proves the file lane works. Understanding a PDF or spreadsheet is"
+  note "separate — it depends on the gateway's tools, model, and provider."
+}
+
 # The custom half of the same gate, answering a different question. For OpenClaw
 # and Hermes this wizard configured the agent itself, so a failed sentinel means
 # something IT set up is wrong and the lane comes out — the operator can fix the
@@ -429,12 +448,7 @@ custom_agent_file_lane_gate() {
   if agent_file_probe; then
     FS_AGENT_PROOF="proved"
     ok "agent file lane: your agent read the sentinel, wrote it back byte-identically, and named it in its reply"
-    # The boundary is said where the proof lands, so it reads as scope rather than
-    # as doubt. The sentinel is a small text file: passing it proves this agent can
-    # reach the shared folder in both directions, and nothing about whether it can
-    # make sense of any particular format once it gets there.
-    note "That is proof for plain bytes through this folder. Whether the agent can READ a given"
-    note "format — a PDF, a spreadsheet — depends on the tools it has, not on this lane."
+    agent_file_proof_scope_note
     return 0
   fi
 
@@ -616,6 +630,7 @@ agent_file_lane_gate() {
   if agent_file_probe; then
     FS_AGENT_PROOF="proved"
     ok "$agent_name agent file lane: tool read + byte-identical write + reply discovery all green"
+    agent_file_proof_scope_note
     return 0
   fi
 

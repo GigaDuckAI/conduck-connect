@@ -3794,6 +3794,36 @@ raise SystemExit(0 if generic and not tooled and guards
   else
     pass "agent sentinel exact cleanup"
   fi
+
+  # A green sentinel is proof for BYTES: its payload is a small text file, and no
+  # format handler is ever exercised. The sentence saying so is printed on every
+  # gateway kind — the two whose tool policy this run just wrote included, where a
+  # policy edit is exactly what makes the unproved half look proved. Same
+  # evidence, same scope, so the same sentence, out of one shared routine.
+  #
+  # The sentence names three things, not one: a tool the agent HOLDS is not
+  # enough. Measured live, OpenClaw's pdf tool was present and permitted and
+  # still failed every call, because the model behind it did not resolve — so
+  # "tools, model, and provider" is the claim, and this pins that wording.
+  local proved_out="$TMP/proved-gate.out"
+  FS_URL="$lane_url"; FS_CRED="$password"
+  FS_AGENT_PROOF=""
+  if agent_file_lane_gate > "$proved_out" 2>&1 && [ "$FS_AGENT_PROOF" = "proved" ] \
+     && [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+    pass "a green OpenClaw sentinel keeps the lane and grades it proved"
+  else
+    fail "a green OpenClaw sentinel keeps the lane and grades it proved" "$(cat "$proved_out")"
+  fi
+  case "$(cat "$proved_out")" in *"it depends on the gateway's tools, model, and provider"*)
+      pass "a green OpenClaw sentinel still says which half it did not prove" ;;
+    *) fail "a green OpenClaw sentinel still says which half it did not prove" \
+            "$(cat "$proved_out")" ;; esac
+  # Out of ONE routine, never a second copy: two hand-written paragraphs about
+  # the same evidence are how the two gates drift into promising different things.
+  expect_eq "the proof's scope comes from one shared routine, not a copy" \
+    "$(declare -f agent_file_lane_gate custom_agent_file_lane_gate \
+       | grep -c 'agent_file_proof_scope_note')" "2"
+  rm -f "$proved_out"
   stop_adapter
 
   stop_webdav
@@ -5121,10 +5151,17 @@ test_restart_note_names_the_right_change() {
 # the waiter's semantics are proved above, and what matters here is that a restart
 # the step performs is followed by a wait, that a spent wait changes no verdict,
 # and that a restart the operator declined is never reported as applied.
+#
+# The needs-fix arm denies group:fs — the hardening move that genuinely breaks
+# the lane. It has to be a policy that really does break it, or every
+# restart/wait/re-read case below would pass by never entering the branch it is
+# about; test_tool_policy_verdict asserts both arms reach the status assumed
+# here. The ready arm is exactly the config that same fix produces, so the
+# modelled config-set writes what the real one would.
 openclaw_fix_config() { # openclaw_fix_config <path> <ready|needs-fix>
   case "$2" in
-    ready) printf '%s\n' '{"tools": {"profile": "coding", "alsoAllow": ["pdf"]}}' > "$1" ;;
-    *)     printf '%s\n' '{"tools": {"profile": "coding"}}' > "$1" ;;
+    ready) printf '%s\n' '{"tools": {"profile": "coding", "deny": ["edit", "apply_patch"]}}' > "$1" ;;
+    *)     printf '%s\n' '{"tools": {"profile": "coding", "deny": ["group:fs"]}}' > "$1" ;;
   esac
 }
 
@@ -5247,6 +5284,287 @@ test_tool_policy_restart_handoff() {
   expect_eq "tool policy: dry-run neither restarts nor waits" \
     "$facts" "rc=0 waits=0 epoch=none"
 
+  HOME="$saved_home"
+}
+
+# ================= tool policy: what the verdict claims, what it writes =======
+#
+# The step's whole concern is read and write, the two tools the file lane runs
+# on. It also used to switch OpenClaw's pdf tool on and report "pdf on" from the
+# tool list alone. Measured against a live box, that tool failed every call with
+# "Unknown model: <slug>" for the common BYO shape, while the correct PDF answers
+# came from a container-side binary and the base profile's image tool whether the
+# tool was on or off — so the wizard now proposes nothing about it, and these
+# cases hold that line from both ends: what the verdict claims, and what the
+# write actually contains.
+#
+# The other half is case. OpenClaw matches allow/deny entries CASE-INSENSITIVELY
+# (docs.openclaw.ai → gateway/config-tools), so a comparison here that did not
+# would read deny ["Write"] as harmless, add permissions around a denial still in
+# force, and restart the gateway for nothing. Every mixed-case arm below is a
+# config that behaves identically to its lowercase twin, asserted as such.
+#
+# Driven through openclaw_tools_analysis where the verdict is the subject, and
+# through the REAL openclaw_tool_policy_step where the operator's screen and the
+# prompt/restart flow are: the verdict is a pure function of the config file, and
+# the step renders what it returns.
+
+# One field of the analysis record set, read the way the step reads it — awk
+# -F'\t', never sed \t, because BSD sed treats \t as a literal 't'.
+policy_field() { # policy_field <tag> <column> <config-json>
+  printf '%s\n' "$3" > "$TMP/policy-verdict.json"
+  openclaw_tools_analysis "$TMP/policy-verdict.json" \
+    | awk -F '\t' -v tag="$1" -v col="$2" '$1==tag{print $col; exit}'
+}
+
+# Every op the analysis proposes, flattened to "<key>=<v1>,<v2>; <key>=…", so a
+# case names the WHOLE write in one string. An assertion that reads only the key
+# it expects cannot see an extra key beside it, which is exactly how an unwanted
+# tool would get added without a single case going red.
+policy_ops_summary() { # policy_ops_summary <config-json>
+  policy_field ops 2 "$1" | python3 -c 'import json, sys
+raw = sys.stdin.read().strip()
+print("; ".join("%s=%s" % (o["path"], ",".join(o["value"])) for o in json.loads(raw or "[]")))'
+}
+
+# The conflict check itself, over a config plus an op list handed to it. Split
+# from the caller below so it can be aimed at a write the analysis does NOT make
+# — the only way to prove this oracle can see the class of bug it exists for,
+# rather than passing because it is blind to it.
+policy_conflicts_in() { # policy_conflicts_in <config-json> <ops-json>
+  printf '%s\n' "$1" > "$TMP/policy-invariant.json"
+  python3 - "$TMP/policy-invariant.json" "$2" <<'PY'
+import fnmatch, json, sys
+cfg = json.load(open(sys.argv[1]))
+tools = dict(cfg.get("tools") or {})
+for op in json.loads(sys.argv[2] or "[]"):
+    tools[op["path"].split(".", 1)[1]] = op["value"]
+deny = [e for e in (tools.get("deny") or []) if isinstance(e, str)]
+allowed = [e for e in (tools.get("allow") or []) if isinstance(e, str)]
+allowed += [e for e in (tools.get("alsoAllow") or []) if isinstance(e, str)]
+members = {"group:fs": ("read", "write", "edit", "apply_patch")}
+# Lowercased on both sides, because OpenClaw matches these entries that way: an
+# oracle comparing case-sensitively green-lights allow ["read"] standing beside
+# deny ["READ"], which is one tool denied and allowed at once and precisely the
+# contradiction this exists to catch. The message keeps both original spellings.
+print("; ".join("%s allowed while %s denies it" % (a, d)
+                for a in allowed for d in deny
+                if a.lower() == d.lower()
+                or fnmatch.fnmatchcase(a.lower(), d.lower())
+                or a.lower() in members.get(d.lower(), ())))
+PY
+}
+
+# The invariant, checked against the config this run would LEAVE BEHIND rather
+# than against the proposed ops alone: a key the analysis proposes no change for
+# still contributes whatever the file already said, and a deny that was already
+# sitting there is exactly how the contradiction got in.
+policy_write_conflicts() { # policy_write_conflicts <config-json>
+  local cfg="$TMP/policy-invariant.json" ops
+  printf '%s\n' "$1" > "$cfg"
+  ops=$(openclaw_tools_analysis "$cfg" | awk -F '\t' '$1=="ops"{print $2; exit}')
+  policy_conflicts_in "$1" "${ops:-[]}"
+}
+
+# The REAL step against one config, with every side effect it can have counted:
+# prompts asked, config-set / by-hand steps run, restarts waited out, and the
+# return code its caller reads as keep-or-drop the file lane. A case that only
+# checked the verdict could not tell a silent step from one that restarted the
+# operator's gateway.
+#
+# The transcript path is a file-scope constant, not something the function sets:
+# every caller reads the facts out of a command substitution, so an assignment
+# made inside one would never reach the case that then wants to read the screen.
+POLICY_STEP_OUT="$TMP/policy-step.out"
+policy_step_facts() { # policy_step_facts <config-json> → "rc=… prompts=… steps=… waits=… epoch=…"
+  local home="$TMP/policy-step-home"
+  rm -rf "$home"; mkdir -p "$home/.openclaw"
+  printf '%s\n' "$1" > "$home/.openclaw/openclaw.json"
+  (
+    HOME="$home"
+    WAIT_CALLS=0
+    GW_RESTART_COMPLETED_EPOCH=""
+    gw_wait_local_health_after_restart() { WAIT_CALLS=$((WAIT_CALLS+1)); return 0; }
+    rc=0
+    openclaw_tool_policy_step > "$POLICY_STEP_OUT" 2>&1 || rc=$?
+    printf 'rc=%s prompts=%s steps=%s waits=%s epoch=%s\n' "$rc" \
+      "$(grep -c '^\[confirm\]' "$POLICY_STEP_OUT")" \
+      "$(grep -cE '^\[(run_step|by-hand)\]' "$POLICY_STEP_OUT")" \
+      "$WAIT_CALLS" "${GW_RESTART_COMPLETED_EPOCH:-none}"
+  )
+}
+
+test_tool_policy_verdict() {
+  local saved_home="$HOME" saved_confirm="$CONFIRM_ANSWER" out cfg fixture facts probe want
+  # Deterministic regardless of what ran before: the arms that reach a prompt at
+  # all are the ones asserting a decline, and they set their own answer.
+  CONFIRM_ANSWER="n"
+
+  # ---- the stock install ----------------------------------------------------
+  # What a fresh OpenClaw ships: the coding profile, which carries read and write
+  # already. The step's only correct move is to get out of the way — no proposed
+  # operation, no question, no restart, and the lane kept. Graded as a policy that
+  # BREAKS file transfer, this same config would offer a fix nobody needs and drop
+  # the whole file lane on a decline.
+  facts=$(policy_step_facts '{"tools": {"profile": "coding"}}')
+  expect_eq "stock coding profile: nothing proposed, nothing asked, nothing restarted, lane kept" \
+    "$facts" "rc=0 prompts=0 steps=0 waits=0 epoch=none"
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"would break agent file transfer"*)
+      fail "stock coding profile: not called a policy that breaks file transfer" "$out" ;;
+    *) pass "stock coding profile: not called a policy that breaks file transfer" ;; esac
+  expect_eq "stock coding profile: the analysis proposes no operation at all" \
+    "$(policy_ops_summary '{"tools": {"profile": "coding"}}')" ""
+
+  # The verdict itself, and the sentence the operator reads. It is a config read,
+  # so it points at the live sentinel later in this same run, which is the thing
+  # that actually proves the agent can use the lane.
+  expect_eq "tool policy verdict: the reason names the two tools the lane runs on" \
+    "$(policy_field status 3 '{"tools": {"profile": "coding"}}')" \
+    "read/write allowed, profile: coding"
+  case "$out" in *"The live file test later will confirm file access"*)
+      pass "tool policy verdict: the green screen points at the live test that proves it" ;;
+    *) fail "tool policy verdict: the green screen points at the live test that proves it" "$out" ;; esac
+
+  # ---- nothing emitted anywhere names the pdf tool --------------------------
+  # Machine records and operator screen together, over every branch that emits
+  # either. Each arm carries the status it is supposed to reach, so an arm that
+  # silently stopped exercising its branch fails instead of passing quietly.
+  for probe in \
+    'ok|{"tools": {"profile": "coding"}}' \
+    'ok|{"tools": {"profile": "full"}}' \
+    'fix|{"tools": {"profile": "minimal"}}' \
+    'fix|{"tools": {"profile": "messaging"}}' \
+    'fix|{"tools": {"profile": "coding", "deny": ["group:fs"]}}' \
+    'fix|{"tools": {"allow": ["exec"]}}' \
+    'manual|{"tools": {"deny": ["re*"]}}'
+  do
+    want="${probe%%|*}"; cfg="${probe#*|}"
+    expect_eq "tool policy arm really reaches $want — $cfg" \
+      "$(policy_field status 2 "$cfg")" "$want"
+    facts=$(policy_step_facts "$cfg")
+    printf '%s\n' "$cfg" > "$TMP/policy-pdf.json"
+    out=$(openclaw_tools_analysis "$TMP/policy-pdf.json"; cat "$POLICY_STEP_OUT")
+    case "$out" in *[Pp][Dd][Ff]*)
+        fail "no change, cmd, ops or screen names the pdf tool — $cfg" "$out" ;;
+      *) pass "no change, cmd, ops or screen names the pdf tool — $cfg" ;; esac
+  done
+
+  # ---- what each policy that DOES need a fix gets, exactly ------------------
+  expect_eq "minimal profile: alsoAllow gains read and write, and only those" \
+    "$(policy_ops_summary '{"tools": {"profile": "minimal"}}')" "tools.alsoAllow=read,write"
+  expect_eq "messaging profile: alsoAllow gains read and write, and only those" \
+    "$(policy_ops_summary '{"tools": {"profile": "messaging"}}')" "tools.alsoAllow=read,write"
+  # An existing alsoAllow keeps every entry it holds and gains only the gap.
+  expect_eq "minimal profile: an existing alsoAllow keeps its entries and gains only the gap" \
+    "$(policy_ops_summary '{"tools": {"profile": "minimal", "alsoAllow": ["read", "exec"]}}')" \
+    "tools.alsoAllow=read,exec,write"
+  # An allowlist blocks everything omitted, so the additions go there instead.
+  expect_eq "an allowlist without the file tools gains read and write, and only those" \
+    "$(policy_ops_summary '{"tools": {"allow": ["exec"]}}')" "tools.allow=exec,read,write"
+  # group:fs is REPLACED by its mutating members, never just dropped: read and
+  # write come free while edit and apply_patch stay denied.
+  expect_eq "a group:fs deny is replaced by its mutating members, and nothing else is added" \
+    "$(policy_ops_summary '{"tools": {"profile": "coding", "deny": ["group:fs"]}}')" \
+    "tools.deny=edit,apply_patch"
+  # A pdf the OPERATOR denied beside it is their text: it stays in the deny list
+  # exactly as written, and no branch anywhere proposes allowing it.
+  expect_eq "a pdf denied beside group:fs survives the rewrite untouched and is never allowed" \
+    "$(policy_ops_summary '{"tools": {"profile": "coding", "deny": ["group:fs", "pdf"]}}')" \
+    "tools.deny=edit,apply_patch,pdf"
+
+  # ---- case, which OpenClaw ignores and this therefore must too -------------
+  expect_eq "mixed case: a Write denial is lifted exactly as a write denial is" \
+    "$(policy_ops_summary '{"tools": {"deny": ["Write"]}}')" "tools.deny="
+  expect_eq "mixed case: a READ denial is lifted while the rest of the deny list stands" \
+    "$(policy_ops_summary '{"tools": {"deny": ["READ", "exec"]}}')" "tools.deny=exec"
+  expect_eq "mixed case: a Group:FS denial is replaced exactly as a group:fs denial is" \
+    "$(policy_ops_summary '{"tools": {"profile": "coding", "deny": ["Group:FS"]}}')" \
+    "tools.deny=edit,apply_patch"
+  # …and a member the operator already denied under their own spelling is not
+  # duplicated into the replacement.
+  expect_eq "mixed case: the group:fs rewrite does not duplicate a member denied as Edit" \
+    "$(policy_ops_summary '{"tools": {"profile": "coding", "deny": ["group:fs", "Edit"]}}')" \
+    "tools.deny=apply_patch,Edit"
+  # Duplicate detection: a second lowercase copy of a tool the list already
+  # carries is a config write and a gateway restart bought for nothing.
+  expect_eq "mixed case: an allow list already holding Read and WRITE needs no change" \
+    "$(policy_field status 2 '{"tools": {"allow": ["Read", "WRITE"]}}')" "ok"
+  expect_eq "mixed case: a Group:FS in an allow list already covers read and write" \
+    "$(policy_field status 2 '{"tools": {"allow": ["Group:FS"]}}')" "ok"
+  expect_eq "mixed case: an allow list holding only Read gains write, not read again" \
+    "$(policy_ops_summary '{"tools": {"allow": ["Read"]}}')" "tools.allow=Read,write"
+  expect_eq "mixed case: an alsoAllow already holding READ gains write alone" \
+    "$(policy_ops_summary '{"tools": {"profile": "minimal", "alsoAllow": ["READ"]}}')" \
+    "tools.alsoAllow=READ,write"
+  expect_eq "mixed case: a WRI* deny is the human's call, exactly as wri* is" \
+    "$(policy_field status 2 '{"tools": {"deny": ["WRI*"]}}')" "manual"
+
+  # ---- the write can never contradict itself -------------------------------
+  # OpenClaw resolves deny-versus-allow by denying, so a config naming one tool
+  # in both would leave that tool off while reading as fixed. Mixed-case arms
+  # included: they are the class a case-sensitive oracle cannot see.
+  for cfg in \
+    '{"tools": {"profile": "coding", "deny": ["group:fs", "pdf"]}}' \
+    '{"tools": {"profile": "coding", "deny": ["pdf"]}}' \
+    '{"tools": {"profile": "minimal", "deny": ["PDF"]}}' \
+    '{"tools": {"profile": "coding", "deny": ["pd*"]}}' \
+    '{"tools": {"allow": ["read"], "deny": ["pdf"]}}' \
+    '{"tools": {"allow": ["read"], "deny": ["READ"]}}' \
+    '{"tools": {"allow": ["Read"], "deny": ["read"]}}' \
+    '{"tools": {"profile": "coding", "deny": ["Group:FS"]}}'
+  do
+    expect_eq "tool policy write: nothing is denied and allowed at once — $cfg" \
+      "$(policy_write_conflicts "$cfg")" ""
+  done
+
+  # The oracle's own anti-vacuity guard. This is the write the case-sensitive
+  # analysis produced for that config — allow ["read"] left standing beside deny
+  # ["READ"] — and the oracle has to name it, or every line above passes by being
+  # unable to see the thing it is checking for.
+  expect_eq "the conflict oracle catches a contradiction that differs only in case" \
+    "$(policy_conflicts_in '{"tools": {"allow": ["read"], "deny": ["READ"]}}' \
+       '[{"path": "tools.allow", "value": ["read", "write"]}]')" \
+    "read allowed while READ denies it"
+
+  # ---- a genuine repair, declined, still reaches the informed choice --------
+  # The lane really is broken here (group:fs denied), the by-hand route leaves the
+  # file unchanged, so the step reaches its keep-or-drop question. That path must
+  # stay reachable: it is the only place an operator who cannot fix the policy
+  # right now gets to keep the lane on purpose.
+  facts=$(CONFIRM_ANSWER="n"; policy_step_facts '{"tools": {"profile": "coding", "deny": ["group:fs"]}}')
+  case "$facts" in "rc=1 prompts=1 "*)
+      pass "a declined genuine repair still asks, and a no still drops the lane" ;;
+    *) fail "a declined genuine repair still asks, and a no still drops the lane" "$facts" ;; esac
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"Keep the file lane anyway"*)
+      pass "a declined genuine repair states the consequence before asking" ;;
+    *) fail "a declined genuine repair states the consequence before asking" "$out" ;; esac
+  facts=$(CONFIRM_ANSWER="y"; policy_step_facts '{"tools": {"profile": "coding", "deny": ["group:fs"]}}')
+  case "$facts" in "rc=0 prompts=1 "*)
+      pass "…and an explicit yes keeps the lane with the policy still unrepaired" ;;
+    *) fail "…and an explicit yes keeps the lane with the policy still unrepaired" "$facts" ;; esac
+
+  # ---- the fixture the restart/wait cases above are built on ----------------
+  # If its needs-fix arm ever stopped needing a fix, every one of them would pass
+  # by never entering the branch it exists to exercise.
+  fixture="$TMP/policy-fixture.json"
+  openclaw_fix_config "$fixture" needs-fix
+  expect_eq "tool policy fixture: the needs-fix arm really needs a fix" \
+    "$(openclaw_tools_analysis "$fixture" | awk -F '\t' '$1=="status"{print $2; exit}')" "fix"
+  openclaw_fix_config "$fixture" ready
+  expect_eq "tool policy fixture: the ready arm really is ready" \
+    "$(openclaw_tools_analysis "$fixture" | awk -F '\t' '$1=="status"{print $2; exit}')" "ok"
+  # …and the ready arm is the config the real fix produces, not merely one that
+  # happens to pass: the modelled config-set must write what the wizard would.
+  openclaw_fix_config "$fixture" needs-fix
+  expect_eq "tool policy fixture: the ready arm is what fixing the needs-fix arm produces" \
+    "$(openclaw_tools_analysis "$fixture" | awk -F '\t' '$1=="ops"{print $2; exit}')" \
+    '[{"path": "tools.deny", "value": ["edit", "apply_patch"]}]'
+  rm -f "$fixture" "$TMP/policy-verdict.json" "$TMP/policy-invariant.json" \
+        "$TMP/policy-pdf.json" "$POLICY_STEP_OUT"
+  rm -rf "$TMP/policy-step-home"
+  CONFIRM_ANSWER="$saved_confirm"
   HOME="$saved_home"
 }
 
@@ -5461,6 +5779,7 @@ test_gateway_restart_wait
 test_restart_timing_note
 test_restart_note_names_the_right_change
 test_tool_policy_restart_handoff
+test_tool_policy_verdict
 test_missing_rclone_continues
 test_pdftotext_note_is_advisory
 test_hermes_lane_pdf_notes

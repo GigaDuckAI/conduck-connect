@@ -4,6 +4,65 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **The wizard stops switching OpenClaw's `pdf` tool on.** Its tool-policy check
+  used to add `pdf` beside `read` and `write` and then report the result as
+  *file-transfer-ready (read/write allowed, pdf on)*. Measured against a live
+  box, that tool failed every call it was given. It does not use your chat model:
+  it uses whatever `agents.defaults.pdfModel` names, and for the common
+  bring-your-own shape — an OpenRouter-routed OpenAI model — the gateway answered
+  `Unknown model:` and gave up. The correct answers to those same PDFs came from
+  somewhere else entirely: a `clawpdf` binary that ships in the container whatever
+  the tool policy says, plus the `image` tool, which lives in the base coding
+  profile and was never ours to switch on. A scanned, image-only PDF scored eight
+  of eight facts correct with the tool on and with it off, and invented nothing
+  either way, including under pressure to guess. So the write bought two failing
+  tool calls per PDF request and a visible *tool failed* line stapled to an
+  otherwise correct reply. The check's concern is now exactly `read` and `write`,
+  the two tools the file lane genuinely runs on, and it proposes, adds and claims
+  nothing else. Nobody loses a tool they already have — this only stops the
+  wizard adding one during pairing, and a gateway pinned to a provider with a
+  real native PDF path keeps it, yours to configure. The two explanation panels
+  behind `i` drop the same overclaim from the other end: the lane needs read and
+  write, so they no longer describe PDF handling as a requirement of it. What to
+  check when a PDF answers with generic content is written out instead, as an
+  ordered three-step list in the README's file-lane troubleshooting — the denial,
+  then `tools.alsoAllow`, then a `pdfModel` your gateway can actually resolve.
+- **The tool policy is read the way OpenClaw reads it: ignoring case.** OpenClaw
+  matches `allow` and `deny` entries case-insensitively, and this check did not.
+  A `tools.deny` of `["Write"]` therefore looked like a policy with nothing wrong
+  in it, and the file-lane repair would go on to add permissions *around* a
+  denial still in force — then restart your gateway to apply a difference that
+  was none. `Read`, `Group:FS`, a `WRI*` wildcard, and a tool your `allow` list
+  already carries under another spelling now all behave exactly as their
+  lowercase twins do. That last one matters most in daily use: a tool already
+  permitted is not added a second time, so no config is written and no gateway is
+  restarted for a change that would change nothing. Anything the wizard does
+  write back keeps your own spelling.
+- **A stock OpenClaw install stops being told its tool policy is broken.** The
+  configuration a fresh gateway ships — `{"tools": {"profile": "coding"}}`, with
+  the agent's file tools fully allowed — was reported as a policy that *would
+  break agent file transfer*, offered a repair it did not need, and, if you
+  declined that repair, took the entire file lane out of your setup code. That
+  config now reaches the green verdict: nothing proposed, nothing asked, nothing
+  restarted, lane kept. Declining a repair the lane genuinely does need is
+  unchanged — the consequence is stated plainly and you choose whether to keep
+  the lane anyway.
+- **A green verdict says what it is, and points at what proves it.** The
+  tool-policy line is read off your config file, while the live file test later in
+  the same run is what actually proves your agent can use the lane — so the
+  verdict now says so: *OpenClaw's file-tool settings look ready … The live file
+  test later will confirm file access.* And when that test passes, every gateway
+  kind is told the same thing about what it proved. The sentinel is a small text
+  file, so a pass proves bytes make the round trip through your shared folder and
+  nothing about reading any particular format. That sentence used to go only to
+  operators of a custom gateway, the ones this wizard configures nothing for, and
+  was withheld from OpenClaw and Hermes, where it had just written to the agent's
+  tool policy — precisely where a proof about bytes is easiest to read as a proof
+  about documents. Both paths print it now, out of one routine so the two cannot
+  drift into saying different things about the same evidence, and it names three
+  things rather than one: understanding a PDF or a spreadsheet depends on the
+  gateway's tools, its model, and its provider. Holding the tool is not enough,
+  which is exactly what the `pdf` measurements above showed.
 - **A run whose gateway has already failed stops spending a five-minute agent
   turn to learn nothing.** The last verification step asks your actual agent to
   read a randomized file and write it back — a real chat turn against your own
