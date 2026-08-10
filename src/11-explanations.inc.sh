@@ -521,7 +521,7 @@ explain_action() { # explain_action <action-id>
     verification.image_ignored|image-ignored)
       explain_panel \
         "Pair a gateway whose reply did not reflect the test picture" \
-        "This is the one failure the app cannot show you later: a photo comes back as an ordinary, confident reply that does not reflect it, and the pairing code carries no field that could warn the app about it — so this screen is the only place it can be said." \
+        "This is the one failure the app cannot show you later: a photo comes back as an ordinary, confident reply that does not reflect it, and the pairing code carries no field that could warn the app about it — so this screen is the only place it can be said. What was measured is that two freshly drawn pictures were not read back; whether they never reached an engine or reached one that could not read them is not visible from here." \
         "Yes prints the code and pairs the gateway exactly as it is; nothing about this finding is recorded in the code, in the app, or in the saved profile. No ends this run without a code — which is a failed verification like any other, so a file lane is left out of this run and any network exposure this run applied for it is rolled back, and you are offered the commands to undo the rest." \
         "Enter means No. Your gateway is not reconfigured either way: this question is about whether a code is printed, not about changing the server." \
         "Re-running verifies again from scratch, so fixing the gateway — sending pictures to an engine that can see them, or refusing them with HTTP 400 and code \"image_unsupported\" — clears this without any further undo."

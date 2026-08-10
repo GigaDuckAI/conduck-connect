@@ -25,16 +25,18 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   a turn that never completed are reported and pass: a run that measured nothing
   may not convict, so a dropped tunnel is never reported as a gateway that loses
   photos. Only one answer withholds a code — a confident reply that quotes neither
-  picture, asked twice with freshly drawn digits. Reached setup from
-  `--check-adapter`? That is your own statement that this software was built for
-  Conduck, whose contract admits exactly two answers here, so the run stops and
-  points at `--check-adapter --deep` to iterate. Everywhere else the wizard cannot
-  know what it is talking to — a plain Ollama behind a text-only model behaves
-  identically, and its owner did nothing wrong — so it reports and asks whether to
-  pair anyway. **Enter means no.** Answering yes prints the code and says plainly
-  that this screen is the only record; the pairing screen repeats it beside the
-  code. A run with no terminal to ask on stops instead of printing a question into
-  a log, and says why.
+  picture, asked twice with freshly drawn digits — and it asks rather than
+  decides. **Enter means no.** The wizard cannot know what it is talking to: a
+  purpose-built adapter that dropped the picture and a plain Ollama whose model
+  simply cannot read four small digits answer identically from out here, and the
+  second owner did nothing wrong. So the finding is reported for what it is —
+  photos are *unverified*, not proven broken — and the same loud, default-No
+  question is asked however you got here, including from `--check-adapter`. That
+  route additionally gets pointed at `--check-adapter --deep`, which is where the
+  wire is graded strictly and where this result is red and exits nonzero.
+  Answering yes prints the code and says plainly that this screen is the only
+  record; the pairing screen repeats it beside the code. A run with no terminal to
+  ask on stops instead of printing a question into a log, and says why.
 
 - Tracks adapter contract **revision 1.5**. The revision resolves a contradiction
   between the contract's prose and its own conformance checker over one image

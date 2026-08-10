@@ -4712,13 +4712,21 @@ run_image_gate_case() {
   fi
   : > "$TMP/doctor.out"
 
+  # Severity keys on the OUTCOME and nothing else. The two adapter-provenance
+  # arms are the load-bearing pair: arriving from --check-adapter changes the
+  # advice printed, never what the gate does with the answer. The probe cannot
+  # observe forwarding — only whether the digits came back — so a run that came
+  # through the stricter door must not convert that same inconclusive reading
+  # into a verdict a conforming adapter cannot appeal.
+  #
   # arm|fixture-mode|from-check-kind|tty|answer|expect-proof|expect-VERIFY_FAILED
   local arms='sees-it|good||yes|n|verified|false
 declines-honestly|text-only||yes|n|declined|false
 refused-too-large|strict-fields-image-413||yes|n|too-large|false
 ignored-declined|silent-drop-image||yes|n|ignored|true
 ignored-acknowledged|silent-drop-image||yes|y|ignored-acked|false
-ignored-from-check-adapter|silent-drop-image|adapter|yes|y|ignored-blocked|true
+ignored-from-check-adapter-declined|silent-drop-image|adapter|yes|n|ignored|true
+ignored-from-check-adapter-acked|silent-drop-image|adapter|yes|y|ignored-acked|false
 ignored-no-terminal|silent-drop-image||no|y|ignored|true'
   while IFS='|' read -r arm mode kind tty ans want_proof want_failed; do
     [ -n "$arm" ] || continue
@@ -4748,7 +4756,7 @@ ignored-no-terminal|silent-drop-image||no|y|ignored|true'
     # transport fault, an honest decline, or a size cap.
     case "$flat" in *"Trying once with a new picture"*) got_retry=yes ;; *) got_retry=no ;; esac
     case "$want_proof" in
-      ignored|ignored-acked|ignored-blocked)
+      ignored|ignored-acked)
         [ "$got_retry" = "yes" ] || { fail_case "$name" "[$arm] judged a silent answer on one turn"; return ;} ;;
       *)
         [ "$got_retry" = "no" ] || { fail_case "$name" "[$arm] spent a second live turn on an outcome that cannot block"; return ;} ;;
@@ -4775,20 +4783,26 @@ ARMS
     fail_case "$name" "an honest decline did not say what the app shows instead"; return
   fi
 
-  # The provenance arm blocks WITHOUT asking. Offering "continue anyway" to
-  # someone who just declared this software purpose-built would be offering to
-  # pair a contract violation, and the answer that costs them their photos must
-  # never be reachable by pressing y at a question the wizard should not ask.
+  # The provenance arm ASKS, like every other. It is measured here in both
+  # directions because the earlier revision of this gate did the opposite: it
+  # converted the same inconclusive reading into an unappealable block whenever
+  # the run arrived from --check-adapter. The probe cannot see forwarding, only
+  # whether the digits came back, so an adapter that forwarded a picture to an
+  # engine that misread it produces this exact transcript — and would have been
+  # refused a code for conforming. What provenance still earns is ADVICE: the
+  # loop that grades the wire strictly, and the rule it grades against. Driven
+  # with No, which is where an adapter author who takes the finding seriously
+  # lands and therefore where the advice has to be waiting.
   start_fixture silent-drop-image || { fail_case "$name" "silent-drop fixture failed to start"; stop_fixture; return; }
-  out=$(run_image_gate_probe "$lib" "http://127.0.0.1:$PORT" bearer "$TOKEN" adapter yes y)
+  out=$(run_image_gate_probe "$lib" "http://127.0.0.1:$PORT" bearer "$TOKEN" adapter yes n)
   stop_fixture
   printf -- '--- adapter provenance ---\n%s\n' "$out" >> "$TMP/doctor.out"
   flat=$(printf '%s\n' "$out" | tr '\n' ' ')
-  if warning_states "$flat" 'CONFIRM'; then
-    fail_case "$name" "the adapter block asked a question a yes could have walked through"; return
+  if ! warning_states "$flat" 'CONFIRM'; then
+    fail_case "$name" "arriving from --check-adapter decided the question instead of asking it"; return
   fi
   if ! warning_states "$flat" 'check-adapter --deep' || ! warning_states "$flat" 'image_unsupported'; then
-    fail_case "$name" "the adapter block named neither the way to iterate nor the conforming refusal"; return
+    fail_case "$name" "the adapter route named neither the way to iterate nor the conforming refusal"; return
   fi
 
   # A run with no terminal reaches the same fail-closed end WITHOUT printing a
@@ -4805,6 +4819,13 @@ ARMS
   fi
   if ! warning_states "$flat" 'no terminal'; then
     fail_case "$name" "the fail-closed run did not say why it could not ask"; return
+  fi
+  # No bypass flag exists, so the recovery this prints is the whole recovery and
+  # it has to be actionable: re-run it somewhere the question can be answered, or
+  # fix the gateway. A stop with no way forward sends the operator to the one
+  # workaround always available and always wrong — deleting the check.
+  if ! warning_states "$flat" 'Re-run me from a terminal' || ! warning_states "$flat" 'image_unsupported'; then
+    fail_case "$name" "the fail-closed run named no way forward"; return
   fi
 
   # A transport failure is NOT a verdict about images. Nothing is listening on

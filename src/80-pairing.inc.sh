@@ -164,8 +164,9 @@ pairing_capability_summary() {
     opaque)
       warn "Photos will fail with an error the app can only show as a generic failure." ;;
     ignored-acked)
-      warn "Photo replies DON'T REFLECT THE PICTURE — you chose to pair anyway. A photo comes"
-      note "back as a confident answer that doesn't match what you sent, and the app cannot tell you." ;;
+      warn "Photos are UNVERIFIED — the test picture came back unread, twice, and you paired anyway."
+      note "A photo may be silently ignored: the reply looks confident either way, and the app cannot"
+      note "tell you which it was." ;;
   esac
 }
 

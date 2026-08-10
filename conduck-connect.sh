@@ -1661,7 +1661,7 @@ explain_action() { # explain_action <action-id>
     verification.image_ignored|image-ignored)
       explain_panel \
         "Pair a gateway whose reply did not reflect the test picture" \
-        "This is the one failure the app cannot show you later: a photo comes back as an ordinary, confident reply that does not reflect it, and the pairing code carries no field that could warn the app about it — so this screen is the only place it can be said." \
+        "This is the one failure the app cannot show you later: a photo comes back as an ordinary, confident reply that does not reflect it, and the pairing code carries no field that could warn the app about it — so this screen is the only place it can be said. What was measured is that two freshly drawn pictures were not read back; whether they never reached an engine or reached one that could not read them is not visible from here." \
         "Yes prints the code and pairs the gateway exactly as it is; nothing about this finding is recorded in the code, in the app, or in the saved profile. No ends this run without a code — which is a failed verification like any other, so a file lane is left out of this run and any network exposure this run applied for it is rolled back, and you are offered the commands to undo the rest." \
         "Enter means No. Your gateway is not reconfigured either way: this question is about whether a code is printed, not about changing the server." \
         "Re-running verifies again from scratch, so fixing the gateway — sending pictures to an engine that can see them, or refusing them with HTTP 400 and code \"image_unsupported\" — clears this without any further undo."
@@ -9277,18 +9277,23 @@ agent_file_lane_gate() {
 # Severity keys on the probe's OUTCOME, never on the target's pedigree. A
 # purpose-built adapter and a plain Ollama behind a text-only model produce the
 # identical silent 200 — behaviour is the evidence, so a 200 that answers as if
-# no picture was attached is what gets stopped, and an honest refusal passes on
-# every kind. Provenance moves exactly one outcome: on the --check-adapter →
-# setup handoff the operator has themselves declared this software was built for
-# Conduck, and there the contract admits no third answer, so the warning becomes
-# a block.
+# no picture was attached is what gets asked about, and an honest refusal passes
+# on every kind. Provenance moves nothing. It is tempting on the --check-adapter
+# → setup handoff, where the operator has declared this software was built for
+# Conduck and its contract does forbid answering a picture the engine never saw
+# — but this probe cannot observe forwarding, only whether the digits came back,
+# and the sentences it prints say so. Convicting on that reading because of the
+# door the run came through turns an inconclusive measurement into an assertion,
+# and it can stop an adapter that forwarded the picture correctly to an engine
+# that misread four small digits. The strict grade still lands where a grade
+# belongs: --check-adapter --deep reports IMAGE_INPUT red and exits nonzero.
 #
 # It never fails on the absence of evidence. A transfer that does not complete, a
 # body cap, an error nobody can classify — each is reported for what it is and
 # none of them withholds a code: the text turn above already passed, and a run
 # that cannot measure something must not convict on it.
 IMG_PROOF=""     # transcript state for THIS run: "" | verified | declined | too-large
-                 # | unmeasured | opaque | ignored-acked | ignored-blocked. Not in
+                 # | unmeasured | opaque | ignored | ignored-acked. Not in
                  # the payload and not in the profile — there is nowhere honest to
                  # put it, which is the whole reason this gate is on screen.
 IMG_OUTCOME=""   # the last graded turn, set by verify_image_probe_once
@@ -9348,7 +9353,7 @@ verify_image_probe_once() { # verify_image_probe_once [digits-the-retry-must-not
 }
 
 # The two ways out of a gateway whose reply does not reflect the picture it was
-# sent, said in one place because the block arm and the refusal arm owe the
+# sent, said in one place because the refusal arm and the no-terminal arm owe the
 # identical advice and a second copy is how they drift.
 verify_image_two_fixes() {
   say "    Two ways to fix it, and either one is fine:"
@@ -9369,36 +9374,31 @@ verify_image_ignored_gate() {
   say "    app cannot tell that reply from a real one — the pairing code has no field to warn it,"
   say "    and there is no error for it to show."
 
-  # The ONE place provenance is known: this operator ran --check-adapter, which is
-  # their own statement that the software was built for Conduck. That contract
-  # allows exactly two answers to a picture in the newest message, so there is no
-  # honest "continue anyway" to offer here — the thing being paired is the thing
-  # whose author can fix it.
+  # Wording only — it changes no severity and no arm below. An operator who came
+  # from --check-adapter is the one person on this screen who can fix the software
+  # instead of working around it, so they get the loop that grades it and the rule
+  # it grades against. Everyone else is pointed at the two fixes and left alone.
   # ${…:-} because the suites lift this module into runtimes under `set -u` that
   # declare only what they drive; 10-utilities owns the initialisation, and a
   # module may not depend on an earlier one's globals existing in a harness.
   if [ "${SETUP_FROM_CHECK_KIND:-}" = "adapter" ]; then
-    IMG_PROOF="ignored-blocked"
-    VERIFY_FAILED=true
     say ""
-    say "    You reached setup from ${BOLD}--check-adapter${RESET}, so this is software built for Conduck, and"
-    say "    its contract allows exactly two answers to a picture in the newest message: forward it"
-    say "    to the engine, or refuse the whole request. A 200 produced without the engine seeing"
-    say "    the picture is the one forbidden move — a substituted note about it is the same move —"
-    say "    so this run stops here rather than handing you a code that pairs it."
-    verify_image_two_fixes
-    say "    Then iterate until [IMAGE_INPUT] is green:"
+    say "    You reached setup from ${BOLD}--check-adapter${RESET}, so this is software built for Conduck. Its"
+    say "    contract allows two answers to a picture in the newest message — forward it to the engine,"
+    say "    or refuse the whole request — and a 200 the engine never saw the picture for is neither."
+    say "    From out here this run cannot tell that apart from an engine that misread the digits, so"
+    say "    it does not stop you on it. The grade that judges the wire is:"
     say "      ${BOLD}bash conduck-connect.sh --check-adapter --deep${RESET}"
     say "      ${BOLD}conduck.com/setup/adapter/v1/${RESET} → Images   (the rule, and the text-only recipe)"
-    return 0
   fi
 
-  # Everywhere else this script cannot know what it is talking to — the custom
-  # bucket deliberately holds hand-written adapters and plain model servers alike
-  # — and a text-only Ollama behaving exactly like this is not a defect in
-  # Ollama. So: report, and offer. Default No, because the answer that costs
-  # someone their photos should not be the one Enter gives.
-  warn "Photo replies won't reflect the picture you send, and there is no way to tell the app so."
+  # One outcome, one severity, whichever door the run came through. This script
+  # cannot know what it is talking to — the custom bucket deliberately holds
+  # hand-written adapters and plain model servers alike — and a text-only Ollama
+  # behaving exactly like this is not a defect in Ollama. So: report, and offer.
+  # Default No, because the answer that may cost someone their photos should not
+  # be the one Enter gives.
+  warn "Photos are UNVERIFIED here — one may be silently ignored, and the app cannot tell you."
 
   # --setup only reaches a person (a redirected check exits before it offers the
   # handoff), but --show-code has no such guard and is the path a script uses to
@@ -9406,19 +9406,21 @@ verify_image_ignored_gate() {
   # the right ANSWER, printed as a question into a log nobody is reading, which
   # leaves the operator with a missing code and a prompt as the only explanation.
   # Same outcome, said as a statement: this run stops, and here is why and where
-  # to decide it. Not an escape hatch — redirecting stdin gets you fewer codes,
-  # never more, so there is nothing here to cargo-cult around the gate.
+  # to decide it. No flag opens it: the code this run would print is a QR for a
+  # person holding a phone, so "re-run it where you can answer" is the whole
+  # recovery, and a bypass would be permanent public surface bought for a case
+  # that starts by not having anyone to show the code to.
   if ! interactive_terminal; then
     IMG_PROOF="ignored"
     VERIFY_FAILED=true
-    say "    There is no terminal to ask on in this run, and pairing a gateway that loses photos is"
-    say "    not a decision to make on your behalf — so it stops here, with no code."
+    say "    There is no terminal to ask on in this run, and pairing a gateway whose photos are"
+    say "    unverified is not a decision to make on your behalf — so it stops here, with no code."
     say "    Re-run me from a terminal to decide it yourself, or fix it:"
     verify_image_two_fixes
     return 0
   fi
 
-  if confirm "Continue and get the code anyway, knowing photo replies won't reflect the picture?" \
+  if confirm "Continue and get the code anyway, knowing a photo here may be silently ignored?" \
              "verification.image_ignored"; then
     IMG_PROOF="ignored-acked"
     note "Continuing. This screen is the only record of it — nothing in the code, the app, or your"
@@ -12805,8 +12807,9 @@ pairing_capability_summary() {
     opaque)
       warn "Photos will fail with an error the app can only show as a generic failure." ;;
     ignored-acked)
-      warn "Photo replies DON'T REFLECT THE PICTURE — you chose to pair anyway. A photo comes"
-      note "back as a confident answer that doesn't match what you sent, and the app cannot tell you." ;;
+      warn "Photos are UNVERIFIED — the test picture came back unread, twice, and you paired anyway."
+      note "A photo may be silently ignored: the reply looks confident either way, and the app cannot"
+      note "tell you which it was." ;;
   esac
 }
 
