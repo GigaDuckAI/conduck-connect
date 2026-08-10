@@ -828,16 +828,63 @@ run_doctor_files() {
   return 0
 }
 
-# The frozen machine line (schema=3) — printed as the LAST line of EVERY
-# adapter-check exit, green, red, or an early die: fixed field order, ASCII enums,
-# no ANSI. Consumers (build loops, CI, the builder guide's definition of
-# done) key on this + the exit code — never on check counts, which change
-# between harness versions. Any grammar change bumps schema=; renaming the
-# prefix CONDUCK_DOCTOR -> CONDUCK_CHECK_ADAPTER is such a change, which is why
-# schema went 2 -> 3. Exactly ONE summary line is emitted (consumers use
-# `tail -1`), so the retired prefix is never dual-emitted. The three file
-# meters are NOT_REQUESTED without --files; with it they grade independently
-# (NOT_RUN|PASS|FAIL|ERROR — see the --files block above).
+# The frozen machine line (schema=3), and the published grammar for it.
+#
+# Printed as the LAST line of EVERY adapter-check exit — green, red, or an early
+# die: fixed field order, ASCII enums, no ANSI. Any key added, removed, renamed or
+# given a new value bumps schema=, so a consumer pins the number it parses and
+# ignores a line carrying one it does not know. Renaming the prefix
+# CONDUCK_DOCTOR -> CONDUCK_CHECK_ADAPTER was such a change, which is why schema
+# went 2 -> 3. Exactly ONE summary line is emitted (consumers use `tail -1`), so
+# the retired prefix is never dual-emitted.
+#
+# The domains are written HERE, in the one artifact a consumer is guaranteed to
+# have: the adapter build brief tells an agent to curl this script and nothing
+# else, so a grammar that lives only in the README is a grammar it cannot read.
+#
+#   schema=3            this grammar
+#   contract=v1         the adapter contract family being graded
+#   revision=<n.n>      the contract revision this harness implements
+#   harness=<version>   conduck-connect's own version; informational, never a gate
+#   profile=            basic | deep — deep adds the semantic image probe
+#   core=               PASS | FAIL | NOT_RUN — the core wire contract's roll-up.
+#                       IMAGE_INPUT and every file check are excluded from it by
+#                       design: they grade optional capabilities
+#   history_image=      PASS | FAIL | NOT_RUN
+#   stream=             PASS | FAIL | NOT_RUN
+#   image_input=        VERIFIED | DECLINED | UNVERIFIED | FAIL | NOT_RUN
+#   file_transport=     NOT_REQUESTED | NOT_RUN | PASS | FAIL | ERROR
+#   file_access=        same domain
+#   file_e2e=           same domain
+#   checks=<n>          counted verdict lines
+#   failed=<n>          how many of them went red
+#   exit=<n>            see below
+#
+# Never key on checks= or failed= as absolute numbers: they move whenever a check
+# is added, and a loop pinned to "checks=10" breaks on a harness upgrade that
+# fixed nothing about the adapter. Key on the meters and the exit status.
+#
+# NOT_RUN vs NOT_REQUESTED, because that is precisely what a retry loop branches
+# on. NOT_RUN means "this run never got far enough to measure it" — a prerequisite
+# stopped the tier, or the probe failed for a cause this run could not tell apart
+# from another rule's failure. Fix what went red above and run again; it never
+# means "fine". NOT_REQUESTED means "you did not ask for this profile", which is
+# not a problem and must never be retried: only the three file meters emit it, and
+# only when --files was absent. A capability the run could not measure is never
+# reported as failing it — the run-level verdict lives in core=, failed= and
+# exit=, and a red verdict line is what says the adapter is non-conformant.
+#
+# exit=<n> versus the process exit status:
+#   * In a NON-INTERACTIVE run — the only kind a machine gets, including any run
+#     under CI=1 — this line is the LAST line and exit= IS the process status.
+#   * In an interactive run the summary prints BEFORE the optional setup handoff,
+#     and it grades the CHECK: exit=0 says every check passed, while the process
+#     walks on into setup and finally exits on setup's own result. Read exit=
+#     there as this check's verdict, never as a prediction about the process.
+# The statuses: 0 every check passed · 1 a check failed, or the run broke · 2 a
+# usage error caught after the check began (a malformed URL — a bad FLAG is
+# refused by the argument parser before any check exists, so it carries no summary
+# at all) · 3 an operator stopped the run at a prompt · 128+signal for HUP/INT/TERM.
 doctor_summary() { # doctor_summary <exit-code>
   local rc="${1:-1}" core="NOT_RUN"
   if $DOCTOR_CORE_RAN; then
@@ -881,22 +928,30 @@ run_doctor() {
   preflight
 
   say "${BOLD}conduck-connect $VERSION — --check-adapter${RESET}"
-  say "Checks whether an adapter built for Conduck follows the rules at"
-  say "${BOLD}conduck.com/setup/adapter/v1/${RESET} — real requests, graded strictly against contract"
+  # The opening block, printed on the machine path too. An adapter build loop is
+  # exactly where nobody read a README first, and this is the only place the
+  # command says out loud that its checks send real turns that can cost quota and
+  # land in a server's own history. The lines under it are the facts the shared
+  # block cannot carry: which contract revision this harness grades, and what
+  # --files does to the shared folder in concrete terms.
+  explain_check_adapter
+  say "  Graded against contract revision $DOCTOR_CONTRACT_REV: ${BOLD}conduck.com/setup/adapter/v1/${RESET}"
   if $DOCTOR_FILES; then
-    say "revision $DOCTOR_CONTRACT_REV. The chat checks change no host configuration; --files then writes and"
-    say "removes small conduck-check-* files in the configured shared folder, and asks the"
-    say "selected agent to copy one — I clean up after myself, but I can't promise a"
-    say "MISBEHAVING agent touches nothing else."
-  else
-    say "revision $DOCTOR_CONTRACT_REV. Changes no host configuration; sends live adapter turns"
-    say "that may consume compute or enter server-side history."
+    say "  --files writes and removes small conduck-check-* files in the configured shared folder,"
+    say "  and asks the selected agent to copy one. I clean up after myself, but I can't promise a"
+    say "  MISBEHAVING agent touches nothing else."
   fi
   note "Building your own adapter? Loop me from a shell — exit code 0 means every check passed."
   if interactive_terminal; then
     note "A CONDUCK_CHECK_ADAPTER machine summary prints before the optional setup handoff."
   else
     note "The last line is always a CONDUCK_CHECK_ADAPTER machine summary — scripts key on it."
+    # Where the grammar is, said to the only reader who needs it. A machine is
+    # told to download this script and nothing else, so "see the README" is a
+    # pointer it cannot follow; the comment above doctor_summary in this very file
+    # is one it can. The function name is the anchor because it is stable — prose
+    # in a comment is not.
+    note "Its key/value domains are in this script, in the comment above doctor_summary."
   fi
 
   # Target: the positional URL if one was given, else ask.
@@ -905,7 +960,14 @@ run_doctor() {
       || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
   else
     say ""
-    GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
+    # explain_check_adapter is the prompt's `i` copy, passed by FUNCTION NAME
+    # rather than as an action id: explain_prompt resolves a function before it
+    # consults the explanation catalogue, and the block that says what this
+    # command wants an address for is the block that opened the command.
+    # prompt_into, not $(…), so a `q` here stops the run in THIS shell — inside
+    # the subshell it would kill the subshell and the check would walk on with an
+    # empty address.
+    prompt_into GW_URL doctor_ask_url explain_check_adapter
   fi
   apply_gateway_url_normalization
 
@@ -923,8 +985,19 @@ run_doctor() {
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — this server has no token") \
-      || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
+    # Two failures, two different meanings, and they must not share a message.
+    # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
+    # supply a token, so printing it to someone who deliberately stopped is both
+    # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
+    # still emits the machine summary, with exit=3.
+    local token_rc=0
+    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — this server has no token" "gateway.token") \
+      || token_rc=$?
+    case "$token_rc" in
+      0)  ;;
+      11) quit_run ;;
+      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+    esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi
   # Plain TLS validation, the same rule the app applies. For a certificate this
@@ -1009,9 +1082,7 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   say ""
   if [ "$DOCTOR_FAILS" = "0" ]; then
     ok "Adapter check: PASS — $DOCTOR_CHECKS/$DOCTOR_CHECKS checks green. This adapter follows Conduck's rules."
-    if ! interactive_terminal; then
-      say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
-    fi
+    check_setup_next_step
     return 0
   fi
   bad "Adapter check: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."

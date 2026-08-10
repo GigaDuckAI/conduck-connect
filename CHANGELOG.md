@@ -2,7 +2,136 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
-## [Unreleased]
+## [0.14.0] — the setups you already have, and controls that mean what they say
+
+Everything this release adds is something you can see on screen. The tool could
+already set a gateway up; it could not show you what it had set up, change one
+field of it, or remove it — and the controls it advertised at every prompt
+(`i` explains, `b` goes back, `q` stops) worked at some prompts and were
+silently swallowed as answers at others. Both are fixed. **One change matters to
+scripts:** an operator who stops a run part-way now exits `3` instead of `0`.
+See [For scripts and agents](#for-scripts-and-agents) below.
+
+- **You can see what this machine already has set up, change one thing about it,
+  or remove it.** `--list` names your configuration folder and then every saved
+  setup in it: address, how it is reached, model, shared folder, and whether its
+  file server is running right now. `--edit [id]` changes exactly one field — a
+  new web address, a different model — and re-verifies only what that change
+  affects. `--forget <id>` removes one setup completely: it stops and deletes the
+  file server, closes the HTTPS routes it opened, and deletes **both** copies of
+  the file-server password, including the one macOS keeps inside the LaunchAgent
+  file. It lists everything it will remove *and* everything it will not — your
+  shared folder, your agent's own configuration, the gateway itself, the pairing
+  already on your phone — and you confirm by typing the id, not by pressing
+  Enter. Anything it cannot prove it removed is reported by exact name with the
+  commands to finish by hand, and it says plainly that it did not run them.
+- **The motivating failure has a one-command fix.** A Cloudflare quick tunnel
+  hands out a new hostname every time it restarts, so a setup that worked last
+  night is dead by morning. `--edit <id>` now takes the new address, checks that
+  something answers there, offers to move the file address to the same new host,
+  and offers to show the updated setup code — instead of a full walk through the
+  wizard. The edit screen says so at the top when it recognises a quick tunnel.
+- **A file server left behind by a setup you no longer have is named out loud.**
+  `--list` also reports file servers with no saved setup behind them. Each one is
+  a live, authenticated WebDAV server over your agent's working folder that
+  starts again at every boot, and until now nothing on the machine ever mentioned
+  it again. Each is listed with its state, the folder it serves, and the
+  `--forget` line that removes it.
+- **`i`, `b` and `q` now do the same thing at every prompt.** Value prompts —
+  names, addresses, ports, tokens — accepted no controls at all, and three of
+  them took the keystroke as the answer: pressing `q` at *A short name for it*
+  named your gateway `q` and permanently filed the service, the credential and
+  the saved setup under `custom-q`. The address prompt was worse: `q`, `b`, `i`
+  and Enter all produced the same rejection, and Ctrl-C was the only way out.
+  Every prompt now lists the controls that actually work at that prompt and
+  honours them, and a prompt that offers `b` genuinely goes back. If you really
+  want a one-character answer, you confirm it once.
+- **The welcome menu is somewhere you come back to.** Finishing an action returns
+  you to the menu rather than ending the session, `q` inside an action offers the
+  menu as well as the exit, and the menu itself now says what the tool does and
+  never does before you pick anything — that summary used to be reachable only
+  behind `--help`, which a first-time user does not type. Menu item 1 names the
+  products it is for (OpenClaw, Hermes, or any OpenAI-compatible server) and
+  items 2 and 3 are marked as diagnostics.
+- **A wrong answer costs you one question, not the whole run.** Choosing OpenClaw
+  when it is not set up on this host used to end the run at the first real
+  question; so did choosing Tailscale without Tailscale installed. Both now name
+  exactly what was looked for and ask again, with the unavailable option marked.
+  Pressing `b` at the exposure menu after a passing check no longer throws that
+  check away — it returns to the offer to continue into setup, with the result
+  still in memory.
+- **The port question says where the number comes from.** Setup lists the ports
+  actually listening on this machine, with the program name the system reports,
+  as a numbered pick — plus the plain-English rule (the number after the last
+  colon in the address your server prints at startup) and the command to find it
+  yourself. Typing the number by hand still works exactly as before.
+- **Endings print the thing you were about to type.** `--dry-run` ends with the
+  exact command that runs it for real, rebuilt from the flags you used, so
+  committing to the run cannot silently drop `--allow-keyless-public`. A failing
+  `--check-server` now says how to fix and re-run it, and that you may still be
+  able to pair. The `--check-server <url>` re-check line prints for every gateway
+  kind, not only custom ones — so OpenClaw and Hermes users learn the check
+  commands exist.
+- **Setting up OpenClaw or Hermes a second time no longer silently replaces the
+  first.** Those two paths write to a fixed id and used to overwrite an existing
+  saved setup wholesale — the collision protection built for custom servers never
+  covered them. Setup now finds the existing one, says what would be replaced,
+  and asks.
+- **Every successful run tells you where its files live.** The configuration
+  folder used to reach the screen only inside a permissions warning, so anyone
+  whose runs all succeeded never learned it existed.
+- **"Setup code", everywhere.** The app says *setup code* and never *pairing
+  code*; this tool said both, one keystroke apart — a menu item reading *Show a
+  saved setup code* opened a screen headed *Re-show your pairing code*. One name
+  now, here and in the README and SECURITY.md. "Connector" and "helper" are gone
+  from anything a user reads: the `--setup` flow is the wizard, and the program
+  is `conduck-connect`.
+- **Enter never claims you ran a command you did not run.** After the script
+  prints a command for you to run yourself, the prompt was the only one in the
+  tool where Enter meant *yes* — six lines away from `[y/N]` prompts where Enter
+  means *no*. It now reads `Did you run it? [y/N] (Enter = No, skip)`, so an
+  Enter pressed in rhythm can no longer make the script misdiagnose a config
+  change that never happened as a broken gateway.
+- **A prompt with nobody there says so.** A closed input used to be treated as a
+  silent "no" or a silent default. It now prints which question went unanswered
+  and what was assumed.
+
+### For scripts and agents
+
+- **Two new exit statuses.** `3` means the operator stopped the run before it
+  finished — previously that exited `0`, so a wrapper read an abandoned setup as
+  a successful pairing. `4` means the action needs a person at a terminal.
+  Choosing "exit" at the welcome menu is still `0`: that is a completed choice,
+  not an abort. `0`, `1` and `2` are unchanged.
+- **`CI=1` is documented and does what a build loop needs.** A *passing*
+  `--check-adapter` under a PTY would print `exit=0` and then block forever on
+  "continue into setup?". `CI=1` makes both checks end at their machine summary.
+  It was already implemented and written down nowhere.
+- **`--list --json` is the machine-readable inventory** — one JSON object with
+  its own `schemaVersion`, every saved setup, and every file server with no setup
+  behind it. It needs no terminal, changes nothing, and prints no token, no
+  password and no setup code. It is how a tool finds the id that `--edit` and
+  `--forget` want.
+- **A refusal now names the reason a machine cannot finish.** `--setup` ends in a
+  QR code somebody scans with a phone, so no amount of scripting completes it;
+  the message says that instead of pointing at stdin, and names what *is*
+  scriptable. `AGENTS.md` carries the full agent-operator contract.
+- **The machine-summary grammars are published in the script itself**, in a
+  comment block above each summary, because the one artifact a build agent is
+  guaranteed to have is the file it downloaded.
+- **Exposure bookkeeping changed format.** The records the script writes when it
+  opens an HTTPS route now carry the gateway they belong to, which is what makes
+  per-gateway teardown possible at all. A record written by 0.13.0 is not
+  readable by 0.14.0: it is left exactly where it is, never acted on, and the run
+  tells you to check `tailscale serve status` yourself, because an unreadable
+  record may still name a live public exposure.
+
+### Also in this release
+
+The rest of the cycle, newest first: the OpenClaw tool-policy check learning to
+read a policy the way OpenClaw itself reads it, the Hermes recall and PDF work,
+exposure records that survive an interrupted run, and a long run of failures
+that now name themselves.
 
 - **Two policies this check used to rewrite are now left to you, because the only
   safe edit to either was none.** An empty `tools.allow` was read as an allowlist
@@ -575,7 +704,7 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   `fileserver-<id>.cred`, but in a writable directory any local account can
   replace the whole file, and rclone then reads its password out of somebody
   else's copy at the next start — likewise `profile-<id>.json`, which is what
-  `--show-code` rebuilds a pairing code from. Write is now graded apart from read
+  `--show-code` rebuilds a setup code from. Write is now graded apart from read
   and worded for what it actually permits. `--show-code` checks the mode too: it
   parses the profile and re-derives both secrets, so it carries the same
   exposure, and the check runs before any secret is read.
@@ -634,7 +763,7 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   line claims the file (`openclaw.json` is file-transfer-ready), and when the
   gateway was not restarted it says so out loud, with what that costs until it
   is.
-- **A missing `rclone` read as the end of the run, and then a pairing code
+- **A missing `rclone` read as the end of the run, and then a setup code
   arrived anyway.** "Install it and re-run me, or skip the file lane for now"
   was the last thing said before setup carried on to pair the gateway, so the
   sensible-looking reaction was to abandon a setup that was about to succeed.

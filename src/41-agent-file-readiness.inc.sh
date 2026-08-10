@@ -82,7 +82,7 @@ HERMES_ANALYSIS_CHANGE_KINDS=()
 # narrowing those is not this connector's business.
 #
 # JSON-quoted because that is the only inline form the scanner above reads back:
-# a bare flow sequence is refused as "YAML syntax this connector will not guess
+# a bare flow sequence is refused as "YAML syntax this script will not guess
 # at", and the refusal names the key, not the quoting — so an operator told to
 # write `[web, file]` types the exact line the next run refuses, with nothing on
 # screen to explain it. Quoted is also what hermes_config_analysis's own rewrite
@@ -746,12 +746,12 @@ manual = []
 changes = []
 
 if unsupported_root_form():
-    manual.append("config.yaml uses a document-root YAML form outside this connector's conservative plain block-map subset")
+    manual.append("config.yaml uses a document-root YAML form outside the conservative plain block-map subset this script edits")
 
 if any(ANCHOR_OR_ALIAS.search(unquoted_yaml_code(content(line))) or
        MERGE_KEY.search(unquoted_yaml_code(content(line)))
        for line in lines):
-    manual.append("YAML anchors, aliases, or merge keys can change the effective target paths; this connector will not edit through them")
+    manual.append("YAML anchors, aliases, or merge keys can change the effective target paths; this script will not edit through them")
 
 # Whether the document itself is inside the editable subset. Captured before the
 # path-specific reasons below so a workspace mismatch never makes the toolset
@@ -811,7 +811,7 @@ if action == "recall":
 remove_targets = []
 if scope_expect is not None:
     if recall_fix != "literal" or pst != "OK":
-        manual.append("the API-server recall entries are not in the plain list form this connector edits")
+        manual.append("the API-server recall entries are not in the plain list form this script edits")
     else:
         try:
             expected = json.loads(scope_expect)
@@ -827,7 +827,7 @@ if not recall_only:
     if bst == "OK" and backend not in ("", "local"):
         manual.append("terminal.backend is %r; a host WebDAV folder is not proven inside that backend" % backend)
     elif bst in ("AMBIG", "FLOW"):
-        manual.append("terminal.backend uses YAML syntax this connector will not guess at")
+        manual.append("terminal.backend uses YAML syntax this script will not guess at")
 
     cst, cwd = scalar("terminal", "cwd")
     if cst == "OK":
@@ -837,7 +837,7 @@ if not recall_only:
     elif cst in ("MISSING",):
         changes.append(("cwd", "terminal.cwd: (absent) -> %s" % json.dumps(workspace)))
     else:
-        manual.append("terminal.cwd uses YAML syntax this connector will not guess at")
+        manual.append("terminal.cwd uses YAML syntax this script will not guess at")
 
 file_bundles = {"file", "all", "*", "hermes-api-server", "hermes-cli"}
 if pst == "OK":
@@ -850,7 +850,7 @@ if pst == "OK":
         changes.append(("toolset", "platform_toolsets.api_server: %s -> %s" %
                         (json.dumps(pvals), json.dumps(want))))
 elif pst in ("AMBIG", "FLOW"):
-    manual.append("platform_toolsets.api_server uses YAML syntax this connector will not guess at")
+    manual.append("platform_toolsets.api_server uses YAML syntax this script will not guess at")
 # Missing or null api_server means Hermes's own full API-server default remains
 # authoritative, so its file tools are there. The live sentinel still proves the
 # installed version rather than trusting that default on faith.
@@ -869,7 +869,7 @@ if not recall_only:
             manual.append("agent.disabled_toolsets globally disables %s; removing it would broaden other Hermes platforms" %
                           ", ".join(sorted(blocked)))
     elif st in ("AMBIG", "FLOW"):
-        manual.append("agent.disabled_toolsets uses YAML syntax this connector will not guess at")
+        manual.append("agent.disabled_toolsets uses YAML syntax this script will not guess at")
 
 if manual:
     print("status\tmanual")

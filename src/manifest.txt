@@ -12,4 +12,5 @@
 80-pairing.inc.sh
 90-dry-run.inc.sh
 91-show-code.inc.sh
+95-manage.inc.sh
 99-main.inc.sh

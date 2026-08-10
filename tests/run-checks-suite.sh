@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run-checks-suite.sh — connector check and command regression suite.
+# run-checks-suite.sh — conduck-connect check and command regression suite.
 #
 # For every adapter check there is a known-good fixture (must stay green) and at
 # least one deliberately-broken fixture-adapter mode proving the check fails
@@ -25,6 +25,7 @@
 set -u -o pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+SRC_DIR="$HERE/../src"
 SCRIPT="$HERE/../conduck-connect.sh"
 FIXTURE="$HERE/fixture-adapter.py"
 WEBDAV="$HERE/fixture-webdav.py"
@@ -253,6 +254,38 @@ fail_case() { # fail_case <name> <why>
   FAIL=$((FAIL+1))
   printf 'SUITE ✗ %s — %s\n' "$1" "$2"
   sed 's/^/    | /' "$TMP/doctor.out" | tail -n 25
+}
+
+# THE guard that keeps the rest of this file honest. Read this before adding a case.
+#
+# Most cases here assemble a MINIMAL runtime: extract_funcs lifts the handful of
+# functions the case is about out of the release artifact, and everything else is a
+# stub. That assembly degrades SILENTLY the moment a lifted function grows a new
+# callee: an undefined function is exit 127 with no output, there is no `set -e`,
+# so the run walks on and every assertion downstream of it passes — or fails — for
+# no reason at all. This is not hypothetical. One release taught six existing
+# functions to call six new helpers; no lift list was updated; the suite then ran
+# with 62 undefined-function calls and reported 159 passes, an unknown number of
+# them vacuous. A green suite that tests nothing is worse than a red one.
+#
+# So every isolated case runs its captured transcript through here. The shell's own
+# "command not found" is the signal — it costs nothing, it cannot go stale, and it
+# fires the first time src/ grows a callee a lift list does not carry, in whichever
+# case reaches it first. The fix is always the same: add the name to that case's
+# extract_funcs list, or stub it beside the case's other stubs when the case wants
+# the callee neutralised rather than exercised.
+#
+# Callers MUST capture stderr (`2>&1`) — that is where the shell reports it. A case
+# that deliberately drops stderr cannot be guarded and has to say so in a comment.
+assert_runtime_defined() { # assert_runtime_defined <case-name> <transcript…>
+  local name="$1"; shift
+  local missing
+  missing=$(printf '%s\n' "$*" \
+    | sed -n 's/.*: \([A-Za-z_][A-Za-z0-9_]*\): command not found.*/\1/p' \
+    | sort -u | tr '\n' ' ')
+  [ -z "$missing" ] && return 0
+  fail_case "$name" "the assembled runtime called undefined function(s): ${missing% }"
+  return 1
 }
 
 # Invariants every REDIRECTED check run owes its machine consumers, whichever
@@ -536,7 +569,7 @@ grade_adapter() { # grade_adapter <name> <rc> <expexit> <expfails> <args> <frags
 # The --files fault-injection cases. Each spins up its OWN temp served dir + a
 # fixture-webdav server (own OS-assigned port, per-case random credential) and
 # runs the adapter check with --files, HOME isolated so no
-# real pairing profile is consulted and no shared state leaks.
+# real saved profile is consulted and no shared state leaks.
 # name|adapter-mode|webdav-mode|env-mode|adapter-args|exp-exit|exp-fails|frags|post
 #   webdav-mode "-"      = no WebDAV server (config-error cases fail before contact)
 #   env-mode: full       = CONDUCK_FILES_URL(webdav)+DIR(served)+PASS(cred)
@@ -798,6 +831,7 @@ server-models-no-id|models-no-id|no|0|wire=PASS model_ids=0 exit=0
 server-models-html|models-html|no|1|wire=FAIL models=FAIL chat=NOT_RUN checks=1 failed=1 exit=1
 server-models-slow|models-slow|no|1|wire=FAIL models=FAIL chat=NOT_RUN checks=1 failed=1 exit=1
 server-require-model|require-model|no|0|wire=PASS model=required chat=PASS exit=0
+server-model-less-500|model-less-500|no|1|wire=FAIL chat=FAIL model=required exit=1
 server-require-long-model|require-long-model|no|0|wire=PASS model=required model_ids=1 chat=PASS exit=0
 server-bogus-model-200|bogus-model-200|no|0|wire=PASS exit=0
 server-bad-json|bad-json|no|1|wire=FAIL chat=FAIL exit=1
@@ -879,6 +913,28 @@ run_server_case() { # run_server_case <table-row>
     fi
     if ! grep -qF 'CONDUCK_CHECK_SERVER_MODEL=<id> grades the model you plan to use' "$TMP/doctor.out"; then
       fail_case "$name" "the multi-model hint never reached the closing FAIL"; return
+    fi
+  fi
+  # The middle branch of the three-way chat verdict, and the only place it can be
+  # observed. The model-less turn failed, the model-NAMED turn succeeded — and the
+  # model-less status (500) is outside the list the app's own model-required gate
+  # accepts, so this is a real fault rather than a configuration fact.
+  #
+  # The wrong verdict is the expensive one: told "this server requires a model",
+  # the operator configures one in the app, and the intermittent 5xx is still
+  # there with its only diagnosis already spent. So both halves are asserted —
+  # that the PASS wording is absent, and that the FAIL says which kind it is.
+  if [ "$name" = "server-model-less-500" ]; then
+    if grep -qF 'chat works once a model is set' "$TMP/doctor.out"; then
+      fail_case "$name" "a 500 on the model-less turn was read as 'this server requires a model'"; return
+    fi
+    if ! grep -qF "this failure isn't the missing-model kind" "$TMP/doctor.out"; then
+      fail_case "$name" "the FAIL never said why it is not the missing-model kind"; return
+    fi
+    # The named-model turn really did pass, so the fork above was reached at all
+    # rather than the whole chat step failing for one reason.
+    if ! grep -qF 'selects (the app sends what the user picked)' "$TMP/doctor.out"; then
+      fail_case "$name" "the model-named turn did not pass — the arm never reached the fork"; return
     fi
   fi
   if [ "$name" = "server-direct-check" ] &&
@@ -992,16 +1048,38 @@ run_direct_setup_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# No terminal, no arguments. This does NOT reach the menu any more, and the change
+# is the point: exit 4 means "this needs a person at a terminal", which is a
+# different fact from exit 1 ("something went wrong"), and a wrapper has no other way
+# to tell them apart. Reaching the menu and then dying at EOF told a machine driver
+# to try harder at a question no machine can answer.
+#
+# HOME and XDG_CONFIG_HOME are isolated even though this run only reads: the operator's
+# real ~/.config/conduck must never be an input to a test result, or the suite grades a
+# different thing on the machine that paired a gateway than on a clean runner.
 run_noarg_noninteractive_case() {
   local name="menu-noninteractive-eof" rc=0
-  TERM=dumb bash "$SCRIPT" </dev/null > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" != "1" ]; then
-    fail_case "$name" "menu EOF exited $rc, expected runtime exit 1"; return
+  local home="$TMP/noarg-home" state="$TMP/noarg-state"
+  mkdir -p "$home" "$state"
+  env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
+    bash "$SCRIPT" </dev/null > "$TMP/doctor.out" 2>&1 || rc=$?
+  if [ "$rc" != "4" ]; then
+    fail_case "$name" "a no-terminal run exited $rc, expected 4 (needs a person at a terminal)"; return
   fi
-  if ! grep -qF 'Welcome to Conduck Connect' "$TMP/doctor.out" ||
-     ! grep -qF '1) Set up and pair a gateway' "$TMP/doctor.out" ||
-     ! grep -qF 'No answer (the input ended)' "$TMP/doctor.out"; then
-    fail_case "$name" "noninteractive menu did not show the welcome/options/EOF help"; return
+  if ! grep -qF 'needs a person at a terminal' "$TMP/doctor.out"; then
+    fail_case "$name" "the refusal did not say what is actually missing"; return
+  fi
+  # A refusal that only refuses is a dead end. It has to name what a machine CAN run
+  # here, or the transcript reads: green check, instruction, failure.
+  if ! grep -qF 'CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-server' "$TMP/doctor.out" ||
+     ! grep -qF 'CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-adapter' "$TMP/doctor.out" ||
+     ! grep -qF 'bash conduck-connect.sh --list --json' "$TMP/doctor.out"; then
+    fail_case "$name" "the refusal did not name the commands a machine can run instead"; return
+  fi
+  # …and it must not hand a machine the one command it has just explained it cannot
+  # finish. --setup --dry-run is offered explicitly "from a terminal".
+  if ! grep -qF 'From a terminal, to see every change setup would make' "$TMP/doctor.out"; then
+    fail_case "$name" "the dry-run suggestion no longer says it needs a terminal"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -1015,14 +1093,26 @@ run_menu_q_case() {
   # top-level menu without dispatching an action or creating setup state.
   PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
   pty_run 10 $'i\nbogus\nq\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  # q at the WELCOME MENU is 0, not 3. It is a completed choice — the operator was
+  # asked what to do and answered "nothing" — where 3 means a run was abandoned
+  # partway. A wrapper that cannot tell those apart reads every deliberate exit as a
+  # failure, or every abandoned setup as a success.
   if [ "$rc" != "0" ] ||
-     ! grep -qF 'Welcome to Conduck Connect' "$TMP/doctor.out" ||
-     ! grep -qF 'About this step: Choose what conduck-connect should do' "$TMP/doctor.out" ||
+     ! grep -qF 'pair your self-hosted AI gateway with Conduck' "$TMP/doctor.out" ||
      ! grep -qF 'Please enter one of the listed options.' "$TMP/doctor.out" ||
      ! grep -qF 'Nothing changed.' "$TMP/doctor.out"; then
     fail_case "$name" "info / invalid retry / q did not complete the PTY menu flow"; return
   fi
-  prompt_count=$(grep -c 'Choose an option (Enter = no default; i = explain; q = stop)' "$TMP/doctor.out")
+  # The entry-point explanation answers a stranger's questions rather than reciting
+  # the mid-wizard prompt template. Four of them, and each is a heading a reader can
+  # find: what this is, what they end up with, how long, what changes on this machine.
+  local heading
+  for heading in 'What this is' 'What you end up with' 'How long' 'What changes on this machine'; do
+    if ! grep -qF "  $heading" "$TMP/doctor.out"; then
+      fail_case "$name" "the welcome explanation no longer answers '$heading'"; return
+    fi
+  done
+  prompt_count=$(grep -c 'Choose an option (Enter = ask again; i = explain; q = stop)' "$TMP/doctor.out")
   if [ "$prompt_count" != "3" ]; then
     fail_case "$name" "the menu prompt appeared $prompt_count times, expected once per info/retry/q answer"; return
   fi
@@ -1034,139 +1124,916 @@ run_menu_q_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
-# Exercise the prompt primitives in a real PTY without entering setup. This is
-# deliberately below the menu case: `i`, `?`, `b`, and `q` are controls only at
-# bounded decision prompts. Free-form and hidden-value prompts must keep those
-# exact bytes as data, while every visible Enter meaning remains testable.
-run_prompt_controls_case() {
-  local name="prompt-controls-and-defaults" funcs input out rc=0
-  local confirm_marker="$TMP/prompt-confirm-ran" manual_marker="$TMP/prompt-manual-ran"
-  local quit_marker="$TMP/prompt-after-quit" choice_marker="$TMP/prompt-choice-q-ran"
+# The menu is a HUB, and this is the case that proves it in one process.
+#
+# Three separate things, and the third is why this case exists at all:
+#
+#   1. An action entered from the menu RETURNS to the menu on `m`, so a wrong turn
+#      costs one action instead of the whole session.
+#   2. `m` is offered at quit_run too — the place somebody who mis-stepped actually
+#      presses q — and its wording is the CHECK flavour there, not the setup one.
+#      Three of quit_run's five closing sentences are about undoing configuration
+#      changes, and a check makes none; reading them after a diagnostic is alarming
+#      for no reason.
+#   3. NO FLAG STATE LEAKS BETWEEN TWO ACTIONS IN ONE PROCESS. This is the bug that
+#      shipped: `validate_cli` runs in the PARENT shell (the action itself runs in a
+#      subshell and cannot leak), it set `REUSE_ONLY=true` for a check and never
+#      restored it, and both symptoms were silent to whoever caused them —
+#         · a later "set up and pair" ran REUSE-ONLY, refusing every change it was
+#           chosen to make, announced only by a line in a banner nobody re-reads;
+#         · a later CHECK read that leftover as a `--reuse-only` on the command
+#           line and killed the whole session with a usage error, from the parent,
+#           so the hub could not even redraw.
+#      It was caught by hand. Nothing in the suite could see it, because every
+#      other case in this file runs exactly one action per process.
+#
+# The walk: check-server → q → m → check-adapter → q → m → setup → q → Enter.
+# Two checks in a row and then a setup, which is the shortest path that exercises
+# both symptoms of (3).
+run_menu_hub_case() {
+  local name="menu-hub-returns-and-leaks-nothing" rc=0 menus
+  local home="$TMP/hub-home" state="$TMP/hub-state"
+  mkdir -p "$home" "$state"
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+  pty_run 20 $'2\nq\nm\n3\nq\nm\n1\nq\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
 
-  funcs=$(extract_funcs \
-    explain_prompt quit_run confirm ask ask_default ask_secret require_choice print_and_wait)
-  for fn in explain_prompt quit_run confirm ask ask_default ask_secret require_choice print_and_wait; do
-    if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
-      fail_case "$name" "could not extract $fn from the release artifact"; return
-    fi
-  done
+  # SYMPTOM B of the leak, and the sharper of the two: a hard session kill. It is
+  # asserted first because if it fires, everything below it never ran.
+  if grep -qF 'Usage error:' "$TMP/doctor.out"; then
+    fail_case "$name" "a second action in one session died with a usage error — argv state leaked between actions"; return
+  fi
+  # SYMPTOM A: the setup that follows two checks must be a REAL setup.
+  if grep -qF 'reuse-only: I' "$TMP/doctor.out"; then
+    fail_case "$name" "setup entered from the menu ran reuse-only — --reuse-only leaked out of a check"; return
+  fi
+  # The hub really did come back. Three drawings: the first, and one after each m.
+  #
+  # Counted on the menu's QUESTION, not on its title line. The setup banner opens
+  # with the same sentence one full stop apart ("…with Conduck." vs "…with
+  # Conduck"), so counting the title would score the setup pass as a fourth menu.
+  menus=$(grep -c '  What would you like to do?' "$TMP/doctor.out")
+  if [ "$menus" != "3" ]; then
+    fail_case "$name" "the welcome menu was drawn $menus times, expected 3 (start + two returns)"; return
+  fi
+  if ! grep -qF 'Enter = stop; m = back to the menu' "$TMP/doctor.out"; then
+    fail_case "$name" "q never offered the way back to the menu"; return
+  fi
+  # All three actions were genuinely entered, so the count above is not three
+  # redraws of a menu nothing ever left.
+  if ! grep -qF 'CONDUCK_CHECK_SERVER schema=' "$TMP/doctor.out" ||
+     ! grep -qF 'CONDUCK_CHECK_ADAPTER schema=' "$TMP/doctor.out" ||
+     ! grep -qF 'Step 1 — find your gateway' "$TMP/doctor.out"; then
+    fail_case "$name" "one of the three menu actions was never reached"; return
+  fi
+  # quit_run's fork. A check edits nothing, so it gets the sentence that says so —
+  # and must NOT get the setup paragraph about config edits and restarts.
+  if ! grep -qF 'Stopped here. Nothing was changed' "$TMP/doctor.out"; then
+    fail_case "$name" "stopping a check printed the setup vocabulary instead of its own"; return
+  fi
+  # …and the setup pass, the last of the three, gets the setup one.
+  if ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
+    fail_case "$name" "stopping the setup pass did not print the setup ending"; return
+  fi
+  # No FILE was written: every action here was stopped before it could change
+  # anything. Directories are excluded on purpose and the distinction is real —
+  # the setup pass takes its lock, which creates $STATE_DIR itself (0700, silently,
+  # through the one ensure_state_dir every writer goes through) and then releases
+  # it on the way out. An empty directory is the documented footprint of a run that
+  # started; a file in it would be a saved gateway nobody agreed to.
+  if [ -n "$(find "$home" "$state" -type f -print -quit 2>/dev/null)" ]; then
+    fail_case "$name" "a session of three abandoned actions still wrote a file"; return
+  fi
+  # 3, from the last action: the hub propagates an action's own status rather than
+  # flattening it, which is the only reason a wrapper can tell an abandoned run
+  # from a finished one.
+  if [ "$rc" != "3" ]; then
+    fail_case "$name" "the hub session exited $rc, expected 3 from the abandoned setup"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
 
-  input=$'bogus\ni\n\n'          # confirm: invalid, info, Enter = No
-  input+=$'b\n'                   # confirm with allow-back: b = status 10
-  input+=$'b\n\n'                # ordinary confirm: b rejected, Enter = No
-  input+=$'\nnope\n?\n2\n'       # required choice: no default, invalid, help, valid
-  input+=$'bogus\ni\n\n'          # printed command: invalid, info, Enter = ran
-  input+=$'\n'                     # value prompt: Enter = displayed default
-  input+=$'i\nb\nq\n'             # free-form values stay literal
-  input+=$'i\nb\nq\n'             # secret values stay literal too
-
-  out=$(env -u CI TERM=dumb FUNCS="$funcs" \
-      CONFIRM_MARKER="$confirm_marker" MANUAL_MARKER="$manual_marker" \
-      python3 "$PTY_RUN" 10 "$input" bash -c '
+# A menu action runs in a SUBSHELL, and bash resets every caught trap on entering
+# one. So the EXIT trap armed at file scope is simply gone inside an action chosen
+# from the menu, and the parent's copy cannot stand in: it fires in the PARENT, where
+# the dead child's state never existed. menu_hub_loop re-arms it, and this case is
+# the only thing that says so.
+#
+# Why it matters and why it was invisible: --show-code arms no trap of its own, and
+# the agent sentinel's last DELETE-and-prove pass plus the "remove this exact file
+# later" warning reach the operator through on_exit and nowhere else. Entered from a
+# flag it worked; entered from the menu it silently did not, and the difference is a
+# file left behind in somebody's agent workspace with nothing on screen about it. The
+# checks and setup escaped it only because they re-arm their own traps first.
+#
+# Graded on a LIFTED menu_hub_loop with stubbed surroundings, because the observable
+# in a real run is the absence of a cleanup pass on state that takes a whole gateway
+# to build. The stub on_exit reports a variable that only the ACTION sets: it can be
+# seen exactly once from inside the action's subshell, and once — empty — from the
+# parent's own exit. Two sightings is the re-arm; one is the bug.
+run_menu_trap_rearm_case() {
+  local name="menu-action-runs-with-its-own-exit-trap" out rc=0 hits
+  local funcs
+  funcs=$(extract_funcs menu_hub_loop)
+  if ! printf '%s\n' "$funcs" | grep -qF 'menu_hub_loop()'; then
+    fail_case "$name" "could not extract menu_hub_loop from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+  out=$(env -u CI TERM=dumb FUNCS="$funcs" bash -c '
 eval "$FUNCS"
-BOLD=""; DIM=""; RESET=""
+MENU_RETURN_STATUS=20
+COMMAND=""
+PASSES=0
+say() { printf "SAY %s\n" "$*"; }
+choose_main_action() {
+  PASSES=$((PASSES+1))
+  case "$PASSES" in 1) COMMAND="show-code" ;; *) COMMAND="exit" ;; esac
+}
+validate_cli() { :; }
+on_exit() { printf "ON_EXIT state=[%s]\n" "${ACTION_STATE:-}"; }
+dispatch_menu_command() {
+  ACTION_STATE="inside-the-action"
+  printf "ACTION ran\n"
+  trap -p INT
+  exit "$MENU_RETURN_STATUS"
+}
+trap on_exit EXIT
+menu_hub_loop; rc=$?
+printf "AFTER_LOOP rc=%s\n" "$rc"
+exit "$rc"
+' 2>&1) || rc=$?
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "the hub fixture exited $rc, expected 0 — the loop never came back for the second pass"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'ACTION ran'; then
+    fail_case "$name" "the menu action was never dispatched, so nothing below grades a trap"; return
+  fi
+  # THE assertion: on_exit fired somewhere that could still see the action's state.
+  if ! printf '%s\n' "$out" | grep -qF 'ON_EXIT state=[inside-the-action]'; then
+    fail_case "$name" "the EXIT trap did not run for a menu-entered action — bash reset it on subshell entry and nothing re-armed it"; return
+  fi
+  # Twice: once at the end of the action, once at the end of the session. One
+  # sighting means only the parent's file-scope trap ever ran.
+  hits=$(printf '%s\n' "$out" | grep -cF 'ON_EXIT state=')
+  if [ "$hits" != "2" ]; then
+    fail_case "$name" "on_exit ran $hits times, expected 2 (once per action, once for the session)"; return
+  fi
+  # The signal routing is re-armed by the same three lines and is worth the same
+  # keystroke: without it a Ctrl-C during a menu-entered action skips the EXIT trap
+  # on macOS bash 3.2 entirely.
+  if ! printf '%s\n' "$out" | grep -qF "exit 130"; then
+    fail_case "$name" "the action's subshell had no INT handler — signal routing was not re-armed with the EXIT trap"; return
+  fi
+  # …and an action that returns MENU_RETURN_STATUS returns to the hub rather than
+  # ending the session, which is what makes the two sightings above two and not one.
+  if ! printf '%s\n' "$out" | grep -qF 'AFTER_LOOP rc=0'; then
+    fail_case "$name" "the hub did not survive the action it dispatched"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The minimal runtime every prompt-primitive sub-case runs inside. The stubs are
+# the screen (say/note/warn/explain_action) and the two guards a prompt can reach
+# (mutate_guard/plan_add); everything a primitive genuinely does is lifted from the
+# artifact, so a control key that stops working here stopped working for real.
+#
+# DOCTOR/COMPAT/SHOW_QR are seeded explicitly because run_changes_nothing reads
+# them and picks quit_run's whole closing paragraph off them. Unseeded they would
+# answer on their own defaults and the wording assertion below would hold for a
+# reason that has nothing to do with the wizard.
+PROMPT_FIXTURE_PRELUDE='
+eval "$FUNCS"
+BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""
 DRY_RUN=false; REUSE_ONLY=false
+DOCTOR=false; COMPAT=false; SHOW_QR=false; DOCTOR_FILES=false; MENU_HUB=false
 say()  { printf "SAY %s\n" "$*"; }
 note() { printf "NOTE %s\n" "$*"; }
 warn() { printf "WARN %s\n" "$*"; }
 explain_action() { printf "INFO %s\n" "$1"; }
 mutate_guard() { printf "GUARD %s\n" "$1"; return 0; }
 plan_add() { printf "PLAN %s\n" "$*"; }
+'
+# prompt_fixture <input> <body> -> transcript in $PF_OUT, process status in $PF_RC.
+# Both are globals rather than a captured stdout: the STATUS is half of what these
+# sub-cases grade (11 stop, 10 back, 3 stopped mid-flow), and $(…) would throw it
+# away. stderr is folded in deliberately — every value primitive writes its
+# human-facing lines there, because its callers capture stdout — and
+# assert_runtime_defined needs it too.
+PF_RC=0
+PF_OUT=""
+prompt_fixture() { # prompt_fixture <input> <body>
+  PF_RC=0
+  PF_OUT=$(env -u CI TERM=dumb FUNCS="$PROMPT_FUNCS" \
+    CONFIRM_MARKER="$TMP/prompt-confirm-ran" MANUAL_MARKER="$TMP/prompt-manual-ran" \
+    QUIT_MARKER="$TMP/prompt-after-quit" CHOICE_MARKER="$TMP/prompt-choice-q-ran" \
+    python3 "$PTY_RUN" 10 "$1" bash -c "$PROMPT_FIXTURE_PRELUDE$2" 2>&1) || PF_RC=$?
+}
+# Same runtime, stdin from a PIPE. A PTY never reaches EOF — it would need an EOT
+# byte — and EOF is not an exotic case here: it is what every redirected run, CI
+# job and agent driver hands these prompts. Under a pipe `read -r -p` also prints
+# no prompt at all, so this lane is the only place prompt_echo's stderr re-emit is
+# observable, and an invisible prompt is exactly how a machine driver ends up
+# answering a question it could not see.
+prompt_fixture_piped() { # prompt_fixture_piped <input> <body>
+  PF_RC=0
+  PF_OUT=$(printf '%s' "$1" | env -u CI TERM=dumb FUNCS="$PROMPT_FUNCS" \
+    CONFIRM_MARKER="$TMP/prompt-confirm-ran" MANUAL_MARKER="$TMP/prompt-manual-ran" \
+    QUIT_MARKER="$TMP/prompt-after-quit" CHOICE_MARKER="$TMP/prompt-choice-q-ran" \
+    bash -c "$PROMPT_FIXTURE_PRELUDE$2" 2>&1) || PF_RC=$?
+}
+# Appends the sub-case to the failure transcript and re-checks the runtime guard.
+# Returns 1 when a lift gap was found, so the caller stops rather than grading a
+# run that half-executed.
+prompt_stage() { # prompt_stage <case-name> <stage-label>
+  printf -- '--- %s (exit %s) ---\n%s\n' "$2" "$PF_RC" "$PF_OUT" >> "$TMP/doctor.out"
+  assert_runtime_defined "$1" "$PF_OUT"
+}
+pf_has() { printf '%s\n' "$PF_OUT" | grep -qF "$1"; }
+pf_count() { printf '%s\n' "$PF_OUT" | grep -cF "$1"; }
 
+# The prompt primitives, exercised in a real PTY without entering setup, and graded
+# as TWELVE independent sub-cases.
+#
+# The contract they all share: a key is a control at a prompt IF AND ONLY IF that
+# prompt's own suffix advertises it, the answer travels on stdout and the intent
+# travels on the exit status — 10 back, 11 stop, 1 no answer. That last part is why
+# there is no literal `q` sentinel to assert any more: a user's real answer can be
+# the single letter q, so the string cannot carry the meaning.
+#
+# One sub-case per primitive, and the split is not cosmetic. A single case spanning
+# the whole contract stops at its FIRST failure, so a release that broke ask_secret
+# and print_and_wait reports one red line naming confirm and never grades the other
+# ten — the suite's own ✗ line points at the wrong primitive. Twelve names means the
+# ✗ lines ARE the diagnosis, and a regression in one primitive can no longer hide a
+# regression in another. Short keystroke scripts are the other half of the same
+# reason: one long script through eight prompts is a desynchronisation waiting to
+# happen, and it too names the wrong prompt when it drifts.
+#
+# `prompt-controls-and-defaults` survives as a SELECTOR that runs all twelve, because
+# that is the name the triage tables and earlier notes use. Nothing prints it.
+PROMPT_SUBCASES="prompt-confirm-controls
+prompt-require-choice-retry
+prompt-require-choice-q-status
+prompt-into-q-stops-the-process
+prompt-into-b-returns-back
+prompt-into-eof-dies
+prompt-literal-answer-confirmation
+prompt-literal-declined-falls-through
+prompt-secret-controls
+prompt-default-and-resolved-echo
+prompt-eof-at-every-primitive
+prompt-and-wait-enter-is-no
+prompt-q-status-at-every-value-primitive
+prompt-back-only-where-advertised
+prompt-uncaptured-q-stops-the-run"
+
+prompt_case_wanted() { # prompt_case_wanted <sub-case-name>
+  [ -n "$ONLY" ] || return 0
+  case " $ONLY " in
+    *" prompt-controls-and-defaults "*) return 0 ;;
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# One lift for all twelve — it is one runtime — and a broken lift fails every
+# sub-case that was asked for. Failing only the first would report eleven passes for
+# a runtime that was never assembled, which is the same vacuous-green the guard
+# exists to kill.
+#
+# NO_ANSWER is a top-level string, not a function, and prompt_into's EOF arm
+# dereferences it under set -u — lift the real one so the EOF sub-cases grade the
+# message users actually get.
+PROMPT_FUNCS=""
+prompt_controls_lift() {
+  local fn sub lifted why=""
+  lifted="explain_prompt run_changes_nothing quit_run interactive_terminal
+          control_keys control_suffix prompt_echo prompt_wants_literal
+          value_prompt_control prompt_into ask_report_no_answer
+          looks_like_a_secret warn_answer_looked_like_a_secret die
+          url_has_userinfo
+          confirm ask ask_default ask_secret ask_url require_choice print_and_wait"
+  PROMPT_FUNCS=$(extract_funcs $lifted
+                 sed -n '/^NO_ANSWER=/p;/^URL_USERINFO_HINT=/p' "$SCRIPT")
+  for fn in $lifted; do
+    printf '%s\n' "$PROMPT_FUNCS" | grep -qF "$fn()" ||
+      why="could not extract $fn from the release artifact"
+  done
+  printf '%s\n' "$PROMPT_FUNCS" | grep -q '^NO_ANSWER=' ||
+    why="could not lift NO_ANSWER from the release artifact"
+  [ -z "$why" ] && return 0
+  # Deliberately an EMPTY transcript: fail_case tails $TMP/doctor.out, and twelve
+  # copies of the same 25 lines is how a red run becomes unreadable.
+  : > "$TMP/doctor.out"
+  for sub in $PROMPT_SUBCASES; do
+    prompt_case_wanted "$sub" && fail_case "$sub" "$why"
+  done
+  return 1
+}
+
+# --- confirm: invalid retries, i explains, Enter = No, b only where offered ---
+prompt_sub_confirm() {
+  local name="prompt-confirm-controls" marker="$TMP/prompt-confirm-ran"
+  : > "$TMP/doctor.out"; rm -f "$marker"
+  prompt_fixture $'bogus\ni\n\nb\nb\n\n' '
 if confirm "Fixture confirmation" "fixture.confirm"; then
-  : > "$CONFIRM_MARKER"
-  printf "CONFIRM=yes\n"
+  : > "$CONFIRM_MARKER"; printf "CONFIRM=yes\n"
 else
   printf "CONFIRM=no rc=%s\n" "$?"
 fi
-
 confirm "Back-capable confirmation" "fixture.back" true
 printf "BACK_ALLOWED_RC=%s\n" "$?"
 confirm "Ordinary confirmation" "fixture.no_back"
 printf "BACK_BLOCKED_RC=%s\n" "$?"
-
-choice=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice")
-printf "CHOICE=%s rc=%s\n" "$choice" "$?"
-
-if print_and_wait "fixture.manual" "fixture manual action" "touch $MANUAL_MARKER"; then
-  printf "MANUAL=acknowledged\n"
-else
-  printf "MANUAL=skipped rc=%s\n" "$?"
-fi
-
-defaulted=$(ask_default "Fixture value" "fixture-default")
-printf "DEFAULT=%s\n" "$defaulted"
-free_i=$(ask "Free i" ""); free_b=$(ask "Free b" ""); free_q=$(ask "Free q" "")
-printf "FREEFORM=%s|%s|%s\n" "$free_i" "$free_b" "$free_q"
-secret_i=$(ask_secret "Secret i" "leave empty"); secret_b=$(ask_secret "Secret b" "leave empty"); secret_q=$(ask_secret "Secret q" "leave empty")
-printf "SECRETS=%s|%s|%s\n" "$secret_i" "$secret_b" "$secret_q"
-' 2>&1) || rc=$?
-  printf -- '--- prompt primitives ---\n%s\n' "$out" > "$TMP/doctor.out"
-
-  if [ "$rc" != "0" ] ||
-     ! printf '%s\n' "$out" | grep -qF 'CONFIRM=no rc=1' ||
-     ! printf '%s\n' "$out" | grep -qF 'INFO fixture.confirm' ||
-     ! printf '%s\n' "$out" | grep -qF 'Please answer y or n, press Enter for No' ||
-     ! printf '%s\n' "$out" | grep -qF 'BACK_ALLOWED_RC=10' ||
-     ! printf '%s\n' "$out" | grep -qF 'Enter = No; i = explain; b = back; q = stop' ||
-     ! printf '%s\n' "$out" | grep -qF 'BACK_BLOCKED_RC=1' ||
-     ! printf '%s\n' "$out" | grep -qF 'Back is not available at this step' ||
-     ! printf '%s\n' "$out" | grep -qF 'CHOICE=2 rc=0' ||
-     ! printf '%s\n' "$out" | grep -qF 'INFO fixture.choice' ||
-     [ "$(printf '%s\n' "$out" | grep -c 'Please enter one of the listed options.')" != "2" ]; then
-    fail_case "$name" "confirm or required-choice controls lost their retry/info/default semantics"; return
+'
+  prompt_stage "$name" confirm || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the confirm fixture exited $PF_RC, expected 0 — it never reached the end"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'MANUAL=acknowledged' ||
-     ! printf '%s\n' "$out" | grep -qF 'INFO fixture.manual' ||
-     ! printf '%s\n' "$out" | grep -qF 'Please press Enter only after running it' ||
-     ! printf '%s\n' "$out" | grep -qF 'DEFAULT=fixture-default' ||
-     [ -e "$confirm_marker" ] || [ -e "$manual_marker" ]; then
-    fail_case "$name" "an Enter default was unclear, changed meaning, or executed the displayed command"; return
+  if ! pf_has 'Please answer y or n, press Enter for No'; then
+    fail_case "$name" "an unparseable answer was not re-asked"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'FREEFORM=i|b|q' ||
-     ! printf '%s\n' "$out" | grep -qF 'SECRETS=i|b|q' ||
-     ! printf '%s\n' "$out" | grep -qF 'Secret i (Enter = leave empty)'; then
-    fail_case "$name" "a navigation key was consumed by a free-form or secret prompt"; return
+  if ! pf_has 'INFO fixture.confirm'; then
+    fail_case "$name" "i at a confirm did not print the explanation"; return
   fi
-
-  # require_choice runs in $(), so q must survive as a literal sentinel for its
-  # parent to interpret; it must not exit from inside the subshell.
-  rc=0
-  out=$(env -u CI TERM=dumb FUNCS="$funcs" CHOICE_MARKER="$choice_marker" \
-      python3 "$PTY_RUN" 10 $'q\n' bash -c '
-eval "$FUNCS"
-BOLD=""; RESET=""
-say() { printf "SAY %s\n" "$*"; }; note() { printf "NOTE %s\n" "$*"; }; warn() { printf "WARN %s\n" "$*"; }
-choice=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice") || exit $?
-printf "CHOICE_SENTINEL=%s\n" "$choice"
-[ "$choice" = q ] || : > "$CHOICE_MARKER"
-' 2>&1) || rc=$?
-  printf -- '--- required-choice q ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'CHOICE_SENTINEL=q' || [ -e "$choice_marker" ]; then
-    fail_case "$name" "require_choice did not return literal q through command substitution"; return
+  if ! pf_has 'CONFIRM=no rc=1'; then
+    fail_case "$name" "Enter at a confirm was not No (status 1)"; return
   fi
-
-  # At a consent prompt q belongs to the whole run. Nothing after the prompt may
-  # execute, and the clean stop still explains that earlier actions are not undone.
-  rc=0
-  out=$(env -u CI TERM=dumb FUNCS="$funcs" QUIT_MARKER="$quit_marker" \
-      python3 "$PTY_RUN" 10 $'q\n' bash -c '
-eval "$FUNCS"
-BOLD=""; RESET=""
-say() { printf "SAY %s\n" "$*"; }; note() { printf "NOTE %s\n" "$*"; }; warn() { printf "WARN %s\n" "$*"; }
-confirm "Fixture confirmation" "fixture.confirm"
-: > "$QUIT_MARKER"
-' 2>&1) || rc=$?
-  printf -- '--- consent q ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if [ "$rc" != "0" ] ||
-     ! printf '%s\n' "$out" | grep -qF 'Stopped here. No further setup actions will run.' ||
-     ! printf '%s\n' "$out" | grep -qF 'does not undo' ||
-     [ -e "$quit_marker" ]; then
-    fail_case "$name" "q did not stop cleanly before the next action"; return
+  if [ -e "$marker" ]; then
+    fail_case "$name" "Enter at a confirm ran the yes branch"; return
   fi
-
+  if ! pf_has 'Enter = No; i = explain; b = back; q = stop'; then
+    fail_case "$name" "a back-capable confirm did not advertise b in its suffix"; return
+  fi
+  if ! pf_has 'BACK_ALLOWED_RC=10'; then
+    fail_case "$name" "b at a back-capable confirm did not return status 10"; return
+  fi
+  # The asymmetry is the rule: the same key at a prompt whose suffix does not offer
+  # it is refused out loud, not silently taken as No.
+  if ! pf_has 'Enter = No; i = explain; q = stop'; then
+    fail_case "$name" "an ordinary confirm advertised b it does not honour"; return
+  fi
+  if ! pf_has 'Back is not available at this step'; then
+    fail_case "$name" "b at a confirm that does not offer it was not refused out loud"; return
+  fi
+  if ! pf_has 'BACK_BLOCKED_RC=1'; then
+    fail_case "$name" "b at a confirm that does not offer it did not fall through to Enter = No"; return
+  fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- require_choice: Enter is an advertised no-op, not a mistake ---
+# Enter at a prompt with no default is a pause, so it gets a note; a wrong answer
+# is a mistake, so it gets the warning. Counting both keeps the two apart — the
+# release that merged them told somebody who paused that they had erred.
+prompt_sub_require_choice() {
+  local name="prompt-require-choice-retry"
+  : > "$TMP/doctor.out"
+  prompt_fixture $'\nnope\n?\n2\n' '
+choice=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice")
+printf "CHOICE=%s rc=%s\n" "$choice" "$?"
+'
+  prompt_stage "$name" require_choice || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the require_choice fixture exited $PF_RC, expected 0"; return
+  fi
+  if ! pf_has 'CHOICE=2 rc=0'; then
+    fail_case "$name" "a valid answer after two retries was not returned"; return
+  fi
+  if ! pf_has 'INFO fixture.choice'; then
+    fail_case "$name" "? at require_choice did not print the explanation"; return
+  fi
+  if ! pf_has 'Enter = ask again; i = explain; q = stop'; then
+    fail_case "$name" "require_choice lost the suffix naming its controls"; return
+  fi
+  if [ "$(pf_count 'Nothing chosen — the options are above.')" != "1" ]; then
+    fail_case "$name" "a blank answer was not treated as a pause exactly once"; return
+  fi
+  if [ "$(pf_count 'Please enter one of the listed options.')" != "1" ]; then
+    fail_case "$name" "a wrong answer was not treated as a mistake exactly once"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- q at a captured primitive: status 11, EMPTY stdout, subshell survives ---
+# There is no literal `q` on stdout any more and there must never be one again:
+# a gateway called "q" is a legal answer, and the release where the sentinel and
+# the answer were the same string minted the permanent id `custom-q`.
+prompt_sub_require_choice_q() {
+  local name="prompt-require-choice-q-status" marker="$TMP/prompt-choice-q-ran"
+  : > "$TMP/doctor.out"; rm -f "$marker"
+  prompt_fixture $'q\n' '
+choice=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice"); rc=$?
+printf "CHOICE_Q=[%s] rc=%s\n" "$choice" "$rc"
+[ "$rc" = 11 ] && [ -z "$choice" ] || : > "$CHOICE_MARKER"
+printf "AFTER_CHOICE_Q=reached\n"
+'
+  prompt_stage "$name" 'require_choice q' || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "q inside \$(…) took the whole fixture down (exit $PF_RC), not just the subshell"; return
+  fi
+  if ! pf_has 'CHOICE_Q=[] rc=11'; then
+    fail_case "$name" "q at require_choice did not return status 11 with an empty answer"; return
+  fi
+  if [ -e "$marker" ]; then
+    fail_case "$name" "the stop intent reached the caller as data rather than as status 11"; return
+  fi
+  if ! pf_has 'AFTER_CHOICE_Q=reached'; then
+    fail_case "$name" "the caller of a captured primitive did not survive q"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- prompt_into: the reason it exists ---
+# A die or an exit inside $(…) kills the subshell only and the caller walks on with
+# an empty answer. prompt_into is the parent-shell half of the contract: it stops the
+# PROCESS on q (status 3, with the wizard's closing wording), hands 10 back to a
+# caller that offered Back, and dies on a closed stdin. One sub-case each.
+prompt_sub_into_q() {
+  local name="prompt-into-q-stops-the-process" marker="$TMP/prompt-after-quit"
+  : > "$TMP/doctor.out"; rm -f "$marker"
+  prompt_fixture $'q\n' '
+prompt_into PICK require_choice "Choose 1-2" "^[12]$" "fixture.choice"
+: > "$QUIT_MARKER"
+printf "AFTER_PROMPT_INTO=reached\n"
+'
+  prompt_stage "$name" 'prompt_into q' || return
+  if [ "$PF_RC" != "3" ]; then
+    fail_case "$name" "q at a captured prompt exited $PF_RC, expected 3 (the operator stopped)"; return
+  fi
+  if pf_has 'AFTER_PROMPT_INTO=reached' || [ -e "$marker" ]; then
+    fail_case "$name" "the process kept running past a q that was supposed to end it"; return
+  fi
+  if ! pf_has 'Stopped here. No further setup actions will run.'; then
+    fail_case "$name" "stopping mid-setup did not print the setup ending"; return
+  fi
+  # The closing paragraph has to say what a stop does NOT do, or an operator who
+  # stops halfway assumes the earlier steps were rolled back.
+  if ! pf_has 'does not undo'; then
+    fail_case "$name" "the closing paragraph did not say a stop does not undo earlier steps"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+prompt_sub_into_back() {
+  local name="prompt-into-b-returns-back"
+  : > "$TMP/doctor.out"
+  prompt_fixture $'b\n' '
+prompt_into PICK require_choice "Choose 1-2" "^[12]$" "fixture.choice" true; rc=$?
+printf "INTO_BACK_RC=%s PICK=[%s]\n" "$rc" "${PICK:-}"
+'
+  prompt_stage "$name" 'prompt_into b' || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "b ended the process (exit $PF_RC) instead of returning to the caller"; return
+  fi
+  if ! pf_has 'INTO_BACK_RC=10 PICK=[]'; then
+    fail_case "$name" "b at a back-capable captured prompt did not reach the caller as status 10 with no value"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+prompt_sub_into_eof() {
+  local name="prompt-into-eof-dies"
+  : > "$TMP/doctor.out"
+  prompt_fixture_piped '' '
+prompt_into PICK require_choice "Choose 1-2" "^[12]$" "fixture.choice"
+printf "AFTER_EOF=reached\n"
+'
+  prompt_stage "$name" 'prompt_into EOF' || return
+  if [ "$PF_RC" != "1" ]; then
+    fail_case "$name" "a closed stdin at a captured prompt exited $PF_RC, expected 1"; return
+  fi
+  if ! pf_has 'No answer (the input ended).'; then
+    fail_case "$name" "the closed-stdin death did not name its cause"; return
+  fi
+  if pf_has 'AFTER_EOF=reached'; then
+    fail_case "$name" "the caller walked on past a prompt nobody answered"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- the literal-value path: a user who genuinely wants the answer "q" ---
+# The control is the Enter default, so the common reading costs no keystroke and the
+# rare literal one costs a single y. b is NOT advertised at these calls, so it is not
+# a control here and must be taken as data with no question at all — that asymmetry
+# is the whole rule, and the zero count below is what pins it.
+prompt_sub_literal_values() {
+  local name="prompt-literal-answer-confirmation"
+  : > "$TMP/doctor.out"
+  prompt_fixture $'i\ny\nb\nq\ny\n' '
+free_i=$(ask "Free i" ""); free_b=$(ask "Free b" ""); free_q=$(ask "Free q" "")
+printf "FREEFORM=%s|%s|%s\n" "$free_i" "$free_b" "$free_q"
+'
+  prompt_stage "$name" 'ask literal values' || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the literal-value fixture exited $PF_RC, expected 0"; return
+  fi
+  if ! pf_has 'FREEFORM=i|b|q'; then
+    fail_case "$name" "a confirmed literal control key was not returned as the answer"; return
+  fi
+  if ! pf_has 'Use "i" as your answer instead of showing an explanation? [y/N]'; then
+    fail_case "$name" "i at a free-form prompt lost its literal-answer question"; return
+  fi
+  if ! pf_has 'Use "q" as your answer instead of stopping the run? [y/N]'; then
+    fail_case "$name" "q at a free-form prompt lost its literal-answer question"; return
+  fi
+  if [ "$(pf_count 'as your answer instead of going back')" != "0" ]; then
+    fail_case "$name" "a prompt that never offered b still bargained over it"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# …and the same keys, declined, do what the suffix promises.
+prompt_sub_literal_declined() {
+  local name="prompt-literal-declined-falls-through"
+  : > "$TMP/doctor.out"
+  prompt_fixture $'i\n\ntyped\nq\n\n' '
+v=$(ask "Ctrl i" "" "leave blank" "fixture.value"); printf "CTRL_VALUE=%s\n" "$v"
+w=$(ask "Ctrl q" "" "leave blank" "fixture.value"); printf "CTRL_Q_RC=%s w=[%s]\n" "$?" "$w"
+'
+  prompt_stage "$name" 'ask controls' || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the declined-literal fixture exited $PF_RC, expected 0"; return
+  fi
+  if ! pf_has 'INFO fixture.value'; then
+    fail_case "$name" "a declined literal i did not fall through to the explanation"; return
+  fi
+  if ! pf_has 'CTRL_VALUE=typed'; then
+    fail_case "$name" "the prompt did not come back for a real answer after explaining"; return
+  fi
+  if ! pf_has 'CTRL_Q_RC=11 w=[]'; then
+    fail_case "$name" "a declined literal q did not fall through to the stop control"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- ask_secret: no literal question, because there is nothing to disambiguate ---
+# A bearer token that is exactly one character is not a real token. Taking q as a
+# control costs a stop the operator asked for; taking it as data costs a run that
+# authenticates with the byte "q" and fails minutes later somewhere else entirely.
+# Back is not offered at all — a hidden prompt has no visible state to return to —
+# so b is data here.
+prompt_sub_secret() {
+  local name="prompt-secret-controls"
+  : > "$TMP/doctor.out"
+  prompt_fixture $'i\nb\nq\n' '
+s1=$(ask_secret "Secret one" "leave empty" "fixture.secret"); printf "SECRET1=[%s] rc=%s\n" "$s1" "$?"
+s2=$(ask_secret "Secret two" "leave empty" "fixture.secret"); printf "SECRET2=[%s] rc=%s\n" "$s2" "$?"
+'
+  prompt_stage "$name" ask_secret || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the hidden-prompt fixture exited $PF_RC, expected 0"; return
+  fi
+  if ! pf_has 'Secret one (Enter = leave empty; i = explain; q = stop)'; then
+    fail_case "$name" "the hidden prompt's suffix no longer names exactly the keys it honours"; return
+  fi
+  if ! pf_has 'INFO fixture.secret'; then
+    fail_case "$name" "i at a hidden prompt did not explain"; return
+  fi
+  if ! pf_has 'SECRET1=[b] rc=0'; then
+    fail_case "$name" "b at a hidden prompt was taken as a control instead of as data"; return
+  fi
+  if ! pf_has 'SECRET2=[] rc=11'; then
+    fail_case "$name" "q at a hidden prompt did not stop with status 11 and an empty answer"; return
+  fi
+  if [ "$(pf_count 'as your answer instead of')" != "0" ]; then
+    fail_case "$name" "the hidden prompt started bargaining over a one-character secret"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- Enter defaults, and the echo of whatever the value resolved to ---
+prompt_sub_default() {
+  local name="prompt-default-and-resolved-echo"
+  : > "$TMP/doctor.out"
+  prompt_fixture $'\nover\n' '
+d1=$(ask_default "Fixture value" "fixture-default"); printf "DEFAULT=%s\n" "$d1"
+d2=$(ask_default "Fixture value" "fixture-default"); printf "TYPED=%s\n" "$d2"
+'
+  prompt_stage "$name" ask_default || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the ask_default fixture exited $PF_RC, expected 0"; return
+  fi
+  if ! pf_has 'Press Enter to use: fixture-default'; then
+    fail_case "$name" "ask_default no longer shows the value Enter would take"; return
+  fi
+  if ! pf_has 'DEFAULT=fixture-default'; then
+    fail_case "$name" "Enter at ask_default did not take the default"; return
+  fi
+  if ! pf_has 'TYPED=over'; then
+    fail_case "$name" "a typed answer did not override the default"; return
+  fi
+  if ! pf_has '→ using over'; then
+    fail_case "$name" "ask_default did not echo the value it resolved to"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- the EOF row of the contract, primitive by primitive ---
+# Two different answers, both correct, and the split is the point. A DEFAULTED prompt
+# takes its default — that is what makes a scripted run reproducible — but never in
+# silence. Everything else returns nonzero, because "nobody answered" and "somebody
+# chose the empty answer" must never be the same value: ask_secret returning 0 with
+# an empty string is how a redirected run infers no-auth from a missing answer, which
+# is the fail-closed-auth invariant in one line.
+#
+# This one sub-case covers eight primitives because they share ONE fixture run — a
+# closed stdin cannot be reopened between them — and splitting it further would mean
+# eight PTY-free runs of the same shape for no extra signal.
+prompt_sub_eof_all() {
+  local name="prompt-eof-at-every-primitive" marker="$TMP/prompt-manual-ran"
+  : > "$TMP/doctor.out"; rm -f "$marker"
+  prompt_fixture_piped '' '
+a=$(ask "Free" "the-default"); printf "ASK_EOF=%s rc=%s\n" "$a" "$?"
+b=$(ask "Blank" "" "leave blank"); printf "BLANK_EOF=[%s] rc=%s\n" "$b" "$?"
+d=$(ask_default "Defaulted" "dflt"); printf "ASKDEF_EOF=%s rc=%s\n" "$d" "$?"
+s=$(ask_secret "Secret" "leave empty"); printf "SECRET_EOF=[%s] rc=%s\n" "$s" "$?"
+c=$(require_choice "Choose 1-2" "^[12]$"); printf "CHOICE_EOF=[%s] rc=%s\n" "$c" "$?"
+u=$(ask_url "Address" "https://ai.example.com"); printf "URL_EOF=[%s] rc=%s\n" "$u" "$?"
+confirm "Consent"; printf "CONFIRM_EOF_RC=%s\n" "$?"
+print_and_wait "fixture.manual" "fixture manual action" "touch $MANUAL_MARKER"
+printf "MANUAL_EOF_RC=%s\n" "$?"
+'
+  prompt_stage "$name" 'EOF at every primitive' || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the EOF fixture exited $PF_RC, expected 0 — it never reached the last primitive"; return
+  fi
+  # The two that take a default at EOF — and say so.
+  if ! pf_has 'ASK_EOF=the-default rc=0' || ! pf_has 'ASKDEF_EOF=dflt rc=0'; then
+    fail_case "$name" "a defaulted prompt did not take its default at EOF"; return
+  fi
+  if ! pf_has 'No answer — using the default: the-default'; then
+    fail_case "$name" "a default was taken at EOF in silence"; return
+  fi
+  if ! pf_has 'BLANK_EOF=[] rc=0' || ! pf_has 'No answer — leaving this blank (leave blank).'; then
+    fail_case "$name" "an explicitly-blankable prompt did not record leaving itself blank"; return
+  fi
+  # …and the ones that must NOT: an empty answer and no answer cannot share a status.
+  if ! pf_has 'SECRET_EOF=[] rc=1'; then
+    fail_case "$name" "ask_secret returned success at EOF — a redirected run would read that as no-auth"; return
+  fi
+  if ! pf_has 'CHOICE_EOF=[] rc=1'; then
+    fail_case "$name" "require_choice returned success at EOF"; return
+  fi
+  if ! pf_has 'URL_EOF=[] rc=1'; then
+    fail_case "$name" "ask_url returned success at EOF"; return
+  fi
+  if ! pf_has 'CONFIRM_EOF_RC=1' || ! pf_has 'No answer — treating this as No: Consent'; then
+    fail_case "$name" "confirm did not fail closed, out loud, at EOF"; return
+  fi
+  if ! pf_has 'MANUAL_EOF_RC=1' || ! pf_has 'No answer — treating this step as skipped.'; then
+    fail_case "$name" "print_and_wait did not fail closed, out loud, at EOF"; return
+  fi
+  if [ -e "$marker" ]; then
+    fail_case "$name" "an unanswered print_and_wait ran the displayed command"; return
+  fi
+  # Under a pipe `read -r -p` prints nothing, so these lines can only have come from
+  # prompt_echo. Without it a machine driver sees a menu and then silence.
+  if ! pf_has 'Free (Enter = the-default; i = explain; q = stop):' ||
+     ! pf_has 'Choose 1-2 (Enter = ask again; i = explain; q = stop):' ||
+     ! pf_has 'Consent [y/N] (Enter = No; i = explain; q = stop):'; then
+    fail_case "$name" "a prompt was invisible under a pipe — prompt_echo did not re-emit it"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- print_and_wait: Enter means No, exactly as it does at every confirm ---
+# This prompt and a mutation gate sit six lines apart in the gateway step. If Enter
+# here asserted "yes, I already ran your command", anybody in Enter-rhythm would
+# claim to have applied a config change they never applied — and the tool would then
+# diagnose the resulting failure as a gateway fault. The marker file proves the other
+# half: the displayed command is never executed for you.
+prompt_sub_print_and_wait() {
+  local name="prompt-and-wait-enter-is-no" marker="$TMP/prompt-manual-ran"
+  : > "$TMP/doctor.out"; rm -f "$marker"
+  prompt_fixture $'bogus\ni\n\ny\n' '
+if print_and_wait "fixture.manual" "fixture manual action" "touch $MANUAL_MARKER"; then
+  printf "MANUAL1=acknowledged\n"; else printf "MANUAL1=skipped rc=%s\n" "$?"; fi
+if print_and_wait "fixture.manual" "fixture manual action" "touch $MANUAL_MARKER"; then
+  printf "MANUAL2=acknowledged\n"; else printf "MANUAL2=skipped rc=%s\n" "$?"; fi
+'
+  prompt_stage "$name" print_and_wait || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the print_and_wait fixture exited $PF_RC, expected 0"; return
+  fi
+  if ! pf_has 'Did you run it? [y/N] (Enter = No, skip; i = explain; q = stop)'; then
+    fail_case "$name" "print_and_wait's suffix no longer says Enter skips"; return
+  fi
+  if ! pf_has 'INFO fixture.manual'; then
+    fail_case "$name" "i at print_and_wait did not explain"; return
+  fi
+  if ! pf_has 'MANUAL1=skipped rc=1'; then
+    fail_case "$name" "Enter at print_and_wait claimed the command had been run"; return
+  fi
+  if ! pf_has 'MANUAL2=acknowledged'; then
+    fail_case "$name" "y at print_and_wait was not taken as an acknowledgement"; return
+  fi
+  if [ -e "$marker" ]; then
+    fail_case "$name" "print_and_wait executed the command it only meant to display"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- the q ROW of the contract, across all five captured primitives at once ---
+# The row every other sub-case only samples: q at a value prompt returns 11 with an
+# EMPTY answer and does not stop anything itself. It cannot: all five are captured
+# with $(…), so an exit or a die inside one kills the subshell and the wizard walks
+# on with a blank value — the single behaviour this whole contract was rebuilt to
+# remove. AFTER_ALL below is the proof that the parent survived all five.
+#
+# The other half is the emptiness. There is no `q` sentinel on stdout any more and
+# there must never be one again: a gateway genuinely called "q" is a legal answer,
+# and the release where the stop key and the answer were the same string minted the
+# permanent id custom-q — the id the systemd unit, the credential file and the saved
+# profile were all filed under.
+prompt_sub_q_every_value() {
+  local name="prompt-q-status-at-every-value-primitive"
+  : > "$TMP/doctor.out"
+  # q, then n to decline the literal question at the two free-text prompts; ask_url,
+  # ask_secret and require_choice never bargain, so their q is one keystroke.
+  prompt_fixture $'q\nn\nq\nn\nq\nq\nq\n' '
+a=$(ask "Free" "" "leave blank" "fixture.value");            printf "QASK=[%s] rc=%s\n" "$a" "$?"
+d=$(ask_default "Defaulted" "dflt" "fixture.value");         printf "QDEF=[%s] rc=%s\n" "$d" "$?"
+u=$(ask_url "Address" "https://ai.example.com" 0 "" "fixture.value"); printf "QURL=[%s] rc=%s\n" "$u" "$?"
+s=$(ask_secret "Secret" "leave empty" "fixture.secret");     printf "QSEC=[%s] rc=%s\n" "$s" "$?"
+c=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice");  printf "QCHOICE=[%s] rc=%s\n" "$c" "$?"
+printf "AFTER_ALL=reached\n"
+'
+  prompt_stage "$name" 'q at every value primitive' || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "a captured primitive stopped the process itself on q (exit $PF_RC) — only the caller may do that"; return
+  fi
+  if ! pf_has 'QASK=[] rc=11'; then
+    fail_case "$name" "q at ask did not return status 11 with an empty answer"; return
+  fi
+  if ! pf_has 'QDEF=[] rc=11'; then
+    fail_case "$name" "q at ask_default did not return status 11 with an empty answer"; return
+  fi
+  if ! pf_has 'QURL=[] rc=11'; then
+    fail_case "$name" "q at ask_url did not return status 11 with an empty answer"; return
+  fi
+  if ! pf_has 'QSEC=[] rc=11'; then
+    fail_case "$name" "q at ask_secret did not return status 11 with an empty answer"; return
+  fi
+  if ! pf_has 'QCHOICE=[] rc=11'; then
+    fail_case "$name" "q at require_choice did not return status 11 with an empty answer"; return
+  fi
+  if ! pf_has 'AFTER_ALL=reached'; then
+    fail_case "$name" "the caller did not survive q at all five captured primitives"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- the b ROW: a key is a control IF AND ONLY IF the suffix advertises it ---
+# Both directions, at every primitive that can offer Back, because both failures are
+# real and they point opposite ways. Honouring b where it was never advertised
+# discards an answer the operator meant literally; refusing it where the suffix
+# promised it strands them at the one step that was supposed to be reversible.
+#
+# The three primitives answer an unadvertised b differently, and that is by design,
+# not drift: at a FREE-TEXT prompt "b" is a plausible value so it is taken as data,
+# while at a URL prompt and at a numbered choice nothing that spells b can ever be a
+# legal answer, so it is refused out loud and re-asked.
+prompt_sub_back_advertised() {
+  local name="prompt-back-only-where-advertised"
+  : > "$TMP/doctor.out"
+  # b,n (backable default) · b (plain default, data) · b (backable URL) ·
+  # b,URL (plain URL, refused then answered) · b,1 (choice, refused then answered)
+  prompt_fixture $'b\nn\nb\nb\nb\nhttps://ai.example.com\nb\n1\n' '
+d1=$(ask_default "Backable default" "dflt" "fixture.value" true); printf "DBACK=[%s] rc=%s\n" "$d1" "$?"
+d2=$(ask_default "Plain default" "dflt" "fixture.value");         printf "DPLAIN=[%s] rc=%s\n" "$d2" "$?"
+u1=$(ask_url "Backable address" "https://ai.example.com" 0 "" "fixture.value" true); printf "UBACK=[%s] rc=%s\n" "$u1" "$?"
+u2=$(ask_url "Plain address" "https://ai.example.com" 0 "" "fixture.value");         printf "UPLAIN=[%s] rc=%s\n" "$u2" "$?"
+c=$(require_choice "Choose 1-2" "^[12]$" "fixture.choice");       printf "CPLAIN=[%s] rc=%s\n" "$c" "$?"
+'
+  prompt_stage "$name" 'b only where advertised' || return
+  if [ "$PF_RC" != "0" ]; then
+    fail_case "$name" "the back-contract fixture exited $PF_RC, expected 0 — it never reached the last prompt"; return
+  fi
+  # Advertised, at each of the two primitives that can offer it.
+  if ! pf_has '(or type a value; i = explain; b = back; q = stop)'; then
+    fail_case "$name" "a back-capable ask_default did not advertise b in its suffix"; return
+  fi
+  if ! pf_has 'DBACK=[] rc=10'; then
+    fail_case "$name" "b at a back-capable ask_default did not return status 10 with no value"; return
+  fi
+  if ! pf_has 'Enter = ask again; i = explain; b = back; q = stop'; then
+    fail_case "$name" "a back-capable ask_url did not advertise b in its suffix"; return
+  fi
+  if ! pf_has 'UBACK=[] rc=10'; then
+    fail_case "$name" "b at a back-capable ask_url did not return status 10 with no value"; return
+  fi
+  # …and NOT advertised: same key, same release, three refusals that each fit the
+  # prompt they belong to.
+  if ! pf_has '(or type a value; i = explain; q = stop)'; then
+    fail_case "$name" "an ordinary ask_default advertised a b it does not honour"; return
+  fi
+  if ! pf_has 'DPLAIN=[b] rc=0'; then
+    fail_case "$name" "b at a free-text prompt that never offered it was taken as a control instead of as data"; return
+  fi
+  if ! pf_has 'Back is not available at this step; type an https:// URL'; then
+    fail_case "$name" "b at an ask_url that does not offer it was not refused out loud"; return
+  fi
+  if ! pf_has 'UPLAIN=[https://ai.example.com] rc=0'; then
+    fail_case "$name" "the refused b did not leave ask_url asking for a real address"; return
+  fi
+  if ! pf_has 'Back is not available at this step; choose one of the options above'; then
+    fail_case "$name" "b at a require_choice that does not offer it was not refused out loud"; return
+  fi
+  if ! pf_has 'CPLAIN=[1] rc=0'; then
+    fail_case "$name" "the refused b did not leave require_choice asking for a real option"; return
+  fi
+  # Exactly once, at the ONE prompt where b is both advertised and ambiguous. A URL
+  # prompt and a numbered choice have no answer that spells b, so bargaining there
+  # would be a question with only one possible answer.
+  if [ "$(pf_count 'as your answer instead of going back')" != "1" ]; then
+    fail_case "$name" "the literal-b question was asked somewhere other than the one free-text prompt that offers b"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --- the two prompts that are NOT captured, and therefore act on q themselves ---
+# confirm and print_and_wait are called as commands, not inside $(…), so they are the
+# only prompts in the tool that can and must call quit_run directly. The asymmetry is
+# load-bearing in the other direction too: if either ever started RETURNING 11 like a
+# value primitive, every `if confirm …; then` site would read that nonzero as "No" and
+# the run would walk straight past a stop the operator asked for — silently, because a
+# declined gate looks exactly like a normal answer.
+prompt_sub_uncaptured_q() {
+  local name="prompt-uncaptured-q-stops-the-run" marker="$TMP/prompt-manual-ran"
+  : > "$TMP/doctor.out"; rm -f "$marker"
+  prompt_fixture $'q\n' '
+confirm "Fixture confirmation" "fixture.confirm"
+printf "CONFIRM_AFTER_Q=reached rc=%s\n" "$?"
+'
+  prompt_stage "$name" 'confirm q' || return
+  if [ "$PF_RC" != "3" ]; then
+    fail_case "$name" "q at a confirm exited $PF_RC, expected 3 (the operator stopped)"; return
+  fi
+  if pf_has 'CONFIRM_AFTER_Q=reached'; then
+    fail_case "$name" "q at a confirm returned a status to the caller instead of ending the run"; return
+  fi
+  if ! pf_has 'Stopped here. No further setup actions will run.'; then
+    fail_case "$name" "stopping at a confirm did not print the setup ending"; return
+  fi
+  prompt_fixture $'q\n' '
+print_and_wait "fixture.manual" "fixture manual action" "touch $MANUAL_MARKER"
+printf "MANUAL_AFTER_Q=reached rc=%s\n" "$?"
+'
+  prompt_stage "$name" 'print_and_wait q' || return
+  if [ "$PF_RC" != "3" ]; then
+    fail_case "$name" "q at a print_and_wait exited $PF_RC, expected 3 (the operator stopped)"; return
+  fi
+  if pf_has 'MANUAL_AFTER_Q=reached'; then
+    fail_case "$name" "q at a print_and_wait returned a status to the caller instead of ending the run"; return
+  fi
+  if [ -e "$marker" ]; then
+    fail_case "$name" "a print_and_wait the operator stopped at still ran the command it only meant to display"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+run_prompt_controls_cases() {
+  local sub any=false
+  for sub in $PROMPT_SUBCASES; do
+    if prompt_case_wanted "$sub"; then any=true; break; fi
+  done
+  [ "$any" = true ] || return 0
+  prompt_controls_lift || return 0
+  prompt_case_wanted prompt-confirm-controls            && prompt_sub_confirm
+  prompt_case_wanted prompt-require-choice-retry        && prompt_sub_require_choice
+  prompt_case_wanted prompt-require-choice-q-status     && prompt_sub_require_choice_q
+  prompt_case_wanted prompt-into-q-stops-the-process    && prompt_sub_into_q
+  prompt_case_wanted prompt-into-b-returns-back         && prompt_sub_into_back
+  prompt_case_wanted prompt-into-eof-dies               && prompt_sub_into_eof
+  prompt_case_wanted prompt-literal-answer-confirmation && prompt_sub_literal_values
+  prompt_case_wanted prompt-literal-declined-falls-through && prompt_sub_literal_declined
+  prompt_case_wanted prompt-secret-controls             && prompt_sub_secret
+  prompt_case_wanted prompt-default-and-resolved-echo   && prompt_sub_default
+  prompt_case_wanted prompt-eof-at-every-primitive      && prompt_sub_eof_all
+  prompt_case_wanted prompt-and-wait-enter-is-no        && prompt_sub_print_and_wait
+  prompt_case_wanted prompt-q-status-at-every-value-primitive && prompt_sub_q_every_value
+  prompt_case_wanted prompt-back-only-where-advertised  && prompt_sub_back_advertised
+  prompt_case_wanted prompt-uncaptured-q-stops-the-run  && prompt_sub_uncaptured_q
+  return 0
 }
 
 # A syntactically valid port can still be the wrong server. The review screen is
@@ -1177,14 +2044,26 @@ run_custom_review_back_case() {
   local home="$TMP/custom-review-home" state="$TMP/custom-review-state"
   mkdir -p "$home" "$state"
   PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
-  # Per pass: name, n = no https URL, the port, 2 = keyless (the auth question is
+  # Per pass: name, n = no https URL, t, the port, 2 = keyless (the auth question is
   # a numbered choice under --dry-run, which never solicits a real token), Enter
   # = no model, then b / Enter at the review. A final q stops in Step 3.
-  pty_run 10 $'Wrong gateway\nn\n1111\n2\n\nb\nCorrected gateway\nn\n2222\n2\n\n\nq\n' \
+  #
+  # The `t` before each port answer is what makes this case machine-independent. The
+  # port step now offers a numbered list of whatever is LISTENING on this host first,
+  # and that list exists on a developer laptop and not on a clean runner — so a bare
+  # "1111" answers the picker on one machine and the typed prompt on the other, and
+  # every later keystroke lands one prompt out of step. `t` takes the "type it
+  # myself" row when there IS a list, and is a silent no-op at the typed prompt when
+  # there is not. That property exists so this case can be written once.
+  pty_run 10 $'Wrong gateway\nn\nt\n1111\n2\n\nb\nCorrected gateway\nn\nt\n2222\n2\n\n\nq\n' \
     --generic --dry-run > "$TMP/doctor.out" 2>&1 || rc=$?
 
   review_count=$(grep -c 'Review this gateway' "$TMP/doctor.out")
-  if [ "$rc" != "0" ] || [ "$review_count" != "2" ] ||
+  # 3, not 0: the final `q` lands at the exposure menu — mid-flow, after the
+  # operator has answered real questions — and a run abandoned there is exactly
+  # what exit 3 is for. A wrapper that read this as 0 would record an aborted
+  # setup as a completed pairing.
+  if [ "$rc" != "3" ] || [ "$review_count" != "2" ] ||
      ! grep -qF 'Name:           Wrong gateway' "$TMP/doctor.out" ||
      ! grep -qF 'Address:        http://127.0.0.1:1111 (local; HTTPS comes next)' "$TMP/doctor.out" ||
      ! grep -qF '↩ Re-entering the custom gateway answers. Nothing has been changed.' "$TMP/doctor.out" ||
@@ -1203,18 +2082,110 @@ run_custom_review_back_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# THE regression this release exists to prevent, at the real call site rather than at
+# a fixture. "A short name for it (shown in the app)" is a free-text prompt whose
+# answer becomes a permanent id: press q there in the old release and the gateway was
+# NAMED q, filed forever under `custom-q`, and the systemd unit, the credential file
+# and the saved profile all inherited it — discovered weeks later by somebody who
+# never typed a name.
+#
+# Two lanes, one keystroke apart, and the pair is the assertion. `Filed under:
+# custom-q` must be ABSENT when the operator declines the literal question (they meant
+# to stop) and PRESENT when they confirm it (they meant the letter). Neither half
+# means anything alone: the absence needs the lane that proves the string can appear
+# here at all, and the presence needs the lane that proves it is not the default
+# reading of a q.
+#
+# --dry-run because the point is what the wizard DECIDES, not what it writes; the
+# state assertion below then also covers the dry-run contract of writing nothing.
+run_custom_name_q_case() { # run_custom_name_q_case <declined|confirmed>
+  local lane="$1" name rc=0 asked
+  local home="$TMP/name-q-$lane-home" state="$TMP/name-q-$lane-state"
+  mkdir -p "$home" "$state"
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+  if [ "$lane" = declined ]; then
+    name="custom-name-q-declined-stops-the-run"
+    # q, then n: "no, I did not mean the letter" — which is the Enter default too.
+    pty_run 10 $'q\nn\n' --generic --dry-run > "$TMP/doctor.out" 2>&1 || rc=$?
+  else
+    name="custom-name-q-confirmed-is-the-name"
+    # q, y, then an ordinary custom-server pass: n = no https URL yet, t = type the
+    # port myself (a silent no-op when this host offers no listening-port list —
+    # same machine-independence trick as custom-review-back-corrects-port), the
+    # port, 2 = keyless, Enter = no model, Enter = accept the review, q = stop in
+    # Step 3 once the name has been carried the whole way.
+    pty_run 15 $'q\ny\nn\nt\n1111\n2\n\n\nq\n' --generic --dry-run > "$TMP/doctor.out" 2>&1 || rc=$?
+  fi
+
+  # Asked, and asked ONCE. A prompt that re-bargained on every later question would
+  # train the operator to type y without reading it.
+  asked=$(grep -c 'Use "q" as your answer instead of stopping the run?' "$TMP/doctor.out")
+  if [ "$asked" != "1" ]; then
+    fail_case "$name" "the literal-q question was asked $asked times at the name prompt, expected 1"; return
+  fi
+  # Both lanes reach the naming step — without this the id assertions below are
+  # vacuous, because a run that never named anything also never files anything.
+  if ! grep -qF 'A short name for it (shown in the app)' "$TMP/doctor.out"; then
+    fail_case "$name" "the run never reached the prompt whose answer becomes the id"; return
+  fi
+  if [ "$lane" = declined ]; then
+    if [ "$rc" != "3" ]; then
+      fail_case "$name" "a declined literal q exited $rc, expected 3 (the operator stopped)"; return
+    fi
+    if grep -qF 'Filed under:    custom-q' "$TMP/doctor.out"; then
+      fail_case "$name" "q at the name prompt minted the permanent id custom-q — the exact regression"; return
+    fi
+    if grep -qF 'Step 3 — how should your phone reach this gateway?' "$TMP/doctor.out"; then
+      fail_case "$name" "a stop at the name prompt carried on into the exposure step"; return
+    fi
+    if ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
+      fail_case "$name" "a declined literal q did not end the run the way an operator stop ends it"; return
+    fi
+  else
+    if [ "$rc" != "3" ]; then
+      fail_case "$name" "the confirmed-literal pass exited $rc, expected 3 from the q in Step 3"; return
+    fi
+    if ! grep -qF 'Name:           q' "$TMP/doctor.out"; then
+      fail_case "$name" "a confirmed literal q was not accepted as the gateway's name"; return
+    fi
+    if ! grep -qF 'Filed under:    custom-q' "$TMP/doctor.out"; then
+      fail_case "$name" "the confirmed name did not reach the id the profile and service files use"; return
+    fi
+    if ! grep -qF 'Step 3 — how should your phone reach this gateway?' "$TMP/doctor.out"; then
+      fail_case "$name" "the confirmed name did not survive the review into the exposure step"; return
+    fi
+  fi
+  if [ -n "$(find "$home" "$state" -type f -print -quit 2>/dev/null)" ]; then
+    fail_case "$name" "a dry run wrote a file"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_menu_setup_case() {
   local name="menu-action-1-setup" rc=0
   local home="$TMP/menu-setup-home" state="$TMP/menu-setup-state"
-  # 1 = setup, 3 = another server, Enter = default name, n = local,
-  # Enter = invalid blank port (which re-prompts), q = deliberate clean stop.
+  # 1 = setup, 3 = another server, Enter = default name, n = local, t, Enter =
+  # blank port (an advertised no-op that re-asks), q = deliberate stop.
+  #
+  # `t` is here for the same reason as in custom-review-back-corrects-port: the
+  # port step offers a list of whatever is LISTENING first, and that list exists
+  # on a developer laptop and not on a clean runner. `t` takes the "type it
+  # myself" row when there is a list and is a silent no-op at the typed prompt
+  # when there is not, so the keystrokes after it line up on either machine.
   mkdir -p "$home" "$state"
   PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
-  pty_run 10 $'1\n3\n\nn\n\nq\n' > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" != "0" ] ||
+  # The final Enter answers `Enter = stop; m = back to the menu`: a run stopped
+  # from inside the hub offers the way back rather than ending the session, and
+  # Enter takes the stop.
+  pty_run 10 $'1\n3\n\nn\nt\n\nq\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  # 3: q mid-setup is an abandoned run, and the hub propagates the action's own
+  # status rather than swallowing it — the whole reason a wrapper can tell an
+  # aborted setup from a finished one.
+  if [ "$rc" != "3" ] ||
      ! grep -qF 'Step 1 — find your gateway' "$TMP/doctor.out" ||
      ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out" ||
-     ! grep -qF 'A local setup needs a port. Enter its number, or press b to restart these answers and choose HTTPS.' "$TMP/doctor.out" ||
+     ! grep -qF 'Nothing entered — a server running on this machine needs its port number.' "$TMP/doctor.out" ||
      ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
     fail_case "$name" "menu option 1 did not retry the blank port and stop cleanly"; return
   fi
@@ -1222,23 +2193,52 @@ run_menu_setup_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# The safety invariant: finding OpenClaw on this machine must never make Enter
+# MEAN OpenClaw. A detected gateway is evidence offered to the operator, not a
+# default applied on their behalf, and the cost of getting it wrong is a wizard
+# that reconfigures the wrong program without being asked to.
+#
+# Every condition below gets its OWN failure message, and that is the point of
+# this case's history rather than a style preference. It used to test five
+# unrelated things through one `||` chain with one message ("a detected gateway
+# was treated as an Enter default"). When the exit status of a deliberate stop
+# changed from 0 to 3, this case went red with that sentence — which reads as the
+# safety invariant breaking, and is not what happened. One message covering five
+# conditions cannot tell you which one moved, and the one it names is the one
+# somebody will act on.
 run_detected_requires_choice_case() {
   local name="setup-detected-still-requires-choice" rc=0 home="$TMP/detected-home"
   mkdir -p "$home/.openclaw"
   printf '{}\n' > "$home/.openclaw/openclaw.json"
   # Blank at the gateway question must re-prompt even though OpenClaw is found;
-  # 3 then proves the user can deliberately configure another server.
+  # 3 then proves the user can deliberately configure another server. `t` absorbs
+  # the listening-ports picker on a machine that has one (see menu-action-1-setup).
   PTY_ENV=(HOME="$home")
-  pty_run 10 $'\n3\n\nn\n\nq\n' --setup > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" != "0" ] ||
-     ! grep -qF 'We found these on this machine: openclaw' "$TMP/doctor.out" ||
-     ! grep -qF 'Please enter one of the listed options.' "$TMP/doctor.out" ||
-     ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out" ||
-     ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
-    fail_case "$name" "a detected gateway was treated as an Enter default"; return
-  fi
+  pty_run 10 $'\n3\n\nn\nt\n\nq\n' --setup > "$TMP/doctor.out" 2>&1 || rc=$?
+
+  # THE invariant, asserted first and alone, so it is graded whatever else moved.
   if grep -qF 'Step 2 — OpenClaw' "$TMP/doctor.out"; then
-    fail_case "$name" "blank input silently selected detected OpenClaw"; return
+    fail_case "$name" "blank input silently selected the detected OpenClaw"; return
+  fi
+  if ! grep -qF 'We found these on this machine: openclaw' "$TMP/doctor.out"; then
+    fail_case "$name" "the run never reported the detection — the invariant above is untested"; return
+  fi
+  # Blank at a no-default choice is a PAUSE, not an error: the operator is told
+  # the options are still there rather than told off. A run that answered the
+  # blank with a selection would print neither.
+  if ! grep -qF 'Nothing chosen — the options are above.' "$TMP/doctor.out"; then
+    fail_case "$name" "a blank answer at the gateway question was not re-asked"; return
+  fi
+  if ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out"; then
+    fail_case "$name" "answering 3 after the blank did not reach custom-server setup"; return
+  fi
+  if ! grep -qF 'Stopped here. No further setup actions will run.' "$TMP/doctor.out"; then
+    fail_case "$name" "q did not stop the wizard cleanly"; return
+  fi
+  # Last, because it is the weakest claim of the five and the one most likely to
+  # be re-decided: 3 = the operator stopped a run partway.
+  if [ "$rc" != "3" ]; then
+    fail_case "$name" "a deliberate stop mid-setup exited $rc, expected 3"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -1252,9 +2252,14 @@ run_menu_check_case() { # run_menu_check_case <server|adapter>
     choice=3; prefix="CONDUCK_CHECK_ADAPTER"
   fi
   start_fixture good || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
-  local input
-  input="$choice"$'\nhttp://127.0.0.1:'"$PORT"$'\nn\n'
-  PTY_ENV=(CONDUCK_TOKEN="$TOKEN")
+  local input state="$TMP/menu-check-$kind-state"
+  mkdir -p "$state"
+  # The trailing Enter answers the hub: an action entered from the menu ends by
+  # OFFERING the menu again ("Enter = done; m = back to the menu"), and Enter is
+  # "done". Without it this case would sit at that question until the PTY timeout
+  # and report a hang as a failed check.
+  input="$choice"$'\nhttp://127.0.0.1:'"$PORT"$'\nn\n\n'
+  PTY_ENV=(CONDUCK_TOKEN="$TOKEN" XDG_CONFIG_HOME="$state")
   pty_run 30 "$input" > "$TMP/doctor.out" 2>&1 || rc=$?
   stop_fixture
   if [ "$(grep -c "^$prefix schema=" "$TMP/doctor.out")" != "1" ]; then
@@ -1266,9 +2271,16 @@ run_menu_check_case() { # run_menu_check_case <server|adapter>
      ! grep -qF 'No setup changes were made.' "$TMP/doctor.out"; then
     fail_case "$name" "menu check did not PASS and offer setup"; return
   fi
-  if ! grep -qF '2) Check existing OpenAI-compatible software (not built for Conduck)' "$TMP/doctor.out" ||
-     ! grep -qF '3) Check an adapter built specifically for Conduck' "$TMP/doctor.out"; then
+  # The provenance decision, plus the word that stops a first-timer reading three
+  # equal-looking options and picking the wrong one. "Diagnostic; changes nothing"
+  # is the only thing on the list that says an option is safe to try.
+  if ! grep -qF '2) Check a server that was NOT built for Conduck (diagnostic; changes nothing)' "$TMP/doctor.out" ||
+     ! grep -qF '3) Check an adapter built for Conduck (diagnostic; changes nothing)' "$TMP/doctor.out"; then
     fail_case "$name" "the menu did not state the built-for-Conduck provenance decision"; return
+  fi
+  # The hub really did offer to come back, rather than the run simply ending.
+  if ! grep -qF 'Enter = done; m = back to the menu' "$TMP/doctor.out"; then
+    fail_case "$name" "an action entered from the menu did not end by offering the menu again"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -1285,46 +2297,104 @@ run_menu_show_code_case() {
   write_valid_profile "$state/conduck/profile-custom-good.json" \
     "custom-good" "Good gateway" "https://good.example.test"
   PTY_ENV=(XDG_CONFIG_HOME="$state")
-  pty_run 10 $'4\n\004' > "$TMP/doctor.out" 2>&1 || rc=$?
+  # 4, then Enter at the hidden token prompt. Enter there is the ADVERTISED stop
+  # ("Enter = stop; this saved setup requires a token"), which is a better subject
+  # than an EOT: it grades the meaning the prompt printed rather than the shell's
+  # end-of-input, and it is what an operator who does not have the token to hand
+  # actually presses.
+  pty_run 10 $'4\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
   if [ "$rc" = "0" ] ||
      ! grep -qF '4) Show a saved setup code' "$TMP/doctor.out"; then
     fail_case "$name" "menu did not offer option 4 for a complete saved profile"; return
   fi
-  # DISPATCH, not menu text: these are printed only by the --show-code path.
-  if ! grep -qF 'Re-show your pairing code — skips setup and changes no configuration' "$TMP/doctor.out"; then
+  # DISPATCH, not menu text: this heading is printed only by the --show-code path.
+  # "setup code" is the app's word for the thing and the only one used here — the
+  # screen and the menu entry that opens it once disagreed one keystroke apart.
+  if ! grep -qF 'Re-show a saved setup code — skips setup and changes no configuration' "$TMP/doctor.out"; then
     fail_case "$name" "menu option 4 did not dispatch the --show-code path"; return
   fi
-  if ! grep -qF 'Using saved profile: custom (Good gateway) → https://good.example.test' "$TMP/doctor.out" ||
-     ! grep -qF 'A token is required (the saved profile says auth=bearer)' "$TMP/doctor.out"; then
+  if grep -qiF 'pairing code' "$TMP/doctor.out"; then
+    fail_case "$name" "the show-code screen called it a pairing code, a term the app never uses"; return
+  fi
+  if ! grep -qF 'Using saved profile: custom (Good gateway) → https://good.example.test' "$TMP/doctor.out"; then
     fail_case "$name" "the complete profile was not loaded before the controlled token stop"; return
+  fi
+  # The token is deliberately not on disk, so re-showing a code for a bearer
+  # gateway has to ask for it — and no answer is a hard stop, never a silent
+  # keyless code. This is the fail-closed rule in words, then in behaviour.
+  if ! grep -qF 'this saved setup requires a token' "$TMP/doctor.out"; then
+    fail_case "$name" "the token prompt no longer says the saved setup requires one"; return
+  fi
+  if ! grep -qF 'A token is required (this saved setup says auth=bearer)' "$TMP/doctor.out"; then
+    fail_case "$name" "an unanswered token prompt did not stop the re-show"; return
+  fi
+  # …and it stopped BEFORE emitting anything. A code minted here would be a
+  # keyless one for a gateway whose profile says it needs a bearer token.
+  if grep -qF 'conduck-setup:v1:' "$TMP/doctor.out"; then
+    fail_case "$name" "a setup code was printed even though the token was never supplied"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
 }
 
 # The other half of the gate: a profile that EXISTS but doesn't parse as schema 1
-# must not be advertised. Offering option 4 here would hand the user a menu entry
-# that hard-errors the moment it is chosen.
+# must not be advertised as a setup code. Offering it would hand the user a menu
+# entry that hard-errors the moment it is chosen.
+#
+# It must still be VISIBLE, though, and that is the second half of this case. A
+# file this version cannot read is exactly the thing somebody wants to look at
+# and get rid of, so the entries that work on the saved files themselves are
+# offered for a profile that merely exists — parsed or not. Going quiet about it
+# is what turns an unreadable profile into a lost one: the operator reads "no
+# saved code", picks 1, and setup overwrites the file.
+#
+# So the menu's numbering here is 1-5 with no show-code row, and pressing 4 opens
+# the inventory. The assertions below are about WHICH ACTION each number reaches,
+# because that is the thing a stale number silently changes.
+assert_menu_hides_show_code() { # assert_menu_hides_show_code <case-name> <what>
+  local name="$1" what="$2"
+  # The NUMBERED ROW, anchored — not the bare phrase. The header's warning about
+  # an unreadable profile quotes the entry by name ("…so \"Show a saved setup
+  # code\" is not on the list below"), and a substring match there would read the
+  # explanation of the option's absence as the option being present.
+  if grep -qE '^ +[0-9]+\) Show a saved setup code' "$TMP/doctor.out"; then
+    fail_case "$name" "the menu offered a setup code for $what"; return 1
+  fi
+  # The dispatch, not the menu text. This heading belongs to the --show-code
+  # screen and to nothing else, so its absence is proof the number that was
+  # pressed did not reach it.
+  if grep -qF 'Re-show a saved setup code' "$TMP/doctor.out"; then
+    fail_case "$name" "a menu number dispatched --show-code for $what"; return 1
+  fi
+  return 0
+}
+
 run_menu_corrupt_profile_case() {
   local name="menu-corrupt-profile-hides-show-code" rc=0 state="$TMP/corrupt-state"
   mkdir -p "$state/conduck"
   printf '{}\n' > "$state/conduck/profile-invalid.json"
   PTY_ENV=(XDG_CONFIG_HOME="$state")
-  pty_run 10 $'4\n' > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" = "0" ]; then
-    fail_case "$name" "an unparseable profile still let option 4 run"; return
+  # 4, then Enter at the hub's closing "Enter = done; m = back to the menu".
+  pty_run 10 $'4\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  assert_menu_hides_show_code "$name" "a profile it cannot parse" || return
+  if ! grep -qF '4) See what this machine already has set up' "$TMP/doctor.out"; then
+    fail_case "$name" "the inventory entry is not what number 4 offers here"; return
   fi
-  if grep -qF '4) Show a saved setup code' "$TMP/doctor.out"; then
-    fail_case "$name" "menu offered option 4 for a profile it cannot parse"; return
+  # The warning above the list, which is the whole reason an unreadable profile is
+  # still surfaced: it says the file exists, that this version cannot read it, and
+  # that setting up again would replace it.
+  if ! grep -qF "There IS a saved setup code on this machine, and this version can't read it" "$TMP/doctor.out"; then
+    fail_case "$name" "an unreadable profile was hidden instead of being reported"; return
   fi
-  if ! grep -qF 'Set up a gateway, or check one before pairing.' "$TMP/doctor.out"; then
-    fail_case "$name" "menu header promised a saved-code option that isn't offered"; return
+  if ! grep -qF 'Setting up again REPLACES the saved file' "$TMP/doctor.out"; then
+    fail_case "$name" "the warning did not say what choosing 1 would cost"; return
   fi
-  if grep -qF 'Re-show your pairing code' "$TMP/doctor.out"; then
-    fail_case "$name" "4 dispatched --show-code even though it was never offered"; return
+  # …and 4 really did open the inventory, which names the unreadable id.
+  if ! grep -qF 'Saved here but not usable by this version' "$TMP/doctor.out"; then
+    fail_case "$name" "4 did not open the inventory that lists the unreadable profile"; return
   fi
-  if ! grep -qF 'Please enter one of the listed options.' "$TMP/doctor.out"; then
-    fail_case "$name" "4 was silently accepted instead of being re-prompted"; return
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "looking at what is saved exited $rc — reading is not a failure"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -1332,23 +2402,20 @@ run_menu_corrupt_profile_case() {
 
 # A valid JSON file with schemaVersion=1 is still unusable when its required
 # routing fields are absent. It must be filtered at the same gate as malformed
-# JSON, not advertised and rejected only after the user chooses option 4.
+# JSON, not advertised and rejected only after the user picks it.
 run_menu_partial_profile_case() {
   local name="menu-partial-profile-hides-show-code" rc=0 state="$TMP/partial-state"
   mkdir -p "$state/conduck"
   printf '{"schemaVersion":1,"gateway":{},"fileServer":null}\n' \
     > "$state/conduck/profile-partial.json"
   PTY_ENV=(XDG_CONFIG_HOME="$state")
-  pty_run 10 $'4\n' > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" = "0" ]; then
-    fail_case "$name" "a partial schema-1 profile still let option 4 run"; return
+  pty_run 10 $'4\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  assert_menu_hides_show_code "$name" "a partial schema-1 profile" || return
+  if ! grep -qF '4) See what this machine already has set up' "$TMP/doctor.out"; then
+    fail_case "$name" "the inventory entry is not what number 4 offers here"; return
   fi
-  if grep -qF '4) Show a saved setup code' "$TMP/doctor.out" ||
-     grep -qF 'Re-show your pairing code' "$TMP/doctor.out"; then
-    fail_case "$name" "the partial schema-1 profile was advertised or dispatched"; return
-  fi
-  if ! grep -qF 'Please enter one of the listed options.' "$TMP/doctor.out"; then
-    fail_case "$name" "the unavailable option was silently accepted"; return
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "looking at what is saved exited $rc — reading is not a failure"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -1370,7 +2437,7 @@ run_mixed_profile_picker_case() {
   if [ "$rc" = "0" ]; then
     fail_case "$name" "the controlled EOF after selecting a profile unexpectedly succeeded"; return
   fi
-  if ! grep -qF 'Which profile? Choose 1-2' "$TMP/doctor.out" ||
+  if ! grep -qF 'Which one? Choose 1-2' "$TMP/doctor.out" ||
      ! grep -qF 'custom (Good A) — https://a.example.test' "$TMP/doctor.out" ||
      ! grep -qF 'custom (Good B) — https://b.example.test' "$TMP/doctor.out"; then
     fail_case "$name" "the picker did not list exactly the two complete profiles"; return
@@ -1398,12 +2465,8 @@ run_profile_local_port_gate_case() {
   printf '{"schemaVersion":1,"gateway":{"id":"custom-no-port-public","kind":"custom","name":"No port public","auth":"none","transport":"funnel","reach":"public","url":"https://public.example.test"},"fileServer":null}\n' \
     > "$state/conduck/profile-custom-no-port-public.json"
   PTY_ENV=(XDG_CONFIG_HOME="$state")
-  pty_run 10 $'4\n' > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" = "0" ] ||
-     grep -qF '4) Show a saved setup code' "$TMP/doctor.out" ||
-     grep -qF 'Re-show your pairing code' "$TMP/doctor.out"; then
-    fail_case "$name" "a custom Tailscale/Funnel profile without localPort was advertised"; return
-  fi
+  pty_run 10 $'4\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  assert_menu_hides_show_code "$name" "a custom Tailscale/Funnel profile without localPort" || return
 
   # Backward compatibility: OpenClaw/Hermes profiles may omit localPort because
   # the loader can re-derive it from their canonical configuration.
@@ -1435,12 +2498,8 @@ run_profile_selfsigned_transport_refused_case() {
   printf '{"schemaVersion":1,"gateway":{"id":"custom-pin","kind":"custom","name":"Pinned","auth":"none","transport":"selfsigned","reach":"private","url":"https://gateway.example.test:8443","certFP":"%s"},"fileServer":{"url":"https://files.example.test:9443","reach":"private"}}\n' \
     "$fp" > "$state/conduck/profile-custom-pin.json"
   PTY_ENV=(XDG_CONFIG_HOME="$state")
-  pty_run 10 $'4\n' > "$TMP/doctor.out" 2>&1 || rc=$?
-  if [ "$rc" = "0" ] ||
-     grep -qF '4) Show a saved setup code' "$TMP/doctor.out" ||
-     grep -qF 'Re-show your pairing code' "$TMP/doctor.out"; then
-    fail_case "$name" "a profile pinning a self-signed certificate was still advertised"; return
-  fi
+  pty_run 10 $'4\n\n' > "$TMP/doctor.out" 2>&1 || rc=$?
+  assert_menu_hides_show_code "$name" "a profile pinning a self-signed certificate" || return
 
   # Control: the same gateway on a trusted-certificate transport IS advertised.
   state="$TMP/public-transport-state"
@@ -1484,7 +2543,7 @@ TRANSPORT=""
 GW_URL="https://gw.example.test"
 classify_own_https
 printf "TRANSPORT=%s\n" "$TRANSPORT"
-'
+' 2>&1
 }
 
 # The exposure menu's option 4 is a GATE, not a fork. Apple's App Transport
@@ -1497,7 +2556,9 @@ printf "TRANSPORT=%s\n" "$TRANSPORT"
 run_own_https_trust_gate_case() {
   local name="own-https-requires-trusted-cert" funcs out rc
 
-  funcs=$(extract_funcs classify_own_https)
+  # classify_own_https opens with warn_quick_tunnel_url on EVERY path, so the two
+  # come along or the gate runs with its first line undefined.
+  funcs=$(extract_funcs classify_own_https warn_quick_tunnel_url is_quick_tunnel_url)
   if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'classify_own_https()'; then
     fail_case "$name" "could not extract classify_own_https from the release artifact"; return
   fi
@@ -1506,6 +2567,7 @@ run_own_https_trust_gate_case() {
   rc=0
   out=$(run_classify_own_https_isolated "$funcs" 0 0 "") || rc=$?
   printf -- '--- trusted certificate ---\n%s\n' "$out" > "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
   if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'TRANSPORT=public'; then
     fail_case "$name" "a trusted certificate did not continue setup on the public transport"; return
   fi
@@ -1515,6 +2577,7 @@ run_own_https_trust_gate_case() {
   rc=0
   out=$(run_classify_own_https_isolated "$funcs" 60 18 "") || rc=$?
   printf -- '--- untrusted (self-signed) certificate ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
   if [ "$rc" = "0" ] || ! printf '%s\n' "$out" | grep -qF 'DIE '; then
     fail_case "$name" "an untrusted certificate did not stop the run"; return
   fi
@@ -1636,7 +2699,18 @@ run_exposure_menu_quick_tunnel_case() {
   local name="exposure-menu-places-the-quick-tunnel" funcs out out_nocf rc
   local row3 row4 explainer prompt row lines
 
-  funcs=$(extract_funcs choose_exposure explain_exposure_paths require_choice explain_prompt)
+  # The menu reaches its choice through prompt_into + require_choice, and those two
+  # pull in the whole prompt contract (the suffix renderer, the echo, the literal
+  # disambiguator, and quit_run for the q arm). Lift the lot: without prompt_into
+  # this case cannot obtain a choice AT ALL, and every assertion below it becomes a
+  # statement about an empty string.
+  funcs=$(extract_funcs choose_exposure explain_exposure_paths explain_prompt \
+            require_choice prompt_into control_suffix control_keys prompt_echo \
+            prompt_wants_literal value_prompt_control \
+            looks_like_a_secret warn_answer_looked_like_a_secret \
+            quit_run run_changes_nothing interactive_terminal \
+            exposure_tailscale_ready exposure_cloudflared_ready explain_own_https_target
+          sed -n '/^NO_ANSWER=/p' "$SCRIPT")
   if [ -z "$funcs" ] ||
      ! printf '%s\n' "$funcs" | grep -qF 'choose_exposure()' ||
      ! printf '%s\n' "$funcs" | grep -qF 'explain_exposure_paths()' ||
@@ -1648,6 +2722,7 @@ run_exposure_menu_quick_tunnel_case() {
   rc=0
   out=$(run_exposure_menu_isolated "$funcs" yes) || rc=$?
   printf -- '--- menu, cloudflared present ---\n%s\n' "$out" > "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
   # 10 is the menu's own go-back status: 'b' was taken, no exposure was attempted.
   if [ "$rc" != "10" ]; then
     fail_case "$name" "the menu did not go back on 'b' (status $rc) — the rows below may come from another path"; return
@@ -1691,13 +2766,17 @@ run_exposure_menu_quick_tunnel_case() {
       fail_case "$name" "menu row $row grew to $lines lines — the rows are one consequence plus one constraint"; return
     fi
   done
-  # Still an explicit choice with no default and no favourite.
-  prompt=$(printf '%s\n' "$out" | grep "Choose 1-4 ('i' compares them")
-  if ! printf '%s\n' "$prompt" | grep -qF 'Choose 1-4'; then
+  # Still an explicit choice with no default and no favourite — and the control list
+  # is the PRIMITIVE's, rendered from the same argument that makes `b` work. There
+  # is no hand-written control prose left to grep for, and there must not be: the one
+  # prompt in this tool where Back genuinely works used to be the one whose own
+  # control list denied it. `b = back` appearing here is therefore correct.
+  prompt=$(printf '%s\n' "$out" | grep 'Choose 1-4')
+  if [ -z "$prompt" ]; then
     fail_case "$name" "the menu prompt no longer asks for an explicit 1-4"; return
   fi
-  if [ "$(printf '%s\n' "$prompt" | grep -c 'Enter = no default; i = explain; q = stop')" != "2" ]; then
-    fail_case "$name" "i did not return to the same no-default exposure prompt"; return
+  if [ "$(printf '%s\n' "$prompt" | grep -cF 'Choose 1-4 (Enter = ask again; i = explain; b = back; q = stop)')" != "2" ]; then
+    fail_case "$name" "i did not return to the same prompt, with the same advertised controls"; return
   fi
   if printf '%s\n' "$out" | grep -qiE 'recommend|\(default'; then
     fail_case "$name" "the menu or its comparison started recommending one of the four paths"; return
@@ -1817,7 +2896,7 @@ profile_state_leaks() { # profile_state_leaks <state-dir> <secret> <secret>
   grep -rqF -e "$2" -e "$3" "$1" 2>/dev/null
 }
 
-# The pairing profile is the one file the connector leaves on disk that must
+# The saved profile is the one file conduck-connect leaves on disk that must
 # hold no secret at all — WHAT-IT-TOUCHES.md promises "routing facts only …
 # never a token or credential", and --show-code re-reads it indefinitely.
 # write_profile builds it in a python block that already holds GW_TOKEN's and
@@ -1844,7 +2923,9 @@ run_profile_secret_exclusion_case() {
   # ensure_state_dir + file_mode_is_open ride along because write_profile creates
   # $STATE_DIR through them; the REAL helpers, not stubs, so this case still
   # proves the profile lands in a directory the shipped code made.
-  writer=$(extract_funcs write_profile ensure_state_dir file_mode_is_open)
+  # json_query/json_type ride along too: write_profile asks them what the existing
+  # profile holds before it decides what to keep.
+  writer=$(extract_funcs write_profile ensure_state_dir file_mode_is_open json_query json_type)
   if [ -z "$writer" ] || ! printf '%s\n' "$writer" | grep -qF 'write_profile()'; then
     fail_case "$name" "could not extract write_profile from the release artifact"; return
   fi
@@ -1875,7 +2956,7 @@ if fs.get("folder") != "/home/probe/conduck-files": sys.exit(1)
   # The invariant itself: neither live secret reached the profile — nor any
   # other file the run dropped in the state directory.
   if profile_state_leaks "$state" "$gw_secret" "$fs_secret"; then
-    fail_case "$name" "the saved pairing profile leaked a live token or file-lane credential"; return
+    fail_case "$name" "the saved saved profile leaked a live token or file-lane credential"; return
   fi
 
   # Structural companion: no key that would ever be a place to put one.
@@ -1891,13 +2972,13 @@ def walk(node):
         for v in node: walk(v)
 walk(json.load(open(os.environ["PROF"])))
 '; then
-    fail_case "$name" "the pairing profile grew a token/credential-shaped key"; return
+    fail_case "$name" "the saved profile grew a token/credential-shaped key"; return
   fi
 
   # WHAT-IT-TOUCHES.md states this file is 0600. Nothing else asserts it.
   mode=$(ls -l "$prof" | cut -c1-10)
   if [ "$mode" != "-rw-------" ]; then
-    fail_case "$name" "the pairing profile is $mode, not 0600"; return
+    fail_case "$name" "the saved profile is $mode, not 0600"; return
   fi
 
   # Control: the exact regression this guard exists for — one added line that
@@ -2045,13 +3126,33 @@ ARMS
 # about addresses stays on the path with no rotation reminder.
 # Args: <function-source> <file-server-url> <file-server-credential> [gateway-kind]
 #       [os] [file-server-unit] [linger:on|off] [gateway-url].
+#
+# emit_payload's call closure inside this harness lives in ONE list, on purpose.
+# Five cases drive this same function, and the release that taught it to print
+# explain_setup_code_secrecy updated none of their five separate lift lists — so all
+# five ran with the tool's only "treat this code like a password" statement silently
+# missing, while a case literally named "the warning states what the code is"
+# reported a pass. Everything else emit_payload reaches is stubbed below.
+EMIT_LIFT="emit_payload pairing_capability_summary build_pairing_payload_json
+           b64_nowrap is_quick_tunnel_url explain_setup_code_secrecy
+           gw_loopback_base priv_prefix have"
 run_emit_payload_isolated() {
   FUNCS="$1" FS_URL_IN="$2" FS_CRED_IN="$3" GW_KIND_IN="${4:-custom}" \
   OS_IN="${5:-Darwin}" FS_UNIT_IN="${6:-}" LINGER_IN="${7:-on}" \
   GW_URL_IN="${8:-https://gw.example.test}" VF_IN="${9:-false}" \
   GW_PORT_IN="${10:-}" FS_PROOF_IN="${11:-proved}" bash -c '
 eval "$FUNCS"
-say()   { printf "%s\n" "$*"; }
+# The secrecy panel is say(), not warn(), but it is part of the same passage: it
+# carries the two sentences the warn() lines deliberately do NOT repeat ("treat this
+# code like a password", "no secret is written to disk"). Tag it so the warning case
+# can grade the whole passage as one, and so its ABSENCE is visible — the panel is
+# reached through a function call, which is exactly the kind of thing a stale lift
+# list drops without changing any other line on screen.
+SECRECY=false
+original_secrecy=$(declare -f explain_setup_code_secrecy)
+eval "${original_secrecy/explain_setup_code_secrecy/orig_explain_setup_code_secrecy}"
+explain_setup_code_secrecy() { SECRECY=true; orig_explain_setup_code_secrecy; SECRECY=false; }
+say()   { if [ "$SECRECY" = true ]; then printf "SECRECY %s\n" "$*"; else printf "%s\n" "$*"; fi; }
 warn()  { printf "WARNLINE %s\n" "$*"; }
 # Tagged like warn(): the pre-code summary states what the operator is about to
 # scan, and the positive half of it is an ok() line. Untagged (or undefined) it
@@ -2091,7 +3192,7 @@ FS_CRED="$FS_CRED_IN"
 # lingering — keeps grading the fully-verified lane it always did.
 FS_AGENT_PROOF="$FS_PROOF_IN"
 emit_payload
-'
+' 2>&1
 }
 
 # 0 when the warning block states the fact <regex> describes.
@@ -2117,8 +3218,7 @@ run_pairing_warning_case() {
   # "This code carries:" block lives there so the file-lane suite can drive its
   # states directly, and an emit extracted without it would run with that block
   # silently missing — every assertion about it would then pass vacuously.
-  emit=$(extract_funcs emit_payload pairing_capability_summary \
-           build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
+  emit=$(extract_funcs $EMIT_LIFT)
   if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
      || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
     fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
@@ -2134,19 +3234,47 @@ run_pairing_warning_case() {
 
   printf -- '--- emit_payload WITH a file lane ---\n%s\n--- emit_payload WITHOUT a file lane ---\n%s\n' \
     "$out_files" "$out_bare" > "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out_files$out_bare" || return
 
   # Non-vacuous: both runs really reached the emit, not an early return.
   if ! printf '%s\n' "$out_files" | grep -qF 'conduck-setup:v1:' ||
      ! printf '%s\n' "$out_bare"  | grep -qF 'conduck-setup:v1:'; then
-    fail_case "$name" "emit_payload printed no pairing code — the warning below proves nothing"; return
+    fail_case "$name" "emit_payload printed no setup code — the warning below proves nothing"; return
   fi
 
-  # Grade the warning block only. Flattened to one line so a fact stated across
-  # two wrapped warn() lines still matches.
-  block_files=$(printf '%s\n' "$out_files" | grep '^WARNLINE ' | tr '\n' ' ')
-  block_bare=$(printf '%s\n' "$out_bare" | grep '^WARNLINE ' | tr '\n' ' ')
+  # The one place the tool ever says it. It is printed by emit_payload itself, so a
+  # lift list that drops explain_setup_code_secrecy loses the whole statement while
+  # every FACT assertion below still passes on the surrounding warn() block.
+  local secrecy
+  for secrecy in "$out_files" "$out_bare"; do
+    if [ "$(printf '%s\n' "$secrecy" | grep -cF 'Treat this code like a password.')" != "1" ]; then
+      fail_case "$name" "the success screen said 'treat this code like a password' other than exactly once"; return
+    fi
+    if ! printf '%s\n' "$secrecy" | grep -qF 'No secret is written to disk by this script'; then
+      fail_case "$name" "the success screen stopped saying that no secret is saved on this machine"; return
+    fi
+  done
+
+  # Grade the secrecy passage only — the warn() lines PLUS the panel between them,
+  # which is one passage on screen even though it reaches the terminal through two
+  # helpers. Flattened to one line so a fact stated across two wrapped lines still
+  # matches. Grading only the warn() half would leave the sentences the panel owns
+  # untested, which is how "treat this code like a password" went missing from every
+  # run of this case without the case noticing.
+  # The harness tag is stripped before flattening, so a fact that wraps across two
+  # lines reads as one sentence here. Left in, every alternation below would have to
+  # know where the line breaks fall — which is a verbatim assertion wearing a
+  # regex's clothes, and it rots on the first reflow. Runs of whitespace collapse
+  # for the same reason: the panel indents its continuation lines, so a phrase that
+  # wraps arrives with three spaces in the middle of it.
+  block_files=$(printf '%s\n' "$out_files" | grep -E '^(WARNLINE|SECRECY) ' | sed -E 's/^(WARNLINE|SECRECY) //' | tr '\n' ' ' | tr -s ' ')
+  block_bare=$(printf '%s\n' "$out_bare" | grep -E '^(WARNLINE|SECRECY) ' | sed -E 's/^(WARNLINE|SECRECY) //' | tr '\n' ' ' | tr -s ' ')
   if [ -z "$block_files" ] || [ -z "$block_bare" ]; then
     fail_case "$name" "the pairing emit printed no warning at all"; return
+  fi
+  if ! printf '%s\n' "$out_files" | grep -q '^SECRECY ' ||
+     ! printf '%s\n' "$out_bare" | grep -q '^SECRECY '; then
+    fail_case "$name" "emit_payload no longer prints the secrecy panel at all"; return
   fi
 
   local b
@@ -2156,19 +3284,28 @@ run_pairing_warning_case() {
        ! warning_states "$b" 'like a password|is a secret|keep (it|them|these) secret'; then
       fail_case "$name" "the warning no longer names the gateway token as a secret"; return
     fi
-    # FACT 2 — whoever holds the code gets whatever the gateway permits.
-    if ! warning_states "$b" 'whoever holds|anyone who (holds|scans|copies|has)|the holder' ||
-       ! warning_states "$b" 'your gateway (allows|permits|lets)|anything the gateway (allows|permits)'; then
-      fail_case "$name" "the warning no longer states that the holder gets the gateway's capabilities"; return
+    # FACT 2 — whoever ends up holding the code gets exactly the access the
+    # credentials in it give. This covers both halves of what used to be two facts
+    # ("the holder gets the gateway's capabilities" and "handing it to a person
+    # hands them the same access"); the passage now says them in one sentence, and
+    # asserting them separately would only be asserting the same clause twice.
+    # Every route by which somebody else comes to hold it counts as holding it —
+    # that is the point of naming the photograph and the copy.
+    if ! warning_states "$b" 'whoever holds|anyone who|the holder|photograph' ||
+       ! warning_states "$b" 'your gateway (allows|permits|lets)|anything the gateway (allows|permits)|same access|(exactly )?the access (those|these) credentials give'; then
+      fail_case "$name" "the warning no longer states that whoever holds the code gets that access"; return
     fi
-    # FACT 3 — it stays valid until the secrets are rotated. No expiry.
-    if ! warning_states "$b" 'until you rotate|until (that secret|those secrets|the token) (is|are) rotated'; then
-      fail_case "$name" "the warning no longer states the code works until the secrets are rotated"; return
+    # FACT 3 — it stays valid until the credentials are changed at the gateway.
+    # There is no expiry, and the code cannot be revoked on its own.
+    if ! warning_states "$b" 'until you rotate|until you change (it|them)|until (that secret|those secrets|the token) (is|are) rotated'; then
+      fail_case "$name" "the warning no longer states the code works until the credentials are changed"; return
     fi
-    # FACT 4 — handing it to a person hands them the same access.
-    if ! warning_states "$b" 'another person|someone else|hand(ing)? (it|the code) to' ||
-       ! warning_states "$b" 'same access'; then
-      fail_case "$name" "the warning no longer states that giving the code away grants the same access"; return
+    # FACT 4 — where NOT to put it, concretely. A rule stated only in the abstract
+    # ("keep it secret") is the one people obey right up to the moment they paste a
+    # transcript into an issue, which is the commonest way one of these leaks.
+    if ! warning_states "$b" 'do not paste|don.t paste' ||
+       ! warning_states "$b" 'chat|issue|screenshot'; then
+      fail_case "$name" "the warning no longer names the places the code must not be pasted"; return
     fi
     # FACT 5 — a shared credential has no per-device revoke; rotation hits every
     # device on THAT token (a custom gateway may issue several, so not "every device").
@@ -2181,11 +3318,17 @@ run_pairing_warning_case() {
   # FACT 6 — the file-lane clause is CONDITIONAL. Present when the code really
   # carries the file-server credential; absent when it does not, so the wizard
   # never claims a shared folder this run has no lane for.
-  if ! warning_states "$block_files" 'credential' ||
-     ! warning_states "$block_files" 'folder'; then
+  #
+  # Both patterns name the FILE lane specifically. A bare `credential` would also
+  # match the shared secrecy panel's "the access those credentials give", which is
+  # a statement about whatever the code happens to carry and is true on every run —
+  # the negative below would then fail every lane-less run for saying something
+  # correct, and the usual repair for that is to delete the assertion.
+  if ! warning_states "$block_files" 'file[- ]server credential' ||
+     ! warning_states "$block_files" 'shared folder'; then
     fail_case "$name" "a run WITH a file lane did not warn that the code carries the file-server credential"; return
   fi
-  if warning_states "$block_bare" 'credential|shared folder|file server|file-server'; then
+  if warning_states "$block_bare" 'file[- ]server credential|shared folder|file server'; then
     fail_case "$name" "a run WITHOUT a file lane still claimed a file-server credential or shared folder"; return
   fi
 
@@ -2269,8 +3412,7 @@ run_pairing_check_suggestion_case() {
   # "This code carries:" block lives there so the file-lane suite can drive its
   # states directly, and an emit extracted without it would run with that block
   # silently missing — every assertion about it would then pass vacuously.
-  emit=$(extract_funcs emit_payload pairing_capability_summary \
-           build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
+  emit=$(extract_funcs $EMIT_LIFT)
   if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
      || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
     fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
@@ -2284,12 +3426,13 @@ run_pairing_check_suggestion_case() {
          fail_case "$name" "emit_payload failed to run for an OpenClaw gateway"; return; }
   printf -- '--- success screen, custom gateway ---\n%s\n--- success screen, OpenClaw gateway ---\n%s\n' \
     "$out_custom" "$out_openclaw" > "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out_custom$out_openclaw" || return
 
   # Non-vacuous: both runs really reached the emit, and the custom one really does
   # still offer the adapter grade — the thing the caveat below is about.
   if ! printf '%s\n' "$out_custom" | grep -qF 'conduck-setup:v1:' ||
      ! printf '%s\n' "$out_openclaw" | grep -qF 'conduck-setup:v1:'; then
-    fail_case "$name" "emit_payload printed no pairing code — the screen proves nothing"; return
+    fail_case "$name" "emit_payload printed no setup code — the screen proves nothing"; return
   fi
   if ! printf '%s\n' "$out_custom" | grep -qF -- '--check-adapter'; then
     fail_case "$name" "the success screen no longer offers the adapter grade to a custom gateway"; return
@@ -2336,7 +3479,7 @@ run_pairing_check_suggestion_case() {
 # whose SPLIT is the diagnosis.
 run_pairing_check_targets_the_failed_route_case() {
   local name="pairing-checks-target-the-route-that-failed" emit out flat
-  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap is_quick_tunnel_url gw_loopback_base)
+  emit=$(extract_funcs $EMIT_LIFT)
   if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'gw_loopback_base()'; then
     fail_case "$name" "could not extract emit_payload + gw_loopback_base from the release artifact"; return
   fi
@@ -2346,6 +3489,7 @@ run_pairing_check_targets_the_failed_route_case() {
   out=$(run_emit_payload_isolated "$emit" "" "" custom Darwin "" on \
         "https://gw.example.test" true 11434)
   printf -- '--- failed run, local port known ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
   flat=$(printf '%s\n' "$out" | tr '\n' ' ')
 
   # Non-vacuous: this really is the failure screen, and it really does still suggest checks.
@@ -2394,7 +3538,7 @@ run_pairing_check_targets_the_failed_route_case() {
   printf -- '--- success screen, local port known ---\n%s\n' "$out" >> "$TMP/doctor.out"
   flat=$(printf '%s\n' "$out" | tr '\n' ' ')
   if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
-    fail_case "$name" "the success arm printed no pairing code — the screen proves nothing"; return
+    fail_case "$name" "the success arm printed no setup code — the screen proves nothing"; return
   fi
   if ! warning_states "$flat" '[-][-]check-server https://gw\.example\.test' ||
      ! warning_states "$flat" '[-][-]check-adapter https://gw\.example\.test'; then
@@ -2414,11 +3558,11 @@ run_pairing_check_targets_the_failed_route_case() {
 # The step that built the lane says so, but by the pairing screen that line has
 # scrolled away, and THIS screen is where the operator decides to trust the lane with
 # their attachments. So it is restated here, gated on the one arrangement it is true
-# for: Linux, a connector-owned unit, lingering actually off.
+# for: Linux, a conduck-connect-owned unit, lingering actually off.
 run_pairing_linger_caveat_case() {
   local name="pairing-code-restates-the-logout-caveat"
   local emit out flat arm
-  emit=$(extract_funcs emit_payload build_pairing_payload_json b64_nowrap priv_prefix have is_quick_tunnel_url)
+  emit=$(extract_funcs $EMIT_LIFT)
   if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
     fail_case "$name" "could not extract emit_payload from the release artifact"; return
   fi
@@ -2447,9 +3591,10 @@ linux-no-unit|Linux||off|yes|no'
       || { printf '%s\n' "$out" >> "$TMP/doctor.out"
            fail_case "$name" "[$arm] emit_payload failed to run"; return; }
     printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$out" || return
     # Non-vacuous: the screen really was emitted, so an absent caveat means absent.
     if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
-      fail_case "$name" "[$arm] emit_payload printed no pairing code"; return
+      fail_case "$name" "[$arm] emit_payload printed no setup code"; return
     fi
     flat=$(printf '%s\n' "$out" | tr '\n' ' ')
     if [ "$want" = "yes" ]; then
@@ -2499,8 +3644,7 @@ run_pairing_quick_tunnel_reminder_case() {
   # "This code carries:" block lives there so the file-lane suite can drive its
   # states directly, and an emit extracted without it would run with that block
   # silently missing — every assertion about it would then pass vacuously.
-  emit=$(extract_funcs emit_payload pairing_capability_summary \
-           build_pairing_payload_json b64_nowrap is_quick_tunnel_url)
+  emit=$(extract_funcs $EMIT_LIFT)
   if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
      || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
     fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
@@ -2525,8 +3669,9 @@ near-miss-host|https://not-really.trycloudflare.com.example.test|||none"
       || { printf '%s\n' "$out" >> "$TMP/doctor.out"
            fail_case "$name" "[$arm] emit_payload failed to run"; return; }
     printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$out" || return
     if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
-      fail_case "$name" "[$arm] emit_payload printed no pairing code"; return
+      fail_case "$name" "[$arm] emit_payload printed no setup code"; return
     fi
     flat=$(printf '%s\n' "$out" | grep '^WARNLINE ' | tr '\n' ' ')
     if [ "$want" = "none" ]; then
@@ -2592,11 +3737,23 @@ ARMS
 #     Stubbed, and it prints its target: a case that grades a diagnosis drawn from a
 #     live comparison has to be able to assert the comparison was actually made, and
 #     the suite must never reach a real port to find that out.
+#
+# verify_all's call closure inside this harness, in ONE list. The three cases that
+# drive it kept three different lists, and the diagnosis functions a failure reaches
+# (the 403 route note, the 5xx credential note) were in some of them and not others —
+# so an arm could take a branch whose entire explanation was an undefined function,
+# and still be graded green on the sentences it did print.
+VERIFY_LIFT="verify_all gw_url_drift_note gw_403_route_note gw_5xx_credential_note
+             gw_loopback_base"
 run_verify_all_isolated() {
   FUNCS="$1" TRANSPORT_IN="$2" MRC="$3" MCODE="$4" MCURL="$5" LOOP="$6" \
   LPORT="$7" CHAT="$8" FSU="$9" FSC="${10}" SQ="${11}" \
   GWAUTH="${12:-bearer}" LB2XX="${13:-no}" bash -c '
 eval "$FUNCS"
+# Stubbed rather than lifted: the quota warning is the live-verification step
+# introducing itself, and these cases grade the DIAGNOSIS the step reaches. Lifting
+# it would put eleven lines of unrelated prose in front of every assertion here.
+explain_live_verification() { :; }
 say()   { printf "%s\n" "$*"; }
 ok()    { printf "OK %s\n" "$*"; }
 bad()   { printf "BAD %s\n" "$*"; }
@@ -2634,7 +3791,7 @@ FS_URL="$FSU"
 FS_CRED="$FSC"
 verify_all
 printf "VERIFY_FAILED=%s LANE_DROPPED=%s\n" "$VERIFY_FAILED" "$FS_LANE_DROPPED_BY_CHECK"
-'
+' 2>&1
 }
 
 # A saved address that stops reaching this machine is the commonest real failure on the
@@ -2649,7 +3806,7 @@ printf "VERIFY_FAILED=%s LANE_DROPPED=%s\n" "$VERIFY_FAILED" "$FS_LANE_DROPPED_B
 # already refused above it.
 run_moved_address_diagnosis_case() {
   local name="moved-address-is-not-a-server-error" funcs out flat arm
-  funcs=$(extract_funcs verify_all gw_url_drift_note)
+  funcs=$(extract_funcs $VERIFY_LIFT)
   if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_url_drift_note()'; then
     fail_case "$name" "could not extract verify_all + gw_url_drift_note from the release artifact"; return
   fi
@@ -2670,6 +3827,7 @@ public-401|public|401|up|8080|no|no'
       || { printf '%s\n' "$out" >> "$TMP/doctor.out"
            fail_case "$name" "[$arm] verify_all failed to run in isolation"; return; }
     printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$out" || return
     flat=$(printf '%s\n' "$out" | tr '\n' ' ')
 
     # The wrong diagnosis, in the exact words that sent users at the app or at Cloudflare.
@@ -2800,7 +3958,7 @@ EOF
 # A keyless run that gets a 5xx is told "the server errored", which is wrong for every
 # server that reports a MISSING credential from inside its own error handler — LiteLLM
 # without a database answers 500 there, measured, because the handler imports a module
-# only DB deployments install. The connector settles it by experiment rather than by
+# only DB deployments install. conduck-connect settles it by experiment rather than by
 # guessing, so what this case grades is the EXPERIMENT: the control must hold before any
 # claim is made, and no claim may be made when the difference is not attributable to the
 # credential. Driven against a fixture whose status genuinely depends on the
@@ -2808,7 +3966,9 @@ EOF
 # the wrong order.
 run_keyless_5xx_credential_case() {
   local name="keyless-5xx-names-the-missing-credential" funcs out i line FPID="" FPORT=""
-  funcs=$(extract_funcs curl_gw gw_5xx_credential_note)
+  # curl_gw refuses a token it cannot print safely before it sends anything, so the
+  # experiment below only runs at all with credential_value_safe present.
+  funcs=$(extract_funcs curl_gw credential_value_safe gw_5xx_credential_note)
   if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_5xx_credential_note()'; then
     fail_case "$name" "could not extract curl_gw + gw_5xx_credential_note from the release artifact"; return
   fi
@@ -2915,7 +4075,7 @@ EOF
 
 run_keyless_403_diagnosis_case() {
   local name="keyless-403-is-not-a-rejected-token" funcs out flat arm
-  funcs=$(extract_funcs verify_all gw_url_drift_note gw_403_route_note gw_loopback_base)
+  funcs=$(extract_funcs $VERIFY_LIFT)
   if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_403_route_note()'; then
     fail_case "$name" "could not extract verify_all + gw_403_route_note from the release artifact"; return
   fi
@@ -2936,6 +4096,7 @@ keyless-404|none|404|11434|yes|no|no|no'
       || { printf '%s\n' "$out" >> "$TMP/doctor.out"
            fail_case "$name" "[$arm] verify_all failed to run in isolation"; return; }
     printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$out" || return
     flat=$(printf '%s\n' "$out" | tr '\n' ' ')
 
     # FACT 1 — the false sentence, in the exact words that sent keyless users after a
@@ -3027,7 +4188,7 @@ ARMS
 # above is graded on the gateway verdict and not on a question that was simply deleted.
 run_file_lane_failure_names_the_gateway_case() {
   local name="file-fault-does-not-mask-a-dead-gateway" funcs out flat
-  funcs=$(extract_funcs verify_all gw_url_drift_note)
+  funcs=$(extract_funcs $VERIFY_LIFT)
   if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'verify_all()'; then
     fail_case "$name" "could not extract verify_all from the release artifact"; return
   fi
@@ -3039,6 +4200,7 @@ run_file_lane_failure_names_the_gateway_case() {
   out=$(run_verify_all_isolated "$funcs" public 0 200 0 up 8080 fail \
         "https://files.example.test:8443" "probe-cred" true)
   printf -- '--- dead gateway + failed file lane ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
   flat=$(printf '%s\n' "$out" | tr '\n' ' ')
 
   # Non-vacuous: the run really did fail the gateway AND reach the file-lane branch.
@@ -3078,6 +4240,2025 @@ run_file_lane_failure_names_the_gateway_case() {
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# A LINT, not a behaviour test — and the only kind of assertion that can hold a
+# vocabulary across 14,000 lines and a dozen future edits.
+#
+# Three words are retired from anything a user reads. Each was retired for its own
+# reason and each has a real cost:
+#
+#   "pairing code"  — the app says "setup code" 25 times and "pairing code" zero.
+#                     The script used to contradict itself one keystroke apart:
+#                     menu item 4 read "Show a saved setup code" and opened a
+#                     screen headed "Re-show your pairing code".
+#   "connector"     — a name for this program that appears in no other surface.
+#                     The program is "conduck-connect"; the --setup flow is "the
+#                     wizard". A third name is a third thing to look up.
+#   "helper"        — same, and worse: it also reads as a hedge about what the
+#                     thing is.
+#
+# TWO layers, because one is not enough and the difference is instructive:
+#
+#   Layer 1 grades what the tool PRINTS at --help. Unambiguous, and it is the text
+#   a stranger reads first.
+#   Layer 2 grades the source's SCREEN CALLS — every line whose first word is one
+#   of the output verbs, plus `manual.append(`, which is how the Hermes analysis
+#   returns human sentences from inside a python3 heredoc. That last one is the
+#   whole reason this lint is anchored to verbs rather than to whole lines: the
+#   live occurrences of "connector" that survived two waves of human review were
+#   sitting inside that heredoc, which does not look like tool copy in a diff.
+#
+# Comment lines are excluded on purpose. Developer commentary in `src/` still says
+# "this connector" in dozens of places; that is a separate, cosmetic sweep, and
+# rolling it into this lint would mean either failing today or maintaining an
+# exclusion list that rots. What the user reads is the thing that must not drift.
+# The manage surface's machine contract, which is the half of it a person never
+# sees and therefore the half nothing else in this file would notice breaking.
+#
+# Four claims, and each has a way of being got wrong that looks like working code:
+#
+#   --list on a machine with nothing set up is 0. "Nothing is saved" is an ANSWER,
+#   not a failure, and a wrapper that treats it as one turns a clean host into an
+#   error before anything has gone wrong.
+#
+#   --list --json parses in the three degenerate shapes — empty, a profile this
+#   version cannot read, a service file with no profile behind it. Those are
+#   exactly the states a hand-built report tends to emit as a trailing comma or a
+#   bare null, and they are also the states somebody reaches for the tool IN. It is
+#   asserted with a real JSON parser, never with grep: grep cannot tell valid JSON
+#   from a string that happens to contain the right words.
+#
+#   --edit and --forget with no terminal exit 4, not 1 and not a hang. 4 says "this
+#   needs a person"; 1 says "something went wrong". A retry loop must be able to
+#   tell those apart, and a wrapper that retries an exit-4 forever is the failure
+#   this status exists to prevent.
+#
+#   --forget refuses an id outside [a-z0-9-] before it touches anything. The paths
+#   it deletes are built by concatenation ($STATE_DIR/profile-$id.json,
+#   conduck-files-$id.service), the id comes straight off the command line, and
+#   this is the only irreversible command in the tool.
+run_manage_surface_case() {
+  local name="manage-surface-machine-contract" rc=0 out id
+  local home="$TMP/manage-home" state="$TMP/manage-state" sd="$TMP/manage-state/conduck"
+  mkdir -p "$home/Library/LaunchAgents" "$sd"
+  : > "$TMP/doctor.out"
+
+  # -- an empty state dir is a valid answer -----------------------------------
+  rc=0
+  env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list \
+    > "$TMP/list-empty.out" 2>&1 </dev/null || rc=$?
+  cat "$TMP/list-empty.out" >> "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "--list on a machine with nothing saved exited $rc, expected 0"; return
+  fi
+  if ! grep -qF 'No saved setups yet.' "$TMP/list-empty.out"; then
+    fail_case "$name" "--list did not say plainly that nothing is saved"; return
+  fi
+  # Plan item 17: the directory reaches the screen on a SUCCESS path. Before this
+  # it appeared only inside a permissions warning, so an operator who never hit a
+  # failure never learned where their configuration lives.
+  if ! grep -qF "$sd" "$TMP/list-empty.out"; then
+    fail_case "$name" "--list never named the directory it is reporting on"; return
+  fi
+
+  # -- --list --json, three degenerate shapes ---------------------------------
+  # Shape 1: empty. Shapes 2 and 3 are added below, in one dir, because that is
+  # also the realistic state — a machine acquires an unreadable profile and an
+  # orphaned service by the same route, an interrupted run.
+  local shape
+  for shape in empty mixed; do
+    if [ "$shape" = "mixed" ]; then
+      # A profile this version cannot parse…
+      printf 'not json at all\n' > "$sd/profile-broken.json"
+      # …a profile it can…
+      write_valid_profile "$sd/profile-custom-good.json" \
+        "custom-good" "Good gateway" "https://good.example.test"
+      # …and a service file with no profile behind it. This one is the reason the
+      # leftovers scan exists: it is a live authenticated WebDAV server over the
+      # agent's working folder, restarted at every login, that nothing else in the
+      # tool would ever mention again.
+      printf '<?xml version="1.0"?><plist><dict></dict></plist>\n' \
+        > "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-orphan.plist"
+    fi
+    rc=0
+    env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list --json \
+      > "$TMP/list-$shape.json" 2>&1 </dev/null || rc=$?
+    printf -- '--- --list --json (%s) ---\n' "$shape" >> "$TMP/doctor.out"
+    cat "$TMP/list-$shape.json" >> "$TMP/doctor.out"
+    if [ "$rc" != "0" ]; then
+      fail_case "$name" "--list --json ($shape) exited $rc, expected 0"; return
+    fi
+    # A real parser. The point of --json is that a machine can read it, and only a
+    # parser can say whether one can.
+    if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/list-$shape.json" 2>>"$TMP/doctor.out"; then
+      fail_case "$name" "--list --json ($shape) did not parse as JSON"; return
+    fi
+  done
+
+  # The unreadable profile is REPORTED rather than dropped — with readable:false
+  # and a non-null problem — and the orphaned unit reaches leftovers[]. A report
+  # that silently omitted either would be valid JSON saying the wrong thing, which
+  # is precisely what the parse check above cannot catch.
+  out=$(python3 - "$TMP/list-mixed.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+setups = {s["id"]: s for s in d["setups"]}
+broken = setups.get("broken")
+print("ids=%s" % ",".join(sorted(setups)))
+print("broken_readable=%s" % (broken and broken["readable"]))
+print("broken_problem=%s" % (broken and bool(broken["problem"])))
+print("leftovers=%s" % ",".join(sorted(l["id"] for l in d["leftovers"])))
+print("token_stored=%s" % d["tokenStored"])
+PY
+) || { fail_case "$name" "could not read the JSON report back"; return; }
+  printf -- '--- report facts ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if ! printf '%s\n' "$out" | grep -qF 'ids=broken,custom-good'; then
+    fail_case "$name" "the JSON report did not list both the readable and the unreadable setup"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'broken_readable=False' ||
+     ! printf '%s\n' "$out" | grep -qF 'broken_problem=True'; then
+    fail_case "$name" "an unparseable profile was not reported as unreadable, with a reason"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'leftovers=orphan'; then
+    fail_case "$name" "a service file with no profile behind it never reached leftovers[]"; return
+  fi
+  # The one field that is a claim about this tool rather than about this machine.
+  if ! printf '%s\n' "$out" | grep -qF 'token_stored=False'; then
+    fail_case "$name" "the report stopped saying that no gateway token is stored"; return
+  fi
+
+  # Shape 3, on its own rather than beside the others: a service unit and NO
+  # profiles at all. It is the shape a half-removed machine is left in, and it is
+  # the one that puts an EMPTY array next to a populated one — the arrangement a
+  # hand-rolled emitter gets wrong (a trailing comma, or `setups: null`) and a
+  # parser catches immediately. Both facts are asserted, because valid JSON that
+  # dropped the leftover would be a correct-looking answer that hides a live
+  # authenticated WebDAV server.
+  local ohome="$TMP/manage-orphan-home" ostate="$TMP/manage-orphan-state"
+  mkdir -p "$ohome/Library/LaunchAgents" "$ohome/.config/systemd/user" "$ostate/conduck"
+  if [ "$(uname -s)" = "Linux" ]; then
+    printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav /tmp/x --addr 127.0.0.1:8080\n' \
+      > "$ohome/.config/systemd/user/conduck-files-lonely.service"
+  else
+    printf '<?xml version="1.0"?><plist><dict></dict></plist>\n' \
+      > "$ohome/Library/LaunchAgents/ai.gigaduck.conduck-files-lonely.plist"
+  fi
+  rc=0
+  env -u CI HOME="$ohome" XDG_CONFIG_HOME="$ostate" TERM=dumb bash "$SCRIPT" --list --json \
+    > "$TMP/list-orphan.json" 2>&1 </dev/null || rc=$?
+  printf -- '--- --list --json (orphan only) ---\n' >> "$TMP/doctor.out"
+  cat "$TMP/list-orphan.json" >> "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "--list --json (orphan only) exited $rc, expected 0"; return
+  fi
+  out=$(python3 - "$TMP/list-orphan.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("setups=%d" % len(d["setups"]))
+print("leftovers=%s" % ",".join(sorted(l["id"] for l in d["leftovers"])))
+PY
+) || { fail_case "$name" "--list --json (orphan only) did not parse as JSON"; return; }
+  printf -- '%s\n' "$out" >> "$TMP/doctor.out"
+  if ! printf '%s\n' "$out" | grep -qF 'setups=0'; then
+    fail_case "$name" "a state dir with no profiles reported setups it does not have"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'leftovers=lonely'; then
+    fail_case "$name" "a service unit with no profile anywhere never reached leftovers[]"; return
+  fi
+
+  # -- no terminal: 4, from both commands that need one -----------------------
+  local cmd
+  for cmd in --edit --forget; do
+    rc=0
+    if [ "$cmd" = "--forget" ]; then
+      env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --forget custom-good \
+        > "$TMP/noterm.out" 2>&1 </dev/null || rc=$?
+    else
+      env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --edit \
+        > "$TMP/noterm.out" 2>&1 </dev/null || rc=$?
+    fi
+    printf -- '--- %s, no terminal ---\n' "$cmd" >> "$TMP/doctor.out"
+    cat "$TMP/noterm.out" >> "$TMP/doctor.out"
+    if [ "$rc" != "4" ]; then
+      fail_case "$name" "$cmd with no terminal exited $rc, expected 4"; return
+    fi
+    if ! grep -qF 'needs a person at a terminal' "$TMP/noterm.out"; then
+      fail_case "$name" "$cmd refused without saying what is missing"; return
+    fi
+    # The refusal points at the one command in this group a machine CAN run.
+    if ! grep -qF 'bash conduck-connect.sh --list --json' "$TMP/noterm.out"; then
+      fail_case "$name" "$cmd's refusal did not name --list --json as the machine-readable way in"; return
+    fi
+  done
+  # …and it refused before doing anything. The profile it was pointed at is still
+  # there, unread and unremoved.
+  if [ ! -f "$sd/profile-custom-good.json" ]; then
+    fail_case "$name" "--forget removed a setup on a run it had already refused"; return
+  fi
+
+  # -- a bad id is refused before the filesystem is touched -------------------
+  # Through a PIPE, not /dev/null: a pipe may be carrying answers, so it gets past
+  # the terminal refusal and reaches the id check — which is the thing under test.
+  # /dev/null would exit 4 and prove nothing about the charset.
+  for id in '../../etc' 'foo/bar' 'Foo' 'has space' 'x;rm'; do
+    rc=0
+    out=$(printf '\n' | env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
+            bash "$SCRIPT" --forget "$id" 2>&1) || rc=$?
+    printf -- '--- --forget %s ---\n%s\n' "$id" "$out" >> "$TMP/doctor.out"
+    if [ "$rc" != "1" ]; then
+      fail_case "$name" "--forget '$id' exited $rc, expected 1"; return
+    fi
+    if ! printf '%s\n' "$out" | grep -qF 'is not a saved setup id'; then
+      fail_case "$name" "--forget '$id' did not say why the id was refused"; return
+    fi
+    # The rule, not just the refusal: an operator who is told no needs to know
+    # what a real id looks like, or the next attempt is another guess.
+    if ! printf '%s\n' "$out" | grep -qF 'lowercase letters, digits and hyphens'; then
+      fail_case "$name" "the refusal did not state the id rule"; return
+    fi
+    # Nothing was read, so nothing was named. A transcript that echoed a
+    # constructed path here would mean the id had already been concatenated into
+    # one before it was checked.
+    if printf '%s\n' "$out" | grep -qF "$sd/profile-"; then
+      fail_case "$name" "--forget '$id' built a path out of the id before validating it"; return
+    fi
+  done
+  # Every fixture file survived all five attempts.
+  if [ ! -f "$sd/profile-custom-good.json" ] || [ ! -f "$sd/profile-broken.json" ] ||
+     [ ! -f "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-orphan.plist" ]; then
+    fail_case "$name" "a refused --forget deleted something anyway"; return
+  fi
+
+  # -- no id at all is a USAGE error, which is a different fact ---------------
+  # 2 means "you typed it wrong" and names the flag; 1 would mean "there is no
+  # such setup", which is a claim about this machine and would be false.
+  rc=0
+  out=$(env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --forget \
+          </dev/null 2>&1) || rc=$?
+  printf -- '--- --forget (no id) ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$rc" != "2" ] || ! printf '%s\n' "$out" | grep -qF 'Usage error:'; then
+    fail_case "$name" "--forget with no id exited $rc, expected a usage error (2)"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF -- '--list'; then
+    fail_case "$name" "--forget with no id did not point at the command that shows the ids"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --forget's id check, on a REAL TERMINAL. The machine-contract case above drives
+# it through a pipe, which is the right lane for the exit codes; this one is the
+# lane the destructive command is actually used in, and it is not interchangeable:
+#
+#   With no terminal, --forget can refuse for TWO different reasons — a bad id
+#   (1) and no terminal (4) — and only one of them is under test. A refusal that
+#   moved AFTER the terminal gate would still exit 4 on a closed stdin and the
+#   case would stay green while proving nothing about the charset. On a PTY there
+#   is no second reason left: the terminal is there, so a refusal is the id check
+#   or it is nothing.
+#
+# The pairing is the assertion (§5's rule). The bad-id lane asserts that a removal
+# screen is never reached; the good-id lane, driven identically, asserts that the
+# same PTY drive DOES reach one — otherwise "no removal screen" is satisfied by a
+# fixture with nothing to remove, which is a green that means nothing.
+run_manage_forget_pty_id_case() {
+  local name="manage-forget-bad-id-refused-on-a-terminal" rc=0 id
+  local home="$TMP/forgetpty-home" state="$TMP/forgetpty-state" sd="$TMP/forgetpty-state/conduck"
+  mkdir -p "$home/Library/LaunchAgents" "$home/.config/systemd/user" "$sd"
+  : > "$TMP/doctor.out"
+  write_valid_profile "$sd/profile-custom-good.json" \
+    "custom-good" "Good gateway" "https://good.example.test"
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+
+  # An Enter is queued so the run cannot block if a prompt DOES appear — a hang
+  # would exit 124 and be reported as a timeout rather than as this failure.
+  for id in '../../etc' 'foo/bar'; do
+    rc=0
+    pty_run 15 $'\n' --forget "$id" > "$TMP/forget-bad.out" 2>&1 || rc=$?
+    printf -- '--- --forget %s (pty) ---\n' "$id" >> "$TMP/doctor.out"
+    cat "$TMP/forget-bad.out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$(cat "$TMP/forget-bad.out")" || return
+    if [ "$rc" != "1" ]; then
+      fail_case "$name" "--forget '$id' on a terminal exited $rc, expected 1"; return
+    fi
+    if ! grep -qF 'is not a saved setup id' "$TMP/forget-bad.out"; then
+      fail_case "$name" "--forget '$id' on a terminal did not refuse the id by name"; return
+    fi
+    # The removal screen is the point of no return: it is where the disclosure is
+    # printed and where the type-back prompt appears. Reaching it with an id like
+    # ../../etc means the id has already been turned into paths.
+    if grep -qF 'to remove it (Enter = cancel; i = explain; q = stop)' "$TMP/forget-bad.out"; then
+      fail_case "$name" "--forget '$id' reached the removal confirmation"; return
+    fi
+    if grep -qF 'This removes, on this machine:' "$TMP/forget-bad.out"; then
+      fail_case "$name" "--forget '$id' printed a teardown list for an id it had refused"; return
+    fi
+    if grep -qF "$sd/profile-" "$TMP/forget-bad.out"; then
+      fail_case "$name" "--forget '$id' built a path out of the id before validating it"; return
+    fi
+  done
+  if [ ! -f "$sd/profile-custom-good.json" ]; then
+    fail_case "$name" "a refused --forget deleted the unrelated saved setup"; return
+  fi
+
+  # The presence half: the same drive, a legal id, and the removal screen the two
+  # lanes above must never see. Enter at the type-back prompt CANCELS, so this
+  # lane reaches the point of no return and stops one keystroke short of it.
+  rc=0
+  pty_run 15 $'\n' --forget custom-good > "$TMP/forget-good.out" 2>&1 || rc=$?
+  printf -- '--- --forget custom-good (pty, cancelled) ---\n' >> "$TMP/doctor.out"
+  cat "$TMP/forget-good.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/forget-good.out")" || return
+  if ! grep -qF 'Type custom-good to remove it (Enter = cancel; i = explain; q = stop)' "$TMP/forget-good.out"; then
+    fail_case "$name" "a legal id never reached the removal confirmation — the absence lanes prove nothing"; return
+  fi
+  if [ "$rc" = "0" ]; then
+    fail_case "$name" "a cancelled removal reported success"; return
+  fi
+  if [ ! -f "$sd/profile-custom-good.json" ]; then
+    fail_case "$name" "Enter at the type-back prompt removed the setup instead of cancelling"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The edit screen holds ONE setup's values in its own locals and reprints itself
+# from them after every action — including after action 4, which hands control to
+# the whole --show-code pipeline. That pipeline is a fresh-process program: it loads
+# a profile into GW_*/FS_* and, when it cannot recover a file-lane credential, it
+# offers to print a gateway-only code and CLEARS FS_URL/FS_CRED to mean it. Run from
+# the edit screen with those names unclaimed, both of those writes land in the edit
+# screen's own state, and the next save on that screen writes them back:
+# `"fileServer": null` for a lane that is still there, into a file chosen by an id
+# that came out of the profile rather than off the screen.
+#
+# This is an ISOLATED case because the end-to-end drive is not reachable hermetically:
+# --show-code exits 1 the moment live verification fails, and verification needs a
+# reachable https gateway. The pipeline still runs to completion in production, which
+# is exactly when the finding bites. So the network tail is stubbed and everything
+# that touches the STATE — the profile load, the credential recovery, the fallback,
+# the save, the encoder — is the shipped code.
+#
+# The fixture is the finding's own shape, and every part of it is load-bearing:
+#
+#   The file is profile-custom-a.json and the gateway.id INSIDE it is custom-b.
+#   Nothing forbids that: show_qr_validate_profile checks the charset of the id in
+#   the file and never compares it to the file's name. So the id the operator picked
+#   and the id the profile carries can differ, and only one of them is the file that
+#   may be written.
+#
+#   The credential file for custom-a EXISTS and there is no service unit. That is
+#   the population most likely to press 4: manage_load_profile finds the credential
+#   by the id it was asked about, existing_fs_config cannot (there is no unit to
+#   find), and the gateway-only fallback fires for the reason it is meant to.
+run_manage_show_code_state_isolated() {
+  FUNCS="$1" STATE="$2" HOMEDIR="$3" FOLDER="$4" bash -c '
+eval "$FUNCS"
+say() { :; }; note() { :; }; warn() { :; }; ok() { :; }; head_() { :; }; bad() { :; }
+die() { printf "DIE %s\n" "$*"; exit 9; }
+preflight() { :; }
+show_qr_warn_quick_tunnel() { :; }
+# The network tail, and only the network tail.
+show_qr_check_live()  { :; }
+show_qr_recall_scope() { :; }
+verify_all()          { :; }
+emit_payload()        { :; }
+show_qr_next_steps()  { :; }
+# Answering yes is the case: the fallback is what clears the lane, so declining it
+# would grade a branch that changes nothing.
+confirm() { printf "CONFIRM %s\n" "$1"; return 0; }
+OS=$(uname -s)
+HOME="$HOMEDIR"
+STATE_DIR="$STATE"
+STATE_DIR_EXPOSURE_REPORTED=true
+DRY_RUN=false; REUSE_ONLY=false; SHOW_QR=false
+VERIFY_FAILED=false; FS_LANE_DROPPED_BY_CHECK=false
+
+# manage_edit’s frame: the values the screen is holding when 4 is pressed. The id
+# is the one the operator PICKED, which is the file name, not the id in the file.
+GW_ID="custom-a"; GW_KIND="custom"; GW_NAME="Two id gateway"; GW_AUTH="none"
+TRANSPORT="public"; SCOPE="public"; GW_URL="https://gw.example.test"
+GW_LOCAL_PORT="8080"; GW_MODEL=""
+FS_URL="https://files.example.test:8443"; FS_CRED="not-a-real-password"
+FS_LOCAL_PORT="8081"; FS_REACH="public"; FS_FOLDER="$FOLDER"
+
+printf "BEFORE GW_ID=%s FS_URL=%s FS_CRED=%s\n" "$GW_ID" "$FS_URL" "${FS_CRED:+set}"
+manage_show_code custom-a
+printf "AFTER GW_ID=%s FS_URL=%s FS_CRED=%s\n" "$GW_ID" "$FS_URL" "${FS_CRED:+set}"
+# …and the save the screen offers next, which is where clobbered state becomes a
+# written file.
+GW_URL="https://moved.example.test"
+manage_save_profile custom-a
+' 2>&1
+}
+
+run_manage_show_code_state_case() {
+  local name="manage-edit-survives-showing-a-setup-code" funcs out before after
+  local home="$TMP/showstate-home" sd="$TMP/showstate-state/conduck"
+  : > "$TMP/doctor.out"
+  # No LaunchAgents / systemd user directory at all: "the service unit is gone".
+  local folder="$TMP/showstate-state/work"
+  mkdir -p "$home" "$sd" "$folder"
+  # localPort as a STRING, because that is what write_profile emits — a fixture
+  # that used a JSON number would report every rewrite as a change to the block.
+  printf '{"schemaVersion":1,"gateway":{"id":"custom-b","kind":"custom","name":"Two id gateway","auth":"none","transport":"public","reach":"public","url":"https://gw.example.test","localPort":"8080"},"fileServer":{"url":"https://files.example.test:8443","folder":"%s","reach":"public","localPort":"8081"}}\n' \
+    "$folder" > "$sd/profile-custom-a.json"
+  printf 'conduck:not-a-real-password\n' > "$sd/fileserver-custom-a.cred"
+
+  # The fileServer block as a canonical string, so "unchanged" survives the rewrite
+  # reordering the document's keys — the object is what must be identical, not the
+  # bytes of the file it sits in.
+  before=$(python3 - "$sd/profile-custom-a.json" <<'PY'
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1])).get("fileServer"), sort_keys=True))
+PY
+) || { fail_case "$name" "could not read the fixture's fileServer block"; return; }
+
+  funcs=$(extract_funcs manage_show_code manage_save_profile manage_profile_path \
+    show_qr_load_profile show_qr_validate_profile show_qr_profile_invalid \
+    show_qr_profile_field_invalid show_qr_is_https_host show_qr_is_port \
+    show_qr_recover_gateway_secret show_qr_recover_file_lane \
+    existing_fs_config linux_unit_candidates mac_unit_candidates \
+    json_query json_get json_type write_profile ensure_state_dir)
+  out=$(run_manage_show_code_state_isolated "$funcs" "$sd" "$home" "$folder")
+  printf -- '--- isolated show-code from the edit frame ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+
+  # Non-vacuity first. If the credential HAD been recovered, nothing would be
+  # cleared and every assertion below would pass on a build with no fix in it.
+  if ! printf '%s\n' "$out" | grep -qF 'CONFIRM   Re-show the code for the GATEWAY ONLY'; then
+    fail_case "$name" "the gateway-only fallback never fired, so nothing cleared the lane"; return
+  fi
+  # The id the operator picked. Pre-fix this came back custom-b, read out of the
+  # file — and it is the only thing deciding which file the next save writes.
+  if ! printf '%s\n' "$out" | grep -qF 'AFTER GW_ID=custom-a'; then
+    fail_case "$name" "showing a setup code replaced the id the edit screen was working on"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'AFTER GW_ID=custom-a FS_URL=https://files.example.test:8443 FS_CRED=set'; then
+    fail_case "$name" "showing a setup code emptied the file lane the edit screen was holding"; return
+  fi
+
+  # The second barrier, independent of the first: even with the id clobbered, the
+  # save must land on the file the operator picked.
+  if [ ! -f "$sd/profile-custom-a.json" ]; then
+    fail_case "$name" "the save did not write the profile the operator picked"; return
+  fi
+  if [ -f "$sd/profile-custom-b.json" ]; then
+    fail_case "$name" "the save minted a second profile named after the id inside the file"; return
+  fi
+  # The save really happened — otherwise "the block is unchanged" is satisfied by a
+  # run that wrote nothing at all.
+  out=$(python3 - "$sd/profile-custom-a.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["gateway"]["url"])
+PY
+) || { fail_case "$name" "the rewritten profile did not parse"; return; }
+  printf -- '--- gateway.url after the save ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if [ "$out" != "https://moved.example.test" ]; then
+    fail_case "$name" "the address change did not reach the file (url is '$out')"; return
+  fi
+  after=$(python3 - "$sd/profile-custom-a.json" <<'PY'
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1])).get("fileServer"), sort_keys=True))
+PY
+) || { fail_case "$name" "could not read the rewritten fileServer block"; return; }
+  printf -- '--- fileServer before/after ---\n%s\n%s\n' "$before" "$after" >> "$TMP/doctor.out"
+  if [ "$after" != "$before" ]; then
+    fail_case "$name" "the save rewrote the file lane after a setup code was shown"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Every id and every path on the --list screen is FILESYSTEM-DERIVED: the id comes
+# out of a filename, and the leftovers scan reads unit files nothing in this tool
+# wrote. A filename is attacker-influenced on any machine where something else can
+# create a file in $HOME/Library/LaunchAgents or the state directory — and a name
+# carrying ANSI can rewrite the screen it is printed on, which on this screen means
+# rewriting a list of what will be removed.
+#
+# Two shapes, because they reach the screen by different routes: a profile the
+# validator rejects (its id AND the reason, which quotes the path back, so the same
+# bytes arrive twice), and an orphan service unit (its id, its path, and the
+# teardown command built from them).
+#
+# The command is the sharper half. `--forget <id>` was printed for ids manage_id_ok
+# refuses — an instruction that cannot work — and fs_print_teardown quotes for the
+# SHELL, which does not strip control bytes, so a "correct" command for such a path
+# is by construction one that repaints the terminal. Both are now the by-hand
+# route instead. The ordinary orphan beside it still gets its one-line command,
+# which is what stops the fix from being "print less".
+run_manage_untrusted_names_case() {
+  local name="manage-list-renders-untrusted-names" rc esc evil
+  local home="$TMP/rawnames-home" state="$TMP/rawnames-state" sd="$TMP/rawnames-state/conduck"
+  mkdir -p "$home/Library/LaunchAgents" "$home/.config/systemd/user" "$sd"
+  : > "$TMP/doctor.out"
+  esc=$(printf '\033')
+  evil="${esc}[31mEVIL"
+
+  # The control: an ordinary orphan, whose instruction must survive.
+  printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>x</string><key>ProgramArguments</key><array><string>/usr/local/bin/rclone</string><string>serve</string><string>webdav</string><string>/tmp/lonelyfolder</string><string>--addr</string><string>127.0.0.1:8080</string></array></dict></plist>\n' \
+    > "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-lonely.plist"
+  printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav /tmp/lonelyfolder --addr 127.0.0.1:8080\n' \
+    > "$home/.config/systemd/user/conduck-files-lonely.service"
+  # An orphan whose id carries an ESC, on both platforms' paths so the case does
+  # not depend on which one it runs on.
+  printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>y</string><key>ProgramArguments</key><array><string>/usr/local/bin/rclone</string><string>serve</string><string>webdav</string><string>/tmp/evilfolder</string><string>--addr</string><string>127.0.0.1:8082</string></array></dict></plist>\n' \
+    > "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-$evil.plist"
+  printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav /tmp/evilfolder --addr 127.0.0.1:8082\n' \
+    > "$home/.config/systemd/user/conduck-files-$evil.service"
+  # …a profile this version cannot read, filed under the same kind of id…
+  printf 'not json at all\n' > "$sd/profile-$evil.json"
+  # …and a third orphan whose id is perfectly PRINTABLE and still not one --forget
+  # will accept (ids are lowercase). It separates the two halves of the defect: the
+  # bytes and the instruction. Without it, an id that is merely unaddressable would
+  # be graded only by the escape-byte count, which it does not trip.
+  printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>z</string><key>ProgramArguments</key><array><string>/usr/local/bin/rclone</string><string>serve</string><string>webdav</string><string>/tmp/shoutyfolder</string><string>--addr</string><string>127.0.0.1:8083</string></array></dict></plist>\n' \
+    > "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-SHOUTY.plist"
+  printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav /tmp/shoutyfolder --addr 127.0.0.1:8083\n' \
+    > "$home/.config/systemd/user/conduck-files-SHOUTY.service"
+
+  # The fixture is only a test if the bytes are really in the names.
+  if [ ! -f "$sd/profile-$evil.json" ] ||
+     [ ! -f "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-$evil.plist" ]; then
+    fail_case "$name" "the ESC-bearing fixtures were not created — every assertion here would be vacuous"; return
+  fi
+
+  rc=0
+  env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list \
+    > "$TMP/rawnames.out" 2>&1 </dev/null || rc=$?
+  # cat -v, because the raw bytes are the thing under test and a doctor dump of
+  # them would carry them into the terminal of whoever reads a failing run.
+  printf -- '--- --list with untrusted names (cat -v) ---\n' >> "$TMP/doctor.out"
+  cat -v "$TMP/rawnames.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/rawnames.out")" || return
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "--list with untrusted names exited $rc, expected 0"; return
+  fi
+  # Colour is gated on [ -t 1 ] and this run is redirected, so the ONLY escapes
+  # that could reach here came out of a filename.
+  if [ "$(tr -dc "$esc" < "$TMP/rawnames.out" | wc -c | tr -d ' ')" != "0" ]; then
+    fail_case "$name" "a filesystem-derived name put raw escape bytes on the screen"; return
+  fi
+  # Reported, not dropped: a name this screen cannot print safely is exactly the
+  # one somebody needs to see and get rid of.
+  if ! grep -qF 'Saved here but not usable by this version' "$TMP/rawnames.out"; then
+    fail_case "$name" "a profile this version cannot read went unreported"; return
+  fi
+  if ! grep -qF 'File servers with no saved setup behind them' "$TMP/rawnames.out"; then
+    fail_case "$name" "the leftovers scan did not run"; return
+  fi
+  if ! grep -qF '[31mEVIL' "$TMP/rawnames.out"; then
+    fail_case "$name" "the untrusted names were suppressed rather than made safe to print"; return
+  fi
+  # The instruction that cannot work. An id manage_id_ok refuses gets the by-hand
+  # route, never a --forget the tool will decline.
+  if grep -qE -- '--forget .*EVIL' "$TMP/rawnames.out"; then
+    fail_case "$name" "a --forget command was printed for an id --forget itself refuses"; return
+  fi
+  if grep -qF -- '--forget SHOUTY' "$TMP/rawnames.out"; then
+    fail_case "$name" "a --forget command was printed for an id --forget itself refuses"; return
+  fi
+  if ! grep -qF '/tmp/shoutyfolder' "$TMP/rawnames.out"; then
+    fail_case "$name" "an unaddressable orphan went unreported instead of getting a by-hand teardown"; return
+  fi
+  if ! grep -qF 'Its real filename holds characters a terminal would ACT on' "$TMP/rawnames.out"; then
+    fail_case "$name" "the unprintable name was given no way to be removed at all"; return
+  fi
+  # The control, unchanged.
+  if ! grep -qF 'bash conduck-connect.sh --forget lonely' "$TMP/rawnames.out"; then
+    fail_case "$name" "an ordinary orphan lost its one-line removal command"; return
+  fi
+  if ! grep -qF '/tmp/lonelyfolder' "$TMP/rawnames.out"; then
+    fail_case "$name" "an ordinary orphan lost the folder it serves"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The Token row on --list answers one question — where does the token come from
+# when a setup code is printed? — and the answer is different for each gateway
+# kind. show_qr_recover_gateway_secret is the authority: openclaw reads the literal
+# out of OpenClaw's own config, hermes reads API_SERVER_KEY from ~/.hermes/.env and
+# dies if it is absent, and only the custom arm ever prompts. One sentence for all
+# three told two thirds of the operators to expect a question they will never see,
+# and hid the file they actually need to keep in place.
+run_manage_token_row_case() {
+  local name="manage-list-token-row-is-per-kind" rc kind
+  local home="$TMP/tokenrow-home" state="$TMP/tokenrow-state" sd="$TMP/tokenrow-state/conduck"
+  mkdir -p "$home" "$sd"
+  : > "$TMP/doctor.out"
+  # kind and id must agree (openclaw pairs with the id openclaw, hermes with
+  # hermes, custom with custom-*), so the fixtures are named accordingly.
+  printf '{"schemaVersion":1,"gateway":{"id":"custom-keyless","kind":"custom","name":"Keyless","auth":"none","transport":"public","reach":"public","url":"https://k.example.test"},"fileServer":null}\n' \
+    > "$sd/profile-custom-keyless.json"
+  printf '{"schemaVersion":1,"gateway":{"id":"custom-bearer","kind":"custom","name":"Custom bearer","auth":"bearer","transport":"public","reach":"public","url":"https://c.example.test"},"fileServer":null}\n' \
+    > "$sd/profile-custom-bearer.json"
+  printf '{"schemaVersion":1,"gateway":{"id":"hermes","kind":"hermes","name":"Hermes","auth":"bearer","transport":"public","reach":"public","url":"https://h.example.test"},"fileServer":null}\n' \
+    > "$sd/profile-hermes.json"
+  printf '{"schemaVersion":1,"gateway":{"id":"openclaw","kind":"openclaw","name":"OpenClaw","auth":"bearer","transport":"public","reach":"public","url":"https://o.example.test"},"fileServer":null}\n' \
+    > "$sd/profile-openclaw.json"
+
+  rc=0
+  env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list \
+    > "$TMP/tokenrow.out" 2>&1 </dev/null || rc=$?
+  printf -- '--- --list, four gateway kinds ---\n' >> "$TMP/doctor.out"
+  cat "$TMP/tokenrow.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/tokenrow.out")" || return
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "--list with four saved kinds exited $rc, expected 0"; return
+  fi
+  # One row per kind, each naming the place a code really re-reads the token from.
+  for kind in \
+    "keyless|not stored — this gateway is keyless" \
+    "custom|not saved here — you re-enter it when a code is printed" \
+    "hermes|not saved here — a code re-reads it from ~/.hermes/.env" \
+    "openclaw|not saved here — a code re-reads it from OpenClaw's own config" \
+  ; do
+    if ! grep -qF "${kind#*|}" "$TMP/tokenrow.out"; then
+      fail_case "$name" "the ${kind%%|*} setup's Token row did not say where its token comes from"; return
+    fi
+  done
+  # Four DISTINCT rows. Without this, one sentence printed four times satisfies
+  # every assertion above that happens to match it.
+  if [ "$(grep -c 'Token:' "$TMP/tokenrow.out")" != "4" ]; then
+    fail_case "$name" "expected one Token row per saved setup, found $(grep -c 'Token:' "$TMP/tokenrow.out")"; return
+  fi
+  if [ "$(grep 'Token:' "$TMP/tokenrow.out" | sort -u | wc -l | tr -d ' ')" != "4" ]; then
+    fail_case "$name" "two gateway kinds were given the same Token row"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --edit through a PIPE. A pipe is not a character device, so it gets past the
+# dispatcher's closed-stdin guard and reaches the screen — and the screen used to
+# validate every profile on the machine, draw the whole inventory, print
+# "Which one? Choose 1-2", CONSUME the answer off the pipe, and only then refuse
+# for want of a terminal. To a driver that reads as a tool which took its choice
+# and changed its mind; worse, the answer is gone, so a wrapper cannot retry by
+# feeding the same input to an interactive run.
+#
+# The dry-run half rides along because it is the same question asked of the same
+# two commands — does the refusal arrive before anything happens? — and because
+# the branches it refuses were the ones deleted as unreachable. If --edit ever
+# accepted --dry-run again, its "(dry-run: …)" narration would be the first thing
+# in the transcript.
+run_manage_headless_refusals_case() {
+  local name="manage-refuses-before-it-reads-anything" rc out lane
+  local home="$TMP/headless-home" state="$TMP/headless-state" sd="$TMP/headless-state/conduck"
+  mkdir -p "$home" "$sd"
+  : > "$TMP/doctor.out"
+  write_valid_profile "$sd/profile-custom-one.json" "custom-one" "First gateway" "https://one.example.test"
+  write_valid_profile "$sd/profile-custom-two.json" "custom-two" "Second gateway" "https://two.example.test"
+
+  rc=0
+  out=$(printf '1\n' | env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
+          bash "$SCRIPT" --edit 2>&1) || rc=$?
+  printf -- '--- printf 1 | --edit, rc=%s ---\n%s\n' "$rc" "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+  if [ "$rc" != "4" ]; then
+    fail_case "$name" "--edit through a pipe exited $rc, expected 4"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'needs a person at a terminal'; then
+    fail_case "$name" "--edit through a pipe refused without saying what is missing"; return
+  fi
+  # Nothing was read. The inventory is built by validating every profile in the
+  # directory, so naming one means the refusal came after that work.
+  if printf '%s\n' "$out" | grep -qF 'First gateway'; then
+    fail_case "$name" "--edit rendered the saved setups before refusing"; return
+  fi
+  if printf '%s\n' "$out" | grep -qF 'Which one? Choose'; then
+    fail_case "$name" "--edit asked which setup and consumed the answer before refusing"; return
+  fi
+
+  # --dry-run, on the two commands whose dry-run branches were deleted for being
+  # unreachable. Each names the flag AND says why this command does not take it.
+  for lane in "--edit||--edit asks before every change" \
+              "--edit|custom-one|--edit asks before every change" \
+              "--forget|custom-one|--forget names everything it will remove" \
+  ; do
+    local cmd="${lane%%|*}"; lane="${lane#*|}"
+    local arg="${lane%%|*}"; local want="${lane#*|}"
+    rc=0
+    if [ -n "$arg" ]; then
+      out=$(env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
+              bash "$SCRIPT" "$cmd" "$arg" --dry-run </dev/null 2>&1) || rc=$?
+    else
+      out=$(env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
+              bash "$SCRIPT" "$cmd" --dry-run </dev/null 2>&1) || rc=$?
+    fi
+    printf -- '--- %s %s --dry-run, rc=%s ---\n%s\n' "$cmd" "$arg" "$rc" "$out" >> "$TMP/doctor.out"
+    if [ "$rc" != "2" ]; then
+      fail_case "$name" "$cmd $arg --dry-run exited $rc, expected a usage error (2)"; return
+    fi
+    if ! printf '%s\n' "$out" | grep -qF 'Usage error:'; then
+      fail_case "$name" "$cmd $arg --dry-run did not identify itself as a usage error"; return
+    fi
+    # `--` because every one of these fragments starts with a flag name.
+    if ! printf '%s\n' "$out" | grep -qF -- "$want"; then
+      fail_case "$name" "$cmd $arg --dry-run did not say why this command has no dry run"; return
+    fi
+    # The narration those deleted branches would have produced. Its absence is
+    # what says the refusal really did come first.
+    if printf '%s\n' "$out" | grep -qF '(dry-run:'; then
+      fail_case "$name" "$cmd narrated a dry run on an invocation it had refused"; return
+    fi
+  done
+  # …and no manage transcript in this case carries it either.
+  if grep -qF '(dry-run:' "$TMP/doctor.out"; then
+    fail_case "$name" "a manage transcript narrated a dry run"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The --edit screen's remaining cases all drive the same shape — one saved setup,
+# one PTY, one sequence of keystrokes — so the fixture and the drive live here and
+# each case owns only its fixture and its assertions.
+#
+# EDIT_WORK exists before the profile that names it: the screen prints the shared
+# folder, and a folder that is not there changes what it prints.
+EDIT_HOME=""; EDIT_STATE=""; EDIT_SD=""; EDIT_WORK=""; EDIT_RC=0
+manage_edit_fixture() { # manage_edit_fixture <slug> <profile-json-with-@WORK@>
+  EDIT_HOME="$TMP/editdrive-$1-home"
+  EDIT_STATE="$TMP/editdrive-$1-state"
+  EDIT_SD="$EDIT_STATE/conduck"
+  EDIT_WORK="$TMP/editdrive-$1-work"
+  mkdir -p "$EDIT_HOME/Library/LaunchAgents" "$EDIT_HOME/.config/systemd/user" \
+           "$EDIT_SD" "$EDIT_WORK"
+  printf '%s\n' "${2//@WORK@/$EDIT_WORK}" > "$EDIT_SD/profile-custom-a.json"
+}
+manage_edit_run() { # manage_edit_run <keys-with-\n> [script-args…]
+  local keys="$1"; shift
+  keys=$(printf '%b_' "$keys"); keys="${keys%_}"
+  PTY_ENV=(HOME="$EDIT_HOME" XDG_CONFIG_HOME="$EDIT_STATE")
+  EDIT_RC=0
+  pty_run 40 "$keys" "$@" > "$TMP/editdrive.out" 2>&1 || EDIT_RC=$?
+  cat "$TMP/editdrive.out" >> "$TMP/doctor.out"
+}
+# gateway.url, gateway.model and "does a fileServer block survive", read off the
+# disk in one go — three separate greps of the transcript would grade what the
+# screen SAID rather than what it wrote.
+manage_edit_disk() { # manage_edit_disk -> "<url> <model> fs=<True|False>"
+  python3 - "$EDIT_SD/profile-custom-a.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1])); g = d["gateway"]
+print("%s %s fs=%s" % (g["url"], g.get("model"), bool(d.get("fileServer"))))
+PY
+}
+
+# A Tailscale setup given an address that is not a tailnet name is the one
+# inconsistency this screen can prove on its own — and the consequence is exact:
+# --show-code asserts the live Tailscale mapping before it prints anything and dies
+# on a non-*.ts.net host, so the record is one no setup code can be printed from.
+# The screen printed that warning and then saved anyway, unasked, and offered the
+# setup code whose first step it had just said would refuse.
+#
+# Three lanes, and the third is what makes the first two mean anything.
+#
+# Read this before strengthening the gate assertion: an address that does not
+# ANSWER also opens the confirm gate, and no address can answer in a hermetic
+# suite — ask_url takes https:// only, and this repo has no HTTPS fixture and will
+# not grow a self-signed one. So "Save it anyway? appeared" is graded here as the
+# gate existing at all, and it is NOT what separates the two doubts. The two facts
+# that are only ever true of the transport mismatch are the sentence naming what
+# saving costs, and — after a save — the refusal standing where the code offer
+# would be. Those are the assertions that bite; the cloudflare lane is the same
+# drive against a transport with no mismatch, same unreachable address, same gate,
+# and neither of those two.
+run_manage_edit_tailscale_case() {
+  local name="manage-edit-confirms-a-tailscale-address-mismatch" disk
+  : > "$TMP/doctor.out"
+  local ts='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Tailnet gateway","auth":"bearer","transport":"tailscale","reach":"private","url":"https://box.tail1234.ts.net","localPort":"8080"},"fileServer":null}'
+  local cf='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Cloudflared gateway","auth":"bearer","transport":"cloudflare","reach":"public","url":"https://a.trycloudflare.com"},"fileServer":null}'
+
+  # Lane 1: the gate appears and No leaves the disk alone.
+  manage_edit_fixture ts-no "$ts"
+  printf -- '--- tailscale, answered No ---\n' >> "$TMP/doctor.out"
+  manage_edit_run '1\nhttps://moved.example.test\nn\nq\n' --edit custom-a
+  assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
+  if [ "$EDIT_RC" = "124" ]; then
+    fail_case "$name" "the tailscale lane hung"; return
+  fi
+  if ! grep -qF 'that address is not a' "$TMP/editdrive.out"; then
+    fail_case "$name" "a non-tailnet address on a Tailscale setup was not called out"; return
+  fi
+  if ! grep -qF 'Save it anyway?' "$TMP/editdrive.out"; then
+    fail_case "$name" "the address change was saved without a confirmation of any kind"; return
+  fi
+  if ! grep -qF 'Saving this leaves a record no setup code can be printed from' "$TMP/editdrive.out"; then
+    fail_case "$name" "the confirmation did not name what saving would cost"; return
+  fi
+  disk=$(manage_edit_disk) || { fail_case "$name" "the tailscale profile no longer parses"; return; }
+  if [ "$disk" != "https://box.tail1234.ts.net None fs=False" ]; then
+    fail_case "$name" "answering No still changed the saved address (disk: $disk)"; return
+  fi
+
+  # Lane 2: Yes saves — and the code offer is replaced by the refusal.
+  manage_edit_fixture ts-yes "$ts"
+  printf -- '--- tailscale, answered Yes ---\n' >> "$TMP/doctor.out"
+  manage_edit_run '1\nhttps://moved.example.test\ny\nq\n' --edit custom-a
+  assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
+  if [ "$EDIT_RC" = "124" ]; then
+    fail_case "$name" "the tailscale save lane hung"; return
+  fi
+  disk=$(manage_edit_disk) || { fail_case "$name" "the tailscale profile no longer parses"; return; }
+  if [ "$disk" != "https://moved.example.test None fs=False" ]; then
+    fail_case "$name" "answering Yes did not save the address (disk: $disk)"; return
+  fi
+  if grep -qF 'Show the new setup code now?' "$TMP/editdrive.out"; then
+    fail_case "$name" "a mismatched record was offered a setup code its own pipeline refuses"; return
+  fi
+  if ! grep -qF 'No setup code can be printed from this record' "$TMP/editdrive.out"; then
+    fail_case "$name" "the code offer was dropped without saying why, or how to make one printable again"; return
+  fi
+
+  # Lane 3, the control: no mismatch, so neither of the two above, and the offer
+  # is there.
+  manage_edit_fixture cf "$cf"
+  printf -- '--- cloudflare control ---\n' >> "$TMP/doctor.out"
+  manage_edit_run '1\nhttps://moved.example.test\ny\nn\nq\n' --edit custom-a
+  assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
+  if [ "$EDIT_RC" = "124" ]; then
+    fail_case "$name" "the cloudflare control lane hung"; return
+  fi
+  if grep -qF 'Saving this leaves a record no setup code can be printed from' "$TMP/editdrive.out"; then
+    fail_case "$name" "a transport with no mismatch was warned about one — the lanes above prove nothing"; return
+  fi
+  if grep -qF 'No setup code can be printed from this record' "$TMP/editdrive.out"; then
+    fail_case "$name" "a transport with no mismatch had its setup code refused"; return
+  fi
+  if ! grep -qF 'Show the new setup code now?' "$TMP/editdrive.out"; then
+    fail_case "$name" "an ordinary saved address stopped offering the code that carries it"; return
+  fi
+  disk=$(manage_edit_disk) || { fail_case "$name" "the cloudflare profile no longer parses"; return; }
+  if [ "$disk" != "https://moved.example.test None fs=False" ]; then
+    fail_case "$name" "the control lane did not save (disk: $disk)"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The model question has to fit the setup it is asked about. choose_saved_model is
+# written for a gateway that PINS one — it opens with "This gateway last used the
+# model:" and offers Keep it / Use a different name / Clear it — and called on a
+# setup that pins nothing it rendered an empty colon and two options that are the
+# same no-op. The wizard's own caller guards it on exactly that.
+#
+# Both sides, because a guard is only right if the guarded branch still runs: the
+# un-pinned setup gets the plain question and saves, and the pinned one still
+# reaches choose_saved_model and can still clear the pin.
+run_manage_edit_model_case() {
+  local name="manage-edit-model-question-fits-the-setup" disk
+  : > "$TMP/doctor.out"
+  local nomodel='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Unpinned gateway","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.test"},"fileServer":null}'
+  local pinned='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Pinned gateway","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.test","model":"qwen3-coder:480b"},"fileServer":null}'
+
+  manage_edit_fixture m-none "$nomodel"
+  printf -- '--- model, nothing pinned ---\n' >> "$TMP/doctor.out"
+  manage_edit_run '2\nm9\nq\n' --edit custom-a
+  assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
+  if [ "$EDIT_RC" = "124" ]; then
+    fail_case "$name" "the un-pinned model lane hung"; return
+  fi
+  if grep -qF 'last used the model:' "$TMP/editdrive.out"; then
+    fail_case "$name" "a setup that pins no model was told which model it last used"; return
+  fi
+  # The two options that are the same no-op when nothing is pinned.
+  if grep -qF 'Keep it' "$TMP/editdrive.out"; then
+    fail_case "$name" "a setup that pins no model was offered Keep it / Clear it"; return
+  fi
+  if ! grep -qF 'Model name' "$TMP/editdrive.out"; then
+    fail_case "$name" "the un-pinned setup was not simply asked for a model name"; return
+  fi
+  disk=$(manage_edit_disk) || { fail_case "$name" "the un-pinned profile no longer parses"; return; }
+  if [ "$disk" != "https://gw.example.test m9 fs=False" ]; then
+    fail_case "$name" "the plain model question did not save what was typed (disk: $disk)"; return
+  fi
+
+  manage_edit_fixture m-pin "$pinned"
+  printf -- '--- model, one pinned ---\n' >> "$TMP/doctor.out"
+  manage_edit_run '2\n3\nq\n' --edit custom-a
+  assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
+  if [ "$EDIT_RC" = "124" ]; then
+    fail_case "$name" "the pinned model lane hung"; return
+  fi
+  if ! grep -qF 'last used the model: qwen3-coder:480b' "$TMP/editdrive.out"; then
+    fail_case "$name" "a setup that pins a model no longer reaches the question written for one"; return
+  fi
+  disk=$(manage_edit_disk) || { fail_case "$name" "the pinned profile no longer parses"; return; }
+  # None, not the empty string: a pin on a model with no name is worse than no pin.
+  if [ "$disk" != "https://gw.example.test None fs=False" ]; then
+    fail_case "$name" "clearing a pinned model did not reach the disk (disk: $disk)"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A file lane whose password lives ONLY in its service unit is not an edge case —
+# it is what a machine looks like after the state directory is restored from a
+# backup that skipped 0600 files, or after a lane built by an older run. The edit
+# screen refused every save for those setups, which is the population most likely
+# to be sitting in front of it.
+#
+# The unit is read as a THIRD credential source, and the second assertion is the
+# one that makes reading it safe: the password appears nowhere in the transcript.
+# A screen that recovered the credential and then printed it would satisfy every
+# other line here.
+run_manage_edit_unit_credential_case() {
+  local name="manage-edit-loads-a-unit-only-credential" disk sentinel unit
+  sentinel='SENTINELUNITPW-must-never-be-printed-91c4'
+  : > "$TMP/doctor.out"
+  local lane='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Lane gateway","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.test"},"fileServer":{"url":"https://files.example.test:8443","folder":"@WORK@","reach":"public","localPort":"8081"}}'
+  manage_edit_fixture fs-unit "$lane"
+  # No .cred and no .env on purpose — the unit is the only copy.
+  if [ "$(uname -s)" = "Linux" ]; then
+    unit="$EDIT_HOME/.config/systemd/user/conduck-files-custom-a.service"
+    printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav %s --addr 127.0.0.1:8081 --user conduck --pass %s\n' \
+      "$EDIT_WORK" "$sentinel" > "$unit"
+  else
+    unit="$EDIT_HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-custom-a.plist"
+    printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>x</string><key>ProgramArguments</key><array><string>/usr/local/bin/rclone</string><string>serve</string><string>webdav</string><string>%s</string><string>--addr</string><string>127.0.0.1:8081</string><string>--user</string><string>conduck</string><string>--pass</string><string>%s</string></array></dict></plist>\n' \
+      "$EDIT_WORK" "$sentinel" > "$unit"
+  fi
+  if [ -f "$EDIT_SD/fileserver-custom-a.cred" ] || [ -f "$EDIT_SD/fileserver-custom-a.env" ]; then
+    fail_case "$name" "the fixture left a credential file — the unit is not the only copy"; return
+  fi
+  if ! grep -qF "$sentinel" "$unit"; then
+    fail_case "$name" "the sentinel never reached the unit — the absence assertion below would be vacuous"; return
+  fi
+
+  manage_edit_run '1\nhttps://moved.example.test\ny\nn\nq\n' --edit custom-a
+  # The transcript is appended with the sentinel masked; a leak is named by the
+  # assertion that caught it, never reprinted into the suite's own log.
+  sed -i.bak "s/$sentinel/[sentinel]/g" "$TMP/doctor.out" && rm -f "$TMP/doctor.out.bak"
+  assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
+  if [ "$EDIT_RC" = "124" ]; then
+    fail_case "$name" "the unit-credential lane hung"; return
+  fi
+  if grep -qF 'stored password is not in' "$TMP/editdrive.out"; then
+    fail_case "$name" "the screen refused to save a lane whose password is in its own service unit"; return
+  fi
+  if ! grep -qF '✓ Saved.' "$TMP/editdrive.out"; then
+    fail_case "$name" "the address change was not saved"; return
+  fi
+  disk=$(manage_edit_disk) || { fail_case "$name" "the rewritten profile no longer parses"; return; }
+  # fs=True is the point: write_profile reads FS_CRED as a boolean and drops the
+  # whole fileServer block without one, so a save that could not recover the
+  # credential would silently turn a file lane into a chat-only record.
+  if [ "$disk" != "https://moved.example.test None fs=True" ]; then
+    fail_case "$name" "the save lost the file lane it could not have rebuilt (disk: $disk)"; return
+  fi
+  if grep -qF "$sentinel" "$TMP/editdrive.out"; then
+    fail_case "$name" "the screen printed the password it recovered from the service unit"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --list is the surface whose whole job is to report what is on this machine, and
+# the leftovers scan is the part of it nobody else does: a service unit with no
+# profile behind it is a live authenticated WebDAV server over the agent's working
+# folder, restarted at every login, that nothing else in the tool would mention
+# again. That scan globs paths under $HOME — and under `set -u`, a bare $HOME with
+# no HOME in the environment is a fatal expansion.
+#
+# The consequence is worse than a crash, which is why this case exists at all. The
+# scan runs inside $(…) in a here-doc, so `set -u` kills the SUBSHELL: --list still
+# exits 0, still prints an inventory, and reports `"leftovers": []`. A machine
+# consumer gets a clean, confident, wrong answer with no diagnostic anywhere.
+#
+# HOME unset is not exotic: cron, systemd units without User=, `env -i` wrappers and
+# container entrypoints all produce it, and XDG_CONFIG_HOME set with HOME unset is
+# exactly how a service account is configured.
+#
+# The third lane is the one that keeps the other two honest. `${HOME:-}` also buys
+# silence — a scan that found nothing would pass every assertion about diagnostics —
+# so the same scan, with HOME set and an orphan unit seeded, must still find it and
+# still print the command that removes it.
+run_manage_missing_home_case() {
+  local name="manage-list-survives-a-missing-home" rc out
+  local state="$TMP/nohome-state" sd="$TMP/nohome-state/conduck"
+  local ohome="$TMP/nohome-orphan-home" ostate="$TMP/nohome-orphan-state"
+  mkdir -p "$sd" "$ohome/Library/LaunchAgents" "$ohome/.config/systemd/user" "$ostate/conduck"
+  : > "$TMP/doctor.out"
+  write_valid_profile "$sd/profile-custom-good.json" \
+    "custom-good" "Good gateway" "https://good.example.test"
+
+  local lane
+  for lane in human json; do
+    rc=0
+    if [ "$lane" = "json" ]; then
+      env -u CI -u HOME XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list --json \
+        > "$TMP/nohome-$lane.out" 2>&1 </dev/null || rc=$?
+    else
+      env -u CI -u HOME XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list \
+        > "$TMP/nohome-$lane.out" 2>&1 </dev/null || rc=$?
+    fi
+    printf -- '--- --list (%s), HOME unset, rc=%s ---\n' "$lane" "$rc" >> "$TMP/doctor.out"
+    cat "$TMP/nohome-$lane.out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$(cat "$TMP/nohome-$lane.out")" || return
+    if [ "$rc" != "0" ]; then
+      fail_case "$name" "--list ($lane) with HOME unset exited $rc, expected 0"; return
+    fi
+    # Both streams, because the expansion error goes to stderr and the two lanes
+    # are captured together for exactly that reason.
+    if grep -qF 'unbound variable' "$TMP/nohome-$lane.out"; then
+      fail_case "$name" "--list ($lane) with HOME unset expanded an unset variable"; return
+    fi
+    # Any bash diagnostic, not just that one: a `line NNN:` prefix is the shell
+    # talking about the script, and none of it belongs in either lane's output.
+    if grep -qE '^[^ ]*: line [0-9]+:' "$TMP/nohome-$lane.out"; then
+      fail_case "$name" "--list ($lane) with HOME unset printed a shell diagnostic"; return
+    fi
+  done
+  # The JSON lane owes a parser both arrays, not merely valid JSON: the failure this
+  # case is about produced a perfectly valid document with an empty leftovers[].
+  out=$(python3 - "$TMP/nohome-json.out" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+print("setups=%d leftovers=%d" % (len(d["setups"]), len(d["leftovers"])))
+PY
+) || { fail_case "$name" "--list --json with HOME unset did not parse as JSON"; return; }
+  printf -- '%s\n' "$out" >> "$TMP/doctor.out"
+  if ! printf '%s\n' "$out" | grep -qF 'setups=1'; then
+    fail_case "$name" "--list --json with HOME unset lost the setup it can see without a home directory"; return
+  fi
+
+  # The scan still works. Without this lane, rooting the globs at nothing would pass
+  # everything above by reporting nothing at all.
+  if [ "$(uname -s)" = "Linux" ]; then
+    printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav /tmp/ghostfolder --addr 127.0.0.1:8080\n' \
+      > "$ohome/.config/systemd/user/conduck-files-ghost.service"
+  else
+    printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>x</string><key>ProgramArguments</key><array><string>/usr/local/bin/rclone</string><string>serve</string><string>webdav</string><string>/tmp/ghostfolder</string><string>--addr</string><string>127.0.0.1:8080</string></array></dict></plist>\n' \
+      > "$ohome/Library/LaunchAgents/ai.gigaduck.conduck-files-ghost.plist"
+  fi
+  rc=0
+  env -u CI HOME="$ohome" XDG_CONFIG_HOME="$ostate" TERM=dumb bash "$SCRIPT" --list \
+    > "$TMP/nohome-orphan.out" 2>&1 </dev/null || rc=$?
+  printf -- '--- --list with HOME set and an orphan unit, rc=%s ---\n' "$rc" >> "$TMP/doctor.out"
+  cat "$TMP/nohome-orphan.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/nohome-orphan.out")" || return
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "--list with an orphan unit exited $rc, expected 0"; return
+  fi
+  if ! grep -qF 'File servers with no saved setup behind them' "$TMP/nohome-orphan.out"; then
+    fail_case "$name" "the leftovers scan went quiet — the HOME-unset lanes above prove nothing"; return
+  fi
+  if ! grep -qF '/tmp/ghostfolder' "$TMP/nohome-orphan.out"; then
+    fail_case "$name" "an orphan file server was reported without the folder it serves"; return
+  fi
+  if ! grep -qF 'bash conduck-connect.sh --forget ghost' "$TMP/nohome-orphan.out"; then
+    fail_case "$name" "an orphan file server was reported with no way to remove it"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Which modifiers each command takes, every cell of it. CLI_REJECTION_CASES samples
+# a handful of the interesting ones; the two defects fixed in this release both lived
+# in cells it does not cover — `--show-code --reuse-only` and `--list --reuse-only`
+# were accepted in silence, and `--edit`/`--forget --reuse-only` walked a picker, a
+# setup summary and a live probe before refusing. All four were flags --help had
+# always scoped away from those commands.
+#
+# A sampled table cannot catch that class, because the defect IS the cell nobody
+# thought to sample. So this case enumerates COMMANDS × CLI_MODIFIERS and grades
+# every cell against the accept lists spelled out below — which are --help's own
+# "With --setup: / With --list: / With --check-adapter:" scoping, written down a
+# second time on purpose. Two independent statements of the same rule disagree
+# loudly; one statement drifts in silence.
+#
+# The modifier list is read out of the artifact rather than hardcoded, so a new
+# modifier appears in the matrix the day it is added — and the assertion that the
+# list still matches this table is what forces somebody to say, here, which commands
+# take it. That is the whole point of a default-DENY design: forgetting costs a red
+# test rather than a silent permission.
+#
+# Isolated, against the real validate_cli, because the alternative is running seven
+# commands for real: the ACCEPT cells would send live requests to example.com and
+# open interactive screens, and a matrix that slow gets sampled again. The four
+# newly-refused cells are ALSO driven end to end, by run_manage_reuse_only_case.
+run_cli_matrix_isolated() {
+  FUNCS="$1" MODS="$2" bash -c '
+eval "$FUNCS"
+eval "CLI_MODIFIERS=$MODS"
+usage_die() { printf "REFUSED %s\n" "$*"; exit 2; }
+die() { printf "DIED %s\n" "$*"; exit 3; }
+# The URL grader and the userinfo check belong to the check arms and have their own
+# cases; here they must simply not reject, or every check cell would refuse for a
+# reason that is not the modifier under test.
+doctor_accept_url() { printf "%s" "$1"; }
+url_has_userinfo() { return 1; }
+URL_USERINFO_HINT="a credential was in that URL"
+for COMMAND in setup check-server check-adapter show-code list edit forget; do
+  for m in $CLI_MODIFIERS; do
+    ( CLI_DRY_RUN=false; CLI_REUSE_ONLY=false; CLI_DOCTOR_DEEP=false
+      CLI_DOCTOR_FILES=false; CLI_ALLOW_KEYLESS_PUBLIC=false; CLI_MANAGE_JSON=false
+      CLI_POSITIONAL=""
+      case "$m" in
+        positional)           CLI_POSITIONAL="https://example.com" ;;
+        dry-run)              CLI_DRY_RUN=true ;;
+        reuse-only)           CLI_REUSE_ONLY=true ;;
+        deep)                 CLI_DOCTOR_DEEP=true ;;
+        files)                CLI_DOCTOR_FILES=true ;;
+        allow-keyless-public) CLI_ALLOW_KEYLESS_PUBLIC=true ;;
+        json)                 CLI_MANAGE_JSON=true ;;
+      esac
+      # --forget is the one command with a REQUIRED positional, and it refuses a
+      # missing one before it grades any flag. Without an id every forget cell
+      # would report that refusal instead of the modifier verdict under test.
+      if [ "$COMMAND" = forget ] && [ "$m" != positional ]; then CLI_POSITIONAL="custom-good"; fi
+      out=$(validate_cli 2>&1); rc=$?
+      printf "CELL %s %s rc=%s | %s\n" "$COMMAND" "$m" "$rc" "$out"
+    )
+  done
+done
+# The typo guard, driven directly: cli_modifier_set is the only reader of the flag
+# globals, so a name in CLI_MODIFIERS it does not know would silently never be
+# checked — a permission granted by a spelling mistake.
+( out=$(cli_modifier_set not-a-real-modifier 2>&1); printf "TYPO rc=%s | %s\n" "$?" "$out" )
+'
+}
+
+run_cli_matrix_case() {
+  local name="cli-modifier-matrix" funcs mods out row cmd mod rc want accepted
+  : > "$TMP/doctor.out"
+  funcs=$(extract_funcs validate_cli cli_accept_only cli_modifier_set cli_modifier_refusal)
+  mods=$(sed -n 's/^CLI_MODIFIERS=//p' "$SCRIPT")
+  if [ -z "$mods" ]; then
+    fail_case "$name" "CLI_MODIFIERS could not be read out of the artifact"; return
+  fi
+  out=$(run_cli_matrix_isolated "$funcs" "$mods")
+  printf -- '--- command x modifier matrix ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+
+  # The list itself. A modifier added to the argument loop and not classified below
+  # would otherwise be graded against an accept list that has never heard of it.
+  eval "mods=$mods"
+  if [ "$mods" != "positional dry-run reuse-only deep files allow-keyless-public json" ]; then
+    fail_case "$name" "CLI_MODIFIERS changed to '$mods' — every command's accept list in this case needs a decision about it"; return
+  fi
+
+  # Each command's accept list, from --help's scoping. Everything not named here
+  # must exit 2. show-code accepts NOTHING, which is the whole of its arm.
+  local pairs='
+setup|dry-run reuse-only allow-keyless-public
+check-server|positional
+check-adapter|positional deep files
+show-code|
+list|json
+edit|positional
+forget|positional
+'
+  local cells=0
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    cmd="${row%%|*}"; accepted=" ${row#*|} "
+    for mod in $mods; do
+      cells=$((cells+1))
+      rc=$(printf '%s\n' "$out" | sed -n "s/^CELL $cmd $mod rc=\([0-9]*\) .*/\1/p")
+      if [ -z "$rc" ]; then
+        fail_case "$name" "the matrix never graded $cmd × $mod"; return
+      fi
+      case "$accepted" in
+        *" $mod "*)
+          if [ "$rc" = "2" ]; then
+            fail_case "$name" "--$cmd refuses $mod, which --help says it takes"; return
+          fi ;;
+        *)
+          if [ "$rc" != "2" ]; then
+            fail_case "$name" "--$cmd accepted $mod (exit $rc) — --help scopes that flag away from it"; return
+          fi
+          # Named, not just refused. A refusal that does not say which flag it is
+          # about leaves the operator to guess which of two they typed was wrong.
+          # `positional` has no flag spelling, so its arm is graded on saying what
+          # a bare argument means for this command instead.
+          if [ "$mod" = "positional" ]; then
+            if ! printf '%s\n' "$out" | grep -qE "^CELL $cmd positional rc=2 \| REFUSED .*(id|URL|argument)"; then
+              fail_case "$name" "--$cmd refused a bare argument without saying what one would have meant"; return
+            fi
+          else
+            if ! printf '%s\n' "$out" | grep -qF "CELL $cmd $mod rc=2 | REFUSED " ||
+               ! printf '%s\n' "$out" | sed -n "s/^CELL $cmd $mod rc=2 | //p" | grep -qF -- "--$mod"; then
+              fail_case "$name" "--$cmd refused $mod without naming the flag"; return
+            fi
+          fi ;;
+      esac
+    done
+  done <<EOF
+$pairs
+EOF
+  if [ "$cells" != "49" ]; then
+    fail_case "$name" "graded $cells cells, expected 49 — a command or a modifier went missing"; return
+  fi
+
+  # A name the argument loop cannot set stops the run rather than reading as a
+  # silent permission. Exit 3 is this harness's stub for die.
+  if ! printf '%s\n' "$out" | grep -qF "TYPO rc=3 | DIED Internal error: unknown CLI modifier 'not-a-real-modifier'."; then
+    fail_case "$name" "an unknown modifier name did not stop the run — a typo in an accept list would read as permission"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The four commands --help has always scoped away from --reuse-only, end to end.
+# The matrix above grades validate_cli directly; this case grades what an operator
+# actually gets, and its subject is WHEN the refusal happens rather than whether.
+#
+# Exit 2 alone is not the assertion and must not be: exit 2 was already reachable
+# for --edit and --forget before this was fixed. What was broken is that it arrived
+# LAST — --forget printed the setup summary, the full "This removes, on this
+# machine:" manifest and the "This does NOT touch:" list, and --edit walked the
+# picker and the "Change one thing" menu, and only then refused. A refusal that
+# arrives after the disclosure has already been read is not a refusal an operator
+# can distinguish from a bug, and for --edit it also means an answer has been
+# consumed off stdin.
+#
+# So each lane asserts the absence of the screen it must never reach, and the
+# presence half is not needed here: three other cases prove those screens DO render
+# on the same invocations without the flag.
+run_manage_reuse_only_case() {
+  local name="reuse-only-is-refused-before-anything-is-asked" lane cmd arg rc
+  local home="$TMP/reuseonly-home" state="$TMP/reuseonly-state" sd="$TMP/reuseonly-state/conduck"
+  mkdir -p "$home" "$sd"
+  : > "$TMP/doctor.out"
+  write_valid_profile "$sd/profile-custom-good.json" \
+    "custom-good" "Good gateway" "https://good.example.test"
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+
+  # A PTY, not a pipe: --edit and --forget refuse a run with nobody at a terminal
+  # at exit 4, which would hide the flag refusal behind a different one.
+  for lane in "edit|--edit|custom-good" "forget|--forget|custom-good" \
+              "show-code|--show-code|" "list|--list|"; do
+    lane="${lane#*|}"; cmd="${lane%%|*}"; arg="${lane#*|}"
+    rc=0
+    if [ -n "$arg" ]; then
+      pty_run 20 $'\n' "$cmd" "$arg" --reuse-only > "$TMP/reuseonly.out" 2>&1 || rc=$?
+    else
+      pty_run 20 $'\n' "$cmd" --reuse-only > "$TMP/reuseonly.out" 2>&1 || rc=$?
+    fi
+    printf -- '--- %s %s --reuse-only rc=%s ---\n' "$cmd" "$arg" "$rc" >> "$TMP/doctor.out"
+    cat "$TMP/reuseonly.out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$(cat "$TMP/reuseonly.out")" || return
+    if [ "$rc" != "2" ]; then
+      fail_case "$name" "$cmd --reuse-only exited $rc, expected a usage error (2)"; return
+    fi
+    if ! grep -qF 'Usage error:' "$TMP/reuseonly.out"; then
+      fail_case "$name" "$cmd --reuse-only did not identify itself as a usage error"; return
+    fi
+    if ! grep -qF -- '--reuse-only is a setup modifier' "$TMP/reuseonly.out"; then
+      fail_case "$name" "$cmd --reuse-only did not name the flag it refused"; return
+    fi
+    # Nothing ran. Each of these strings belongs to a screen that only appears once
+    # the command has committed to doing its job.
+    if grep -qF 'Change one thing' "$TMP/reuseonly.out"; then
+      fail_case "$name" "$cmd --reuse-only opened the edit screen before refusing"; return
+    fi
+    if grep -qF 'This removes, on this machine:' "$TMP/reuseonly.out"; then
+      fail_case "$name" "$cmd --reuse-only printed a removal manifest before refusing"; return
+    fi
+    if grep -qF 'Which one?' "$TMP/reuseonly.out"; then
+      fail_case "$name" "$cmd --reuse-only asked which setup before refusing"; return
+    fi
+    if grep -qF 'Good gateway' "$TMP/reuseonly.out"; then
+      fail_case "$name" "$cmd --reuse-only rendered a saved setup before refusing"; return
+    fi
+    # …and it did not touch the fixture either.
+    if [ ! -f "$sd/profile-custom-good.json" ]; then
+      fail_case "$name" "$cmd --reuse-only removed a setup on a run it refused"; return
+    fi
+  done
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# "Saved." is a claim about a file on disk, and write_profile is not in a position
+# to back it up: it WARNS and returns 0 on every failure it has — a state directory
+# it cannot create, a python that would not build the document, a temp file it could
+# not write or rename. That is the right contract for the wizard, where a pairing is
+# complete whether or not the convenience record got written. On the edit screen the
+# save IS the action, and the pre-fix screen printed a green
+# "✓ Saved. … now points at https://moved.example.test" directly underneath
+# write_profile's own "Couldn't save the pairing profile" warning, then offered to
+# print a setup code carrying the address that was never recorded. The operator
+# finds out days later, on a phone.
+#
+# A mode-500 state directory is the cheapest honest reproduction: readable, so the
+# profile still loads and the whole screen still runs, and unwritable, so the rename
+# fails for a reason the tool genuinely encounters (a directory owned by another
+# account, a full disk, a file something else is holding).
+#
+# Every read-only lane is PAIRED with the identical drive on a writable directory.
+# Without the pair, "does not print ✓ Saved." is satisfied by a screen that never
+# got as far as saving anything, and "the disk is unchanged" by a fixture nobody
+# ever tried to write.
+run_manage_save_must_land_case() {
+  local name="manage-edit-reports-a-save-that-did-not-land" lane
+  local label mode keys want_saved home state sd rc disk
+  : > "$TMP/doctor.out"
+
+  # label|dir mode|keys|does this lane's write land?
+  # The address lanes carry an extra answer: a save that lands offers a setup code,
+  # and the offer has to be declined or the run blocks on it.
+  for lane in \
+    "addr-ro|500|1\nhttps://moved.example.test\ny\nq\n|no" \
+    "addr-rw|700|1\nhttps://moved.example.test\ny\nn\nq\n|yes" \
+    "model-ro|500|2\n2\nm2\nq\n|no" \
+    "model-rw|700|2\n2\nm2\nq\n|yes" \
+    "clear-ro|500|2\n3\nq\n|no" \
+    "clear-rw|700|2\n3\nq\n|yes" \
+  ; do
+    label="${lane%%|*}"; lane="${lane#*|}"
+    mode="${lane%%|*}"; lane="${lane#*|}"
+    keys="${lane%%|*}"; want_saved="${lane#*|}"
+
+    home="$TMP/savland-$label-home"; state="$TMP/savland-$label-state"
+    sd="$state/conduck"
+    mkdir -p "$home" "$sd"
+    printf '{"schemaVersion":1,"gateway":{"id":"custom-ro","kind":"custom","name":"Read only gateway","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.test","model":"m1"},"fileServer":null}\n' \
+      > "$sd/profile-custom-ro.json"
+    chmod "$mode" "$sd"
+    PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+    rc=0
+    lane=$(printf '%b_' "$keys"); lane="${lane%_}"
+    pty_run 40 "$lane" --edit custom-ro > "$TMP/savland.out" 2>&1 || rc=$?
+    # Immediately, and before any assertion can return early: the suite's own EXIT
+    # trap cannot rm -rf a directory it may not write into.
+    chmod 700 "$sd"
+    printf -- '--- lane %s (mode %s) rc=%s ---\n' "$label" "$mode" "$rc" >> "$TMP/doctor.out"
+    cat "$TMP/savland.out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$(cat "$TMP/savland.out")" || return
+    if [ "$rc" = "124" ]; then
+      fail_case "$name" "lane $label hung on the edit screen"; return
+    fi
+
+    disk=$(python3 - "$sd/profile-custom-ro.json" <<'PY'
+import json, sys
+g = json.load(open(sys.argv[1]))["gateway"]
+print("%s %s" % (g["url"], g.get("model")))
+PY
+) || { fail_case "$name" "lane $label left a profile that no longer parses"; return; }
+    printf -- 'disk: %s\n' "$disk" >> "$TMP/doctor.out"
+
+    if [ "$want_saved" = "no" ]; then
+      if ! grep -qF 'NOT saved.' "$TMP/savland.out"; then
+        fail_case "$name" "lane $label did not say the write had failed"; return
+      fi
+      if grep -qF '✓ Saved.' "$TMP/savland.out"; then
+        fail_case "$name" "lane $label reported a save that never reached the disk"; return
+      fi
+      # The offer is the second half of the lie: a setup code built from an address
+      # the file does not hold would put the unsaved value on the phone.
+      if grep -qF 'Show the new setup code now?' "$TMP/savland.out"; then
+        fail_case "$name" "lane $label offered a setup code for a change that was not recorded"; return
+      fi
+      if [ "$disk" != "https://gw.example.test m1" ]; then
+        fail_case "$name" "lane $label changed the profile it had just said it could not write (disk: $disk)"; return
+      fi
+    else
+      if grep -qF 'NOT saved.' "$TMP/savland.out"; then
+        fail_case "$name" "lane $label reported a failure on a directory it can write"; return
+      fi
+      if ! grep -qF '✓ Saved.' "$TMP/savland.out"; then
+        fail_case "$name" "lane $label saved nothing on a writable directory — the read-only lane proves nothing"; return
+      fi
+      case "$label" in
+        addr-rw)
+          if ! grep -qF 'Show the new setup code now?' "$TMP/savland.out"; then
+            fail_case "$name" "a landed address change did not offer the setup code that carries it"; return
+          fi
+          if [ "$disk" != "https://moved.example.test m1" ]; then
+            fail_case "$name" "a landed address change did not reach the disk (disk: $disk)"; return
+          fi ;;
+        model-rw)
+          if [ "$disk" != "https://gw.example.test m2" ]; then
+            fail_case "$name" "a landed model change did not reach the disk (disk: $disk)"; return
+          fi ;;
+        clear-rw)
+          # None, not the empty string: clearing the model must remove the key, or
+          # the app is handed a pin on a model with no name.
+          if [ "$disk" != "https://gw.example.test None" ]; then
+            fail_case "$name" "clearing the model did not remove it from the disk (disk: $disk)"; return
+          fi ;;
+      esac
+    fi
+  done
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# --forget's disclosure is a claim about what will be left behind, and the most
+# dangerous thing it can leave behind is a PUBLIC one: a Tailscale Funnel is an
+# address on the open internet, and the record that names it lives in the state
+# directory this command is emptying.
+#
+# read_exposure_record refuses any record whose format version is not the current
+# one — that is correct, the id field the teardown depends on only arrived with the
+# current version — but "cannot read" was being spelled `continue`. So on every
+# machine an older conduck-connect ever touched, --forget removed the profile, the
+# unit and the password, reported a clean removal, and said nothing at all about a
+# public route it had just lost the last on-disk trace of. Silence there is worse
+# than a wrong answer: there is nothing left to go looking with.
+#
+# The case is a PAIR, and the pair is the assertion. The v1 lane proves the record
+# is named; the v2 lane, identical but for the version byte and the id, proves the
+# ordinary disclosure still works and that the v1 lane is not passing because this
+# fixture makes every run print the block. A shim `tailscale` on PATH is required
+# for either: the whole exposure section is skipped unless `serve status --json`
+# resolves, so without it both lanes go quiet and both assertions become vacuous.
+run_manage_forget_exposure_case() {
+  local name="manage-forget-discloses-unreadable-exposures" lane rc out
+  local label ver gwid home state sd unit credf envf rec
+  : > "$TMP/doctor.out"
+
+  # The shim answers exactly the one question ts_targets asks, and refuses
+  # everything else — a teardown that shelled out to `tailscale funnel … off`
+  # would fail loudly here rather than quietly appearing to have worked.
+  mkdir -p "$TMP/forgetexp-bin"
+  cat > "$TMP/forgetexp-bin/tailscale" <<'SHIM'
+#!/usr/bin/env bash
+if [ "$1" = "serve" ] && [ "$2" = "status" ] && [ "$3" = "--json" ]; then
+  printf '%s\n' '{"Web":{"box.tail1234.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}},"AllowFunnel":{"box.tail1234.ts.net:8443":true}}'
+  exit 0
+fi
+exit 1
+SHIM
+  chmod +x "$TMP/forgetexp-bin/tailscale"
+
+  # label|record version|record's gateway id
+  # A v1 record has no gateway-id field at all, so `unknown` is what a v1 line's
+  # sixth column reads as here — and it is why the record can never be attributed
+  # to the setup being removed, which is why it is reported rather than closed.
+  for lane in "v1|1|unknown" "v2|2|custom-a"; do
+    label="${lane%%|*}"; lane="${lane#*|}"
+    ver="${lane%%|*}"; gwid="${lane#*|}"
+
+    home="$TMP/forgetexp-$label-home"; state="$TMP/forgetexp-$label-state"
+    sd="$state/conduck"
+    mkdir -p "$home/Library/LaunchAgents" "$home/.config/systemd/user" "$sd"
+    printf '{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Tailnet gateway","auth":"bearer","transport":"tailscale","reach":"public","url":"https://box.tail1234.ts.net:8443"},"fileServer":null}\n' \
+      > "$sd/profile-custom-a.json"
+    # The things the removal really does prove it removed. They are seeded so the
+    # case can assert that reporting a leftover did NOT turn the removal into a
+    # no-op — a "safe" fix that refused to remove anything while an unreadable
+    # record existed would satisfy the disclosure assertions and break the command.
+    #
+    # No SERVICE UNIT in this fixture, deliberately. Removing one is gated on this
+    # host being able to answer whether that service is running, and a machine
+    # where launchctl/systemctl cannot answer gets the correct, different outcome:
+    # the file is left alone rather than deleted on a guess, and the command exits
+    # 1. That is a real behaviour with its own coverage, and folding it in here
+    # would make THIS case's verdict depend on the host it runs on rather than on
+    # whether an unreadable exposure record is disclosed.
+    credf="$sd/fileserver-custom-a.cred"; envf="$sd/fileserver-custom-a.env"
+    printf 'conduck:not-a-real-password\n' > "$credf"
+    printf 'RCLONE_PASS=not-a-real-password\n' > "$envf"
+    unit="$home/Library/LaunchAgents/ai.gigaduck.conduck-files-custom-a.plist"
+    rm -f "$unit" "$home/.config/systemd/user/conduck-files-custom-a.service"
+    rec="$sd/exposure-oldrun-001.pending"
+    printf '%s\tgateway\t8443\tfunnel\thttp://127.0.0.1:8080\t%s\tEMPTY\n' "$ver" "$gwid" > "$rec"
+
+    PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state" PATH="$TMP/forgetexp-bin:$PATH")
+    rc=0
+    pty_run 30 $'custom-a\n' --forget custom-a > "$TMP/forgetexp.out" 2>&1 || rc=$?
+    printf -- '--- lane %s (record version %s) rc=%s ---\n' "$label" "$ver" "$rc" >> "$TMP/doctor.out"
+    cat "$TMP/forgetexp.out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$(cat "$TMP/forgetexp.out")" || return
+    if [ "$rc" = "124" ]; then
+      fail_case "$name" "lane $label hung instead of completing the removal"; return
+    fi
+    if [ "$rc" != "0" ]; then
+      fail_case "$name" "lane $label exited $rc, expected 0 — the removal was confirmed"; return
+    fi
+
+    # Whichever lane this is, the removal it DID prove has to have happened. This
+    # is asserted before the disclosure text, because a case that only graded the
+    # warning would be green on a build that printed a beautiful warning and
+    # removed nothing.
+    if ! grep -qF 'Removed the saved setup' "$TMP/forgetexp.out"; then
+      fail_case "$name" "lane $label never reported the removal"; return
+    fi
+    if [ -f "$sd/profile-custom-a.json" ]; then
+      fail_case "$name" "lane $label left the saved setup on disk"; return
+    fi
+    if [ -f "$credf" ] || [ -f "$envf" ]; then
+      fail_case "$name" "lane $label left the stored password on disk"; return
+    fi
+
+    case "$label" in
+      v1)
+        # The count, the path and the sentence, separately. The count is what tells
+        # an operator how much is out there; the path is the only thing that lets
+        # them go look; and the closing sentence is the one that stops the block
+        # reading as a report of work already done.
+        if ! grep -qF 'holds 1 recorded exposure(s) in a format this version cannot read' "$TMP/forgetexp.out"; then
+          fail_case "$name" "an unreadable exposure record was skipped in silence"; return
+        fi
+        if ! grep -qF "$rec" "$TMP/forgetexp.out"; then
+          fail_case "$name" "the unreadable record was counted but never named, so nothing can be gone and looked at"; return
+        fi
+        if ! grep -qF 'I did not run those' "$TMP/forgetexp.out"; then
+          fail_case "$name" "the teardown commands were printed without saying they had not been run"; return
+        fi
+        # Left alone, not deleted: an unreadable record is the last on-disk trace
+        # of a route this command refuses to close, so removing it would destroy
+        # the evidence the warning just told the operator to go read.
+        if [ ! -f "$rec" ]; then
+          fail_case "$name" "the unreadable record was deleted — the only trace of an unclosed route"; return
+        fi ;;
+      v2)
+        # The pairing. A readable record owned by this setup still gets the plain
+        # line, and must NOT drag the unreadable-records block in with it — if it
+        # did, the v1 assertions above would be satisfied by every run.
+        if ! grep -qF 'a PUBLIC address      port 8443 → 127.0.0.1:8080' "$TMP/forgetexp.out"; then
+          fail_case "$name" "a readable exposure record owned by this setup was not disclosed"; return
+        fi
+        if grep -qF 'in a format this version cannot read' "$TMP/forgetexp.out"; then
+          fail_case "$name" "a record this version CAN read was reported as unreadable — the v1 lane proves nothing"; return
+        fi ;;
+    esac
+  done
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The removal confirmation is the one prompt in this program that is NOT a y/n and
+# NOT a numbered choice: the answer is the id, typed out. It sits beside prompts
+# that all advertise the same three controls, and it drifted — it rendered its own
+# literal "(Enter cancels)", offered no `i`, and swallowed `q` as a cancel. Every
+# one of those is a prompt an operator reads by habit rather than by word, so a
+# prompt here that honours fewer keys than the ones around it is not a cosmetic
+# difference: `q` at the most destructive step in the tool meant something other
+# than everywhere else, silently.
+#
+# So the suffix itself is asserted as the string control_suffix produces, and each
+# advertised key is DRIVEN rather than assumed. The absence half is asserted too:
+# an advertised suffix that no longer matches the code that reads the answer is
+# exactly the shape the drift had, and only the pairing catches it.
+#
+# The last two lanes are the ambiguity this prompt cannot avoid. An id is lowercase
+# letters, digits and hyphens, so `q` is a LEGAL id, and at this one prompt the two
+# readings of that keystroke are "stop the run" and "delete irreversibly". Neither
+# may be chosen silently, and both readings must remain reachable — a fix that made
+# `q` always stop would leave a setup named `q` unremovable, and a fix that made it
+# always literal would put the destructive reading behind the key everyone presses
+# to leave.
+run_manage_forget_prompt_controls_case() {
+  local name="manage-forget-confirmation-honours-its-keys" lane
+  : > "$TMP/doctor.out"
+
+  # lane <label> <id> <input> <want-rc> <want-profile kept|gone>
+  # Each lane gets its own HOME and state dir: four of the six leave the profile in
+  # place and two remove it, so a shared fixture would make the ORDER of the lanes
+  # part of what they assert.
+  local label id input keys want_rc want_profile sd home state rc
+  for lane in \
+    "enter|custom-good|\n|3|kept" \
+    "explain|custom-good|i\n\n|3|kept" \
+    "stop|custom-good|q\n|3|kept" \
+    "typed|custom-good|custom-good\n|0|gone" \
+    "qid-literal|q|q\ny\n|0|gone" \
+    "qid-control|q|q\n\n|3|kept" \
+  ; do
+    label="${lane%%|*}"; lane="${lane#*|}"
+    id="${lane%%|*}"; lane="${lane#*|}"
+    input="${lane%%|*}"; lane="${lane#*|}"
+    want_rc="${lane%%|*}"; want_profile="${lane#*|}"
+
+    home="$TMP/forgetkeys-$label-home"; state="$TMP/forgetkeys-$label-state"
+    sd="$state/conduck"
+    mkdir -p "$home" "$sd"
+    write_valid_profile "$sd/profile-$id.json" "$id" "Good gateway" "https://good.example.test"
+    PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+    rc=0
+    # The table carries \n as two literal characters, so printf renders them —
+    # and the trailing `_`, stripped straight back off, is what survives command
+    # substitution eating trailing newlines. Every one of these inputs ENDS in a
+    # newline (that is the keystroke under test), so without the guard the lanes
+    # hand pty-run.py an unterminated answer and time out at 124.
+    keys=$(printf '%b_' "$input"); keys="${keys%_}"
+    pty_run 20 "$keys" --forget "$id" > "$TMP/forgetkeys.out" 2>&1 || rc=$?
+    printf -- '--- lane %s (--forget %s) rc=%s ---\n' "$label" "$id" "$rc" >> "$TMP/doctor.out"
+    cat "$TMP/forgetkeys.out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$(cat "$TMP/forgetkeys.out")" || return
+    if [ "$rc" = "124" ]; then
+      fail_case "$name" "lane $label hung at the removal confirmation"; return
+    fi
+    if [ "$rc" != "$want_rc" ]; then
+      fail_case "$name" "lane $label exited $rc, expected $want_rc"; return
+    fi
+    if [ "$want_profile" = "kept" ] && [ ! -f "$sd/profile-$id.json" ]; then
+      fail_case "$name" "lane $label removed the setup on an answer that must not remove one"; return
+    fi
+    if [ "$want_profile" = "gone" ] && [ -f "$sd/profile-$id.json" ]; then
+      fail_case "$name" "lane $label left the setup on disk after an answer that removes it"; return
+    fi
+
+    # The suffix, on every lane that reaches the prompt at all — which is all six.
+    if ! grep -qF "to remove it (Enter = cancel; i = explain; q = stop)" "$TMP/forgetkeys.out"; then
+      fail_case "$name" "lane $label did not advertise the controls control_suffix produces"; return
+    fi
+    if grep -qF 'to remove it (Enter cancels)' "$TMP/forgetkeys.out"; then
+      fail_case "$name" "lane $label re-grew the hand-written suffix that named only Enter"; return
+    fi
+
+    case "$label" in
+      enter)
+        if ! grep -qF 'Cancelled — nothing was removed.' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "Enter at the confirmation did not say the removal was cancelled"; return
+        fi ;;
+      explain)
+        # Advertised and honoured: the explanation appears AND the prompt comes
+        # back. An `i` that explained and then fell through to "that is not the id"
+        # would satisfy the first half alone.
+        if ! grep -qF 'What typing the id does' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "i at the confirmation printed no explanation"; return
+        fi
+        if [ "$(grep -cF 'to remove it (Enter = cancel; i = explain; q = stop)' "$TMP/forgetkeys.out")" != "2" ]; then
+          fail_case "$name" "i at the confirmation did not re-ask the question"; return
+        fi ;;
+      stop)
+        # quit_run, not the cancel note: they are different facts. Cancelling is an
+        # answer to THIS question; stopping is leaving the program.
+        if ! grep -qF 'Stopped here.' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "q at the confirmation did not stop the run"; return
+        fi
+        if grep -qF 'Cancelled — nothing was removed.' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "q at the confirmation was quietly read as a cancel"; return
+        fi ;;
+      typed)
+        if ! grep -qF 'Removed the saved setup' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "typing the id back did not report the removal"; return
+        fi ;;
+      qid-literal)
+        if ! grep -qF 'Use "q" as your answer instead of stopping the run?' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "an id of \"q\" was resolved without asking which reading was meant"; return
+        fi
+        if ! grep -qF 'Removed the saved setup' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "a setup whose id is \"q\" could not be removed"; return
+        fi ;;
+      qid-control)
+        if ! grep -qF 'Use "q" as your answer instead of stopping the run?' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "an id of \"q\" was resolved without asking which reading was meant"; return
+        fi
+        if ! grep -qF 'Stopped here.' "$TMP/forgetkeys.out"; then
+          fail_case "$name" "declining the literal reading of \"q\" did not stop the run"; return
+        fi ;;
+    esac
+  done
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The manage surface's one absolute rule: it prints no secret. It is the only
+# surface in this tool that READS a machine's whole file-lane state — the WebDAV
+# credential file, its environment file, and the service file that carries the
+# same password a second time — and it is the surface most likely to grow a
+# "print everything you found" line, because that is what an inventory is for.
+#
+# Two distinct leaks, and they fail in different places:
+#
+#   A file that holds a password is opened and echoed. Guarded by seeding a
+#   sentinel into all three of them and asserting the string reaches no
+#   transcript. The seeding is asserted too: an absence assertion for a string
+#   that is not in the fixture is green forever.
+#
+#   A password that arrived in a URL is printed as part of the address.
+#   `ask_url` refuses `user:pass@` and the profile validator refuses it again on
+#   read, so the wizard never writes one — but these surfaces deliberately read
+#   profiles the validator REJECTS (showing and removing an unusable setup is
+#   their job), and a hand-edited profile is exactly where such a URL survives.
+#   Both halves are asserted: the credential is gone AND the host survives, since
+#   dropping the whole address would also pass a "no sentinel" check.
+#
+# Four surfaces, because they are four different code paths to the same data:
+# --list (human), --list --json (python), --edit (the picker + the same renderer)
+# and --forget's disclosure screen, which is the ONLY human surface that renders a
+# profile the validator rejected — and therefore the only one where the redaction
+# in manage_safe_url can be observed at all.
+#
+# Transcripts are appended with the sentinel masked. A leak is named by the
+# assertion that caught it; reprinting it into the suite's own output would put
+# the thing under test in the log of every failing run.
+run_manage_no_secret_case() {
+  local name="manage-surface-prints-no-secret" rc=0 sentinel url
+  local home="$TMP/nosecret-home" state="$TMP/nosecret-state" sd="$TMP/nosecret-state/conduck"
+  local unit legacy
+  sentinel='SENTINELPW-must-never-be-printed-7f3a'
+  mkdir -p "$home/Library/LaunchAgents" "$home/.config/systemd/user" "$sd" "$TMP/nosecret-work"
+  : > "$TMP/doctor.out"
+
+  # A readable setup with a live file lane — the one --list, --edit and the JSON
+  # all render in full.
+  printf '{"schemaVersion":1,"gateway":{"id":"custom-good","kind":"custom","name":"Files gateway","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.test"},"fileServer":{"url":"https://files.example.test:8443","folder":"%s","reach":"public"}}\n' \
+    "$TMP/nosecret-work" > "$sd/profile-custom-good.json"
+  # …and an unusable one whose address carries the credential. Its gateway URL is
+  # why this version refuses to load it, which is what puts it on the --forget
+  # path and off the --edit one.
+  printf '{"schemaVersion":1,"gateway":{"id":"custom-userinfo","kind":"custom","name":"Hand edited","auth":"bearer","transport":"public","reach":"public","url":"https://conduck:%s@gw2.example.test"},"fileServer":null}\n' \
+    "$sentinel" > "$sd/profile-custom-userinfo.json"
+  # …and the same shape with a password that CONTAINS an @, which is the fixture the
+  # single-@ one above cannot stand in for. A redaction that splits the authority on
+  # the FIRST @ keeps everything after it — so with one @ the whole credential goes
+  # and the case is green, while with two the tail of the password is reprinted, in
+  # an address still shaped like user:pass@host. That leak shipped past the single-@
+  # fixture. An @ is legal in a password and illegal in a host, so the LAST one is
+  # always the separator, and only a multi-@ fixture can tell the two splits apart.
+  printf '{"schemaVersion":1,"gateway":{"id":"custom-atpass","kind":"custom","name":"At in password","auth":"bearer","transport":"public","reach":"public","url":"https://conduck:pa@%s@gw3.example.test"},"fileServer":null}\n' \
+    "$sentinel" > "$sd/profile-custom-atpass.json"
+  # The two files that really do hold the WebDAV password, under the names the
+  # tool itself uses for them.
+  printf 'conduck:%s\n' "$sentinel" > "$sd/fileserver-custom-good.cred"
+  printf 'RCLONE_PASS=%s\n' "$sentinel" > "$sd/fileserver-custom-good.env"
+  # The service file is the password's second home, and the leftovers scan parses
+  # unit files it cannot attribute to any setup — so one of each: the id-bearing
+  # unit for custom-good, and an unnamed legacy one, which is the entry --list
+  # prints teardown commands for.
+  if [ "$(uname -s)" = "Linux" ]; then
+    unit="$home/.config/systemd/user/conduck-files-custom-good.service"
+    legacy="$home/.config/systemd/user/conduck-fileserver.service"
+    printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav %s --addr 127.0.0.1:8080 --user conduck --pass %s\n' \
+      "$TMP/nosecret-work" "$sentinel" > "$unit"
+    printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav %s --addr 127.0.0.1:8081 --user conduck --pass %s\n' \
+      "$TMP/nosecret-work" "$sentinel" > "$legacy"
+  else
+    unit="$home/Library/LaunchAgents/ai.gigaduck.conduck-files-custom-good.plist"
+    legacy="$home/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"
+    printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>x</string><key>ProgramArguments</key><array><string>/usr/local/bin/rclone</string><string>serve</string><string>webdav</string><string>%s</string><string>--addr</string><string>127.0.0.1:8080</string><string>--user</string><string>conduck</string><string>--pass</string><string>%s</string></array></dict></plist>\n' \
+      "$TMP/nosecret-work" "$sentinel" > "$unit"
+    printf '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>y</string><key>ProgramArguments</key><array><string>/usr/local/bin/rclone</string><string>serve</string><string>webdav</string><string>%s</string><string>--addr</string><string>127.0.0.1:8081</string><string>--user</string><string>conduck</string><string>--pass</string><string>%s</string></array></dict></plist>\n' \
+      "$TMP/nosecret-work" "$sentinel" > "$legacy"
+  fi
+  # The fixture is only a test if the string is really in it. Without this, every
+  # absence below is satisfied by a typo in the seeding.
+  if ! grep -qF "$sentinel" "$sd/fileserver-custom-good.cred" ||
+     ! grep -qF "$sentinel" "$sd/fileserver-custom-good.env" ||
+     ! grep -qF "$sentinel" "$unit" || ! grep -qF "$sentinel" "$legacy" ||
+     ! grep -qF "$sentinel" "$sd/profile-custom-userinfo.json" ||
+     ! grep -qF "$sentinel" "$sd/profile-custom-atpass.json"; then
+    fail_case "$name" "the sentinel never reached the fixture — the absence assertions would be vacuous"; return
+  fi
+  # And the multi-@ fixture really is multi-@. Without this, a stray edit that
+  # dropped the `pa@` prefix would quietly turn it back into the single-@ profile
+  # beside it, which is the exact fixture the leak already survived.
+  if ! grep -qF "conduck:pa@$sentinel@gw3.example.test" "$sd/profile-custom-atpass.json"; then
+    fail_case "$name" "the multi-@ fixture lost its second @ — it can no longer tell the two splits apart"; return
+  fi
+
+  # -- surface 1: --list, the human inventory, with stdin closed ---------------
+  rc=0
+  env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list \
+    > "$TMP/nosecret-list.out" 2>&1 </dev/null || rc=$?
+  printf -- '--- --list ---\n' >> "$TMP/doctor.out"
+  sed "s/$sentinel/[sentinel]/g" "$TMP/nosecret-list.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/nosecret-list.out")" || return
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "--list with a seeded file lane exited $rc, expected 0"; return
+  fi
+  # Reached: the setup whose credential files sit beside it was rendered in full,
+  # and the leftovers scan — which parses a unit file it cannot attribute and
+  # prints commands built from it — ran too.
+  if ! grep -qF 'Files gateway' "$TMP/nosecret-list.out"; then
+    fail_case "$name" "--list never rendered the setup the secret files belong to"; return
+  fi
+  if ! grep -qF 'File servers with no saved setup behind them' "$TMP/nosecret-list.out"; then
+    fail_case "$name" "--list never reached the leftovers scan, which is the surface that parses unit files"; return
+  fi
+  if grep -qF "$sentinel" "$TMP/nosecret-list.out"; then
+    fail_case "$name" "--list printed the file-lane password"; return
+  fi
+
+  # -- surface 2: --list --json, the agent-facing one -------------------------
+  rc=0
+  env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list --json \
+    > "$TMP/nosecret-list.json" 2>&1 </dev/null || rc=$?
+  printf -- '--- --list --json ---\n' >> "$TMP/doctor.out"
+  sed "s/$sentinel/[sentinel]/g" "$TMP/nosecret-list.json" >> "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "--list --json with a seeded file lane exited $rc, expected 0"; return
+  fi
+  if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/nosecret-list.json" 2>>"$TMP/doctor.out"; then
+    fail_case "$name" "--list --json did not parse with a hand-edited profile in the directory"; return
+  fi
+  if grep -qF "$sentinel" "$TMP/nosecret-list.json"; then
+    fail_case "$name" "--list --json emitted the credential into machine-readable output"; return
+  fi
+  # The redaction, both halves, read out of the parsed document rather than off
+  # the text: the credential is gone AND the address is still an address.
+  url=$(python3 - "$TMP/nosecret-list.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for s in d["setups"]:
+    if s["id"] == "custom-userinfo":
+        print(s["url"] or "")
+PY
+) || { fail_case "$name" "could not read the hand-edited setup's url back out of the JSON"; return; }
+  printf -- '--- custom-userinfo url ---\n%s\n' "$url" >> "$TMP/doctor.out"
+  if [ "$url" != "https://gw2.example.test" ]; then
+    fail_case "$name" "the JSON url for a user:pass@ address was '$url', expected the host alone"; return
+  fi
+  # The same read for the multi-@ address, and an EQUALITY rather than an absence:
+  # a redaction that gave up and emitted nothing at all would satisfy "no sentinel"
+  # while telling a machine consumer nothing about which gateway this record names.
+  url=$(python3 - "$TMP/nosecret-list.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for s in d["setups"]:
+    if s["id"] == "custom-atpass":
+        print(s["url"] or "")
+PY
+) || { fail_case "$name" "could not read the multi-@ setup's url back out of the JSON"; return; }
+  printf -- '--- custom-atpass url ---\n%s\n' "$url" >> "$TMP/doctor.out"
+  if [ "$url" != "https://gw3.example.test" ]; then
+    fail_case "$name" "the JSON url for a password containing @ was '$url', expected the host alone"; return
+  fi
+
+  # -- surface 3: --edit, which needs a terminal ------------------------------
+  # 1 picks the only readable setup, q stops at the first question it asks. The
+  # picker and the renderer both run, which is everything --edit reads.
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+  rc=0
+  pty_run 20 $'1\nq\n' --edit > "$TMP/nosecret-edit.out" 2>&1 || rc=$?
+  printf -- '--- --edit (pty) ---\n' >> "$TMP/doctor.out"
+  sed "s/$sentinel/[sentinel]/g" "$TMP/nosecret-edit.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/nosecret-edit.out")" || return
+  if [ "$rc" = "124" ]; then
+    fail_case "$name" "--edit hung instead of reaching its menu"; return
+  fi
+  if ! grep -qF 'Change one thing' "$TMP/nosecret-edit.out"; then
+    fail_case "$name" "--edit never reached the setup it was pointed at"; return
+  fi
+  if grep -qF "$sentinel" "$TMP/nosecret-edit.out"; then
+    fail_case "$name" "--edit printed the file-lane password"; return
+  fi
+
+  # -- surface 4: --forget's disclosure, the only human render of a rejected
+  #    profile — and therefore the only place manage_safe_url is observable.
+  #    Enter at the type-back prompt cancels, so nothing is removed.
+  rc=0
+  pty_run 20 $'\n' --forget custom-userinfo > "$TMP/nosecret-forget.out" 2>&1 || rc=$?
+  printf -- '--- --forget custom-userinfo (pty, cancelled) ---\n' >> "$TMP/doctor.out"
+  sed "s/$sentinel/[sentinel]/g" "$TMP/nosecret-forget.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/nosecret-forget.out")" || return
+  if ! grep -qF 'Remove the saved setup "custom-userinfo"' "$TMP/nosecret-forget.out"; then
+    fail_case "$name" "--forget never rendered the hand-edited setup it was pointed at"; return
+  fi
+  if grep -qF "$sentinel" "$TMP/nosecret-forget.out"; then
+    fail_case "$name" "--forget printed the credential out of the saved address"; return
+  fi
+  if ! grep -qF 'https://gw2.example.test' "$TMP/nosecret-forget.out"; then
+    fail_case "$name" "the redacted address lost its host as well as its credential"; return
+  fi
+  # Said out loud, not merely dropped: an address that silently lost a piece is an
+  # address the operator cannot match against the one they typed.
+  if ! grep -qF 'a username and password were in this saved address; not shown' "$TMP/nosecret-forget.out"; then
+    fail_case "$name" "the redaction happened silently — nothing said the address had been edited"; return
+  fi
+  # …and the same disclosure for the multi-@ address. It is a separate drive, not a
+  # second grep of the run above, because manage_safe_url is reached once per
+  # rendered record: a redaction that is right for one authority and wrong for the
+  # other is exactly the defect, and only the record that carries the second @ can
+  # show it.
+  rc=0
+  pty_run 20 $'\n' --forget custom-atpass > "$TMP/nosecret-forget-at.out" 2>&1 || rc=$?
+  printf -- '--- --forget custom-atpass (pty, cancelled) ---\n' >> "$TMP/doctor.out"
+  sed "s/$sentinel/[sentinel]/g" "$TMP/nosecret-forget-at.out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$(cat "$TMP/nosecret-forget-at.out")" || return
+  if ! grep -qF 'Remove the saved setup "custom-atpass"' "$TMP/nosecret-forget-at.out"; then
+    fail_case "$name" "--forget never rendered the setup whose password contains an @"; return
+  fi
+  if grep -qF "$sentinel" "$TMP/nosecret-forget-at.out"; then
+    fail_case "$name" "--forget printed part of a password that contains an @"; return
+  fi
+  # No userinfo AT ALL, not merely no sentinel: the leak reprinted the password's
+  # tail in an authority still shaped like user:pass@host, so an address that still
+  # carries an @ before its host is a leak whatever is on the left of it.
+  if grep -qE 'https://[^ ]*@gw3\.example\.test' "$TMP/nosecret-forget-at.out"; then
+    fail_case "$name" "the redacted address still carried userinfo before the host"; return
+  fi
+  if ! grep -qF 'https://gw3.example.test' "$TMP/nosecret-forget-at.out"; then
+    fail_case "$name" "the redacted multi-@ address lost its host as well as its credential"; return
+  fi
+  if [ ! -f "$sd/profile-custom-userinfo.json" ] || [ ! -f "$sd/profile-custom-atpass.json" ] ||
+     [ ! -f "$sd/fileserver-custom-good.cred" ]; then
+    fail_case "$name" "a cancelled --forget removed something"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+run_terminology_lint_case() {
+  local name="retired-words-stay-retired" hits words
+  words='connector|pairing[ -]code|helpers?'
+  : > "$TMP/doctor.out"
+
+  # -- layer 1: what --help prints -------------------------------------------
+  TERM=dumb bash "$SCRIPT" --help </dev/null > "$TMP/help.out" 2>&1
+  hits=$(grep -inE "$words" "$TMP/help.out")
+  if [ -n "$hits" ]; then
+    printf -- '--- --help ---\n%s\n' "$hits" >> "$TMP/doctor.out"
+    fail_case "$name" "--help uses a retired word (see above)"; return
+  fi
+
+  # -- layer 2: every screen call in src/ ------------------------------------
+  # d_say/d_ok/d_bad and c_say/c_ok/c_bad are the check commands' own emitters;
+  # head_ is a screen heading; plan_add writes the dry-run plan, which the
+  # operator reads as a list of things about to happen.
+  #
+  # The QUESTION verbs are here for the same reason manual.append( is: a prompt's
+  # text is a user-visible string that does not look like one in a diff. `ask`,
+  # `ask_url`, `confirm`, `require_choice` and friends take their whole screen as
+  # an argument, and `prompt_into VAR ask "…"` puts the emitter in argument
+  # position where a command-position scan would miss it entirely. printf is here
+  # because the terminal refusals write their first line with it directly.
+  hits=$(grep -nE '^[[:space:]]*(say|note|warn|ok|bad|die|usage_die|head_|hint|plan_add|d_say|d_ok|d_bad|c_say|c_ok|c_bad|prompt_echo|printf|ask|ask_default|ask_url|ask_secret|confirm|require_choice|prompt_into|print_and_wait)[[:space:]]|manual\.append\(' \
+           "$SRC_DIR"/*.inc.sh | grep -inE "$words")
+  if [ -n "$hits" ]; then
+    printf -- '--- src/ screen calls ---\n%s\n' "$hits" >> "$TMP/doctor.out"
+    fail_case "$name" "a line the user reads uses a retired word (see above)"; return
+  fi
+
+  # Non-vacuous: the scan really does reach the lines it claims to. If the verb
+  # list or the file glob ever stops matching, everything above passes for free.
+  if [ "$(grep -cE '^[[:space:]]*say[[:space:]]' "$SRC_DIR"/*.inc.sh | awk -F: '{n+=$2} END {print n+0}')" -lt 500 ]; then
+    fail_case "$name" "the lint matched almost no screen calls — its pattern or its glob is broken"; return
+  fi
+  # The question verbs are a separate class with a separate way of going missing —
+  # a rename of the prompt primitives would silently empty that half of the scan
+  # while the `say` count above stayed healthy.
+  if [ "$(grep -cE '^[[:space:]]*(ask|ask_default|ask_url|ask_secret|confirm|require_choice|prompt_into)[[:space:]]' "$SRC_DIR"/*.inc.sh | awk -F: '{n+=$2} END {print n+0}')" -lt 20 ]; then
+    fail_case "$name" "the lint matched almost no prompt questions — the prompt primitives were renamed under it"; return
+  fi
+  if ! grep -qE 'manual\.append\(' "$SRC_DIR"/41-agent-file-readiness.inc.sh; then
+    fail_case "$name" "the python heredoc's manual.append() sentences are no longer where the lint looks for them"; return
+  fi
+
+  # The word that REPLACED them is present, so this is a rename and not a deletion.
+  if ! grep -qF 'setup code' "$TMP/help.out"; then
+    fail_case "$name" "--help stopped naming the thing at all"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The claim this release deliberately retired from the file header:
+#
+#     - Send ANY data anywhere except to your own gateway. No telemetry, ever.
+#
+# It is not true, and the header now says the true version instead — a "Where its
+# own requests go" section that names the one path with third-party contact (the
+# exposure tool the operator picked, running under their own credentials) and
+# carves it out in full. `choose_main_action` states the same rule in a comment
+# above the six-line intro it prints: "No telemetry" is unqualified and safe; "I
+# talk only to your own gateway" is NOT, and must never be said there.
+#
+# A claim retired for being false is exactly the kind that comes back, because it
+# is short, reassuring and reads well. So this is a RATCHET rather than a
+# prohibition: it pins the number of occurrences left in `src/`, which is
+# currently one (`11-explanations.inc.sh`, the nav.main panel — see the followups
+# in the handoff note, it is a real defect and not mine to fix). Add a second and
+# the suite goes red. Fix the one that is there and the suite ALSO goes red, with
+# a message telling you to tighten the number to zero — which is the only way a
+# ratchet like this cannot quietly rot into an exemption.
+run_retired_gateway_claim_case() {
+  local name="retired-gateway-claim-does-not-come-back" n
+  : > "$TMP/doctor.out"
+
+  TERM=dumb bash "$SCRIPT" --help </dev/null > "$TMP/help.out" 2>&1
+  if grep -qF 'except to your own gateway' "$TMP/help.out"; then
+    grep -nF 'except to your own gateway' "$TMP/help.out" >> "$TMP/doctor.out"
+    fail_case "$name" "--help regained the retired absolute claim"; return
+  fi
+  # The header's replacement is still there, and still names the carve-out.
+  if ! grep -qF 'Where its own requests go' "$SCRIPT"; then
+    fail_case "$name" "the header lost the section that says where this script's requests actually go"; return
+  fi
+
+  # The ratchet is ZERO, everywhere in src/ — not "one tolerated site". The claim was cut
+  # from the header for being false, and the welcome panel held the last copy of it three
+  # lines below the very paragraph that names Tailscale and Cloudflare as the front door.
+  # A count of 1 could only ever be pinned to a location, and a location check cannot see
+  # the claim reappearing in a file nobody thought to name. Zero is the only setting that
+  # is not a guess about where a well-meaning contributor would put it back.
+  n=$(grep -cF 'except to your own gateway' "$SRC_DIR"/*.inc.sh | awk -F: '{n+=$2} END {print n+0}')
+  if [ "$n" -gt 0 ]; then
+    grep -nF 'except to your own gateway' "$SRC_DIR"/*.inc.sh >> "$TMP/doctor.out"
+    fail_case "$name" "the retired claim is back in src/ ($n occurrence(s)) — it is false wherever it appears, because the tunnel path contacts that vendor"; return
+  fi
+  # Going silent is not the fix either. A reader who loses the reassurance entirely is
+  # worse off than one who gets the honest carve-out, so the panel must still make the
+  # absolute claim that IS true.
+  if ! grep -qF 'no telemetry ever' "$SRC_DIR/11-explanations.inc.sh"; then
+    fail_case "$name" "the welcome panel dropped the retired claim without keeping the honest replacement"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_help_surface_case() {
   local name="help-lists-public-meta-flags" rc=0
   TERM=dumb bash "$SCRIPT" --help </dev/null > "$TMP/doctor.out" 2>&1 || rc=$?
@@ -3093,8 +6274,39 @@ run_help_surface_case() {
   if grep -qF -- '--generic' "$TMP/doctor.out"; then
     fail_case "$name" "--help exposed the private shipped-client compatibility arm"; return
   fi
-  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.13.0" ]; then
+  # Written out, not read from the artifact: the point is that a release BUMPED
+  # it, and a test that derives the number from the same file it grades can never
+  # notice a release that forgot to.
+  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.14.0" ]; then
     fail_case "$name" "--version did not print the expected public version"; return
+  fi
+  # The manage surface is public CLI, so --help owes it the same contract as the
+  # rest: named, and filed under whether a machine can drive it. --list is the one
+  # command in this group that answers with no terminal at all.
+  if ! grep -qF -- '--list [--json]' "$TMP/doctor.out" ||
+     ! grep -qF -- '--forget <id>' "$TMP/doctor.out" ||
+     ! grep -qF -- '--edit [id]' "$TMP/doctor.out"; then
+    fail_case "$name" "--help omitted part of the manage surface"; return
+  fi
+  # The two statuses this release made contractual. A documented status nothing
+  # emits is worse than an undocumented one — it tells a wrapper author to write a
+  # branch that never runs — so both are asserted here and driven elsewhere in
+  # this file (see the exit-4 and quit_run cases).
+  if ! grep -qF '3  stopped by the operator before completion' "$TMP/doctor.out" ||
+     ! grep -qF '4  this action requires an interactive terminal' "$TMP/doctor.out"; then
+    fail_case "$name" "--help omitted the exit 3 / exit 4 contract"; return
+  fi
+  # The split that makes the COMMANDS section worth reading: which of these a
+  # machine can drive, said once, at the top of each group.
+  if ! grep -qF 'COMMANDS — scriptable' "$TMP/doctor.out" ||
+     ! grep -qF 'COMMANDS — need a person at a terminal' "$TMP/doctor.out"; then
+    fail_case "$name" "--help stopped separating scriptable commands from interactive ones"; return
+  fi
+  # CI=1 is the one switch that turns a blocking check into a scriptable one, and
+  # it was documented nowhere. An agent that cannot find it hangs forever on a
+  # question after its check already printed exit=0.
+  if ! grep -qF 'CI=1' "$TMP/doctor.out"; then
+    fail_case "$name" "--help does not document CI=1"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -3104,9 +6316,17 @@ run_check_continue_yes_case() {
   local name="check-pass-continue-setup" rc=0
   start_fixture good || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
   local input
-  # Menu 2 → URL → yes → default name → b at exposure. The checked URL/token
-  # must be reused, so there is no second gateway or auth question.
-  input=$'2\nhttp://127.0.0.1:'"$PORT"$'\ny\n\nb\n'
+  # Menu 2 → URL → yes → default name → b at exposure → n → Enter at the hub.
+  # The checked URL/token must be reused, so there is no second gateway or auth
+  # question.
+  #
+  # `b` at the exposure menu returns to the OFFER that started this setup — it
+  # does not end the process. That matters because the check that got here sent
+  # real chat turns: quota spent, a message in somebody's provider history, and a
+  # result still sitting in memory. Throwing that away for a keystroke whose whole
+  # meaning is "I want to go back one step" was the defect; the `n` below is the
+  # second answer that keystroke now needs.
+  input=$'2\nhttp://127.0.0.1:'"$PORT"$'\ny\n\nb\nn\n\n'
   # Isolated state: the handoff asks which saved gateway this is before exposure,
   # so a machine with one paired would answer a list here instead of the name
   # prompt this input assumes.
@@ -3123,6 +6343,16 @@ run_check_continue_yes_case() {
   fi
   if [ "$(grep -cF 'Step 1 — find your gateway' "$TMP/doctor.out")" != "0" ]; then
     fail_case "$name" "continued setup redundantly returned to gateway selection"; return
+  fi
+  # `b` came back to the SAME question the check offered, so a No here means what
+  # a No there meant. Two different spellings of one decision is precisely what a
+  # wrapper cannot be asked to tell apart, so they share an ending and a status.
+  if ! grep -qF 'Continue with setup and pairing after all?' "$TMP/doctor.out"; then
+    fail_case "$name" "b at the exposure menu did not return to the offer that started this setup"; return
+  fi
+  # The exposure menu names its own b, and names the thing it protects.
+  if ! grep -qF 'b) back out of this setup (the completed check remains unchanged)' "$TMP/doctor.out"; then
+    fail_case "$name" "the exposure menu no longer says what backing out costs"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -3146,7 +6376,9 @@ run_long_model_handoff_case() {
   local lm_home="$TMP/long-model-home" lm_state="$TMP/long-model-state"
   mkdir -p "$lm_home" "$lm_state"
   PTY_ENV=(CONDUCK_TOKEN="$TOKEN" HOME="$lm_home" XDG_CONFIG_HOME="$lm_state")
-  pty_run 30 $'y\n\nb\n' --check-server "http://127.0.0.1:$PORT" \
+  # y → default name → b at exposure → n at the offer it returns to. See
+  # check-pass-continue-setup for why `b` re-asks instead of ending the process.
+  pty_run 30 $'y\n\nb\nn\n' --check-server "http://127.0.0.1:$PORT" \
     > "$TMP/doctor.out" 2>&1 || rc=$?
   stop_fixture
   if [ "$rc" != "0" ] ||
@@ -3274,8 +6506,14 @@ run_scope_quick_tunnel_case() {
   # stale artifact, and fail_case tails this file unconditionally.
   : > "$TMP/doctor.out"
 
-  funcs=$(extract_funcs scope_choice is_quick_tunnel_url keyless_public_guard)
-  for fn in scope_choice is_quick_tunnel_url keyless_public_guard; do
+  # prompt_into is the caller side of the prompt contract and scope_choice reaches
+  # its question through it, so it is lifted while require_choice itself stays
+  # STUBBED — the stub is what lets the arms below distinguish "asked" from "derived
+  # without asking", which is the whole case. Without prompt_into the choice is never
+  # assigned at all and every arm reads as "decided without asking", including the
+  # near-miss host that is supposed to be asked.
+  funcs=$(extract_funcs scope_choice is_quick_tunnel_url keyless_public_guard prompt_into)
+  for fn in scope_choice is_quick_tunnel_url keyless_public_guard prompt_into; do
     if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
       fail_case "$name" "could not extract $fn from the release artifact"; return
     fi
@@ -3307,6 +6545,7 @@ quick-keyless-overridden|https://x.trycloudflare.com|none|true|public|no|0|warn"
     rc=0
     out=$(run_scope_choice_isolated "$funcs" "$url" "$auth" "$akp") || rc=$?
     printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$out" || return
 
     if [ "$rc" != "$exprc" ]; then
       fail_case "$name" "[$arm] exit $rc, expected $exprc"; return
@@ -3395,8 +6634,12 @@ run_secret_shape_case() {
   # Truncated before the extraction guards, which fail_case tails.
   : > "$TMP/doctor.out"
 
-  funcs=$(extract_funcs looks_like_a_secret warn_answer_looked_like_a_secret confirm)
-  for fn in looks_like_a_secret warn_answer_looked_like_a_secret confirm; do
+  # confirm renders its own control suffix and re-emits the prompt under a pipe, so
+  # the three primitives behind that come with it.
+  funcs=$(extract_funcs looks_like_a_secret warn_answer_looked_like_a_secret confirm \
+            control_suffix control_keys prompt_echo)
+  for fn in looks_like_a_secret warn_answer_looked_like_a_secret confirm \
+            control_suffix control_keys prompt_echo; do
     if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
       fail_case "$name" "could not extract $fn from the release artifact"; return
     fi
@@ -3704,7 +6947,7 @@ printf "REASON<%s>\n" "$CCE_REASON"
 }
 
 # https://user:pass@host is a credential smuggled into a routing field: it is
-# echoed to the terminal, written to the pairing profile that WHAT-IT-TOUCHES.md
+# echoed to the terminal, written to the saved profile that WHAT-IT-TOUCHES.md
 # calls credential-free, and paired into the app — which refuses userinfo on
 # every persisted endpoint URL. Both URL entry points must refuse it too, and
 # the refusal must name the real fix rather than say "use https://".
@@ -3741,7 +6984,10 @@ printf "DONE\n"
 
   # The interactive prompt: it must re-ask rather than abort, and the warning has
   # to point at the token field instead of repeating "use https://".
-  funcs=$(extract_funcs url_has_userinfo ask_url; sed -n '/^URL_USERINFO_HINT=/p' "$SCRIPT")
+  funcs=$(extract_funcs url_has_userinfo ask_url explain_prompt \
+            control_suffix control_keys prompt_echo looks_like_a_secret \
+            warn_answer_looked_like_a_secret
+          sed -n '/^URL_USERINFO_HINT=/p' "$SCRIPT")
   if ! printf '%s\n' "$funcs" | grep -qF 'ask_url()' \
      || ! printf '%s\n' "$funcs" | grep -qF 'URL_USERINFO_HINT='; then
     fail_case "$name" "could not extract ask_url from the release artifact"; return
@@ -3768,7 +7014,7 @@ printf "%s\nhttps://gateway.example.test\n" "$CRED" | ask_url "Address" "https:/
   printf 'SUITE ✓ %s\n' "$name"
 }
 
-# SECURITY.md's load-bearing promise: the connector "never changes a config it
+# SECURITY.md's load-bearing promise: conduck-connect "never changes a config it
 # didn't create without showing you the exact change first". A file's PERMISSIONS
 # are part of its configuration, so tightening a pre-existing ~/.hermes/.env to
 # 0600 goes through the same announce-then-confirm gate as any other change to
@@ -3815,7 +7061,10 @@ run_owned_config_mode_change_case() {
     fail_case "$name" "configure_hermes no longer routes the .env mode through the announce gate"; return
   fi
 
-  funcs=$(extract_funcs file_mode_is_open secure_owned_file_mode run_step mutate_guard confirm plan_add say ok warn note)
+  funcs=$(extract_funcs file_mode_is_open secure_owned_file_mode run_step mutate_guard \
+            confirm control_suffix control_keys prompt_echo explain_prompt quit_run \
+            run_changes_nothing interactive_terminal looks_like_a_secret \
+            warn_answer_looked_like_a_secret plan_add say ok warn note)
   if ! printf '%s\n' "$funcs" | grep -qF 'secure_owned_file_mode()'; then
     fail_case "$name" "could not extract secure_owned_file_mode from the release artifact"; return
   fi
@@ -4067,15 +7316,26 @@ printf "blocked-rc=%d\n" "$?"
 run_check_continue_eof_case() {
   local name="check-pass-continuation-eof" rc=0
   start_fixture good || { fail_case "$name" "fixture failed to start"; stop_fixture; return; }
-  local input
-  input=$'2\nhttp://127.0.0.1:'"$PORT"$'\n\004'
-  PTY_ENV=(CONDUCK_TOKEN="$TOKEN")
+  local input state="$TMP/check-eof-state"
+  mkdir -p "$state"
+  # \004 is the EOT byte: on a PTY it is the only way to give a reader an end of
+  # input, because a terminal never closes. The trailing Enter answers the hub's
+  # closing question, which is a SECOND read and would otherwise block until the
+  # PTY timeout — a hang the case would then report as a failed continuation.
+  input=$'2\nhttp://127.0.0.1:'"$PORT"$'\n\004\n'
+  PTY_ENV=(CONDUCK_TOKEN="$TOKEN" XDG_CONFIG_HOME="$state")
   pty_run 30 "$input" > "$TMP/doctor.out" 2>&1 || rc=$?
   stop_fixture
   if [ "$rc" != "0" ] ||
      ! grep -qF 'Would you like to continue with setup and pairing?' "$TMP/doctor.out" ||
      ! grep -qF 'No setup changes were made.' "$TMP/doctor.out"; then
     fail_case "$name" "EOF at the optional continuation did not safely mean no"; return
+  fi
+  # …and it said so. A default taken because nobody answered is a decision no
+  # person made, and a transcript that records it silently is how a reader comes
+  # to believe somebody declined on purpose.
+  if ! grep -qF 'No answer — treating this as No: Would you like to continue with setup and pairing?' "$TMP/doctor.out"; then
+    fail_case "$name" "the unanswered continuation took its default in silence"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -4525,16 +7785,52 @@ run_preflight_missing_tool_case() { # <server|adapter> <python3|curl>
 # config precisely because an unrelated install must NOT become the default for
 # someone who asked for a custom server. EOF at the port question is the
 # deliberate clean stop (nothing is configured, no network request is made).
+# --generic is a FUNCTIONAL legacy alias for custom-server setup: shipped App
+# Store builds still emit it verbatim, so it has to keep working even though
+# --help never mentions it. Two independent facts, and they need two different
+# lanes to observe:
+#
+#   1. With no terminal it refuses at exit 4 like any other setup, BEFORE the
+#      gateway phase. That is the alias inheriting the refusal rather than
+#      hand-rolling its own — and the run is over before Step 2, so nothing about
+#      the alias's actual behaviour is visible on this path.
+#   2. On a PTY it skips detection and lands in custom-server setup even though
+#      an OpenClaw install is sitting right there. That is the whole point of the
+#      alias, and only a run that can answer questions ever reaches it.
 run_generic_alias_case() { # run_generic_alias_case <plain|dry-run>
   local variant="$1" name="generic-legacy-alias" rc=0 home="$TMP/generic-home"
+  local state="$TMP/generic-state"
   local -a extra=()
-  if [ "$variant" = "dry-run" ]; then name="generic-legacy-alias-dry-run"; extra=(--dry-run); fi
-  mkdir -p "$home/.openclaw"
+  if [ "$variant" = "dry-run" ]; then
+    name="generic-legacy-alias-dry-run"; extra=(--dry-run)
+    home="$TMP/generic-dry-home"; state="$TMP/generic-dry-state"
+  fi
+  mkdir -p "$home/.openclaw" "$state"
   printf '{}\n' > "$home/.openclaw/openclaw.json"
-  env -u XDG_CONFIG_HOME HOME="$home" TERM=dumb bash "$SCRIPT" --generic ${extra[@]+"${extra[@]}"} \
+
+  # -- lane 1: no terminal -----------------------------------------------------
+  env HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --generic ${extra[@]+"${extra[@]}"} \
     > "$TMP/doctor.out" 2>&1 < /dev/null || rc=$?
-  if [ "$rc" = "0" ]; then
-    fail_case "$name" "expected the EOF-driven run to stop for missing input"; return
+  if [ "$rc" != "4" ]; then
+    fail_case "$name" "a no-terminal --generic run exited $rc, expected 4"; return
+  fi
+  if ! grep -qF 'needs a person at a terminal' "$TMP/doctor.out"; then
+    fail_case "$name" "the refusal did not say what is actually missing"; return
+  fi
+  # Refused BEFORE the gateway phase — no question was asked and no config was
+  # read. If Step 2 ever appears on this path the refusal has moved too late.
+  if grep -qF 'Step 2 —' "$TMP/doctor.out"; then
+    fail_case "$name" "the terminal refusal came after setup had already started asking"; return
+  fi
+
+  # -- lane 2: a real terminal -------------------------------------------------
+  # Enter = the default name, n = local rather than https, t = "I'll type the
+  # port" (a silent no-op when this machine offered no listening ports), q = stop.
+  rc=0
+  PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state")
+  pty_run 15 $'\nn\nt\nq\n' --generic ${extra[@]+"${extra[@]}"} > "$TMP/doctor.out" 2>&1 || rc=$?
+  if [ "$rc" != "3" ]; then
+    fail_case "$name" "q during --generic setup exited $rc, expected 3"; return
   fi
   if ! grep -qF -- '--generic is the older name for custom-server setup.' "$TMP/doctor.out"; then
     fail_case "$name" "the migration note is missing"; return
@@ -4549,8 +7845,7 @@ run_generic_alias_case() { # run_generic_alias_case <plain|dry-run>
   if grep -qF 'Step 2 — OpenClaw' "$TMP/doctor.out"; then
     fail_case "$name" "an unrelated OpenClaw install hijacked custom-server setup"; return
   fi
-  if ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out" ||
-     ! grep -qF 'Need the local port (or an https URL).' "$TMP/doctor.out"; then
+  if ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out"; then
     fail_case "$name" "--generic did not enter custom-server setup"; return
   fi
   if [ "$variant" = "dry-run" ] &&
@@ -4605,7 +7900,7 @@ run_shared_app_evaluator_wiring_case() {
 }
 
 ONLY="${*:-}"
-printf 'connector regression suite — fixture on 127.0.0.1 (OS-assigned port), per-run token\n'
+printf 'conduck-connect regression suite — fixture on 127.0.0.1 (OS-assigned port), per-run token\n'
 while IFS= read -r row; do
   [ -n "$row" ] || continue
   case "$row" in \#*) continue ;; esac
@@ -4666,9 +7961,19 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" menu-q-exit "*) true ;; *) false ;; es
   run_menu_q_case
 fi
 
-if [ -z "$ONLY" ] || case " $ONLY " in *" prompt-controls-and-defaults "*) true ;; *) false ;; esac; then
-  run_prompt_controls_case
+if [ -z "$ONLY" ] || case " $ONLY " in *" menu-hub-returns-and-leaks-nothing "*) true ;; *) false ;; esac; then
+  run_menu_hub_case
 fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" menu-action-runs-with-its-own-exit-trap "*) true ;; *) false ;; esac; then
+  run_menu_trap_rearm_case
+fi
+
+# Unconditional on purpose — this is the one family whose selection its own runner
+# owns, because a dozen sub-case names plus the umbrella selector do not fit the
+# one-name-per-block pattern. run_prompt_controls_cases returns immediately when
+# nothing in the family was asked for, and does not pay for the lift.
+run_prompt_controls_cases
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" quick-tunnel-reach-is-not-a-question "*) true ;; *) false ;; esac; then
   run_scope_quick_tunnel_case
@@ -4680,6 +7985,14 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" custom-review-back-corrects-port "*) true ;; *) false ;; esac; then
   run_custom_review_back_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" custom-name-q-declined-stops-the-run "*) true ;; *) false ;; esac; then
+  run_custom_name_q_case declined
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" custom-name-q-confirmed-is-the-name "*) true ;; *) false ;; esac; then
+  run_custom_name_q_case confirmed
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" menu-action-1-setup "*) true ;; *) false ;; esac; then
@@ -4784,6 +8097,78 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" help-lists-public-meta-flags "*) true ;; *) false ;; esac; then
   run_help_surface_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-surface-machine-contract "*) true ;; *) false ;; esac; then
+  run_manage_surface_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-forget-bad-id-refused-on-a-terminal "*) true ;; *) false ;; esac; then
+  run_manage_forget_pty_id_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-forget-confirmation-honours-its-keys "*) true ;; *) false ;; esac; then
+  run_manage_forget_prompt_controls_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-forget-discloses-unreadable-exposures "*) true ;; *) false ;; esac; then
+  run_manage_forget_exposure_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-survives-showing-a-setup-code "*) true ;; *) false ;; esac; then
+  run_manage_show_code_state_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-reports-a-save-that-did-not-land "*) true ;; *) false ;; esac; then
+  run_manage_save_must_land_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-list-survives-a-missing-home "*) true ;; *) false ;; esac; then
+  run_manage_missing_home_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-list-renders-untrusted-names "*) true ;; *) false ;; esac; then
+  run_manage_untrusted_names_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-list-token-row-is-per-kind "*) true ;; *) false ;; esac; then
+  run_manage_token_row_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-refuses-before-it-reads-anything "*) true ;; *) false ;; esac; then
+  run_manage_headless_refusals_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-confirms-a-tailscale-address-mismatch "*) true ;; *) false ;; esac; then
+  run_manage_edit_tailscale_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-model-question-fits-the-setup "*) true ;; *) false ;; esac; then
+  run_manage_edit_model_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-loads-a-unit-only-credential "*) true ;; *) false ;; esac; then
+  run_manage_edit_unit_credential_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" cli-modifier-matrix "*) true ;; *) false ;; esac; then
+  run_cli_matrix_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" reuse-only-is-refused-before-anything-is-asked "*) true ;; *) false ;; esac; then
+  run_manage_reuse_only_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-surface-prints-no-secret "*) true ;; *) false ;; esac; then
+  run_manage_no_secret_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" retired-words-stay-retired "*) true ;; *) false ;; esac; then
+  run_terminology_lint_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" retired-gateway-claim-does-not-come-back "*) true ;; *) false ;; esac; then
+  run_retired_gateway_claim_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" ci-gate-no-handoff "*) true ;; *) false ;; esac; then

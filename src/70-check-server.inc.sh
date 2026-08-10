@@ -30,6 +30,12 @@ COMPAT_RAN=false
 COMPAT_CHECKS=0; COMPAT_FAILS=0
 COMPAT_MODELS="NOT_RUN"; COMPAT_CHAT="NOT_RUN"; COMPAT_HISTORY_IMAGE="NOT_RUN"
 COMPAT_IMAGE_INPUT="NOT_RUN"; COMPAT_MODEL_FIELD="NOT_RUN"
+# Did a request that NAMED a model select it? Kept for the closing FAIL, which owes
+# the reader an honest split between the reds that block pairing and the reds that
+# merely limit it — and a model-selection failure is the second kind whenever a
+# model-less turn works. Deliberately NOT a summary key: the schema=2 grammar is
+# frozen per schema number, so a new field would break every consumer pinned to 2.
+COMPAT_MODEL_SELECT="NOT_RUN"
 
 # WHICH model these verdicts describe. A fan-out gateway is one endpoint in
 # front of hundreds of upstream models, and /v1/models lists them in an order
@@ -194,6 +200,56 @@ pats = (r"support.*image", r"image.*input", r"unsupported.*content", r"image.*no
 sys.exit(0 if any(re.search(p, text, re.I | re.S) for p in pats) else 1)' 2>/dev/null
 }
 
+# The machine summary — schema=2, and the published grammar for it.
+#
+# One line, ASCII only, no ANSI, fixed key order, printed from the EXIT trap so it
+# rides EVERY exit: pass, fail, usage error, Ctrl-C, or an operator's q. The
+# grammar is frozen per schema number — any key added, removed, renamed, or given
+# a new value bumps schema= — so a consumer pins the number it parses and ignores
+# a line carrying a number it does not know.
+#
+# The domains are written here, in the one artifact a consumer is guaranteed to
+# have: the build brief tells an agent to curl this script and nothing else, so a
+# grammar that lives only in the README is a grammar it cannot read.
+#
+#   schema=2            this grammar
+#   harness=<version>   conduck-connect's own version; informational, never a gate
+#   wire=               PASS | FAIL | NOT_RUN — the roll-up of every counted check
+#   models=             PASS | FAIL | NOT_RUN
+#   chat=               PASS | FAIL | NOT_RUN
+#   history_image=      PASS | FAIL | NOT_RUN
+#   image_input=        VERIFIED | IGNORED | DECLINED | OPAQUE | NOT_RUN
+#                       informational: it never moves wire=, failed=, or the exit
+#   model=              optional | required | none_advertised | NOT_RUN
+#                       whether this server needs a "model" field to answer
+#   model_ids=<n>       how many usable ids /v1/models advertised (0 = none)
+#   auth=               bearer | none | NOT_RUN — what this run actually sent
+#   checks=<n>          counted verdict lines
+#   failed=<n>          how many of them went red
+#   exit=<n>            see below
+#
+# Never key on checks= or failed= as absolute numbers: they move whenever a check
+# is added, and a loop pinned to "checks=4" breaks on a harness upgrade that fixed
+# nothing about the server. Key on the meters and the exit status.
+#
+# NOT_RUN vs NOT_REQUESTED, because that is exactly what a retry loop branches on:
+# NOT_RUN means "this run never got far enough to measure it — fix what went red
+# above and run me again", and it never means "fine". NOT_REQUESTED means "you did
+# not ask for this profile", which is not a problem and must never be retried;
+# only --check-adapter's optional file profile emits it (schema=3). --check-server
+# has no optional profile, so NOT_REQUESTED never appears here.
+#
+# exit=<n> versus the process exit status:
+#   * In a NON-INTERACTIVE run — the only kind a machine gets, including any run
+#     under CI=1 — this line is the LAST line and exit= IS the process status.
+#   * In an interactive run the summary prints BEFORE the optional setup handoff,
+#     and it grades the CHECK: exit=0 says the check passed, while the process
+#     continues into setup and finally exits on setup's own result. There, read
+#     exit= as this check's verdict and not as a prediction about the process.
+# The statuses: 0 every check passed · 1 a check failed, or the run broke · 2 a
+# usage error caught after the check began (a malformed URL — a bad FLAG is
+# refused by the argument parser before any check exists, so it carries no summary
+# at all) · 3 an operator stopped the run at a prompt · 128+signal for HUP/INT/TERM.
 compat_summary() { # compat_summary <exit-code>
   local rc="${1:-1}" wire="NOT_RUN"
   if $COMPAT_RAN; then
@@ -220,13 +276,26 @@ compat_on_exit() {
 # the exit. Same acceptance rule as the first prompt — https anywhere, plain http
 # only toward this machine — so the retry can't relax what the first ask enforced.
 compat_reask_url() {
-  local reply url
+  local reply url p
   interactive_terminal || return 1
   say ""
-  say "  Another address to try? The token you already entered is kept — Enter to stop."
+  say "  Another address to try? The token you already entered is kept."
+  # Enter and q both end the asking, and they are two different endings, which is
+  # why both are offered: Enter says "I am done trying, give me the verdict" and
+  # leaves the FAIL summary and its exit 1 behind, while q stops the run outright.
+  # This prompt runs in the parent shell (it assigns $GW_URL directly), so q can
+  # call quit_run here rather than travelling out on an exit status.
+  # No prompt_echo here, unlike every other prompt in the tool: the
+  # interactive_terminal gate above has already proved stdin is a terminal, so
+  # `read -p` writes the prompt itself and the non-tty re-emit could never fire.
+  p="  URL ($(control_suffix "stop trying and take the FAIL" false)) > "
   while true; do
-    read -r -p "  URL (Enter to stop) > " reply || return 1
-    case "$reply" in '') return 1 ;; esac
+    read -r -p "$p" reply || return 1
+    case "$reply" in
+      '') return 1 ;;
+      [iI]) explain_check_server; continue ;;
+      [qQ]) quit_run ;;
+    esac
     if url=$(doctor_accept_url "$reply"); then
       GW_URL="$url"
       apply_gateway_url_normalization
@@ -328,31 +397,48 @@ run_compat() {
   preflight
 
   say "${BOLD}conduck-connect $VERSION — --check-server${RESET}"
-  say "Asks ONE question: does this OpenAI-compatible server speak the core wire the"
-  say "current Apple Conduck app needs? It changes no host configuration. It sends live"
-  say "model/chat/image requests that may consume compute or enter server-side history."
-  say "The check matches the app's request/response acceptance at the directly addressed"
-  say "endpoint. It does not follow redirects or forward credentials to Location targets;"
-  say "use the final server URL directly. This is NOT the adapter contract:"
-  say "${BOLD}--check-adapter${RESET} grades adapters built FOR Conduck,"
-  say "and generic servers fail it on rules the app never exercises. A pass here does NOT"
-  say "make this server a Conduck adapter."
+  # The opening block, printed on the machine path too. It carries the only
+  # statement anywhere in this command that the check spends real provider quota
+  # and lands in a server's own history — and a scripted run is precisely where
+  # nobody read a README first. The two facts below are the ones it leaves out,
+  # both of which decide what the operator types next.
+  explain_check_server
+  say "  It grades the address you give me DIRECTLY: no redirect is followed and your credential"
+  say "  is never forwarded to a Location target, so give me the FINAL server URL."
+  say "  And a red ${BOLD}--check-adapter${RESET} here would mean nothing: those rules are written for software"
+  say "  built FOR Conduck, and generic servers are expected to fail them."
   if interactive_terminal; then
     note "A CONDUCK_CHECK_SERVER machine summary prints before the optional setup handoff."
   else
     note "The last line is always a CONDUCK_CHECK_SERVER machine summary — scripts key on it."
+    # Where the grammar is, said to the only reader who needs it. A machine is
+    # told to download this script and nothing else, so "see the README" is a
+    # pointer it cannot follow; the comment above compat_summary in this very file
+    # is one it can. The function name is the anchor because it is stable — prose
+    # in a comment is not.
+    note "Its key/value domains are in this script, in the comment above compat_summary."
   fi
   note "What this can't see: a server that keeps its OWN chat history will pass and still"
   note "double-count context — Conduck resends the full history every turn (client-owned)."
   note "This grades ONE model path. Set CONDUCK_CHECK_SERVER_MODEL=<id> to grade the model"
   note "you actually plan to use — otherwise a multi-model server is judged on one sample."
 
+  # auth= in the summary must describe what this run SENT. GW_AUTH is initialised
+  # to "bearer" for the wizard, and a check that dies before the token step below
+  # would otherwise report a credential mode it never used; empty makes the
+  # summary's own NOT_RUN fallback fire, which is the honest reading.
+  GW_AUTH=""
+
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
       || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
   else
     say ""
-    GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
+    # explain_check_server is passed as the prompt's `i` copy, not an action id:
+    # explain_prompt resolves a function name before it consults the catalogue,
+    # and the block that says what this command wants an address FOR is the same
+    # block that opened the command. Someone who pressed i here scrolled past it.
+    prompt_into GW_URL doctor_ask_url explain_check_server
   fi
   apply_gateway_url_normalization
 
@@ -370,8 +456,19 @@ run_compat() {
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode") \
-      || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
+    # Two failures, two different meanings, and they must not share a message.
+    # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
+    # supply a token, so printing it to someone who deliberately stopped is both
+    # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
+    # still emits the machine summary, with exit=3.
+    local token_rc=0
+    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode" "gateway.token") \
+      || token_rc=$?
+    case "$token_rc" in
+      0)  ;;
+      11) quit_run ;;
+      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+    esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
       GW_AUTH="none"
       note "Keyless: mirroring the app's explicit no-auth scheme — sensible only on an isolated network."
@@ -398,7 +495,17 @@ run_compat() {
     compat_reask_url && continue
     say ""
     bad "Server check: FAIL — the app's Test Connection fails here, so nothing else can work."
-    say "  Fix that first, then re-run me. Testing an adapter you BUILT? Use ${BOLD}--check-adapter${RESET}."
+    # Be specific about what this red costs, because this is the one --check-server
+    # failure that genuinely blocks pairing: the app asks every gateway for its
+    # model list before it will talk to it, so there is no "pair it anyway" here.
+    # The closing FAIL below is the opposite case and says so — telling both stories
+    # the same way would make one of them a lie.
+    say "  ${BOLD}This blocks pairing.${RESET} The app asks a gateway for its model list before it"
+    say "  will talk to it, so pairing this address would only move the same failure onto your"
+    say "  phone. The ✗ line above says what went wrong; fix that, then re-run me:"
+    say "      ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+    say "  Wrote this server yourself, FOR Conduck? ${BOLD}--check-adapter${RESET} grades it against the"
+    say "  adapter rules instead: ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
     exit 1
   done
 
@@ -487,8 +594,10 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     local named_what="the first advertised model id"
     [ -n "$COMPAT_WANTED_MODEL" ] && named_what="the model you named"
     if [ "$b_ok" = "true" ]; then
+      COMPAT_MODEL_SELECT="PASS"
       c_ok SERVER_MODEL_SELECT "$named_what selects (the app sends what the user picked)"
     else
+      COMPAT_MODEL_SELECT="FAIL"
       c_bad SERVER_MODEL_SELECT "a request naming $named_what fails — $b_reason"
       if [ -n "$COMPAT_WANTED_MODEL" ] && ! $MODELS_WANTED_FOUND; then
         # Don't blame the server's picker for an id the server never offered.
@@ -649,7 +758,7 @@ print(json.dumps(req))') \
     if [ "$COMPAT_MODEL_SOURCE" = "explicit" ]; then
       # The setup handoff pairs $COMPAT_MODEL_ID — the model this run actually
       # graded — so a deliberately-graded model is the one that gets carried.
-      note "Continuing into setup? The pairing code carries the model you named here."
+      note "Continuing into setup? The setup code carries the model you named here."
     fi
     # Statefulness is invisible ON THE WIRE, not always invisible: when the address
     # that just passed matches this machine's own Hermes API-server settings, the
@@ -665,9 +774,7 @@ print(json.dumps(req))') \
         say "  whether this gateway keeps a memory of its own."
       fi
     fi
-    if ! interactive_terminal; then
-      say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
-    fi
+    check_setup_next_step
     return 0
   fi
   bad "Server check: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
@@ -681,7 +788,53 @@ print(json.dumps(req))') \
     say "  That is not yet a verdict on the server: it advertises $MODELS_ID_COUNT model ids and this run"
     say "  graded one path. CONDUCK_CHECK_SERVER_MODEL=<id> grades the model you plan to use."
   fi
-  say "  Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
-  say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+  # Which of these reds actually stops you pairing? The sibling command answers
+  # that on every red exit (doctor_not_yours_hint); this one pointed only at the
+  # adapter contract — written for a different audience entirely — and left
+  # someone whose server merely mishandles photos believing the app cannot be
+  # used with it at all.
+  #
+  # Three answers, not two, because the middle one is where a two-way split lies:
+  #   · a model-less turn failed AND a model-NAMED turn worked — the app sends
+  #     whatever model a gateway is set to, so that route is reachable and this is
+  #     not a blocker
+  #   · every chat turn failed — nothing to pair; the app would never get a reply
+  #   · a chat turn worked — the rest are LIMITS on a gateway that otherwise works
+  # Honest, not generous: each branch claims exactly what this run measured, and
+  # saying which is which is what stops a fixable annoyance reading as a dead end.
+  say ""
+  if [ "$COMPAT_CHAT" = "FAIL" ] && [ "$COMPAT_MODEL_SELECT" = "PASS" ]; then
+    # The middle case, and the one a two-way split gets confidently wrong: the
+    # model-less turn failed for a reason that is NOT the missing-model kind, yet
+    # the turn that NAMED a model answered. The app can be told to always send a
+    # model, so that route is reachable — calling this a blocker would be false.
+    say "  ${BOLD}Pairing may still work, if you name a model.${RESET} The plain request failed, but the one"
+    say "  that named a model answered — and the app sends whatever model you set for a gateway."
+    say "  Set one in the app after pairing, or fix the failure above and re-check:"
+    say "      ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+    check_setup_next_step
+  elif [ "$COMPAT_CHAT" = "FAIL" ]; then
+    say "  ${BOLD}This blocks pairing.${RESET} The app could not get a reply out of this server at all,"
+    say "  so a paired gateway would fail on the first message you send it. Fix the chat failure"
+    say "  above, then re-run me:"
+    say "      ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+  else
+    say "  ${BOLD}You can still pair this server.${RESET} A plain text round-trip worked; what failed above"
+    say "  limits it rather than blocking it:"
+    [ "$COMPAT_HISTORY_IMAGE" = "FAIL" ] \
+      && say "    · once a chat contains a photo, the turns after it fail the same way. Other chats are fine."
+    # "try a different one", never "pick a different one": nothing in this run
+    # tested a second model, so promising one that works would be inventing
+    # evidence.
+    [ "$COMPAT_MODEL_SELECT" = "FAIL" ] \
+      && say "    · naming this model in the app fails. Leave the model blank, or try a different one."
+    say "  Re-check after a fix:  ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+    # The setup line goes through the shared helper rather than being printed
+    # straight, so this branch cannot hand a machine the one command a machine
+    # can't finish — the same trap the PASS ending exists to close.
+    check_setup_next_step
+  fi
+  say "  Wrote this server yourself, FOR Conduck? Then ${BOLD}--check-adapter${RESET} is the grade you want,"
+  say "  against the rules at ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
   exit 1
 }

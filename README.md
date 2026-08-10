@@ -1,6 +1,24 @@
 # conduck-connect
 
-Pair your self-hosted AI gateway with the **[Conduck](https://conduck.com)** app — one plain-text script you can inspect before you run. Zero telemetry.
+Pair your self-hosted AI gateway with the **[Conduck](https://conduck.com)** app — one plain-text script you can read before you run it. Zero telemetry. Conduck itself is on the App Store; this is the piece that runs on your own server.
+
+## What it does
+
+You already run an AI agent somewhere — a VPS, a home server, a Mac mini that never sleeps. Conduck is the iPhone, iPad and Mac app that talks to it by voice. `conduck-connect` is what joins the two, and it runs on the machine your agent runs on.
+
+Point it at a gateway — **OpenClaw**, **Hermes**, or any server that speaks the OpenAI chat API — and it will:
+
+1. **Switch the chat endpoint on** if it is off. OpenClaw and Hermes both ship it off, so the gateway looks perfectly healthy while `/v1/chat/completions` answers 404 and no app can connect.
+2. **Help you reach it over HTTPS.** Conduck only talks to an `https://` address whose certificate your devices already trust. The script walks the four ways to get one and lets you choose; it does not choose for you.
+3. **Optionally set up file transfer** — the shared folder your attachments land in and your agent writes files back to — as a small WebDAV server bound to your own machine.
+4. **Verify all of it with real requests**, ending with one real chat turn in which your actual agent has to read a file and write one back. A green transport with an agent that cannot see the files is the failure this exists to catch.
+5. **Print a setup code**, as a QR code and as text. Scan it with the app and you are paired.
+
+It will also **grade a server without changing anything** (two check commands, further down), and **manage what you have already set up**: list it, change one field of it, or remove it completely.
+
+What it never does: install a gateway, Tailscale, cloudflared or rclone; elevate to root without showing you the exact command first; change your gateway's configuration without showing you the exact before-and-after; make your machine publicly reachable without saying so in plain words; or send a byte anywhere except the gateway and file server *you* named. There is no GigaDuck server for it to report to — a claim you can settle by reading the file rather than by trusting us.
+
+**Four words used throughout.** The **wizard** is the `--setup` flow; **conduck-connect** is the whole program. Your **gateway** is the agent server this script configures. The **setup code** is the QR/paste string that pairs a device — treat it like a password. The **file lane** is the pair of things that make attachments work: the shared folder your agent reads and writes, and the small file server in front of it.
 
 ## Quick start
 
@@ -12,32 +30,32 @@ curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/downlo
 
 - **Go straight to setup?** Append ` --setup` to the trailing `bash conduck-connect.sh`.
 - **Preview setup, change nothing?** Append ` --setup --dry-run` instead.
-- **Read it before running?** Drop the trailing `&& bash conduck-connect.sh` — the rest still downloads the file — then `less conduck-connect.sh` and run it when you're happy. It stays plain text on purpose ([why](#why-a-shell-script)).
+- **Read it before running?** Drop the trailing `&& bash conduck-connect.sh` — the rest still downloads the file — then `less conduck-connect.sh` and run it when you're happy. It stays plain text on purpose ([how to read it](#read-it-before-you-run-it)).
 
-Works on macOS and Linux. `-O` lands the full file on disk before anything runs, so inspecting it is one `less` away. An optional same-release checksum is [below](#what-each-step-does); it confirms the download arrived intact but is not a tamper-proof signature.
+Works on macOS and Linux. `-O` lands the whole file on disk before anything runs, so you can read it first — see [Read it before you run it](#read-it-before-you-run-it) for how. An optional same-release checksum is [below](#what-each-step-does); it confirms the download arrived intact but is not a tamper-proof signature.
 
-It pairs **OpenClaw**, **Hermes**, or any OpenAI-compatible server with Conduck (built your own agent? see the [adapter contract](https://conduck.com/setup/adapter/v1/)): enables the chat endpoint, helps you expose the gateway over HTTPS, optionally stands up the agent file lane (rclone WebDAV), verifies everything with real requests, and prints a QR + paste **pairing code** the app imports in one scan. Agent-side checks are gateway-aware: OpenClaw gets a tool-policy check plus workspace `TOOLS.md` guidance; Hermes gets its API-server file toolset and exact `terminal.cwd` checked plus verified Hermes context guidance. Both must then pass a real read→byte-identical-write→reply-discovery sentinel before the file lane reaches the code. Any other server runs the same sentinel worded without tool names, against the model you paired; it has no folder default, so you name the folder your agent already uses.
+## Read it before you run it
 
-> **Release boundary:** the script's `VERSION` remains `0.13.0`, while `main`
-> may also contain entries under **Unreleased** that are not in the published
-> `v0.13.0` asset. The Quick start always downloads the latest *published*
-> release—not `main`; the [releases page](https://github.com/gigaduckai/conduck-connect/releases)
-> is the authority on what is live. Rebuilding or testing the local artifact
-> does not publish it. The Conduck app is already available on the App Store.
-> Every release artifact is plain, unminified shell that can be inspected
-> before it runs.
+That is the point of shipping one plain file, and the Quick start writes it to disk **before** anything executes. This is deliberately *not* `curl | bash`, which pipes unread code straight into your shell — and would break the script's prompts anyway.
 
-## Why a shell script?
+Now the honest part: **the released script is about 18,500 lines.** Most of that is explanation, verification and refusals — it is a wizard that argues with you — but nobody reads 18,500 lines of shell to decide whether to run something, and a README that tells you to is not being straight with you. So read for a *question*, not from the top.
 
-Because you can inspect exactly what would run on your server — it is plain text, not an opaque binary or installer. The Quick start writes it to a file **before** anything runs, so review is one `less` away — always encouraged for a tool that touches your gateway.
+The release is one file, but it is assembled from the modules in [`src/`](src/), and those modules are your map. CI proves they reproduce the released script byte for byte, so reading a module is reading the shipped code — and each one opens with a comment stating its job and its reasoning.
 
-This is deliberately *not* `curl | bash` — that pipes unverified code straight into your shell, unread (and would break this script's interactive prompts anyway). Here the file lands on disk, remains available to inspect, and only then runs.
+| If you want to know | Read this |
+|---|---|
+| What it claims to do and never do, in its own words | the comment header at the top of `conduck-connect.sh` — the same text is [`src/00-cli.inc.sh`](src/00-cli.inc.sh) |
+| Whether it can phone home | `grep -n 'curl -q' src/*.inc.sh` — eighteen call sites, each taking its address from a value you supplied. The two wrappers that build them, `curl_gw` and `curl_fs_*`, are in [`src/50-verification.inc.sh`](src/50-verification.inc.sh) |
+| What it can change on your machine, and how it asks first | `run_step`, `print_and_wait`, `mutate_guard` and `confirm` in [`src/10-utilities.inc.sh`](src/10-utilities.inc.sh) — every change on the machine goes through one of them |
+| What it reads from — and may write to — your gateway's own config | [`src/20-gateway.inc.sh`](src/20-gateway.inc.sh) |
+| What could make your machine reachable from outside | [`src/30-exposure.inc.sh`](src/30-exposure.inc.sh): every `tailscale` command it can run, every Cloudflare command it prints for you, and the records that let a later run close what an interrupted one opened |
+| Where the file-server password comes from, and where it is stored | [`src/40-file-lane.inc.sh`](src/40-file-lane.inc.sh) |
+| What it writes into your agent's own instructions file | [`src/41-agent-file-readiness.inc.sh`](src/41-agent-file-readiness.inc.sh) |
+| What ends up inside the setup code | [`src/80-pairing.inc.sh`](src/80-pairing.inc.sh), and [PAYLOAD.md](PAYLOAD.md) for the format |
+| What `--list`, `--edit` and `--forget` do — and exactly what `--forget` deletes | [`src/95-manage.inc.sh`](src/95-manage.inc.sh) |
+| Which command runs what | [`src/99-main.inc.sh`](src/99-main.inc.sh) |
 
-For maintainers, the source is split by responsibility under [`src/`](src/) and
-assembled deterministically. CI proves those modules reproduce the checked-in
-`conduck-connect.sh` byte for byte. That keeps development navigable without
-turning the user-facing tool into a runtime bundle: the release is still one
-plain, unminified script.
+Two things to save you time. The one very large block near the bottom of the released script is a vendored, unmodified QR encoder (Project Nayuki, MIT) used to draw the QR locally; it is inert — Python standard library only, no network, file or process access, checked in CI against a pinned checksum — and safe to skip. And `bash conduck-connect.sh --setup --dry-run` prints the exact actions a real run would take **on your host** without taking any of them, which answers "what would this do to my machine" faster than any amount of reading.
 
 ## What each step does
 
@@ -67,57 +85,136 @@ curl -fsSLO https://github.com/gigaduckai/conduck-connect/releases/latest/downlo
 shasum -a 256 -c conduck-connect.sh.sha256        # Linux: sha256sum -c conduck-connect.sh.sha256
 ```
 
-No `chmod` needed. The one large block near the bottom of the script is a vendored, unmodified QR-code encoder (Project Nayuki, MIT) used to draw the QR locally. It is inert — Python standard library only, no network, file, or process access — and safe to skip when reading.
+No `chmod` needed — `bash <file>` runs it without the execute bit.
 
-### Prompt controls
+## Prompt controls — `i`, `b`, `q`
 
-At each interactive decision, the prompt lists the controls available for that
-step and states exactly what pressing **Enter** will do. The controls are
-contextual:
+Every interactive question — a yes/no gate, a menu, a value you type, a hidden
+token — ends with the controls that work at *that* question and says exactly
+what pressing **Enter** will do. A key is a control there if and only if the
+prompt lists it, which is why a question that will not accept `b` does not
+offer it.
 
-- **`i` — explain this step.** Shows what the current action does, why it is
-  part of setup, what it may read, change, contact, restart, or expose, and what
-  declining means. The same decision is then shown again.
-- **`q` — stop setup.** Stops deliberately instead of treating the answer as
-  “no.” It does not undo configuration changes you already approved, commands
-  you already ran, or exposure changes already confirmed.
-- **`b` — go back.** Appears only where setup has a safe, defined earlier
-  choice to return to. It is not offered after an external command handoff or
-  where “back” could be mistaken for undo, and it never rolls back earlier
-  approved changes.
+- **`i` — explain this step.** What this action does, why it is part of setup,
+  what it may read, change, contact, restart or expose, what declining means,
+  and — where the answer is genuinely hard — what to pick if you are honestly
+  unsure. The same question is then asked again.
+- **`q` — stop.** Stops deliberately rather than being read as “no”, and the run
+  exits `3`. It does not undo configuration changes you already approved,
+  commands you already ran, or exposure changes already confirmed; it says so
+  before it goes.
+- **`b` — go back.** Offered where there is a safe, defined earlier choice to
+  return to. It is not offered after the script has handed you a command to run,
+  or anywhere “back” could be mistaken for undo, and it never rolls back an
+  approved change.
 
-Enter is not one global answer: at `[y/N]` it means **No**, at a value with a
-displayed default it accepts that value, and at a
-menu with no default it makes no selection and asks again. At an explicitly
-optional value it skips or selects keyless mode only when the prompt says so.
-After setup prints a command for you to run, Enter means **“I ran it; continue”**;
-the script does not run that command for you.
+If you genuinely want to *answer* a question with one of those letters — a
+gateway named `q`, say — the script asks you to confirm it once rather than
+guessing.
+
+Enter is not one global answer. At `[y/N]` it means **No**. At a value with a
+displayed default it accepts that default. At a menu with no default it selects
+nothing and asks again. At an explicitly optional value it skips, or selects
+keyless mode, only where the prompt says so. And after the script prints a
+command for *you* to run, Enter means **No, skip** — the same as everywhere
+else, so an Enter pressed in rhythm can never claim you applied a change you
+never made.
+
+If the answer is a closed pipe or an empty file, the script says which question
+went unanswered and what it assumed, instead of proceeding in silence.
+
+## Where your configuration lives
+
+Everything the script saves goes in one directory, and nowhere else:
+
+```
+${XDG_CONFIG_HOME:-~/.config}/conduck/
+```
+
+The script creates it `0700`, so only your account can read it. A directory that *already* existed with a wider mode keeps that mode — the script will not silently re-permission a folder it did not create — but it says so once per run and prints the exact `chmod`. It holds, per gateway you have paired:
+
+| File | What it is | Holds a secret? |
+|---|---|---|
+| `profile-<id>.json` | Routing facts: gateway kind, web address, transport, model, shared folder, file address. Plain, readable JSON. | No |
+| `fileserver-<id>.cred` | The file server's password — the one your app uses to reach the shared folder. | **Yes**, `0600` |
+| `fileserver-<id>.env` | The same password as `RCLONE_PASS=…` (Linux only). It exists so the systemd service can read the password without it appearing in the service file or in `ps`. | **Yes**, `0600` |
+| `exposure-<run>-<n>.pending` | One line per HTTPS route a run opened but has not yet reported to you, so a later run can offer to close what an interrupted one left open. | No |
+| `setup.lock` | A directory that exists only while a setup is running, so two runs cannot pick the same port and overwrite each other's saved setup. | No |
+
+**Your gateway token is never written to disk by this script** — not in the profile, not anywhere in that directory. That is a deliberate limit on what a compromised configuration folder is worth, and it is why `--show-code` asks you for the token again.
+
+**On macOS the file-server password exists in a second place.** The LaunchAgent that keeps your file server running (`~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist`) carries it in cleartext, because launchd has no equivalent of an environment file. The file is written `0600`. Deleting only the `.cred` leaves the password on disk; `--forget <id>` removes both, and [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md) has the by-hand version.
+
+```bash
+bash conduck-connect.sh --list
+```
+
+prints all of it for your machine: the directory itself, every saved setup in it, and whether each file server is running right now. It asks nothing, changes nothing, and prints no password and no setup code.
+
+## Managing what you have already set up
+
+Pairing is not the end of the story. A tunnel hands out a new hostname, you want a different model, or you stop using a gateway entirely — and until you deal with the last one, a live authenticated file server keeps running over your agent's working folder, at every boot, indefinitely.
+
+```bash
+bash conduck-connect.sh --list                 # what is set up here, and what is still running
+bash conduck-connect.sh --list --json          # the same, for a script
+bash conduck-connect.sh --edit [id]            # change one thing about one setup
+bash conduck-connect.sh --forget <id>          # remove one setup completely
+```
+
+**`--list`** names your configuration directory and then every saved setup: id, gateway kind, web address, how it is reached, model, shared folder, file address, and the *live* state of its file server. Tokens are reported as `not stored` rather than omitted, so the absence is visible. It also lists **file servers with no saved setup behind them** — the leftovers of a gateway you removed by hand — with the command to remove each one. A saved setup this version cannot parse is listed separately, with the reason, because its id stays taken.
+
+**`--edit [id]`** changes exactly one field and re-runs only the verification that field affects: the web address, the model, or a hand-off to setup for the shared folder (which has to agree in three places at once, so it is not a one-field change). From the same screen you can re-show the setup code or remove the setup. Leave the id out and it asks which one you mean.
+
+The case it exists for: a Cloudflare **quick tunnel** (`*.trycloudflare.com`) is reassigned a new hostname every time it restarts, so a setup that worked last night is dead by morning. `--edit` takes the new address, checks that something answers there, offers to move the file address to the same new host, and offers to print the updated setup code — instead of a full walk through the wizard. The screen says so at the top when it recognises one.
+
+**`--forget <id>`** is the only irreversible thing in this tool, so it is the one action Enter cannot complete: you confirm by typing the id. Before it asks, it lists everything it will remove — the saved setup, the file-server service, **both** copies of the file-server password, and each HTTPS route it opened — and everything it will **not** touch:
+
+- **your shared folder and everything in it.** On OpenClaw and Hermes that folder is the agent's own working directory.
+- **your agent's `TOOLS.md`**, and any gateway configuration this script edited.
+- **the gateway itself.** It keeps running, on the same port, with the same token.
+- **the pairing already on your phone, tablet or Mac.** That device still holds the gateway's address and its token, and nothing on this machine can reach it — remove the connection in the app too. If you are removing this because the token leaked, rotate the token at the gateway; that is the only thing that revokes it.
+
+Anything it cannot *prove* it removed is reported by exact name, with the commands to finish by hand and a plain statement that it did not run them. It exits `0` when everything is gone, `1` when some of it is still there.
 
 ## Public commands and flags
 
 | Command | Effect |
 |---|---|
-| _(none)_ | Welcome menu: setup, check a server, check an adapter, or re-show a saved code |
+| _(none)_ | Welcome menu, and a hub you return to: set up, check a server, check an adapter, re-show a saved code, see what is already set up, change or remove one of them. Finishing an action offers the menu again rather than ending the session |
 | `--setup` | Go straight to setup. Detection reports OpenClaw/Hermes installs, but you always explicitly choose OpenClaw, Hermes, or another server |
 | `--check-server [url]` | Existing OpenAI-compatible software **not built for Conduck**: check core compatibility with the current Apple Conduck app |
 | `--check-adapter [url]` | An adapter built specifically for Conduck: grade the stricter adapter contract |
-| `--show-code` | Re-show a saved gateway's pairing code without configuration changes. It re-emits exactly what the saved profile holds, so a code minted without a file lane stays chat-only — attachments remain inline-only until a full `--setup` run captures a lane. Live verification sends gateway requests and, when configured, one small file-lane PUT→GET→DELETE probe; every configured lane also gets a real agent sentinel turn — tool-named on OpenClaw/Hermes, tool-agnostic on any other server — which costs one real chat turn on a metered gateway |
-| `--setup --dry-run` | Show setup state and the exact actions a real run would take, then stop. Never prompts for secrets, mints credentials, sends requests, or emits a code |
+| `--list` | What this machine already has set up: every saved setup, where its files live, and any file server still running with no setup behind it. Asks nothing, changes nothing, prints no secret |
+| `--list --json` | The same inventory as one JSON object, with its own `schemaVersion`. Needs no terminal |
+| `--edit [id]` | Change one thing about one saved setup — its web address, its model — and re-verify only what that changed. Re-showing the code and removing the setup live here too. Without an id, it asks which setup you mean |
+| `--forget <id>` | Remove one saved setup: stop and delete its file server, close the HTTPS routes it opened, delete both copies of its file-server password, delete the saved setup. Confirmed by typing the id. Never deletes your shared folder. Exits `1` if no setup has that id |
+| `--show-code` | Re-show a saved gateway's setup code without configuration changes. It re-emits exactly what the saved profile holds, so a code minted without a file lane stays chat-only — attachments remain inline-only until a full `--setup` run captures a lane. Live verification sends gateway requests and, when configured, one small file-lane PUT→GET→DELETE probe; every configured lane also gets a real agent sentinel turn — tool-named on OpenClaw/Hermes, tool-agnostic on any other server — which costs one real chat turn on a metered gateway |
+| `--setup --dry-run` | Show setup state and the exact actions a real run would take, then stop. Never prompts for secrets, mints credentials, sends requests, or emits a code. It ends by printing the exact command that runs it for real, rebuilt from the flags you used, so committing to the run cannot silently drop one |
 | `--setup --reuse-only` | Walk setup using only what already exists. It does not apply host configuration changes — the first step that would need one stops the run and names it, rather than skipping past it. Live verification still sends gateway requests and may write/delete the normal byte probe; a configured OpenClaw/Hermes lane also runs the real agent read→write→reply sentinel |
 | `--check-adapter --deep [url]` | Also test how the adapter handles a message with an image |
 | `--check-adapter --files [url]` | Also grade the file lane. This explicitly mutating check writes and removes small named artifacts — `conduck-check-*` plus one `output-*.txt` — in the configured shared folder |
 | `--setup --allow-keyless-public` | Expert: permit a keyless gateway on a public transport |
-| `--help` / `-h` | The script's whole header: what it does, what it never does, and every public flag |
+| `--help` / `-h` | A one-screen reference: synopsis, every command split by whether a script can drive it, options, environment variables, exit status, examples |
 | `--version` | Print `conduck-connect <version>` and exit — nothing else runs |
 
-Exit status is deliberately small and stable: `0` means success (or a passing
-check), `1` means setup/runtime failure or a completed check that failed, and
-`2` means the command line itself is invalid—an unknown or retired spelling,
-incompatible flags, an extra positional argument, or an invalid direct URL.
-Signal interruptions retain their conventional `128 + signal` status. Once a
-noninteractive check has passed command validation, its machine summary remains
-the final line even if runtime preflight fails—for example, missing `curl` or
-`python3` reports `exit=1` with all check meters still `NOT_RUN`.
+Exit status is deliberately small and stable:
+
+| Status | Meaning |
+|---|---|
+| `0` | The action succeeded, or a check passed. Choosing "exit" at the welcome menu is also `0` — that is a completed choice, not an abort |
+| `1` | A setup or runtime failure, or a completed check that failed |
+| `2` | The command line itself is invalid: an unknown or retired spelling, incompatible flags, an extra positional argument, an invalid direct URL |
+| `3` | You stopped the run before it finished — `q` at a prompt, or backing out of a removal |
+| `4` | This action needs a person at a terminal |
+| `128+signal` | Interrupted by HUP/INT/TERM, in the conventional way |
+
+Once a noninteractive check has passed command validation, its machine summary
+remains the final line even if runtime preflight fails — for example, missing
+`curl` or `python3` reports `exit=1` with all check meters still `NOT_RUN`.
+Machine-driven use — `CI=1`, `CONDUCK_TOKEN`, the summary grammars, and what a
+tool can and cannot finish on its own — is written up in
+[AGENTS.md](AGENTS.md#for-ai-tools-driving-this-script).
 
 The public setup command is `--setup`; there is no second public “generic”
 mode. One older spelling, `--generic`, remains functional but intentionally
@@ -134,6 +231,8 @@ Have an adapter built for Conduck — by hand or by an AI coding tool? Before ex
 ```bash
 CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --check-adapter http://127.0.0.1:8080
 ```
+
+Running it from a build script or an AI coding tool? Put `CI=1` in front. Without it, a check that **passes** in a real terminal goes on to ask whether you want to continue into setup — and an automated caller that has already read `exit=0` sits at that question forever. `CI=1` makes the machine summary the last thing either check prints.
 
 The check changes no host configuration. It sends a handful of real requests—which may consume compute or enter server-side history—and grades the answers against the rules at **[conduck.com/setup/adapter/v1/](https://conduck.com/setup/adapter/v1/)**. That includes the one the pairing wizard cannot prove: your token check is actually **enforced** (a missing or wrong token must get `401` on both routes). Exit code `0` means every check passed. Plain `http://` is accepted toward `127.0.0.1`/`localhost` only; the token comes from `$CONDUCK_TOKEN` or a hidden prompt, never the command line (`argv` is visible to `ps`). For a scripted run with no keys at all, export `CONDUCK_TOKEN=` **empty** — that is an explicit keyless declaration. Leaving it unset where no prompt is possible (piped or closed input) fails fast instead of grading the target as keyless, because a silently-assumed keyless run grades the wrong thing and calls it a pass. Add `--deep` to test a message with an image (an honest HTTP `400` "images unsupported" answer passes).
 
@@ -173,18 +272,19 @@ CONDUCK_CHECK_SERVER_MODEL='llama-3.3-70b' bash conduck-connect.sh --check-serve
 
 Every request in that run that carries a model name then carries that one, and the transcript says which model each verdict describes. The requests that deliberately test model-less behavior still leave it out — that is a separate thing worth knowing about your server. An id your server does not advertise is checked anyway; you just get a note that it is not in the list, in case it is a typo. Leave the variable unset and nothing about the run changes: it falls back to the first advertised id, or to whatever your server routes to by default when it answers without a model field at all.
 
-If you continue into setup, the pairing code keeps the routing the check actually proved — the model you named, or no model name at all when what got tested was the server's own default route.
+If you continue into setup, the setup code keeps the routing the check actually proved — the model you named, or no model name at all when what got tested was the server's own default route.
 
 The last line of every noninteractive run is a machine summary (`CONDUCK_CHECK_SERVER schema=2 … wire=PASS|FAIL …`); exit `0` means core text-chat compatibility is green. It does **not** certify image understanding, public reachability, HTTPS certificate trust, or make the server a Conduck adapter (that is `--check-adapter`). Statefulness is also invisible on the wire: Conduck resends the full conversation every turn, so a server that keeps its own history will silently double-count context.
 
 ## Trust posture
 
 - Runs on **your** gateway host. **No telemetry, ever — there is no GigaDuck server.** Its own HTTP probes go only to the gateway and file lane you name, and the QR is generated locally. The exception is the exposure path you choose: `tailscale serve` / `tailscale funnel` and `cloudflared tunnel list` are that vendor's own commands, and running them contacts that vendor's control plane.
-- Never installs gateways, Tailscale, cloudflared, rclone, or any daemon it didn't create.
-- Previews and asks before changing gateway or user-owned configuration and before changing network exposure. Connector-owned bookkeeping and exact verification artifacts may be created automatically inside the bounded setup or check action you chose; the complete list and undo guidance is in [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md). Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
+- Never installs gateways, Tailscale, cloudflared, rclone, or any background program it didn't create.
+- Previews and asks before changing gateway or user-owned configuration and before changing network exposure. Bookkeeping the script owns, plus the exact verification artifacts, may be created automatically inside the bounded setup or check action you chose; the complete list and undo guidance is in [WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md). Things *you* own (a Cloudflare tunnel, your reverse proxy) are printed as exact commands for you to run yourself.
 - Never elevates silently. Every command that needs higher rights is shown in full first — prefixed with `sudo` or `doas`, whichever this machine has, and bare when you are already root or have neither — and all but one are printed for you to review and run yourself (Tailscale operator rights, `pmset`). The exception is `loginctl enable-linger <user>` in the file-lane step — lingering is what keeps your file server running after you log out. The script runs that one itself, and only after you approve the exact command at a `y/N` prompt; decline and it prints it as a tip instead.
 - Never makes your gateway public without telling you, in plain words, that it will — and refuses to publish a keyless gateway unless you run setup with `--setup --allow-keyless-public`.
-- Re-running is safe; `--show-code` re-shows your saved pairing code without changing configuration. Its live verification still sends gateway requests and briefly writes/removes small randomized probes when a file lane is configured (including one real agent file turn, on any gateway kind).
+- Re-running is safe; `--show-code` re-shows your saved setup code without changing configuration. Its live verification still sends gateway requests and briefly writes/removes small randomized probes when a file lane is configured (including one real agent file turn, on any gateway kind).
+- Removal is the one irreversible action, and it is the one Enter cannot complete: `--forget <id>` lists everything it will remove *and* everything it will leave alone, then asks you to type the id.
 
 See **[WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md)** for the exact files, services, and ports it reads or changes — and how to undo each.
 
@@ -192,7 +292,7 @@ See **[WHAT-IT-TOUCHES.md](WHAT-IT-TOUCHES.md)** for the exact files, services, 
 
 `bash` (3.2+), `curl`, `python3`, `openssl`. A Linux or macOS gateway host.
 
-The wizard is interactive and needs a real terminal: prompts cannot be piped in, and there are no non-interactive answer flags. (An AI tool driving it needs a real PTY.)
+The wizard is interactive and needs a real terminal: prompts cannot be piped in, and there are no non-interactive answer flags. Setup also ends in a QR code somebody scans with a phone, so a machine cannot finish it however good its PTY is. What *is* fully scriptable — `--check-server`, `--check-adapter` and `--list --json`, with `CI=1` so a passing check never waits for a person — is written up in [AGENTS.md](AGENTS.md#for-ai-tools-driving-this-script).
 
 ## Reaching your gateway
 
@@ -210,11 +310,11 @@ Whatever you pick, the certificate is not negotiable: Apple's App Transport Secu
 - **Let's Encrypt** — free, and since January 2026 it also issues certificates for a bare IP address, so no domain is required.
 - **A domain in front of it** — Caddy or another reverse proxy obtains and renews the certificate for you.
 
-Whichever path you pick, every address you type — gateway or file lane — has to be a plain URL. One carrying `user:pass@` credentials is refused, by the wizard and by both check commands: that password would otherwise be echoed on screen, saved into the profile, and ride inside the pairing code. Credentials belong in the token prompt, not the address.
+Whichever path you pick, every address you type — gateway or file lane — has to be a plain URL. One carrying `user:pass@` credentials is refused, by the wizard and by both check commands: that password would otherwise be echoed on screen, saved into the profile, and ride inside the setup code. Credentials belong in the token prompt, not the address.
 
 ## Set up the file lane by hand (any WebDAV server)
 
-**The easy path is to re-run `conduck-connect`.** It's the supported way to add file transfer after chat is already paired: it detects an existing `conduck-files-<gwid>` server, reuses its stable folder/port/credential, allocates a different free loopback port when another gateway already owns the default, checks the local service before exposing it, reconciles the lane's reach against the gateway's, and emits a fresh pairing code only after live verification. `--show-code` is not a shortcut for this: it re-emits the saved profile as it stands, and a profile captured without a file lane has none to hand over — skip the lane during `--setup` and the code you scan carries chat only, with attachments inline-only, until a later `--setup` run gives the lane an address. Reach for the manual path below only when you run your own topology — Caddy, nginx, a NAS appliance, containers, or rclone under your own supervisor — anything that already speaks WebDAV.
+**The easy path is to re-run `conduck-connect`.** It's the supported way to add file transfer after chat is already paired: it detects an existing `conduck-files-<gwid>` server, reuses its stable folder/port/credential, allocates a different free loopback port when another gateway already owns the default, checks the local service before exposing it, reconciles the lane's reach against the gateway's, and emits a fresh setup code only after live verification. `--show-code` is not a shortcut for this: it re-emits the saved profile as it stands, and a profile captured without a file lane has none to hand over — skip the lane during `--setup` and the code you scan carries chat only, with attachments inline-only, until a later `--setup` run gives the lane an address. Reach for the manual path below only when you run your own topology — Caddy, nginx, a NAS appliance, containers, or rclone under your own supervisor — anything that already speaks WebDAV.
 
 Conduck doesn't care *how* the endpoint is built, only that it satisfies the contract the in-app **Test Connection** stages check. Serve that contract with whatever you already run.
 
@@ -283,8 +383,8 @@ Nothing fails, so no message prints — but the result quietly isn't what you wa
 - **Hermes: the full-agent API server keeps a memory of its own until you narrow it.** `memory` and `session_search` in `platform_toolsets.api_server` let the gateway answer from things Conduck never sent it — and because Conduck resends the whole conversation every turn, you pay for that hidden context on top of the history you already sent. Nothing on the wire shows it: a gateway in that state passes every check here and in `--check-server`. Write no `api_server` list at all and Hermes falls back to a default bundle carrying both, so a fresh install starts this way. The wizard reports the scope before pairing, offers to remove exactly those entries when they are plainly listed, and never blocks pairing over it. Whichever route you take, the agent's other tools and skills stay — this is only Hermes's own recall, not the whole agent you give up on `8645` above. Test it yourself: tell it something in one conversation, then ask for it in a brand-new one. Where the wizard will not make the edit for you, what it prints depends on what it can prove:
   - **Entries it can see by name in an explicit list** — take exactly those two out, leave every other entry alone.
   - **No `api_server` key at all, or a list holding exactly the one bundle name `hermes-api-server`** — Hermes has no exclusion syntax, so nothing subtracts two names from a bundle and the per-surface fix is to write the list out. It prints the one line to write — `api_server: ["browser", "code_execution", "cronjob", "delegation", "file", "image_gen", "skills", "terminal", "todo", "vision", "web"]` — as that child key alone, names its full path `platform_toolsets.api_server`, and says where it goes before it shows it: two spaces in under a `platform_toolsets:` line and never at the left margin — inside the `platform_toolsets:` section your file already has, leaving that section's other platforms alone, or under one you add at the left margin yourself if there is no such section anywhere. Placement is the whole game here: two `platform_toolsets:` sections in one file do not merge — one wins outright, and the platforms configured in the other stop applying. The list is the reviewed Hermes API-server default minus the two recall toolsets, so everything else that default resolves to **from your configuration alone** — terminal, code execution, the browser, skills, vision, image generation — survives the move to an explicit list. Two toolsets sit outside that promise and outside the list: Hermes switches `homeassistant` and `x_search` on from `HASS_TOKEN` / `XAI_API_KEY` in its own environment, and only while no explicit list exists, so add either one yourself if you run Home Assistant or xAI search. The wizard says so where it prints the list. The list is otherwise a deliberate freeze: from then on it is yours to maintain, and a later Hermes that adds a toolset to its own bundle will not add it here.
-  - **A bundle it has not reviewed** — `all`, `*`, `hermes-cli`, any other `hermes-*` — is described, not handed a list. The connector cannot know what those contain, so it asks you to name the toolsets this API server should have rather than printing a set that might silently drop tools you use.
-  - **`hermes-api-server` with anything beside it** — that bundle *is* the one the connector has reviewed, and it has just named it on your screen, so it does not pretend otherwise. What it will not do is decide the fate of the entries standing next to it: those are deliberate choices of yours, and any replacement list has to either carry them across or drop them. It asks you to write the list out yourself — what that bundle gives this API server, without the two recall toolsets, plus the entries beside it you still want. An entry your `agent.disabled_toolsets` currently switches off counts as an entry beside it: that is a dormant choice you made, not a line to discard for you.
+  - **A bundle it has not reviewed** — `all`, `*`, `hermes-cli`, any other `hermes-*` — is described, not handed a list. The wizard cannot know what those contain, so it asks you to name the toolsets this API server should have rather than printing a set that might silently drop tools you use.
+  - **`hermes-api-server` with anything beside it** — that bundle *is* the one the wizard has reviewed, and it has just named it on your screen, so it does not pretend otherwise. What it will not do is decide the fate of the entries standing next to it: those are deliberate choices of yours, and any replacement list has to either carry them across or drop them. It asks you to write the list out yourself — what that bundle gives this API server, without the two recall toolsets, plus the entries beside it you still want. An entry your `agent.disabled_toolsets` currently switches off counts as an entry beside it: that is a dormant choice you made, not a line to discard for you.
   - **YAML it cannot read, or a toolset name it doesn't recognise** — it says exactly that and stops there: no claim about what the key holds, and no replacement for it.
   - **The one-line global alternative, named wherever the fix means writing a list** — **add** (never set) `memory` and `session_search` to `agent.disabled_toolsets`. It is printed the same way: the `disabled_toolsets:` key and its two items alone, to append to the `agent:` section your file already has, with a fresh `agent:` line of your own only if there is none — two `agent:` sections do not merge either, one wins, and everything the other one set stops applying. It buys simplicity at a price the wizard states out loud: it reaches every Hermes surface at once rather than just this API server, Hermes's own `hermes tools` screen can silently drop those entries again when you re-enable a toolset anywhere, and it stops memory writes and session search without stopping saved memories from reaching the prompt.
 - **vLLM can list a model whose chat fails** — a model served without a chat template answers `/v1/models` but errors on `/v1/chat/completions`.
@@ -292,7 +392,7 @@ Nothing fails, so no message prints — but the result quietly isn't what you wa
 
 ### File-lane problems
 
-- `The file-server service exists but is not active` / `did not answer with its saved credential` / `did not reject both missing and wrong credentials` — the local service behind the planned exposure is stopped, shadowed, or insecure. The wizard leaves it out rather than putting an unproved lane in the code. Repair/restart that exact `conduck-files-<gateway>` unit and re-run. If two pre-existing per-gateway units claim the same loopback port, only the exact unit that is active and passes the authenticated byte probe can be used; the connector intentionally does not rewrite or rebind either existing definition. Stop/repair/remove the stale duplicate, or assign it a different port, then re-run.
+- `The file-server service exists but is not active` / `did not answer with its saved credential` / `did not reject both missing and wrong credentials` — the local service behind the planned exposure is stopped, shadowed, or insecure. The wizard leaves it out rather than putting an unproved lane in the code. Repair/restart that exact `conduck-files-<gateway>` unit and re-run. If two pre-existing per-gateway units claim the same loopback port, only the exact unit that is active and passes the authenticated byte probe can be used; the wizard intentionally does not rewrite or rebind either existing definition. Stop/repair/remove the stale duplicate, or assign it a different port, then re-run.
 - `OpenClaw agent file lane failed: …` / `Hermes agent file lane failed: …` — WebDAV worked, but the full agent did not read the randomized input, finish a byte-identical output at the shared root, or name it in the reply. The lane is omitted. For OpenClaw, check the workspace/tool policy/`TOOLS.md`; for Hermes, check `terminal.cwd`, the API-server `file` toolset, and `.hermes.md` / `HERMES.md`. Re-run after fixing it.
 - `The file-lane sentinel did not pass: …` (any other OpenAI-compatible server) — the same sentinel, worded without tool names because your server's file tools are whatever its author called them. The screen names which step fell short, and that decides what it means: a failure at the agent's own file work is the expected result for a plain model server — Ollama, vLLM and LiteLLM have no file tools at all, and nothing on your host is wrong — while a WebDAV refusal, a chat request that never came back, or a temp file the script could not stage says nothing about your agent, which was never asked anything. The agent-side failure can equally mean the agent works somewhere other than the folder you named, or sees a different filesystem than the machine you ran setup on — a container, another account, a worker on another box. You are asked whether to include the file server anyway, and the default is to leave it out; the setup code has no field for "untested", so a lane you keep arrives in the app looking fully working. Declining also closes an HTTPS route that run opened for the lane; the file server itself keeps running.
 - `file lane probe failed` / `the saved profile's file lane failed live verification` — the WebDAV server didn't complete the PUT → GET → DELETE round-trip: wrong credential, server not running, or its HTTPS front broken.
@@ -315,15 +415,21 @@ Nothing fails, so no message prints — but the result quietly isn't what you wa
 - **The agent says it saved/sent a file, but no download chip appears** — the agent delivered it as a channel-attachment directive (e.g. a `MEDIA:<path>` line), which the OpenAI-compatible endpoint strips; the reply reaches Conduck without the filename, so nothing can be offered for download. The rule (installed into `TOOLS.md` by the wizard, scoped to Conduck turns): write the file to the working-directory root and **name it in plain reply text**. Agent guidance loads at session start — test in a **new** conversation. If the file was really written, asking "what is the exact filename of the file you saved?" in the same conversation makes the chip appear on the answer.
 - **Chat works everywhere, but attachments fail on a standalone Apple Watch** — the file lane rides a narrower rail than the gateway (say, a tailnet-only lane behind a public gateway). Expose both on the same rail; re-running the wizard reconciles the two.
 
-## Pairing code
+## Setup code
 
 `conduck-setup:v1:<base64(JSON)>` — same content in the QR and the paste string. Full contract in **[PAYLOAD.md](PAYLOAD.md)**.
 
-It is a reusable credential, not a one-time invite: it carries your gateway token (and the file-server credential when a file lane is set up), so whoever holds it keeps that access until you rotate those secrets — see **[SECURITY.md](SECURITY.md#the-pairing-code-is-a-secret)**.
+It is a reusable credential, not a one-time invite: it carries your gateway token (and the file-server credential when a file lane is set up), so whoever holds it keeps that access until you rotate those secrets — see **[SECURITY.md](SECURITY.md#the-setup-code-is-a-secret)**.
 
 ## Reporting a problem
 
 Security issues: see **[SECURITY.md](SECURITY.md)** (private vulnerability reporting — please don't open a public issue). Bugs and questions: open an issue.
+
+## For contributors
+
+The maintainable source is the numbered modules under [`src/`](src/), concatenated in `src/manifest.txt` order into the single `conduck-connect.sh` at the repository root. Edit a module, never the root script; CI rejects any drift between the two. [CONTRIBUTING.md](CONTRIBUTING.md) holds the invariants and the contracts shared with the app, and [AGENTS.md](AGENTS.md) is the short orientation for a contributor — human or AI — arriving cold.
+
+**Release boundary.** The Quick start always downloads the latest *published* release, not `main`. `main` may carry changes under **Unreleased** in [CHANGELOG.md](CHANGELOG.md) that are not in the published asset, and rebuilding or testing the artifact locally does not publish it — the [releases page](https://github.com/gigaduckai/conduck-connect/releases) is the authority on what is live. Every release artifact is plain, unminified shell that can be read before it runs.
 
 ## License
 

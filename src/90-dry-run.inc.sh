@@ -43,5 +43,33 @@ print_plan() {
   fi
   say ""
   note "No secrets were prompted, no credentials minted, no requests sent, no QR emitted (the QR appears only on a real run)."
-  say "  Re-run without --dry-run to apply and show the QR (each change still asks first)."
+  print_plan_real_run_command
+}
+
+# The command this was a dry run OF, printed at the moment the reader decides to
+# commit. "Re-run without --dry-run" is an instruction to edit a command line that
+# may have scrolled away, or that a driving agent composed and discarded — and the
+# flags are not decoration: --allow-keyless-public dropped by accident turns a run
+# the operator planned into one the wizard refuses, and --reuse-only dropped by
+# accident turns a plan that changes nothing into one that changes the host.
+#
+# So the line is RECONSTRUCTED from the flags this run is actually holding rather
+# than quoted from a template. Everything except --dry-run survives; --dry-run is
+# the one flag whose whole meaning is "not this time".
+print_plan_real_run_command() {
+  local cmd="bash conduck-connect.sh --setup"
+  $REUSE_ONLY && cmd="$cmd --reuse-only"
+  $ALLOW_KEYLESS_PUBLIC && cmd="$cmd --allow-keyless-public"
+  say ""
+  say "  ${BOLD}Ready? Run:${RESET}"
+  say "    ${BOLD}$cmd${RESET}"
+  if $LEGACY_GENERIC; then
+    # --generic is the retired spelling the shipped app still emits. The real run
+    # above is the current one, and it asks the gateway question --generic answers
+    # silently, so say which answer keeps this plan intact.
+    note "You used --generic, which is the older name for custom-server setup. The command"
+    note "above asks the gateway question instead: choose the OpenAI-compatible option."
+  fi
+  note "A plan banks nothing: the real run asks all of these questions again, and each"
+  note "change still asks before it happens. Nothing above is saved anywhere."
 }

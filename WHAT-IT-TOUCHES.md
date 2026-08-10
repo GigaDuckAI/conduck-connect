@@ -2,14 +2,19 @@
 
 Every file, service, and network port the script may read or change — and how
 to undo each. Gateway or user-owned configuration and network-exposure changes
-are previewed and require a bounded approval. Connector-owned bookkeeping and
-exact verification artifacts described below may be created automatically
+are previewed and require a bounded approval. Bookkeeping this script owns, and the exact verification artifacts described
+below, may be created automatically
 inside a setup or check action you already chose. `--setup --dry-run` lists all
 of this for *your* host without changing anything, so start there:
 
 ```bash
 bash conduck-connect.sh --setup --dry-run
 ```
+
+And once something *is* set up, `bash conduck-connect.sh --list` reports what is
+actually on this machine — every saved setup, where its files live, and any file
+server still running with no setup behind it. Removing one is
+[`--forget <id>`](#removing-a-setup).
 
 ## Reads
 
@@ -23,27 +28,27 @@ Everything here is read to discover the setup you already have. **Your gateway's
 | `~/.hermes/.env` | Hermes: discover `API_SERVER_PORT` (validated as a whole 1–65535 port; anything else is reported and the default used) and read `API_SERVER_KEY`. | **Yes, with your yes** — the `API_SERVER_*` keys appended, plus a separately-confirmed `chmod 600` offered when other accounts can read the file. Row below. |
 | `~/.hermes/config.yaml` | Hermes, whether or not you want the file lane: `platform_toolsets.api_server` together with `agent.disabled_toolsets` decide whether the gateway keeps a conversation memory of its own, so both are read and classified during setup after the optional file-lane step has had its say — one question and one edit for a line both steps change — and again before a saved Hermes code is re-emitted by `--show-code` (after that run's profile, secret, and live-drift checks have passed). The optional file-lane step reads the same file for `terminal.cwd`, the terminal backend, an `agent.disabled_toolsets` that switches the file toolset off across every surface, and whether the API-server scope carries the `terminal` toolset its guidance block's PDF rule needs (its own row below). The toolset is as fine as any of this gets: nothing in Hermes's configuration disables an individual tool, so a key spelled `agent.disabled_tools` has no reader and is not read here either — refusing a lane over one would cost you file transfer for a line Hermes never looks at. A `--check-server` run that continues into setup pairs its gateway as a custom server, so the same classification is reached only when the checked address matches this machine's own Hermes API-server settings — bind address, port, and the key the check authenticated with; anything less stays silent. The parser does not follow a symlink, and any ambiguous or unsupported YAML classifies as *unknown* — never as an all-clear, and never as something to edit. | **Yes, with your yes, and only during setup** — the recall removal and/or the narrow file-lane keys; both rows below. `--show-code` only ever reports. |
 | `tailscale serve status --json` | Read current exposure mappings. Fail-closed: if it can't be read, the script refuses to guess rather than mutate. | No — but the mappings it describes are changed via `tailscale` itself (rows below). |
-| `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/` | Reuse state from earlier runs: the saved non-secret profiles (`--show-code`, drift check) and an existing file-lane credential file (reused, never rotated). | **Yes** — the script owns this directory and writes its own state here (rows below). It creates it `0700`, because it holds the file-lane credential files. |
-| All existing `conduck-files-*`, `conduck-files`, or `conduck-fileserver` service units | Re-read the selected gateway's unit to recover its stable file-lane port/absolute folder/credential, and read every connector-owned unit's loopback port so another gateway never receives the same port, including names used by older releases. Relative served folders are refused. If existing per-gateway units already duplicate a port, activity and the authenticated byte probe remain scoped to the exact selected unit; the connector does not automatically rewrite or rebind either definition. | **Yes**, when you set up or repair a file lane — these are units the script itself created. |
+| `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/` | The one directory this script keeps state in. Read to reuse what earlier runs left: the saved non-secret profiles (`--show-code`, `--list`, `--edit`, the drift check), an existing file-lane credential file (reused, never rotated), the exposure records an interrupted run may have left, and the setup lock. | **Yes** — the script owns this directory and writes its own state here (rows below). It creates it `0700`, because it holds the file-lane credential files; a directory that already existed with a wider mode keeps it, and the run says so with the exact `chmod` rather than re-permissioning a folder it did not create. |
+| All existing `conduck-files-*`, `conduck-files`, or `conduck-fileserver` service units | Re-read the selected gateway's unit to recover its stable file-lane port/absolute folder/credential, and read every unit this script owns for its loopback port, so another gateway never receives the same port, including names used by older releases. Relative served folders are refused. If existing per-gateway units already duplicate a port, activity and the authenticated byte probe remain scoped to the exact selected unit; the script does not automatically rewrite or rebind either definition. | **Yes**, when you set up or repair a file lane — these are units the script itself created. |
 | The selected OpenClaw workspace's `TOOLS.md` | Before adding or refreshing its marker-delimited Conduck guidance, the script checks the existing file, its markers, whether it is a symlink, and whether anyone but its owner can read it — your agent reads this file as its own user, which in the standard Docker install is not the user running this script. | **Yes, with your yes** — only the Conduck marker block. |
 | The selected Hermes workspace's `.hermes.md` or `HERMES.md` | Before adding or refreshing its marker-delimited Conduck guidance, the script checks the actual Hermes context file, its markers, and whether it is a symlink. It refuses to create a higher-priority Hermes file over an existing lower-priority project context. | **Yes, with your yes** — only the Conduck marker block. |
 | `pdftotext` on `PATH` (Hermes file lane) | A lookup, nothing more: the guidance block above tells the agent to extract PDF text with `pdftotext`, so setup checks whether that extractor exists and says plainly when it does not. The check runs in the script's own shell, which is not necessarily the agent's environment, so the result is a non-blocking note rather than a verdict — it never stops the run. Nothing is run against your files, and no package is installed. | No. |
 | The `terminal` toolset in `platform_toolsets.api_server` (Hermes file lane) | The same classification of `~/.hermes/config.yaml` listed above, asked a second question, and the same class of finding as the `pdftotext` lookup beside it: the guidance block tells the agent to run `pdftotext` with Hermes's `terminal` toolset, and an explicit `api_server` list can leave that toolset out — which makes the rule inert no matter what the host has installed. Setup answers it from `platform_toolsets.api_server` and `agent.disabled_toolsets` together, and prints a non-blocking note, never a gate, and only where it read both cleanly and found no `terminal` the agent could reach; the note scopes the gap to PDFs (every other attachment type is unaffected) and gives the fix, which is yours to make: add `terminal` to that list and restart Hermes. An absent or bare `api_server:` key reads as Hermes's own default, which carries the toolset. A bundle name this script has not enumerated, and any YAML it will not guess at, print nothing rather than tell you to fix a key that may already be right. | No. |
-| The configured shared folder and its named check artifacts | Setup/`--show-code` on any gateway kind, and `--check-adapter --files`, read the exact randomized files the connector and tested agent create to prove write-through, agent access, byte identity, reply discovery, and cleanup. Setup/`--show-code` follows file removal with exact HTTP 404 checks and checks temporary-directory absence with GET/PROPFIND. `--check-adapter --files` instead registers each exact name and verifies/removes any remainder directly against the identity-pinned local root. For the setup/`--show-code` sentinel, a failed/timed-out/cancelled turn may still have remote background work, so the exact output path is printed for a later recheck rather than claiming future absence. | **Yes, transiently** — exact per-run names only. Cleanup is proved at check time; setup/`--show-code` also prints an exact recovery path when later agent work remains possible. |
-| Connector-created files under `${TMPDIR:-/tmp}` | Local staging for response bodies/headers, generated probes, and file-check sidecars. | **Yes, transiently** — `mktemp`-named `conduck-*` files (`0600`) directly in that directory, not inside a per-run subdirectory; the one exception is `--check-adapter --files`, whose transport probes are staged in a single `0700` `mktemp -d`. Each is removed by the step that created it, and the live agent sentinel's two files are removed by the exit/signal trap as well. A run killed between staging and removal can leave one behind for your system's own temp cleanup. |
+| The configured shared folder and its named check artifacts | Setup/`--show-code` on any gateway kind, and `--check-adapter --files`, read the exact randomized files the script and the tested agent create to prove write-through, agent access, byte identity, reply discovery, and cleanup. Setup/`--show-code` follows file removal with exact HTTP 404 checks and checks temporary-directory absence with GET/PROPFIND. `--check-adapter --files` instead registers each exact name and verifies/removes any remainder directly against the identity-pinned local root. For the setup/`--show-code` sentinel, a failed/timed-out/cancelled turn may still have remote background work, so the exact output path is printed for a later recheck rather than claiming future absence. | **Yes, transiently** — exact per-run names only. Cleanup is proved at check time; setup/`--show-code` also prints an exact recovery path when later agent work remains possible. |
+| Script-created files under `${TMPDIR:-/tmp}` | Local staging for response bodies/headers, generated probes, and file-check sidecars. | **Yes, transiently** — `mktemp`-named `conduck-*` files (`0600`) directly in that directory, not inside a per-run subdirectory; the one exception is `--check-adapter --files`, whose transport probes are staged in a single `0700` `mktemp -d`. Each is removed by the step that created it, and the live agent sentinel's two files are removed by the exit/signal trap as well. A run killed between staging and removal can leave one behind for your system's own temp cleanup. |
 | `cloudflared tunnel list` | Cloudflare path: discover existing tunnels so the printed instructions reference the right one. | No — Cloudflare changes are printed for you to run. |
 | `http://127.0.0.1:<port>/v1/models` | One loopback probe of your own server during setup, to pre-fill the model name when it advertises exactly one. | Not a file. |
 
 The table covers persistent user configuration/state plus the transient
-connector-owned categories. Every curl invocation puts `-q` first, so curl
+categories this script owns. Every curl invocation puts `-q` first, so curl
 configuration files (and files they might include) are not read. No persistent
 file is changed unless it appears in the next table.
 
 ## May change during an approved setup action
 
 Changes to gateway or user-owned configuration and network exposure get their
-own preview and approval. Connector-owned state, service files, credentials,
-and exact probe artifacts are created only inside the setup or file-lane action
+own preview and approval. State, service files, credentials and exact probe artifacts this script owns
+are created only inside the setup or file-lane action
 you chose, but each bookkeeping write is not a separate prompt. The table makes
 both categories explicit and gives the corresponding undo.
 
@@ -59,11 +64,99 @@ both categories explicit and gives the corresponding undo.
 | Tailscale exposure | `tailscale serve` (private) or `tailscale funnel` (public) on an auto-selected HTTPS port. If that port already maps to the same gateway with the *other* verb, the mapping is switched in place — going private drops the public Funnel flag first, so the port really stops being public. | `tailscale serve --https=<port> off` / `tailscale funnel --https=<port> off`. The script also prints the exact command to restore any prior mapping it replaced. |
 | Turn off a **stale public exposure it did not create** | When you choose a private path, the script looks for Tailscale **Funnels** (public) on *other* ports that still point at the same gateway or file-lane port from an earlier setup, tells you where they are, and offers to switch them off. It never does this without an explicit yes, and never touches a mapping for a different service. Declining leaves them running and says so. | Re-create it: `tailscale funnel --bg --https=<port> http://127.0.0.1:<local-port>`. Note this removal is treated as intentional, so the script's own rollback will not put it back for you. |
 | Shared agent folder (file lane only) | The folder the app and your agent exchange files through: **every attachment you send lands here, and every file the agent writes back**. Setup shows the path and lets you name a different absolute one — default `~/.openclaw/workspace` (OpenClaw), `~/.hermes/files` (Hermes). **Any other server has no default**: setup asks for the absolute path and will not accept a blank, because it cannot know where your agent reads and writes, and it refuses a path that isn't on the machine — that folder has to be one your agent already uses. Only a **new** lane creates it, `0700`, and only for OpenClaw/Hermes; a lane it reuses already has one. A folder that already exists **keeps its own permissions** — if those let other accounts on the host read it, setup says so and prints the `chmod`, rather than silently re-permissioning a directory it did not create. | Nothing to undo if it already existed. A folder created for the lane can be deleted with its contents once the file server is gone — but on OpenClaw and Hermes this doubles as the agent's own working directory, so look before you delete. |
-| File-server service (optional) | rclone WebDAV bound to one auto-selected free loopback port in `127.0.0.1:5006–5105`, stable per gateway and distinct from every other connector-owned lane, as a service the script owns: Linux `~/.config/systemd/user/conduck-files-<id>.service`; macOS `~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist`. On macOS that plist also carries the credential — see the credential rows below. | Linux: `systemctl --user disable --now conduck-files-<id>` then delete the unit. macOS: `launchctl unload <plist>` then delete it. Then remove the credential per your platform's row below. |
+| File-server service (optional) | rclone WebDAV bound to one auto-selected free loopback port in `127.0.0.1:5006–5105`, stable per gateway and distinct from every other lane this script owns, as a service the script owns: Linux `~/.config/systemd/user/conduck-files-<id>.service`; macOS `~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist`. On macOS that plist also carries the credential — see the credential rows below. | `bash conduck-connect.sh --forget <id>` does all of it, including the credential. By hand: [Removing a setup](#removing-a-setup) — the order matters, and the credential rows below are the other half. |
 | Enable user-service linger (systemd/Linux, file lane only) | `sudo loginctl enable-linger <user>` so the file server keeps running after you log out. The one `sudo` step the script runs itself: it shows the exact command and asks `y/N` first — on yes it runs it, on no it prints the command as a tip. | `sudo loginctl disable-linger <user>`. |
-| File-lane credential — **Linux** | A 32-hex secret written to two `0600` files under `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/`: `fileserver-<id>.cred` and `fileserver-<id>.env` (holding `RCLONE_PASS=…`). The systemd unit loads the secret via `EnvironmentFile=`, so the unit file itself contains no credential. | Delete both files. |
-| File-lane credential — **macOS** | The same `0600` `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/fileserver-<id>.cred` — **plus a second copy, in cleartext, inside the LaunchAgent plist itself**: `~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist`, under `EnvironmentVariables` → `RCLONE_PASS`. launchd has no `EnvironmentFile=` equivalent, so the value has to live in the plist. The plist is written `0600`. | **Both** locations, or the password survives: delete the `.cred` file **and** `launchctl unload` the plist and delete it. Deleting only the `.cred` file leaves the credential readable in the plist. |
-| Setup profile (non-secret) | A successful setup writes `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/profile-<gateway>.json` (`0600`): routing facts only — gateway kind, URLs, ports, transport — **never a token or credential**. `--show-code` reads it and never rewrites it. | Delete the file. |
+| File-lane credential — **Linux** | A 32-hex secret written to two `0600` files under `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/`: `fileserver-<id>.cred` and `fileserver-<id>.env` (holding `RCLONE_PASS=…`). The systemd unit loads the secret via `EnvironmentFile=`, so the unit file itself contains no credential. | `--forget <id>`, or delete both files. |
+| File-lane credential — **macOS** | The same `0600` `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/fileserver-<id>.cred` — **plus a second copy, in cleartext, inside the LaunchAgent plist itself**: `~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist`, under `EnvironmentVariables` → `RCLONE_PASS`. launchd has no `EnvironmentFile=` equivalent, so the value has to live in the plist. The plist is written `0600`. | `--forget <id>` removes both and names each one it removed. By hand it is **both** locations or the password survives: delete the `.cred` file **and** `launchctl unload` the plist and delete it. Deleting only the `.cred` file leaves the credential readable in the plist. |
+| Setup profile (non-secret) | A successful setup writes `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/profile-<gateway>.json` (`0600`): routing facts only — gateway kind, URLs, ports, transport — **never a token or credential**. `--show-code` reads it and never rewrites it. | `bash conduck-connect.sh --forget <id>`, or delete the file. |
+| Setup lock | While a **real** setup is running, `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/setup.lock` exists as a directory holding one `owner` file (this run's pid, hostname and command line). It is what stops two overlapping runs from picking the same loopback port, writing the same service, and overwriting each other's saved setup. `--setup --dry-run` is exempt and takes no lock — it changes nothing, and blocking a real setup because somebody is reading a plan would be the worse bug. It is deleted on every exit path, including `q`, a failure, and Ctrl-C. A run that finds one names who holds it, and clears it only when it can *prove* the holder is gone — a `ps` it cannot use, or a lock written on another machine through a shared `$HOME`, both fail closed and stop the run instead. | Nothing, normally. If a run was killed with `SIGKILL` and a later one refuses to start against a lock it cannot judge, it prints the exact path: `rm -rf <state dir>/setup.lock`. |
+| Exposure records | Before it changes network exposure, setup writes one `${XDG_CONFIG_HOME:-$HOME/.config}/conduck/exposure-<run>-<n>.pending` file (`0600`) per mapping: the disk twin of "this script opened this, and has not told you about it yet". A run that finishes normally retires its own records; a run that is cut off leaves them, and the **next** run reports the still-live exposures and offers to close them. Nothing in a record is a secret — it names a port, a loopback backend, a verb and a gateway id — and none of it is ever fed to a command without being re-validated first. Format below. | They are bookkeeping, not state: deleting one only costs you the later offer to close what it describes. Closing the exposure itself is `tailscale serve --https=<port> off` / `tailscale funnel --https=<port> off`, or `--forget <id>`, which does it for you. |
+
+## Removing a setup
+
+**The mechanism is `--forget <id>`.** It does everything the by-hand recipe below does, and — unlike the recipe — it re-checks the machine afterwards and reports only what it can *prove* is gone.
+
+```bash
+bash conduck-connect.sh --list            # the ids, and what each one still has running
+bash conduck-connect.sh --forget <id>     # remove one, after you type the id back
+```
+
+It stops and deletes that gateway's file server, closes the HTTPS routes this script opened for it, deletes **both** copies of the file-lane password, and deletes the saved profile. It lists all of that before it asks, and asks you to type the id rather than press Enter. It never touches your shared folder, your agent's context file, any gateway configuration it edited, the gateway itself, or the pairing already on a device.
+
+`--list` also reports file servers with **no saved setup behind them** — the residue of a gateway removed by hand — with the `--forget` line for each. Two legacy names carry no gateway id (`conduck-files.service`, `ai.gigaduck.conduck-fileserver.plist`); those cannot be attributed to a setup, so they are reported and never removed for you. Use the recipe below on those.
+
+### By hand
+
+Use this when you cannot run the script, or when `--forget` reported something it could not prove it removed. `<id>` is the gateway id — the `<id>` in `profile-<id>.json`.
+
+**1. Stop the file server, then delete its service file.** In that order: a systemd unit whose file disappears while it is still enabled leaves a `failed` entry only `reset-failed` clears, and a loaded LaunchAgent whose plist disappears keeps running with the password it has already read.
+
+```bash
+# Linux
+systemctl --user disable --now conduck-files-<id>.service
+systemctl --user reset-failed conduck-files-<id>.service
+rm -f ~/.config/systemd/user/conduck-files-<id>.service
+systemctl --user daemon-reload
+
+# macOS
+launchctl unload ~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist
+rm -f ~/Library/LaunchAgents/ai.gigaduck.conduck-files-<id>.plist
+```
+
+**2. Delete every copy of the file-lane password.**
+
+```bash
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/conduck/fileserver-<id>.cred"
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/conduck/fileserver-<id>.env"     # Linux only
+```
+
+On **macOS** the LaunchAgent plist you deleted in step 1 held a second cleartext copy under `EnvironmentVariables` → `RCLONE_PASS`; launchd has no environment-file equivalent, so the value has to live there. Deleting only the `.cred` leaves the password on disk. Until every copy is gone, treat that password as live — it opens a WebDAV server over your agent's working folder.
+
+**3. Close the HTTPS routes that were opened for this gateway.** You do not have to remember the port numbers, and nothing else on the machine would tell you them. Every mapping this script opened while it had not yet reported it has a record in the state directory naming both the gateway it belongs to and the port it listens on:
+
+```bash
+cd "${XDG_CONFIG_HOME:-$HOME/.config}/conduck"
+awk -F'\t' -v id="<id>" '$1=="2" && $6==id { print $2, $3, $4 }' exposure-*.pending
+```
+
+Each line is `<role> <port> <verb>` — `role` is `gateway` or `file`, `verb` is `serve` (private, your tailnet only) or `funnel` (**public**). Close each one with the verb it names, then confirm:
+
+```bash
+tailscale serve  --https=<port> off      # for a serve line
+tailscale funnel --https=<port> off      # for a funnel line
+tailscale serve status
+tailscale funnel status
+```
+
+A run that finished normally has already retired its own records, so an empty result usually means there is nothing left open from this script. It is not proof: check `tailscale serve status` and `tailscale funnel status` yourself, which show every mapping regardless of who made it.
+
+**4. Delete the saved setup.**
+
+```bash
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/conduck/profile-<id>.json"
+```
+
+**5. Remove the connection in the Conduck app**, on every device you paired. That device holds the gateway's address and its token, and nothing on this machine can reach it. If you are removing the setup because the token leaked, rotate the token at the gateway — that is the only thing that revokes it.
+
+**Deliberately not removed by any of this:** the shared folder and its contents (on OpenClaw and Hermes it is the agent's own working directory), your agent's `TOOLS.md` / `.hermes.md` guidance block, any gateway configuration change you approved, and the gateway itself, which keeps running on the same port with the same token.
+
+### The exposure record format
+
+Each `exposure-<run>-<n>.pending` file is one line, version **2**, of seven tab-separated fields:
+
+| # | Field | Values |
+|---|---|---|
+| 1 | record version | `2` |
+| 2 | role | `gateway` or `file` — what sits behind the mapping |
+| 3 | port | the HTTPS port the mapping answers on |
+| 4 | verb | `serve` (private) or `funnel` (**public**) |
+| 5 | backend | `http://127.0.0.1:<local port>` |
+| 6 | gateway id | the setup this exposure was opened for, or `unknown` |
+| 7 | prior state | `EMPTY` if that port carried nothing before, otherwise the verb and backend that were there — itself a tab-separated pair, which is what a rollback restores |
+
+Field 6 is what makes per-gateway teardown possible at all, and it is why the `awk` above can select by id instead of asking you for a port number.
+
+Every value is re-validated against exactly those shapes before it is read back, because a file in your own directory is editable by you and outlives version changes; nothing from a record is ever interpolated into a `tailscale` command unchecked. A record that fails any of those checks — including one written by an older version, whose first field is not `2` — is refused **whole and left exactly where it is**, because an unreadable record may still name a live public exposure. The run tells you it found one and points you at `tailscale serve status`.
 
 ## Composes for you to run — it never runs these itself
 
@@ -77,10 +170,12 @@ both categories explicit and gives the corresponding undo.
 Every exposure change is re-checked against `tailscale serve status --json` afterwards. If that check cannot confirm the result — the command needed rights it did not have, or the status could not be read — the script says so plainly and prints the exact commands to fix it by hand. It never reports a change as done on faith, and it will not end a run silently while a file server it exposed may still be reachable.
 
 The prompt controls do not turn setup into a transaction. **`i`** only explains
-the current action and asks again. **`q`** stops setup deliberately; **`b`** is
-shown only where the wizard can safely return to a defined earlier choice.
-Neither `q` nor `b` undoes configuration changes already approved, commands you
-already ran, or exposure changes already confirmed.
+the current action and asks again. **`q`** stops setup deliberately and exits
+`3`; **`b`** is shown only where the wizard can safely return to a defined
+earlier choice. Neither `q` nor `b` undoes configuration changes already
+approved, commands you already ran, or exposure changes already confirmed — the
+run says so as it goes. The one command that undoes things is `--forget <id>`,
+and what it does and does not remove is in [Removing a setup](#removing-a-setup).
 
 Setup is consented step-by-step, not one transaction. A narrow Hermes
 `terminal.cwd`/API-server-toolset edit or marker-delimited guidance edit that
@@ -101,7 +196,7 @@ Setup's requests to the public gateway URL you gave do honour your system proxy
 settings, as any HTTPS client would. Gateway model/chat requests send
 `Accept: application/json`. No address you give may carry `user:pass@`
 credentials: the wizard, both checks, and the saved-profile reader all refuse
-one, so a password can never end up inside a routing field or the pairing code.
+one, so a password can never end up inside a routing field or the setup code.
 
 - Normal setup and `--show-code` verification may send a local health check,
   `GET /v1/models`, and a real `POST /v1/chat/completions` pong. After a restart
@@ -116,11 +211,11 @@ one, so a password can never end up inside a routing field or the pairing code.
   an HTTPS PUT→GET→DELETE probe. Any configured lane then gets one additional
   real agent turn, **whatever the gateway is** — named after OpenClaw's or
   Hermes's own file tools on those two, and worded without tool names on every
-  other OpenAI-compatible server, whose tools this connector cannot know: a
+  other OpenAI-compatible server, whose tools this script cannot know: a
   randomized input is uploaded, the agent must read it, write byte-identical
   output at the shared root before replying, and name that output. It is a real
   chat request against the model you paired, so on a metered gateway it costs
-  what one turn costs, and `--show-code` spends it too. The connector removes and proves the exact
+  what one turn costs, and `--show-code` spends it too. The script removes and proves the exact
   artifacts absent at cleanup time; when timed-out, cancelled, or reply-first
   background work could still write later, it prints the exact output path for
   a later recheck instead of promising future absence.

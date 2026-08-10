@@ -24,7 +24,11 @@ write_profile() {
     # the reuse-only paths that leave a still-running file lane out of THIS code would
     # otherwise delete the record of that live lane for good.
     if $REUSE_ONLY; then
-      note "Kept the saved pairing profile exactly as it is — --reuse-only changes nothing, and this file counts."
+      # Names the directory for the same reason the success branch below does:
+      # this run ends with a working code and no failure, so it is one of the
+      # screens where an operator would otherwise never learn their setups exist
+      # as files they can read, copy or remove.
+      note "Kept the saved pairing profile in $STATE_DIR exactly as it is — --reuse-only changes nothing, and this file counts."
       note "Re-run me without --reuse-only to refresh what it records."
       return 0
     fi
@@ -39,7 +43,7 @@ write_profile() {
     # Recording "no file lane" here is what makes one transient probe failure a
     # permanent deletion — the exact outcome --show-code's guard above exists to avoid.
     if $FS_LANE_DROPPED_BY_CHECK && [ "$(json_type "$pf" "fileServer")" = "object" ]; then
-      note "Left the saved pairing profile untouched, so the file lane it records survives this run's probe failure."
+      note "Left the saved pairing profile in $STATE_DIR untouched, so the file lane it records survives this run's probe failure."
       note "Nothing from this run is saved to it — re-run me once the file server answers again to refresh it."
       return 0
     fi
@@ -79,7 +83,11 @@ PY
   # rename(2) within the same directory is atomic, so readers see old or new, never half.
   if ( umask 077; printf '%s\n' "$out" > "$pf.tmp" && mv -f "$pf.tmp" "$pf" ) 2>/dev/null; then
     chmod 600 "$pf" 2>/dev/null || true       # belt-and-suspenders; umask 077 already made it 0600
-    note "Saved a non-secret pairing profile (no token) — re-show this code later with:  bash conduck-connect.sh --show-code"
+    # Names the directory, because this is the last screen of a successful run and
+    # $STATE_DIR otherwise reaches the operator only inside a permissions warning —
+    # so somebody who never hits a failure never learns where their setups live.
+    note "Saved a non-secret pairing profile (no token) in $STATE_DIR."
+    note "Re-show this code — to pair another device, or after something changes — with:  bash conduck-connect.sh --show-code"
   else
     rm -f "$pf.tmp" 2>/dev/null || true        # never leave a partial temp behind
     warn "Couldn't save the pairing profile to $pf — pairing is still complete."
@@ -157,31 +165,37 @@ emit_payload() {
     # scrolled away, and this epilogue is what the operator is reading when they
     # decide whether to undo a change that was correct.
     gw_restart_timing_note
-    # Custom targets only. Route by provenance: existing OpenAI-compatible
-    # software uses the app-compatibility grader; adapters written for Conduck
-    # use the stricter contract grader. OpenClaw/Hermes users need neither hint.
-    # Both address the PUBLIC url, because that is the route that just failed and
-    # the only one the app ever takes. Aimed at loopback they PASS on every fault
-    # that lives in the HTTPS front — the operator then watches the recommended
-    # diagnostic go green after a red run and concludes the wizard is broken. A
-    # recovery that proves the wrong thing is worse than no recovery at all.
-    # The loopback run is offered SECOND and named as a comparison, because the
-    # split between the two is itself the diagnosis. One loopback command, not
-    # two: it answers "the server, or the route?", and a second grader beside it
-    # would bury that question under four near-identical lines.
+    # The diagnostic every failed run gets, whatever the gateway is. Which route it
+    # addresses is the load-bearing part: the PUBLIC url, because that is the route
+    # that just failed and the only one the app ever takes. Aimed at loopback these
+    # PASS on every fault that lives in the HTTPS front — the operator then watches
+    # the recommended diagnostic go green after a red run and concludes the wizard is
+    # broken. A recovery that proves the wrong thing is worse than no recovery.
+    # The loopback run is offered SECOND and named as a comparison, because the split
+    # between the two is itself the diagnosis. One loopback command, not two: it
+    # answers "the server, or the route?", and a second grader beside it would bury
+    # that question under four near-identical lines.
+    #
+    # The app-compatibility grader is offered to EVERY kind. It asks whether the
+    # app's own wire protocol survives this route, and an OpenClaw or Hermes user
+    # staring at a red verification needs that answer exactly as much as a custom
+    # one does — leaving them with "fix those first" and no command to run is the
+    # dead end this release is about. Only the adapter grade stays custom-gated: it
+    # holds software written FOR Conduck to Conduck's rules, and OpenClaw and Hermes
+    # are not that, so a FAIL there would be noise on top of a failure.
+    local lb; lb=$(gw_loopback_base)
+    say ""
+    say "  Check app compatibility on the route that failed:"
+    say "    ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
     if [ "$GW_KIND" = "custom" ]; then
-      local lb; lb=$(gw_loopback_base)
-      say ""
-      say "  Existing OpenAI-compatible server? Check app compatibility on the route that failed:"
-      say "    ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
       say "  Adapter built for Conduck? Grade that same route against the stricter contract:"
       say "    ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
-      if [ -n "$lb" ]; then
-        say "  Then compare it against the server itself, skipping the HTTPS route in front of it:"
-        say "    ${BOLD}bash conduck-connect.sh --check-server $lb${RESET}"
-        note "Green there and red above means the server is fine and the HTTPS route is refusing or"
-        note "changing the request — fix the route, not the server."
-      fi
+    fi
+    if [ -n "$lb" ]; then
+      say "  Then compare it against the server itself, skipping the HTTPS route in front of it:"
+      say "    ${BOLD}bash conduck-connect.sh --check-server $lb${RESET}"
+      note "Green there and red above means the server is fine and the HTTPS route is refusing or"
+      note "changing the request — fix the route, not the server."
     fi
     exit 1
   fi
@@ -201,18 +215,19 @@ emit_payload() {
   # user cannot check, and omitting it when it IS in the code understates what they hold.
   warn "The setup code below CONTAINS YOUR GATEWAY TOKEN — both the QR and the plain-text string."
   if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
-    warn "It also carries the FILE-SERVER CREDENTIAL for your shared folder."
-    warn "Treat it like a password: whoever holds it can do anything your gateway allows and can"
-    warn "read or change files in that folder, and it keeps working until you rotate those secrets."
-  else
-    warn "Treat it like a password: whoever holds it can do anything your gateway allows, and it"
-    warn "keeps working until you rotate that secret."
+    warn "It also carries the FILE-SERVER CREDENTIAL for your shared folder, so whoever holds"
+    warn "this code can read and change the files in it."
   fi
-  warn "Handing the code to another person hands them that same access. Devices sharing one token"
-  warn "cannot be cut off one at a time — rotating it cuts off every device using that token."
-  warn "Show it to your own phone only. Note: over SSH, Ctrl-L only clears the visible screen —"
-  warn "the code stays in your scroll-back, so close the terminal (or clear scroll-back) when"
-  warn "you're done, and never paste it into chat or a bug report."
+  # What the code IS, said in the one place every route to a code passes through:
+  # setup's own emission and --show-code's re-emission both land here. It states
+  # the password rule and the fact behind every "why is it asking me again?" —
+  # that nothing secret is written to this machine — and it replaces the two
+  # hand-written sentences that used to say the first half twice, once per branch.
+  explain_setup_code_secrecy
+  warn "Devices sharing one token cannot be cut off one at a time — rotating it at the gateway"
+  warn "cuts off every device using that token."
+  warn "Note: over SSH, Ctrl-L only clears the visible screen — the code stays in your"
+  warn "scroll-back, so close the terminal (or clear scroll-back) when you're done."
   say ""
 
   render_qr "$pairing" || true   # prints a QR, or its own "widen/paste" note; string still follows
@@ -268,17 +283,29 @@ emit_payload() {
     note "Make it survive logout and reboot:  ${lpriv:+$lpriv }loginctl enable-linger $lu"
   fi
   say "  Run this script again any time to check the connection or show the code again."
-  # Custom targets only (see the matching gate in emit_payload's failure branch).
-  # Both address the PUBLIC url: it is the route the app takes and the one verification
-  # just proved, so a re-check grades what this pairing actually uses. A loopback target
-  # would grade a route neither the app nor this script ever takes, and a front that
-  # breaks these requests is exactly what the operator needs to hear about.
-  # The adapter line rides a SUCCESS screen, so it needs the outcome named with it:
-  # this pairing already works, and a user who runs the strict grader on generic
-  # software gets a FAIL that means nothing about the setup they just proved.
+  # Both lines address the PUBLIC url: it is the route the app takes and the one
+  # verification just proved, so a re-check grades what this pairing actually uses. A
+  # loopback target would grade a route neither the app nor this script ever takes,
+  # and a front that breaks these requests is exactly what the operator needs to hear
+  # about.
+  #
+  # The compatibility line is UNCONDITIONAL. Gating it on a custom gateway meant that
+  # OpenClaw and Hermes users — options 1 and 2, the paths the wizard leads with —
+  # finished setup having never learned the check commands exist, and so had nothing
+  # to reach for on the day the connection stopped working. Nothing about that grade
+  # is custom-only: it asks whether the app's wire protocol survives this route, which
+  # is as answerable for OpenClaw as for Ollama.
+  say "  Is it still working later? Grade this same route any time:"
+  say "    ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+  note "Real requests, no configuration changes — it costs a little provider quota."
+  # The adapter grade stays custom-gated, because it genuinely does not apply: it
+  # holds software written FOR Conduck to Conduck's own rules, and OpenClaw and Hermes
+  # are not that. Riding a SUCCESS screen it also needs the outcome named with it — a
+  # user who runs the strict grader on generic software gets a FAIL that says nothing
+  # about the setup they just proved.
   if [ "$GW_KIND" = "custom" ]; then
-    say "  Existing OpenAI-compatible server? Re-check that route with:  ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
-    say "  Adapter built for Conduck? Grade that same route with:        ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
+    say "  Adapter built for Conduck? Grade that same route against its contract:"
+    say "    ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
     note "The adapter grade only fits software built for Conduck: generic servers (Ollama, LiteLLM,"
     note "Open WebUI) fail rules that are correct for them — that does not undo the pairing above."
   fi

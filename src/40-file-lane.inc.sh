@@ -28,31 +28,54 @@ FS_FOLDER_REFUSAL=""
 state_cred_file() { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$GW_ID"; }
 state_env_file()  { printf '%s/fileserver-%s.env'  "$STATE_DIR" "$GW_ID"; }
 
+# Every connector-owned unit and plist path in this file is rooted at "${HOME:-}",
+# never at a bare "$HOME", and the difference is not cosmetic.
+#
+# These lookups started life inside the interactive setup, where a person is
+# standing at a terminal and $HOME is a certainty. They are not only there any
+# more: fs_all_units is what --list walks to report file servers with no saved
+# setup behind them, and --list is the command --help and every refusal screen
+# advertise as the entry point for an environment with nobody at a terminal. A CI
+# or container shell legitimately runs with XDG_CONFIG_HOME set and HOME unset —
+# $STATE_DIR is spelled "${HOME:-}/.config" for exactly that case — and under
+# `set -u` a bare "$HOME" there does not fail politely. It kills whatever subshell
+# reached it, so --list prints a raw `HOME: unbound variable` into the middle of
+# the operator's inventory and then reports NO leftovers at all: a live,
+# authenticated WebDAV server over the agent's working folder, restarted at every
+# boot, goes unmentioned by the one surface whose whole job is to mention it.
+#
+# An empty root is the honest answer rather than a fallback: a host with no home
+# directory has no per-user systemd or LaunchAgents directory either, so the globs
+# match nothing and the scan reports what is really there. The default is spelled
+# at each expansion rather than snapshotted into a global at file-scope, because a
+# snapshot answers with the HOME that was set when this file was READ — wrong for
+# any caller that points HOME somewhere else before calling, which the readiness
+# harness does for every case it lifts these functions into.
 linux_unit_candidates() {
   printf '%s\n' \
-    "$HOME/.config/systemd/user/conduck-files-$GW_ID.service" \
-    "$HOME/.config/systemd/user/conduck-files.service" \
-    "$HOME/.config/systemd/user/conduck-fileserver.service"
+    "${HOME:-}/.config/systemd/user/conduck-files-$GW_ID.service" \
+    "${HOME:-}/.config/systemd/user/conduck-files.service" \
+    "${HOME:-}/.config/systemd/user/conduck-fileserver.service"
 }
 mac_unit_candidates() {
   printf '%s\n' \
-    "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist" \
-    "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
-    "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"
+    "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist" \
+    "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
+    "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"
 }
 
 fs_all_units() {
   local f
   if [ "$OS" = "Linux" ]; then
-    for f in "$HOME"/.config/systemd/user/conduck-files-*.service \
-             "$HOME/.config/systemd/user/conduck-files.service" \
-             "$HOME/.config/systemd/user/conduck-fileserver.service"; do
+    for f in "${HOME:-}"/.config/systemd/user/conduck-files-*.service \
+             "${HOME:-}/.config/systemd/user/conduck-files.service" \
+             "${HOME:-}/.config/systemd/user/conduck-fileserver.service"; do
       [ -f "$f" ] && printf '%s\n' "$f"
     done
   else
-    for f in "$HOME"/Library/LaunchAgents/ai.gigaduck.conduck-files-*.plist \
-             "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
-             "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"; do
+    for f in "${HOME:-}"/Library/LaunchAgents/ai.gigaduck.conduck-files-*.plist \
+             "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
+             "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"; do
       [ -f "$f" ] && printf '%s\n' "$f"
     done
   fi
@@ -252,7 +275,7 @@ fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
   warn "I can't serve $1 — ${FS_FOLDER_REFUSAL:-I could not resolve that path on this machine}."
   note "The shared folder is served over WebDAV with read AND write access to everything inside it."
   note "It has to be the agent's working folder, never your whole account: served from / or your home"
-  note "directory, anything holding the file password can read your keys — and this connector's own"
+  note "directory, anything holding the file password can read your keys — and this script's own"
   note "credential files — and write into them."
 }
 
@@ -260,21 +283,33 @@ fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
 # `ask` is not merely unhelpful here, it is unusable: it resolves a blank answer
 # to its default, and a prompt with NO default would then read a stray Enter — or
 # a closed stdin — as an answer, which is the whole defect this prompt exists to
-# remove. It also carries no `i`, so the panel that says what this folder IS has
-# never been reachable for the one operator who has to supply the path cold.
+# remove.
+#
+# The suffix is built by control_suffix like every other prompt, so this question
+# states what Enter does instead of being the one place in the wizard that leaves
+# it out — the banner promises every prompt says so, and a prompt whose answer
+# only the operator can know is the worst one to break that promise at.
+#
 # $()-captured by its caller, so every human-facing line goes to stderr and only
-# the path reaches stdout. `q` is handed BACK rather than acted on: quit_run
-# inside a command substitution would stop the subshell and let the run continue.
-fs_ask_shared_folder() { # -> absolute path | 'q' on stdout; 1 on a closed stdin
-  local reply
+# the path reaches stdout, and it answers on the shared prompt contract: 11 for q,
+# 1 for a closed stdin. Acting on either from in here would stop the command
+# substitution's subshell and let the run walk on, so prompt_into does it in the
+# parent. Back is not offered: the gate that would receive it — "use a different
+# folder than X?" — is asked only where a default exists, and the absence of a
+# default is the entire reason this prompt is reached.
+fs_ask_shared_folder() { # -> absolute path on stdout; 11 on q, 1 on a closed stdin
+  local reply p
+  p="  Absolute path to the folder your agent reads and writes ($(control_suffix "ask again" false)): "
   while true; do
-    read -r -p "  Absolute path to the folder your agent reads and writes (no default; i = explain; q = stop): " reply \
+    prompt_echo "$p"
+    read -r -p "$p" reply \
       || return 1     # closed stdin — never spin a loop nobody is there to answer
     case "$reply" in
       [iI]|\?) explain_prompt "file.folder.override" >&2; continue ;;
-      [qQ]) printf 'q'; return 0 ;;
+      [qQ]) return 11 ;;
       /*) printf '%s' "$reply"; return 0 ;;
-      "") warn "This gateway has no default folder — only you know where your agent reads and writes." >&2 ;;
+      # Enter is an advertised no-op here, so it re-asks without being told off.
+      "") note "This gateway has no default folder — only you know where your agent reads and writes." >&2 ;;
       *)  warn "Please give an absolute path (starting with /)." >&2 ;;
     esac
   done
@@ -422,8 +457,8 @@ ensure_existing_fs_envfile_linux() {
       fs_envfile_exposure_warning
       return 1 ;;
     *)
-      warn "The existing file-server unit has an EnvironmentFile form this connector will not rewrite."
-      warn "Repair or remove that exact connector-owned unit, then re-run setup."
+      warn "The existing file-server unit has an EnvironmentFile form this script will not rewrite."
+      warn "Repair or remove that exact file-server unit, then re-run setup."
       fs_envfile_exposure_warning
       return 1 ;;
   esac
@@ -437,7 +472,7 @@ ensure_existing_fs_envfile_linux() {
   fi
   [ "$status" = "ready" ] && return 0
 
-  warn "This connector-owned unit uses the old quoted EnvironmentFile form."
+  warn "A file server this script set up earlier uses the old quoted EnvironmentFile form."
   # Wording verified against rclone 1.74: `--user conduck` with no password does
   # NOT serve openly. It demands an EMPTY password, so the saved credential gets
   # 401 like every other one. Calling that "unauthenticated" sends the operator
@@ -450,19 +485,19 @@ ensure_existing_fs_envfile_linux() {
   note "then reload and restart this unit."
   if $DRY_RUN; then
     plan_add "REPAIR legacy quoted EnvironmentFile in $FS_UNIT; daemon-reload + restart"
-    note "(dry-run: a real run asks before repairing that connector-owned unit)"
+    note "(dry-run: a real run asks before repairing that file-server unit)"
     return 0
   fi
   if $REUSE_ONLY; then
     warn "(reuse-only: not repairing the legacy unit; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Repair this connector-owned unit now?" "file.unit.repair_envfile"; then
+  if ! confirm "  Repair that file-server unit now?" "file.unit.repair_envfile"; then
     note "Leaving the file lane out; chat is unaffected."
     fs_envfile_exposure_warning
     return 1
   fi
-  mutate_guard "repair the legacy connector-owned EnvironmentFile directive" || return 1
+  mutate_guard "repair the legacy EnvironmentFile directive in that file-server unit" || return 1
   fs_repair_systemd_envfile_exact "$FS_UNIT" "$expected" || {
     warn "The exact legacy directive changed or could not be repaired safely."
     fs_envfile_exposure_warning
@@ -511,7 +546,7 @@ fs_owned_unit_ports_safe() {
   while IFS= read -r unit; do
     p=$(fs_unit_port "$unit" 2>/dev/null || true)
     if [ -z "$p" ]; then
-      FS_PORT_ALLOCATION_REASON="Found connector-owned unit $unit, but its loopback port cannot be read safely. Repair or remove that unit before adding another file lane."
+      FS_PORT_ALLOCATION_REASON="Found the file-server unit $unit, which this script set up earlier, but its loopback port cannot be read safely. Repair or remove that unit before adding another file lane."
       return 1
     fi
   done < <(fs_all_units)
@@ -714,7 +749,7 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
     warn "The file credential or selected paths contain characters this systemd unit cannot encode safely."
     return 1
   fi
-  FS_UNIT="$HOME/.config/systemd/user/conduck-files-$GW_ID.service"
+  FS_UNIT="${HOME:-}/.config/systemd/user/conduck-files-$GW_ID.service"
   # Two mkdirs, deliberately: the systemd unit directory is shared with the rest
   # of the user's units and keeps the ambient mode, while $STATE_DIR goes through
   # ensure_state_dir — it holds fileserver-*.cred/.env and profile-*.json, so it
@@ -774,7 +809,7 @@ write_fs_unit_mac() { # write_fs_unit_mac <workspace>
     warn "The file credential contains control characters and cannot be stored safely."
     return 1
   }
-  FS_UNIT="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
+  FS_UNIT="${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
   # Split for the same reason as the Linux twin: LaunchAgents is shared with the
   # user's other agents and keeps the ambient mode; $STATE_DIR holds credentials
   # and profile-*.json, so it goes through ensure_state_dir.
@@ -860,9 +895,16 @@ fs_unit_state() { # fs_unit_state -> active | inactive | unknown
 # Fails closed on `unknown`: an exposure is created from this answer.
 fs_unit_active() { [ "$(fs_unit_state)" = "active" ]; }
 
-# The exact commands that remove ONE connector-owned file server. Shared by every
-# caller so they cannot drift, and printed rather than run: this tool has no
+# The exact commands that remove ONE file server this script set up. Shared by
+# every caller so they cannot drift, and printed rather than run: this tool has no
 # removal command, so copy-pasteable text IS the mechanism.
+#
+# The saved profile is deliberately NOT in this list — see fs_print_lane_record_note
+# for the one caller that needs it. A file server can be removed for two different
+# reasons, and only one of them touches the profile: abandoning the lane leaves the
+# saved record advertising an address that no longer answers, while MOVING the lane
+# to another port leaves that record entirely correct. Folding an `rm` of the
+# profile in here would hand the port-move path a command that deletes the gateway.
 fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file…]
   local unit="$1" name f; shift
   if [ -n "$unit" ]; then
@@ -884,6 +926,36 @@ fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file�
   done
 }
 
+# The half of the teardown that lives in $STATE_DIR rather than in a service
+# manager. profile-<id>.json is what --show-code reads, so an operator who runs
+# the commands above and stops there keeps a saved gateway that still advertises a
+# file lane: every later --show-code prints a code whose file address answers
+# nothing, and the failure surfaces in the app, on a phone, days later.
+#
+# Only printed when the saved record actually carries a fileServer block, because
+# the usual case is the harmless one — this run goes on to pair chat-only, and
+# write_profile rewrites the record without the lane on its own. It is the runs
+# that DON'T reach a new profile that strand it: a failed verification, a run
+# stopped at a prompt, a --reuse-only pass, or a lane a check dropped, all of which
+# leave the previous profile deliberately untouched.
+#
+# Re-running setup is offered first and the rm second, and that order is the point:
+# re-running rewrites the same record without the lane, while the rm throws away
+# the gateway's address, model and transport along with it.
+fs_print_lane_record_note() {
+  [ -n "${GW_ID:-}" ] || return 0
+  local pf="$STATE_DIR/profile-$GW_ID.json"
+  [ -f "$pf" ] || return 0
+  [ "$(json_type "$pf" "fileServer")" = "object" ] || return 0
+  say ""
+  warn "Your saved record for this gateway still lists that file lane:"
+  note "$pf"
+  note "Until it is updated, --show-code keeps printing a code whose file address answers nothing."
+  say "  Re-run me after removing the file server and I rewrite that record without the lane."
+  say "  Or, to forget this gateway entirely (its address, model and transport go too):"
+  printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$pf")" "$RESET"
+}
+
 # A lane that is BUILT but never shipped leaves a live, authenticated WebDAV
 # server over the agent's working folder, a credential on disk, and — on the
 # transports whose HTTPS route the operator creates by hand — a route still
@@ -891,7 +963,7 @@ fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file�
 # exposure this connector applies itself), so on the other transports the run
 # otherwise ends green and never mentions the server, the credential, or the
 # route again. Same shape whether a Step-5 probe failed or the run was
-# interrupted between the unit and the pairing code.
+# interrupted between the unit and the setup code.
 #
 # It removes nothing: the usual repair is "fix what failed and re-run me", and
 # that re-run reuses this exact unit and credential. So name what exists and hand
@@ -949,6 +1021,10 @@ fs_lane_residue_note() {
   note "own working directory."
   note "Leaving it running is fine too: fix what failed, re-run me, and this same lane ships again"
   note "with the same credential."
+  # Last, because it is the one part of the residue that is not on this machine's
+  # service manager, and the one a reader who stopped at the commands above will
+  # otherwise never learn about.
+  fs_print_lane_record_note
   return 0
 }
 
@@ -1268,16 +1344,24 @@ fs_warn_quick_tunnel_url() {
 # this propagates so the caller's `|| die "$NO_ANSWER"` still fires.
 #
 # This helper deliberately runs in the PARENT shell and returns its value through
-# ASK_FS_URL_RESULT. The confirmation accepts q, and `quit_run` must exit the real
+# ASK_FS_URL_RESULT. Both prompts accept q, and `quit_run` must exit the real
 # setup process—not a command-substitution subshell that would turn q into an
 # empty successful URL and continue as though the operator deliberately skipped.
+# That is why the URL prompt's rc 11 is acted on here rather than folded into the
+# EOF branch: the two arrive as different statuses precisely so they can lead to
+# different endings, and "the operator pressed q" must not print "no answer".
 ASK_FS_URL_RESULT=""
 ask_fs_url() { # ask_fs_url <prompt> -> sets ASK_FS_URL_RESULT; 1 on URL-prompt EOF
-  local prompt="$1" u tries=0
+  local prompt="$1" u tries=0 rc
   ASK_FS_URL_RESULT=""
   while [ "$tries" -lt 3 ]; do
     tries=$((tries + 1))
-    u=$(ask_url "$prompt" "https://files.example.com" 1 "review omitting file transfer") || return 1
+    u=$(ask_url "$prompt" "https://files.example.com" 1 "review omitting file transfer" "file.address.url"); rc=$?
+    case "$rc" in
+      0)  ;;
+      11) quit_run ;;
+      *)  return 1 ;;
+    esac
     if [ -n "$u" ]; then ASK_FS_URL_RESULT="$u"; return 0; fi
     warn "No address was entered."
     confirm "  Leave file transfer OUT of this setup code?" "file.address.skip" && return 0
@@ -1378,6 +1462,12 @@ explain_fs_mismatch() {
 
 # Resolve a scope mismatch: align / omit / include as-is. Sets FS_URL on inclusion,
 # clears FS_CRED on omit. Under --reuse-only the align option is withheld (it mutates).
+#
+# All four menus go through prompt_into, which is the only place q can be acted on:
+# require_choice runs inside $(…), so a quit_run it called itself would stop the
+# subshell and let this function carry on choosing for the operator. The prompt text
+# is bare "Choose 1-N" — require_choice renders the control list from the same
+# parameters that decide the behaviour, and a caller-written copy of it can only drift.
 resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3" c
   if [ "$SCOPE" = "public" ]; then
@@ -1387,8 +1477,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    1) Leave the file lane out — chat still works everywhere; no attachments"
       say "    2) Include it as-is  (advanced) — attachments only on your Tailscale devices"
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
-      [ "$c" = "q" ] && quit_run
+      prompt_into c require_choice "Choose 1-2" '^[12]$' explain_fs_mismatch
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -1401,8 +1490,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat still works everywhere; no attachments"
     say "    3) Include it as-is  (advanced) — attachments only on your Tailscale devices;"
     say "       the file server itself stays private"
-    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
-    [ "$c" = "q" ] && quit_run
+    prompt_into c require_choice "Choose 1-3" '^[123]$' explain_fs_mismatch
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway."
@@ -1416,8 +1504,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    2) Keep it public anyway  (advanced) — the file server stays reachable"
       say "       from the whole internet, unlike the gateway"
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
-      [ "$c" = "q" ] && quit_run
+      prompt_into c require_choice "Choose 1-2" '^[12]$' explain_fs_mismatch
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -1430,8 +1517,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat unaffected; no attachments"
     say "    3) Keep it public anyway  (advanced) — the file server stays reachable"
     say "       from the whole internet, unlike the gateway"
-    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
-    [ "$c" = "q" ] && quit_run
+    prompt_into c require_choice "Choose 1-3" '^[123]$' explain_fs_mismatch
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out."
@@ -2205,7 +2291,16 @@ PY
 }
 
 setup_file_lane() {
-  head_ "Step 4 — agent file lane (optional, recommended)"
+  # The heading does NOT say "recommended". Enter declines this step, and a
+  # heading that recommends what the default refuses leaves a user who trusts
+  # defaults unable to tell whether they just made a mistake. Enter is what has to
+  # stay: yes here mints a credential and starts a boot-persistent authenticated
+  # file server over the agent's working folder, and a change of that size is one
+  # this tool always makes the operator ask for. The recommendation is still true,
+  # so it stays on screen as advice with its price attached — which is the part a
+  # single word could never carry, and the part that makes declining a real choice
+  # rather than the cheapest keystroke.
+  head_ "Step 4 — agent file lane (optional)"
   say "  Lets Conduck hand your agent real files (PDF/CSV/zip…) for its tools, and"
   say "  download files the agent writes back. Skipping is fine — chat (including"
   say "  pasted images) still works; the agent's tools just can't open attachments"
@@ -2213,7 +2308,13 @@ setup_file_lane() {
   say "  How: a small password-protected file server (rclone WebDAV — a standard way"
   say "  to read and write files over the web) over the agent's working folder,"
   say "  shared the same way as the gateway."
-  if ! confirm "  Set it up?" "file.setup.enable"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
+  say "  Adding it afterwards means walking this whole wizard again, so it is worth"
+  say "  the minute now if you ever plan to hand the agent a document."
+  if ! confirm "  Set it up?" "file.setup.enable"; then
+    note "Skipped — Conduck works without it (inline-only attachments)."
+    note "Re-run me whenever you want it; nothing you approved today is undone by adding it later."
+    return 0
+  fi
 
   # rclone FIRST, because asking is free: without it no lane can be built at all,
   # and changing a foreign gateway's tool policy (and restarting it) for a lane
@@ -2274,7 +2375,7 @@ setup_file_lane() {
     workspace="$FS_FOLDER"
     # The served root is re-certified and re-published on every run, so a root the
     # doctor refuses to grade must not pass here either — this is the one gate
-    # between a mis-pointed unit and a pairing code that publishes it.
+    # between a mis-pointed unit and a setup code that publishes it.
     if ! fs_resolve_shared_folder "$FS_FOLDER"; then
       fs_folder_refusal_warn "$FS_FOLDER"
       warn "That is what this unit serves, so I won't expose it or put it in a setup code."
@@ -2347,54 +2448,77 @@ setup_file_lane() {
       hermes)   workspace="$HOME/.hermes/files" ;;
       *)        workspace="" ;;
     esac
+    # The folder questions are the one re-askable group in this step, and the only
+    # place in it where Back costs nothing: at this point the lane exists solely as
+    # a port number held in memory, so walking back out writes nothing and undoes
+    # nothing. `b` at the path prompt returns to "use a different folder?", and `b`
+    # there re-asks the step's own yes/no — the QUESTION only, never the detection
+    # above it. Re-running that would re-open the OpenClaw tool-policy step and ask
+    # the operator to approve a gateway change they already answered.
+    #
     # No default means there is nothing to confirm keeping, so the confirm is
     # skipped rather than answered — and the explanation it carries moves onto the
     # prompt itself (fs_ask_shared_folder's `i`), which is where an operator with
-    # no default to fall back on actually needs it.
-    if [ -z "$workspace" ] || confirm "  Use a different folder than $workspace?" "file.folder.override"; then
-      while true; do
-        local w
-        if [ -n "$workspace" ]; then
-          w=$(ask "  Absolute path to the agent's working folder" "$workspace")
-        else
-          w=$(fs_ask_shared_folder) || die "$NO_ANSWER"
-          [ "$w" = "q" ] && quit_run
-        fi
-        case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
-        if ! fs_resolve_shared_folder "$w"; then
-          fs_folder_refusal_warn "$w"
-          continue
-        fi
-        # Only for the no-default gateways, and only because the question is a
-        # different one there. OpenClaw and Hermes are asked for a folder the
-        # wizard is helping to SET UP, so creating it is part of the job; a custom
-        # operator is naming a folder their agent ALREADY uses, so a path that is
-        # not on this machine is a typo or a path the agent will never see. Left to
-        # run, it becomes an empty folder nothing writes to, served by a lane that
-        # proves only that bytes moved — the exact false green this step removes.
-        if [ -z "$workspace" ] && [ ! -d "$FS_FOLDER_RESOLVED" ]; then
-          warn "$w does not exist on this machine."
-          note "This has to be the folder your agent ALREADY reads and writes. Create it and point your"
-          note "agent at it first, or give me the path it uses today."
-          continue
-        fi
-        [ "$FS_FOLDER_RESOLVED" != "$w" ] \
-          && note "$w resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path, so a later change to the link can't move the served folder under a running server."
-        workspace="$FS_FOLDER_RESOLVED"; break
-      done
-    else
-      # The default is resolved on exactly the same terms: `~/.openclaw/workspace`
-      # is a path like any other, and it can be a link to $HOME too.
-      if ! fs_resolve_shared_folder "$workspace"; then
-        fs_folder_refusal_warn "$workspace"
-        warn "Leaving the optional file lane out; chat is unaffected."
+    # no default to fall back on actually needs it. That prompt offers no `b` for
+    # the same reason: there is no gate above it to go back to.
+    local w folder_gate
+    while true; do
+      folder_gate=0
+      [ -n "$workspace" ] \
+        && { confirm "  Use a different folder than $workspace?" "file.folder.override" true || folder_gate=$?; }
+      if [ "$folder_gate" = "10" ]; then
+        say ""; note "↩ Back to the file-lane question."
+        if confirm "  Set it up?" "file.setup.enable"; then continue; fi
+        note "Skipped — Conduck works without it (inline-only attachments)."
+        note "Re-run me whenever you want it; nothing you approved today is undone by adding it later."
         FS_CRED=""; FS_URL=""; FS_FOLDER=""
         return 0
       fi
-      [ "$FS_FOLDER_RESOLVED" != "$workspace" ] \
-        && note "$workspace resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path."
-      workspace="$FS_FOLDER_RESOLVED"
-    fi
+      if [ "$folder_gate" = "0" ]; then
+        while true; do
+          if [ -n "$workspace" ]; then
+            prompt_into w ask "  Absolute path to the agent's working folder" "$workspace" "" "file.folder.override" true \
+              || continue 2
+          else
+            prompt_into w fs_ask_shared_folder
+          fi
+          case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
+          if ! fs_resolve_shared_folder "$w"; then
+            fs_folder_refusal_warn "$w"
+            continue
+          fi
+          # Only for the no-default gateways, and only because the question is a
+          # different one there. OpenClaw and Hermes are asked for a folder the
+          # wizard is helping to SET UP, so creating it is part of the job; a custom
+          # operator is naming a folder their agent ALREADY uses, so a path that is
+          # not on this machine is a typo or a path the agent will never see. Left to
+          # run, it becomes an empty folder nothing writes to, served by a lane that
+          # proves only that bytes moved — the exact false green this step removes.
+          if [ -z "$workspace" ] && [ ! -d "$FS_FOLDER_RESOLVED" ]; then
+            warn "$w does not exist on this machine."
+            note "This has to be the folder your agent ALREADY reads and writes. Create it and point your"
+            note "agent at it first, or give me the path it uses today."
+            continue
+          fi
+          [ "$FS_FOLDER_RESOLVED" != "$w" ] \
+            && note "$w resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path, so a later change to the link can't move the served folder under a running server."
+          workspace="$FS_FOLDER_RESOLVED"; break
+        done
+      else
+        # The default is resolved on exactly the same terms: `~/.openclaw/workspace`
+        # is a path like any other, and it can be a link to $HOME too.
+        if ! fs_resolve_shared_folder "$workspace"; then
+          fs_folder_refusal_warn "$workspace"
+          warn "Leaving the optional file lane out; chat is unaffected."
+          FS_CRED=""; FS_URL=""; FS_FOLDER=""
+          return 0
+        fi
+        [ "$FS_FOLDER_RESOLVED" != "$workspace" ] \
+          && note "$workspace resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path."
+        workspace="$FS_FOLDER_RESOLVED"
+      fi
+      break
+    done
     FS_FOLDER="$workspace"   # new lane knows its own folder — recorded in the profile
     new_fs=true
   fi
@@ -2613,7 +2737,17 @@ setup_file_lane() {
         h2="$ASK_FS_URL_RESULT"
         if [ -n "$h2" ]; then FS_URL="$h2"; fs_warn_quick_tunnel_url
         else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
-      else FS_CRED=""; fs_lane_residue_note; fi
+      else
+        # Enter at that prompt means "no, I didn't add the route", so this branch is
+        # now the one a hurried operator lands in — it has to say what it decided
+        # rather than fall through in silence. It is still the right ending: without
+        # the ingress rule there is no address that reaches the file server, so a
+        # code claiming one would fail on the first attachment.
+        warn "File transfer is NOT in this setup code — chat still works."
+        note "Add the ingress rule whenever you like and re-run me to put file transfer in a new code."
+        FS_CRED=""
+        fs_lane_residue_note
+      fi
       ;;
     public)
       say ""

@@ -7,14 +7,18 @@
 #
 # conduck-connect — pair your self-hosted AI gateway with the Conduck app.
 #
-# How to run (no install, nothing to compile — this is a plain, unminified shell
-# script on purpose, so you can inspect it before running):
+# This is the file's own preamble, for someone who opened the source before
+# running it: provenance, what the script does, what it never does, and where the
+# rest is written down. `--help` is the command reference and is far shorter.
 #
-# Where this should come from:
-#   1. Get it over HTTPS from the official release — not forwarded to you by
-#      someone else:  https://github.com/gigaduckai/conduck-connect/releases
-#   2. Inspect this plain, unminified file before running it when your threat
-#      model calls for source review. The release tests the exact shipped artifact.
+# Where this should come from
+#   1. Over HTTPS from the official release — not forwarded to you by someone
+#      else:  https://github.com/gigaduckai/conduck-connect/releases
+#   2. Read it before running when your threat model calls for source review: it
+#      is plain, unminified shell, and the release tests the exact shipped
+#      artifact. Reading all of it is a real ask, so there is a second answer —
+#      `--setup --dry-run` prints, for your host, every file it would touch and
+#      every command it would run, and changes nothing.
 #   3. Optional integrity check: the release also ships a checksum
 #        sha256sum -c conduck-connect.sh.sha256
 #        # macOS: shasum -a 256 -c conduck-connect.sh.sha256
@@ -22,117 +26,139 @@
 #      so it can't prove the release itself wasn't swapped.
 #   If you got this script any other way, get it from the link above first.
 #
-#     bash conduck-connect.sh            # welcome menu: setup, check a server,
-#                                        #   check an adapter, or re-show a code
-#     bash conduck-connect.sh --setup    # go straight to the setup wizard
-#     bash conduck-connect.sh --setup --dry-run
-#                                        # preview setup; changes nothing
-#
-# What this script DOES (with host and network changes shown for approval):
+# What this script DOES (with host and network changes shown for approval)
 #   1. Finds your gateway (OpenClaw, Hermes, or any OpenAI-compatible server).
-#   2. Enables the OpenAI-compatible chat endpoint if it is off (the #1 setup trap).
-#   3. Helps you expose the gateway over HTTPS (works WITH what you have installed:
-#      Tailscale, Cloudflare Tunnel, or your own reverse proxy). Whatever the path,
-#      the certificate has to be one your devices already trust; a self-signed one
-#      stops the run, and the script names the free ways to get a real certificate.
+#   2. Enables the OpenAI-compatible chat endpoint if it is off. OpenClaw and
+#      Hermes both ship it off, so the gateway looks healthy while
+#      /v1/chat/completions answers 404 and no app can connect.
+#   3. Helps you expose the gateway over HTTPS, working WITH what you already
+#      have installed: Tailscale, Cloudflare Tunnel, or your own reverse proxy.
+#      Whatever the path, the certificate has to be one your devices already
+#      trust; a self-signed one stops the run, and the script names the free ways
+#      to get a real one.
 #   4. Optionally sets up the agent file lane (rclone WebDAV) so Conduck can hand
-#      your agent real files and download its outputs. OpenClaw gets a tool-policy
-#      check + TOOLS.md guidance. Hermes gets its API-server file toolset and
-#      terminal.cwd checked + verified Hermes context guidance. Every edit is
-#      narrow, shown first, and optional.
+#      your agent real files and download its outputs. The agent-side checks are
+#      gateway-aware (README.md names them per gateway), and every edit they
+#      suggest is narrow, shown first, and optional.
 #   5. Verifies everything with real requests. An OpenClaw/Hermes file lane must
 #      pass a real agent read -> byte-identical write sentinel before a code.
-#   6. Prints a QR code you scan with the Conduck app — URL, token, and file-lane
-#      credentials imported in one scan — nothing to retype on your phone
-#      (iPhone or iPad).
+#   6. Prints a setup code — as a QR you scan with the Conduck app, and as text.
+#      URL, token, and file-lane credentials arrive in one scan; nothing to
+#      retype on your phone (iPhone or iPad).
+#   7. Afterwards: lists what it set up, changes one thing about a saved setup
+#      without re-asking the rest, and removes one completely — the file-lane
+#      service, its credentials and the saved gateway. Removal never deletes the
+#      folder you shared, and it asks you to type the setup's id first.
 #
-# What this script NEVER does:
-#   - Install your gateway, Tailscale, cloudflared, or any daemon it didn't create.
+# What this script NEVER does
+#   - Install your gateway, Tailscale, cloudflared, rclone, or any background
+#     program it didn't create.
 #   - Modify configs it didn't create without showing you the exact change first.
-#   - Send ANY data anywhere except to your own gateway. No telemetry, ever.
-#     The QR code is generated locally on this machine.
+#   - Send telemetry, a usage count, or a version ping — to us or to anyone.
+#     There is no collection endpoint anywhere in this file. That is deliberately
+#     a claim about the file rather than about us, so you can settle it by reading
+#     instead of by trusting. The QR is drawn here too, by the vendored encoder
+#     near the end of this file.
 #   - Make your gateway public without telling you, in plain words, that it will.
 #
-# Works on Linux and macOS gateway hosts. Requires: bash, curl, python3, openssl.
-# No extra install: the QR is rendered locally by a vendored, stdlib-only Python
-# encoder (Project Nayuki, MIT — the big, inert block near the end of this file;
-# it needs Python 3.7+ — on an older Python you just use the printed code).
-# The pairing string is always printed too, so the QR is never required.
+# Where its own requests go
+#   The HTTP and TLS probes this script makes reach two places only: the gateway
+#   you name and the file lane you configure. Third-party contact happens on one
+#   path and only one — the exposure tool YOU picked, doing the job you picked it
+#   for. `tailscale serve` / `tailscale funnel` register the mapping with
+#   Tailscale's control plane, each shown in full and approved before it runs; the
+#   Cloudflare path runs `cloudflared tunnel list` to read the tunnels your
+#   existing Cloudflare login can already see, so it can name yours back to you.
+#   Both are that vendor's own client, on this machine, under your credentials.
+#   Reading local state is a different thing and is not gated on your choice:
+#   `tailscale status` and `tailscale serve status` ask the daemon on THIS
+#   machine, so the menu can label what you already have and the port logic never
+#   has to guess. Choose "I run my own HTTPS" and no mapping change and no account
+#   lookup is ever requested; rclone serves WebDAV on loopback and makes no
+#   outbound request of its own. README.md and SECURITY.md state the same
+#   carve-out.
 #
-# Interactive controls:
-#   i  explain the current bounded decision, then ask it again
-#   q  stop cleanly (does not undo changes you already approved)
-#   b  go back only where the prompt offers it; Back is navigation, not undo
-# Every interactive prompt states what pressing Enter will do.
+# Commands — three a script can drive, five need a person
+#   Scriptable: --check-server [url], --check-adapter [url] and --list [--json].
+#   Set CI=1 and the two checks never prompt; the last line is always a machine
+#   summary, and the exit status is the verdict. --list asks nothing in any case:
+#   it reports the setups saved on this machine, with no token, password or setup
+#   code anywhere in its output.
+#   Need a person at a terminal: no arguments (the welcome menu), --setup,
+#   --show-code, --edit [id] and --forget <id>. Setup ends in a setup code that
+#   somebody scans with the Conduck app on a phone, so a machine cannot finish it —
+#   run the checks, then hand the --setup command to your operator. The wizard is
+#   interactive and needs a real terminal: prompts cannot be piped in and there are
+#   no non-interactive answer flags, so a tool driving it needs a real PTY. --edit
+#   and --forget refuse a run with nobody there for their own reason — each ends in
+#   a decision about one specific saved setup, and removal is confirmed by typing
+#   its id rather than by pressing Enter.
+#   `--help` lists every command, option and example. `--version` prints the
+#   version and exits.
 #
-# Usage:
-#   bash conduck-connect.sh                 # welcome menu
-#   bash conduck-connect.sh --setup         # setup + verify + pair
-#   bash conduck-connect.sh --check-server [url]
-#                                           # software NOT built for Conduck:
-#                                           # check it against the app's core wire
-#   bash conduck-connect.sh --check-adapter [url]
-#                                           # check software built specifically
-#                                           # for Conduck against its adapter contract
-#   bash conduck-connect.sh --show-code     # re-show a SAVED pairing code; no
-#                                           # configuration changes, but live
-#                                           # verification sends requests and a
-#                                           # configured file lane gets live
-#                                           # transport verification; OpenClaw/
-#                                           # Hermes get a real agent sentinel
-#
-# Modifiers:
-#   bash conduck-connect.sh --setup --dry-run
-#                                           # show setup state + plan; change nothing
-#   bash conduck-connect.sh --setup --reuse-only
-#                                           # advanced: walk setup using only what
-#                                           # already exists. The first step that
-#                                           # would change host configuration STOPS
-#                                           # the run and names it — it is not
-#                                           # skipped. Verification still sends
-#                                           # requests and may run a small file probe
-#   bash conduck-connect.sh --check-adapter --deep [url]
-#                                           # add a semantic image-input check
-#   bash conduck-connect.sh --check-adapter --files [url]
-#                                           # also grade the configured file lane;
-#                                           # writes and removes small probe files
-#   bash conduck-connect.sh --setup --allow-keyless-public
-#                                           # expert: permit a keyless
-#                                           # gateway on a public transport during setup
-#
-# Environment:
-#   CONDUCK_TOKEN=<token>                     # bearer token for a check, so it never
-#                                           # reaches your shell history or argv
+# Environment
+#   CONDUCK_TOKEN=<token>   bearer token for a check, so it never reaches your
+#                           shell history or argv. Export it EMPTY to declare a
+#                           keyless target deliberately.
 #   CONDUCK_CHECK_SERVER_MODEL=<model-id>
-#                                           # --check-server only: grade the model you
-#                                           # plan to use. Without it the named-model
-#                                           # checks take whichever id /v1/models lists
-#                                           # FIRST, so a server offering many models
-#                                           # can report FAIL or PASS purely on the
-#                                           # order it lists them. Continue into setup
-#                                           # and the pairing code carries the model
-#                                           # you named.
+#                           --check-server only: grade the model you plan to use,
+#                           rather than whichever id /v1/models lists FIRST — on a
+#                           server offering many, listing order decides the verdict.
+#   CI=1                    never prompt (1/true/yes, any case). Worth setting in
+#                           any scripted run: a check that PASSES otherwise offers
+#                           to continue into setup, and under a PTY with nobody
+#                           watching, that offer waits forever — after the machine
+#                           summary has already printed exit=0.
 #
-# Information:
-#   bash conduck-connect.sh --help            # show this complete public command reference
-#   bash conduck-connect.sh --version         # print the connector version and exit
-#
-# Exit status:
+# Exit status
 #   0  requested action succeeded (or a check passed)
 #   1  setup/runtime failure, or a completed check failed
 #   2  command-line usage error (unknown/retired flag, invalid combination or URL)
+#   3  stopped by the operator before completion (q at a prompt, or Back out of a
+#      run) — no setup code was printed, so a wrapper must not read it as a pairing
+#   4  this action requires an interactive terminal
 #   128+signal  interrupted by HUP/INT/TERM
 #
+# Interactive controls
+#   i  explain the current bounded decision, then ask it again
+#   q  stop cleanly (does not undo changes you already approved)
+#   b  go back only where the prompt offers it; Back is navigation, not undo
+#   Every interactive prompt states what pressing Enter will do.
+#
+# Requirements: a Linux or macOS gateway host with bash, curl, python3 and
+# openssl. Nothing to install, nothing to compile. The QR is rendered locally by
+# a vendored, stdlib-only Python encoder (Project Nayuki, MIT — the big, inert
+# block near the end of this file; it wants Python 3.7+). The setup code is
+# always printed as text as well, so the QR is never required.
+#
 # Re-running is safe: every step detects existing state and reuses what's done.
-# Use --show-code to re-show a saved gateway's code, skipping setup questions
-# (handy for pairing your own second device — the code is the same reusable secret,
-# so treat every copy of it like the token it carries).
+# --show-code re-shows a saved gateway's code without the setup questions — handy
+# for pairing your own second device, and the code is the same reusable secret, so
+# treat every copy of it like the token it carries.
+#
+# Once something is set up you don't have to walk the wizard again to change it.
+# --list shows every saved setup and whether its file-lane service is running,
+# --edit [id] re-asks ONE value — the web address a restarted quick tunnel just
+# changed, the model, the shared folder — and re-verifies only what that affects,
+# and --forget <id> removes one setup's service, credentials and saved gateway. It
+# leaves the folder you shared, your agent's own files, and the pairing already on
+# your phone exactly where they are, and says so before it starts.
+#
+# Where the rest is written down
+#   README.md            install, the full command reference, troubleshooting
+#   SECURITY.md          threat model, what is stored where, how to report
+#   WHAT-IT-TOUCHES.md   every path read or written, with undo steps
+#   https://conduck.com  the app, and the adapter contract these checks grade
+#                        against
+#   src/                 this artifact is assembled from the modules listed in
+#                        src/manifest.txt, each owning one stage of the run — read
+#                        the module that names your question, not the whole file.
 
 # GENERATED FILE — edit src/*.inc.sh and run scripts/build-release.sh; direct edits are overwritten
 
 set -u -o pipefail
 
-VERSION="0.13.0"
+VERSION="0.14.0"
 PAYLOAD_VERSION=1
 # ---------------------------------------------------------------- utilities --
 
@@ -188,6 +214,16 @@ url_has_userinfo() { # url_has_userinfo <url> -> 0 when the authority carries us
 }
 URL_USERINFO_HINT="Credentials don't belong in the address. Drop the \"user:pass@\" part and give the plain URL — the token goes in the token prompt, not the URL."
 
+OS="$(uname -s)"   # Linux | Darwin
+# ${HOME:-} so a check run in a HOME-less environment (a bare CI shell) doesn't
+# abort here under `set -u` on a path it never uses; the wizard would fail later
+# anyway if it genuinely needed a state dir, which is the correct place to notice.
+#
+# Resolved ABOVE the argument loop because --help names this directory, and the
+# argument loop runs the moment the script is read: a definition further down the
+# file would be an unbound variable by the time `--help` printed.
+STATE_DIR="${XDG_CONFIG_HOME:-${HOME:-}/.config}/conduck"
+
 DRY_RUN=false
 REUSE_ONLY=false
 SHOW_QR=false
@@ -197,7 +233,7 @@ DOCTOR_DEEP=false
 DOCTOR_FILES=false
 COMPAT=false
 CHECK_URL=""
-COMMAND=""         # menu | setup | check-server | check-adapter | show-code
+COMMAND=""         # menu | setup | check-server | check-adapter | show-code | list | edit | forget
 SETUP_FROM_CHECK=false
 # Which check handed off (server | adapter). Read only for prompt wording, and
 # held as state because the identity question it phrases is asked later than the
@@ -209,11 +245,134 @@ CLI_ARG_COUNT=$#
 SETUP_GATEWAY_HINT=""
 LEGACY_GENERIC=false
 
+# What argv said about the manage commands. The values the manage module actually
+# reads are $MANAGE_JSON and $MANAGE_ID, and validate_cli assigns them from these
+# two — for the same reason CLI_REUSE_ONLY exists, plus one that is specific to
+# this pair. The argument loop below runs while THIS module is being read, and the
+# manage module is read after it, so anything that module initialises at file
+# scope lands on top of a value parsed here. Holding the parsed answer in a global
+# the manage module has no reason to touch, and handing it over at validate_cli
+# time — which runs once the whole script is assembled — makes the two modules
+# independent of their order in src/manifest.txt.
+CLI_MANAGE_JSON=false
+
+# True only while the run was ENTERED from the welcome menu, which is the one
+# case where "stop" has somewhere to go back to. A run started as
+# `--setup`/`--check-adapter`/… was launched at a shell prompt the operator is
+# already standing at, so offering to "return to the menu" there would invent a
+# screen they never asked for.
+MENU_HUB=false
+# The exit status a menu-entered command uses to say "I am done, show the menu
+# again" instead of "the program is finished". It travels as a status because the
+# command runs in a subshell (see menu_hub_loop) — every other channel out of a
+# subshell is a string on a stream some caller is already parsing.
+MENU_RETURN_STATUS=20
+
 set_command() { # set_command <command>
   if [ -n "$COMMAND" ]; then
-    usage_die "Choose one action only: --setup, --check-server, --check-adapter, or --show-code."
+    usage_die "Choose one action only: --setup, --check-server, --check-adapter, --show-code, --list, --edit or --forget."
   fi
   COMMAND="$1"
+}
+
+# --help is COMPOSED, not extracted from the file header. The two have different
+# readers and cannot be the same text: the header is a preamble for somebody who
+# already opened the file in a pager and is committed to reading it, so it can
+# afford SPDX lines, download provenance and a manifesto. `--help` is the first
+# command a stranger types to decide whether to keep going, and it has to open
+# with a synopsis, fit near a screen, and end with somewhere else to look.
+#
+# The COMMANDS split is load-bearing, not cosmetic: three of the eight commands are
+# fully machine-drivable and five are not, and nothing else in the project says
+# which. --setup ends in a QR code a person scans with a phone, so no amount of
+# scripting finishes it — an agent that learns this here stops trying.
+print_help() {
+  say "conduck-connect $VERSION — pair your self-hosted AI gateway with the Conduck app."
+  say ""
+  say "SYNOPSIS"
+  say "  bash conduck-connect.sh [--setup | --check-server [url] | --check-adapter [url]"
+  say "                          | --show-code | --list [--json] | --edit [id]"
+  say "                          | --forget <id>] [options]"
+  say ""
+  say "COMMANDS — scriptable (pass the url, set CI=1; no terminal needed)"
+  say "  --check-server [url]   Grade software NOT built for Conduck against the app's core"
+  say "                         wire protocol. Ends in one machine-readable summary line."
+  say "  --check-adapter [url]  Grade software built specifically for Conduck against its"
+  say "                         adapter contract. Ends in one machine-readable summary line."
+  say "  --list [--json]        List what is already set up on this machine: each saved"
+  say "                         gateway's id, address, transport, model and shared folder,"
+  say "                         and whether its file-lane service is running. Asks nothing,"
+  say "                         changes nothing, and prints no token, password or setup code."
+  say ""
+  say "COMMANDS — need a person at a terminal"
+  say "  (no command)           Welcome menu: pick one of the actions below."
+  say "  --setup                Set up, verify and pair a gateway. It ends in a QR code"
+  say "                         somebody scans with the Conduck app on an iPhone or iPad,"
+  say "                         so a machine cannot finish it."
+  say "  --show-code            Re-show a SAVED setup code, to pair another device. Changes"
+  say "                         no configuration; live verification still sends requests."
+  say "  --edit [id]            Change ONE thing about a saved setup — its web address, its"
+  say "                         model, its shared folder — and re-verify only what that"
+  say "                         changed. Removal lives here too. Without an id, it asks"
+  say "                         which saved setup you mean."
+  say "  --forget <id>          Remove one saved setup: stop and delete its file-lane"
+  say "                         service, its saved credentials and its saved gateway."
+  say "                         You confirm by typing the id, not by pressing Enter. It"
+  say "                         never deletes your shared folder, and exits 1 if no setup"
+  say "                         has that id — run --list to see the ids."
+  say ""
+  say "OPTIONS"
+  say "  --json                 With --list: machine-readable output instead of the report."
+  say "  --dry-run              With --setup: print the whole plan and change nothing."
+  say "  --reuse-only           With --setup: use only what already exists. The first step"
+  say "                         that would change host configuration stops the run and names"
+  say "                         it — it is not skipped."
+  say "  --allow-keyless-public With --setup: expert — permit a gateway with no token on a"
+  say "                         publicly reachable transport."
+  say "  --deep                 With --check-adapter: add a semantic image-input check."
+  say "  --files                With --check-adapter: also grade the configured file lane."
+  say "                         Writes and removes small probe files."
+  say ""
+  say "  bash conduck-connect.sh --help       print this reference and exit"
+  say "  bash conduck-connect.sh --version    print the version and exit"
+  say ""
+  say "ENVIRONMENT"
+  say "  CONDUCK_TOKEN               Bearer token for a check, so it never reaches your"
+  say "                              shell history or argv."
+  say "  CONDUCK_CHECK_SERVER_MODEL  --check-server only: grade the model you plan to use."
+  say "                              Without it the named-model checks take whichever id"
+  say "                              /v1/models happens to list first."
+  say "  CI=1                        Never wait for a person: a passing check prints its"
+  say "                              summary and exits instead of offering to continue into"
+  say "                              setup. Accepts 1, true or yes."
+  say ""
+  say "EXIT STATUS"
+  say "  0  requested action succeeded (or a check passed)"
+  say "  1  setup/runtime failure, or a completed check failed"
+  say "  2  command-line usage error (unknown/retired flag, invalid combination or URL)"
+  say "  3  stopped by the operator before completion (q at a prompt, or Back out of a run)"
+  say "  4  this action requires an interactive terminal"
+  say "  128+signal  interrupted by HUP/INT/TERM"
+  say ""
+  say "EXAMPLES"
+  say "  bash conduck-connect.sh --setup --dry-run   # see every change first; change nothing"
+  say "  bash conduck-connect.sh --setup             # set up, verify, print the setup code"
+  say "  CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-adapter https://ai.example.com"
+  say "  bash conduck-connect.sh --list              # what this machine already has set up"
+  say "  bash conduck-connect.sh --edit my-gateway   # the quick tunnel handed out a new"
+  say "                                              # address overnight: give this one setup"
+  say "                                              # the new one and leave the rest alone"
+  say ""
+  say "FILES"
+  say "  $STATE_DIR"
+  say "      Saved gateways and file-lane credentials. A gateway token is never stored."
+  say "      --list reports what is in here; --forget <id> removes one setup's share of it."
+  say ""
+  say "SEE ALSO"
+  say "  https://conduck.com/setup/   setup guides and the adapter contract"
+  say "  WHAT-IT-TOUCHES.md           every path this reads or writes, and how to undo it"
+  say "  The comment header at the top of this file — what it does, what it never does,"
+  say "  and where an official copy comes from."
 }
 
 # Temporary pre-0.13 subcommand spellings were published briefly. They do not
@@ -232,6 +391,13 @@ for arg in "$@"; do
     --check-server)  set_command "check-server" ;;
     --check-adapter) set_command "check-adapter" ;;
     --show-code)     set_command "show-code" ;;
+    # The three manage commands. Their optional/required id arrives through the
+    # same single positional slot the checks use for a URL — see CLI_POSITIONAL
+    # below, and validate_cli, which is where a positional gets its meaning.
+    --list)          set_command "list" ;;
+    --edit)          set_command "edit" ;;
+    --forget)        set_command "forget" ;;
+    --json)     CLI_MANAGE_JSON=true ;;
     --dry-run)  DRY_RUN=true ;;
     --reuse-only) REUSE_ONLY=true ;;
     --allow-keyless-public) ALLOW_KEYLESS_PUBLIC=true ;;
@@ -242,7 +408,7 @@ for arg in "$@"; do
       say "conduck-connect $VERSION"; exit 0 ;;
     -h|--help)
       [ "$CLI_ARG_COUNT" = "1" ] || usage_die "$arg must be used by itself."
-      sed -n '2,${/^#/!q;s/^# \{0,1\}//p;}' "$0"; exit 0 ;;   # whole header comment, wherever it ends
+      print_help; exit 0 ;;
     # --- compatibility with pre-0.13.0 spellings -------------------------------
     # Conduck app builds already on the App Store emit `--generic` verbatim, and
     # every client resolves releases/latest, so an old install always downloads the
@@ -272,9 +438,17 @@ if [ -z "$COMMAND" ]; then
   if [ "$CLI_ARG_COUNT" = "0" ]; then
     COMMAND="menu"
   else
-    usage_die "Choose an action: --setup, --check-server, --check-adapter, or --show-code (try --help)."
+    usage_die "Choose an action: --setup, --check-server, --check-adapter, --show-code, --list, --edit or --forget (try --help)."
   fi
 fi
+
+# There is ONE positional slot, and which command reads it decides what it means:
+# an address to grade for --check-server/--check-adapter, the id of a saved setup
+# for --edit/--forget. Captured here, once, before any action runs — the same
+# discipline as the CLI_ captures below, and for the same reason: validate_cli
+# hands it to BOTH $CHECK_URL and $MANAGE_ID on every pass through the hub, so it
+# has to be a value argv owns rather than one an earlier action may have rewritten.
+CLI_POSITIONAL="$CHECK_URL"
 
 # Is this a real person at a terminal? Checks use this to offer setup after a
 # PASS. A CI job or redirected/piped invocation must always print its summary
@@ -316,17 +490,50 @@ saved_profile_exists() {
   return 1
 }
 
+# Which entry each menu number dispatches to, filled in by choose_main_action as it
+# draws the list. It is a global only because the numbering is computed: the answer
+# comes back as "5", and nothing else in the process knows what 5 was.
+MENU_ACTIONS=()
+
 choose_main_action() {
-  # Evaluated ONCE: the answer decides three lines below it, and each validation
+  # Evaluated ONCE: the answers decide four lines below them, and each validation
   # pass re-parses every profile on disk.
-  local have_saved=false
+  local have_saved=false have_setups=false p
   saved_profile_exists && have_saved=true
-  say "${BOLD}Welcome to Conduck Connect${RESET}"
-  if $have_saved; then
-    say "Set up a gateway, check one before pairing, or re-show a saved setup code."
-  else
-    say "Set up a gateway, or check one before pairing."
-  fi
+  # A DIFFERENT question from the one above it, and the difference is the whole
+  # reason the manage entries exist. "Show a saved setup code" has to hand the app
+  # a profile THIS version can parse. Looking at what is saved, re-pointing it and
+  # removing it work on the files themselves — and a profile this version cannot
+  # read is exactly the thing somebody wants to look at and get rid of, so gating
+  # those on a successful parse would hide the options in the one state that needs
+  # them most. The cheap glob is deliberate: it settles the question without
+  # reading, parsing or validating anything.
+  for p in "$STATE_DIR"/profile-*.json; do
+    if [ -f "$p" ]; then have_setups=true; break; fi
+  done
+  # Reaching the menu is what makes "back to the menu" a real destination later.
+  MENU_HUB=true
+  say "${BOLD}conduck-connect $VERSION — pair your self-hosted AI gateway with Conduck${RESET}"
+  say ""
+  # The introduction lives HERE, not only behind --help, because the person who
+  # most needs it is the one deciding whether to trust this at all — and they
+  # have not typed a flag yet. It says the payoff (a QR code, scanned with the
+  # app on a phone), the safety rule, and the way to preview the whole thing,
+  # because those are the three facts that decide whether a stranger continues.
+  say "  I pair a gateway you already run — OpenClaw, Hermes, or any OpenAI-compatible"
+  say "  server — with the Conduck app, and finish by printing a QR code you scan with"
+  say "  the app on your iPhone or iPad."
+  # "No telemetry" is the strong claim and it is unqualified. "I talk only to your
+  # own gateway" is NOT, and must never be said here: the Cloudflare and Tailscale
+  # paths contact that vendor with the operator's own client and credentials. The
+  # header's "Where its own requests go" carves that out in full; a six-line intro
+  # cannot, so it says the part that is true absolutely and points at the rest
+  # rather than overclaiming on the one screen a skeptic reads first.
+  say "  Nothing on this machine changes without your approval, and you see the exact"
+  say "  command first. No telemetry, ever — the only third-party contact is the tunnel"
+  say "  tool you pick, and it asks first. Run me with --setup --dry-run to walk the"
+  say "  whole thing and change nothing."
+  say "  I remember what I set up in $STATE_DIR."
   # Option 4 genuinely cannot be offered for a profile this version cannot read,
   # but going quiet about it is what turns an unreadable profile into a lost one:
   # the operator reads "no saved code", picks 1, and setup overwrites the file.
@@ -339,50 +546,306 @@ choose_main_action() {
     fi
     note "$SAVED_PROFILE_REJECT_REASON"
     note "Setting up again REPLACES the saved file, so read that line before choosing 1."
+    # Which is no longer the only way to deal with it, and saying so here is the
+    # point of the warning: the entries that manage what is already set up are on
+    # the list below (they are offered for a file that EXISTS, parsed or not), so
+    # the operator has a way out that does not overwrite anything.
+    note "You don't have to set up again to deal with it — the last two options below work on"
+    note "the saved files themselves, so this one can be looked at and removed instead."
   fi
   say ""
   say "  What would you like to do?"
-  say "    1) Set up and pair a gateway"
-  say "    2) Check existing OpenAI-compatible software (not built for Conduck)"
-  say "    3) Check an adapter built specifically for Conduck"
+  # The numbers are COMPUTED rather than written into the strings. Three entries
+  # are conditional and they answer two different questions (see have_saved and
+  # have_setups above), so any hardcoded numbering has a reachable state — an
+  # unreadable profile — where the list skips one. A menu that jumps from 3 to 5
+  # reads as a bug in the tool rather than as an option somebody chose not to show.
+  #
+  # Item 1 names the products because that is the word the user was given. Told
+  # "I installed OpenClaw for you", nobody maps that onto "set up and pair a
+  # gateway" — and 2 and 3 are marked as diagnostics so a first-timer does not
+  # read three equal-looking options and pick the wrong one. The manage entries
+  # come last because they are useless until something has been set up, and they
+  # say what they DO rather than naming their flags: nobody arrives here looking
+  # for "--edit", they arrive because an address stopped working.
+  local n=0
+  MENU_ACTIONS=()
+  n=$((n+1)); MENU_ACTIONS[$n]="setup"
+  say "    $n) Set up and pair a gateway (OpenClaw, Hermes, or any OpenAI-compatible"
+  say "       server) — start here"
+  n=$((n+1)); MENU_ACTIONS[$n]="check-server"
+  say "    $n) Check a server that was NOT built for Conduck (diagnostic; changes nothing)"
+  n=$((n+1)); MENU_ACTIONS[$n]="check-adapter"
+  say "    $n) Check an adapter built for Conduck (diagnostic; changes nothing)"
   if $have_saved; then
-    say "    4) Show a saved setup code"
+    n=$((n+1)); MENU_ACTIONS[$n]="show-code"
+    say "    $n) Show a saved setup code (pair another device)"
+  fi
+  if $have_setups; then
+    n=$((n+1)); MENU_ACTIONS[$n]="list"
+    say "    $n) See what this machine already has set up"
+    n=$((n+1)); MENU_ACTIONS[$n]="edit"
+    say "    $n) Change one of them — a new web address, a different model — or remove it"
   fi
   say "    q) Exit"
   say ""
-  local choice regex='^([1-3]|[qQ])$'
-  $have_saved && regex='^([1-4]|[qQ])$'
-  choice=$(require_choice "Choose an option" "$regex" "nav.main") || die "$NO_ANSWER"
+  # The regex still admits q even though require_choice intercepts it and returns
+  # 11: a menu whose accept pattern silently disagreed with the list on screen
+  # would be one more thing to keep in sync for no gain.
+  local choice regex="^([1-$n]|[qQ])\$" rc=0
+  choice=$(require_choice "Choose an option" "$regex" "nav.main") || rc=$?
+  case "$rc" in
+    0) ;;
+    # q at the FRONT DOOR is a completed choice, not an aborted run: the operator
+    # looked at the options and picked "none". It leaves by the same quiet path as
+    # option q on the list, and the process still exits 0 — a wrapper must not read
+    # "I decided not to start" as "setup failed".
+    11) COMMAND="exit"; return 0 ;;
+    *) die "$NO_ANSWER" ;;
+  esac
   case "$choice" in
-    1) COMMAND="setup" ;;
-    2) COMMAND="check-server" ;;
-    3) COMMAND="check-adapter" ;;
-    4) COMMAND="show-code" ;;
     q|Q) COMMAND="exit" ;;
+    *)   COMMAND="${MENU_ACTIONS[$choice]}" ;;
   esac
 }
 
+# The menu is a HUB, not a launcher: an action reached from it returns to it, so
+# a wrong turn costs one action instead of the whole session. A run started by
+# flag never enters this loop: there is no menu behind it to come back to.
+#
+# The chosen action runs in a SUBSHELL, which buys two things at once. Every
+# command in this tool ends by calling `exit`, and a subshell turns that into a
+# status this loop can read; and each pass starts from the globals the script was
+# launched with, so a half-filled GW_* draft from an abandoned setup cannot leak
+# into the next action. The EXIT traps a command installs — the exposure-undo
+# backstop, the setup-lock release, the machine summary — still fire at the end of
+# ITS pass, which is exactly where they belong.
+#
+# The subshell's protection has ONE hole, and it is the line above the subshell:
+# choose_main_action and validate_cli run in the PARENT, so they are the only code
+# in the tool whose writes outlive an action. Every global either of them touches
+# is therefore re-derived on entry rather than left where the last pass put it —
+# validate_cli states that as a contract where it is defined, because it is the one
+# a new derived flag will break.
+#
+# 99-main.inc.sh owns the dispatch and defines dispatch_menu_command. Absent that
+# function this degrades to a single pass rather than failing: a foundation module
+# may not be able to break the program by landing on its own.
+menu_hub_loop() {
+  local rc
+  while true; do
+    choose_main_action
+    [ "$COMMAND" = "exit" ] && return 0
+    declare -F dispatch_menu_command >/dev/null 2>&1 || return 0
+    validate_cli
+    # The trap environment a flag-entered run is given at file scope, re-armed HERE
+    # because bash resets every caught trap on entering a subshell. Without it an
+    # action chosen from the menu runs with no EXIT backstop and no signal routing
+    # at all, and the parent's traps cannot stand in: they fire in the PARENT, where
+    # the dead child's state never existed.
+    #
+    # --show-code is where that is visibly lossy — it arms no trap of its own, and
+    # the agent sentinel's last DELETE-and-prove pass plus the "remove this exact
+    # file later" warning reach the operator through on_exit and nowhere else. The
+    # checks and setup escape it only because they re-arm their own traps first, and
+    # they still do: an action that wants something stronger replaces these, exactly
+    # as it does at file scope.
+    #
+    # Guarded, for the same reason the dispatch below is: a foundation module may not
+    # be able to break the program by landing before the module that defines on_exit.
+    (
+      if declare -F on_exit >/dev/null 2>&1; then
+        trap on_exit EXIT
+        trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+      fi
+      dispatch_menu_command
+    ); rc=$?
+    [ "$rc" = "$MENU_RETURN_STATUS" ] || exit "$rc"
+    COMMAND="menu"
+    say ""
+  done
+}
+
+# What argv said about each modifier, captured once, before any action can change
+# it. These are the restore sources for validate_cli below, and none of them can be
+# spelled inline there as a constant: the setup arm sets no value at all, so a plain
+# `REUSE_ONLY=false` reset would silently drop a `--setup --reuse-only` the operator
+# did pass. Every flag the argument loop can set has a capture here, including the
+# ones no action rewrites today — a modifier with a CLI_ twin cannot be restored to
+# the wrong value, and one without a twin is a hole nobody sees until a hub session
+# lands in it.
+CLI_DRY_RUN=$DRY_RUN
+CLI_REUSE_ONLY=$REUSE_ONLY
+CLI_ALLOW_KEYLESS_PUBLIC=$ALLOW_KEYLESS_PUBLIC
+CLI_DOCTOR_DEEP=$DOCTOR_DEEP
+CLI_DOCTOR_FILES=$DOCTOR_FILES
+
+# ------------------------------------------------------- the modifier table --
+#
+# Which modifiers a command ACCEPTS is declared per command, in one place, and
+# every modifier a command does not name is refused. That direction is the design.
+# The shape it replaces is a hand-written list of REJECTIONS per command, which
+# defaults to ALLOW: a flag missing from one arm's list is accepted in silence and
+# then honoured by code that runs much later, long after the operator could have
+# been told. That has failed twice — --reuse-only surviving a check into the next
+# hub action, and --edit/--forget walking a picker, a setup summary and a live probe
+# before the file lane's own guard stopped the run one prompt short of the change.
+#
+# Default-DENY inverts the cost of forgetting. A modifier added to the argument loop
+# and left out of a command's accept list is refused by that command at exit 2,
+# before anything is asked. For a flag that should have been allowed that is the
+# wrong answer — but it is a LOUD wrong answer, and the very first run finds it,
+# which is the property the other direction can never have.
+#
+# The order below is the order a clash is reported when an invocation carries more
+# than one, so it is fixed rather than alphabetical: the positional first, because a
+# command that takes no id at all should say so before it grades the flags around
+# it, then the modifiers in the order the arms have always met them.
+CLI_MODIFIERS="positional dry-run reuse-only deep files allow-keyless-public json"
+
+# Did argv set this modifier? The ONLY reader of the flag globals, so a modifier
+# renamed in the argument loop breaks here rather than in seven command arms.
+cli_modifier_set() { # cli_modifier_set <modifier>
+  case "$1" in
+    positional)           [ -n "$CHECK_URL" ] ;;
+    dry-run)              $DRY_RUN ;;
+    reuse-only)           $REUSE_ONLY ;;
+    deep)                 $DOCTOR_DEEP ;;
+    files)                $DOCTOR_FILES ;;
+    allow-keyless-public) $ALLOW_KEYLESS_PUBLIC ;;
+    json)                 $MANAGE_JSON ;;
+    # An accept list naming a modifier the argument loop cannot set is a typo, and
+    # a typo in an accept list reads as a silent permission — the exact failure this
+    # table exists to end. It stops the run instead.
+    *) die "Internal error: unknown CLI modifier '$1'." ;;
+  esac
+}
+
+# What to say when this command cannot take it. All the wording for one modifier
+# lives in one arm, because these sentences are met side by side by the same person
+# trying two spellings of one idea, and each has to name why THIS command cannot
+# take the flag rather than restate the flag back at them.
+cli_modifier_refusal() { # cli_modifier_refusal <modifier> -> the sentence for $COMMAND
+  case "$1" in
+    positional)
+      case "$COMMAND" in
+        list) printf '%s' "--list takes no id — it lists every saved setup. Use --edit <id> or --forget <id> to act on one." ;;
+        *)    printf '%s' "A URL argument only works with --check-server or --check-adapter." ;;
+      esac ;;
+    dry-run)
+      case "$COMMAND" in
+        check-server)  printf '%s' "--check-server sends live requests, so it doesn't combine with --dry-run." ;;
+        check-adapter) printf '%s' "--check-adapter sends live requests, so it doesn't combine with --dry-run." ;;
+        show-code)     printf '%s' "--show-code changes no configuration but performs live verification; it doesn't combine with --dry-run." ;;
+        list)          printf '%s' "--list already changes nothing, so it doesn't combine with --dry-run." ;;
+        edit)          printf '%s' "--edit asks before every change and shows you each one, so it doesn't combine with --dry-run." ;;
+        forget)        printf '%s' "--forget names everything it will remove and asks you to type the id before it removes any of it; it doesn't combine with --dry-run." ;;
+        *)             printf '%s' "--dry-run is a setup modifier; it only works with --setup." ;;
+      esac ;;
+    reuse-only)
+      case "$COMMAND" in
+        check-server)  printf '%s' "--reuse-only is a setup modifier; --check-server already changes no host configuration." ;;
+        check-adapter) printf '%s' "--reuse-only is a setup modifier; --check-adapter already changes no host configuration unless --files is requested." ;;
+        show-code)     printf '%s' "--reuse-only is a setup modifier; --show-code already changes no host configuration." ;;
+        list)          printf '%s' "--reuse-only is a setup modifier; --list only reports what is already saved." ;;
+        # The two that change things get the fuller sentence, because refusing the
+        # flag here looks backwards until you read why: --reuse-only cannot make
+        # these safer, it can only make them refuse, at the end, the one change the
+        # command was named for.
+        edit)          printf '%s' "--reuse-only is a setup modifier, and --edit exists to change one saved setup: a mode that forbids changes would walk you through the questions and then refuse the edit you asked for." ;;
+        forget)        printf '%s' "--reuse-only is a setup modifier, and --forget exists to remove one saved setup: a mode that forbids changes would list everything it will remove and then refuse the removal you asked for." ;;
+        *)             printf '%s' "--reuse-only is a setup modifier." ;;
+      esac ;;
+    deep)
+      case "$COMMAND" in
+        check-server) printf '%s' "--deep only works with --check-adapter; --check-server already reports image capability." ;;
+        *)            printf '%s' "--deep only works with --check-adapter." ;;
+      esac ;;
+    files) printf '%s' "--files only works with --check-adapter." ;;
+    allow-keyless-public)
+      case "$COMMAND" in
+        check-server)  printf '%s' "--allow-keyless-public is a setup modifier; --check-server never publishes anything." ;;
+        check-adapter) printf '%s' "--allow-keyless-public is a setup modifier; --check-adapter never publishes anything." ;;
+        list)          printf '%s' "--allow-keyless-public is a setup modifier; --list publishes nothing." ;;
+        *)             printf '%s' "--allow-keyless-public is a setup modifier." ;;
+      esac ;;
+    json)
+      case "$COMMAND" in
+        check-server|check-adapter) printf '%s' "--json only works with --list; a check ends in its own machine summary line." ;;
+        *)                          printf '%s' "--json only works with --list." ;;
+      esac ;;
+  esac
+}
+
+# Refuse every modifier this command did not name. One call per arm, and it is the
+# only thing standing between argv and an action that would carry a flag it has no
+# meaning for all the way to the code that reads it.
+cli_accept_only() { # cli_accept_only [modifier…]
+  local m accepted=" $* "
+  for m in $CLI_MODIFIERS; do
+    case "$accepted" in *" $m "*) continue ;; esac
+    cli_modifier_set "$m" || continue
+    usage_die "$(cli_modifier_refusal "$m")"
+  done
+}
+
+# validate_cli is a PURE FUNCTION of argv and $COMMAND, and that is a contract, not
+# an observation: menu_hub_loop calls it in the PARENT shell once per action, so any
+# global it writes and does not re-derive is carried into every later action of the
+# session. The action itself runs in a subshell and cannot leak — this function is
+# the one place at the hub that can.
+#
+# So every global it writes is reset from its argv value on entry, ALL of them
+# together in the block below, and a new derived flag belongs in that block the day
+# it is added. Two ways the omission bites, both silent to the operator who caused
+# it: a check leaves REUSE_ONLY true, so the next "set up and pair" at the menu runs
+# a reuse-only setup that refuses every change it was chosen to make; and the check
+# arms' own `--reuse-only is a setup modifier` guard then reads that leftover as a
+# flag on the command line and kills the whole session at exit 2 — from the parent
+# shell, so the hub cannot even redraw.
+#
+# Nothing there may be reset to a hardcoded constant for the same reason the CLI_
+# captures exist: the reset restores what the operator TYPED, and only the three
+# derived-from-$COMMAND flags — DOCTOR, COMPAT, SHOW_QR — have no argv spelling of
+# their own and so can be reset to false.
+#
+# The arms themselves are one `cli_accept_only` call each, naming what the command
+# takes. Together the two halves are the whole contract: the reset block decides
+# what argv means on this pass, the accept list decides what the command will carry
+# out of here. Read down the accept lists and they say exactly what `--help` says
+# one screen up — "--dry-run: With --setup", "--json: With --list" — which is the
+# point. Those sentences are the promise; before this shape they were a promise
+# four commands quietly broke.
 validate_cli() {
   DOCTOR=false; COMPAT=false; SHOW_QR=false
+  DRY_RUN=$CLI_DRY_RUN; REUSE_ONLY=$CLI_REUSE_ONLY
+  DOCTOR_DEEP=$CLI_DOCTOR_DEEP; DOCTOR_FILES=$CLI_DOCTOR_FILES
+  ALLOW_KEYLESS_PUBLIC=$CLI_ALLOW_KEYLESS_PUBLIC
+  # The manage module's two inputs, handed over from what argv said. This is also
+  # the line that keeps the menu path and the flag path honest about them: a
+  # menu-entered --edit has no id on the command line, so it gets the empty string
+  # here and asks which saved setup the operator means — the same code path as
+  # `--edit` with no argument, rather than a second one that guesses.
+  MANAGE_JSON=$CLI_MANAGE_JSON
+  # One positional slot, restored to both names that read it: the checks call it a
+  # URL, the manage commands call it an id, and neither may inherit what the other
+  # left behind on an earlier pass through the hub.
+  CHECK_URL=$CLI_POSITIONAL; MANAGE_ID=$CLI_POSITIONAL
   case "$COMMAND" in
     setup)
-      [ -z "$CHECK_URL" ] || usage_die "A URL argument only works with --check-server or --check-adapter."
-      $DOCTOR_DEEP && usage_die "--deep only works with --check-adapter."
-      $DOCTOR_FILES && usage_die "--files only works with --check-adapter."
+      cli_accept_only dry-run reuse-only allow-keyless-public
       ;;
     check-server)
       COMPAT=true
+      # Ahead of the accept list on purpose: an address this command cannot grade is
+      # the more useful thing to say first when the invocation is wrong in two ways.
       if [ -n "$CHECK_URL" ] && ! doctor_accept_url "$CHECK_URL" >/dev/null; then
         # The userinfo case gets its own message, and deliberately does NOT echo
         # the URL back: the rejected value contains the password.
         url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
         usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
       fi
-      $DRY_RUN && usage_die "--check-server sends live requests, so it doesn't combine with --dry-run."
-      $REUSE_ONLY && usage_die "--reuse-only is a setup modifier; --check-server already changes no host configuration."
-      $DOCTOR_DEEP && usage_die "--deep only works with --check-adapter; --check-server already reports image capability."
-      $DOCTOR_FILES && usage_die "--files only works with --check-adapter."
-      $ALLOW_KEYLESS_PUBLIC && usage_die "--allow-keyless-public is a setup modifier; --check-server never publishes anything."
+      cli_accept_only positional
       REUSE_ONLY=true
       ;;
     check-adapter)
@@ -393,19 +856,35 @@ validate_cli() {
         url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
         usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
       fi
-      $DRY_RUN && usage_die "--check-adapter sends live requests, so it doesn't combine with --dry-run."
-      $REUSE_ONLY && usage_die "--reuse-only is a setup modifier; --check-adapter already changes no host configuration unless --files is requested."
-      $ALLOW_KEYLESS_PUBLIC && usage_die "--allow-keyless-public is a setup modifier; --check-adapter never publishes anything."
+      cli_accept_only positional deep files
       REUSE_ONLY=true
       ;;
     show-code)
       SHOW_QR=true
-      [ -z "$CHECK_URL" ] || usage_die "A URL argument only works with --check-server or --check-adapter."
-      $DRY_RUN && usage_die "--show-code changes no configuration but performs live verification; it doesn't combine with --dry-run."
-      $DOCTOR_DEEP && usage_die "--deep only works with --check-adapter."
-      $DOCTOR_FILES && usage_die "--files only works with --check-adapter."
-      $ALLOW_KEYLESS_PUBLIC && usage_die "--allow-keyless-public is a setup modifier."
+      cli_accept_only
       REUSE_ONLY=true
+      ;;
+    # The three manage commands. --list is the scriptable one and is a pure read:
+    # it takes no id (it shows every setup, which is how you find an id), and it is
+    # marked reuse-only so that any shared step it reaches can only report, never
+    # reconfigure. --edit and --forget are the two that change things, so neither
+    # is marked reuse-only — a flag that made the edit screen refuse the edit it
+    # was chosen to make would be a trap, not a safety belt, which is also why both
+    # accept lists leave --reuse-only out and let it be refused up front.
+    list)
+      cli_accept_only json
+      REUSE_ONLY=true
+      ;;
+    edit)
+      cli_accept_only positional
+      ;;
+    forget)
+      # The one required argument in the whole CLI. Removal is irreversible, so
+      # there is no "pick one for me" fallback on the flag path: a wrapper that
+      # meant a different setup would get a picker it cannot answer, and a person
+      # who has forgotten the id is one command away from seeing all of them.
+      [ -n "$MANAGE_ID" ] || usage_die "--forget needs the id of the setup to remove: --forget <id>. Run --list to see the ids."
+      cli_accept_only positional
       ;;
     exit) ;;
     *) die "Internal error: unknown action '$COMMAND'." ;;
@@ -440,15 +919,88 @@ explain_prompt() { # explain_prompt [action-id | help-function]
   say ""
 }
 
-quit_run() { # stop cleanly; EXIT traps still report any exposure undo commands
+# Is the command this run is executing one that cannot have changed anything?
+#
+# The three read-only commands — --check-server, --check-adapter and --show-code —
+# reach every prompt primitive the wizard does, so they reach quit_run too, and the
+# wizard's "here is what stays in place" wording is a false alarm in every word of it
+# there. Telling somebody who stopped a DIAGNOSTIC that their run may have left
+# config edits, restarts and services behind sends them hunting through a machine
+# nothing touched, in the one message whose whole job is to leave them correctly
+# informed.
+#
+# The FLAGS are the authority, never $COMMAND, and the difference is load-bearing:
+# a passing check that hands off into setup clears all three in
+# finish_successful_check, at exactly the moment the wizard wording becomes the true
+# one. The same q, one screen later in the same process, then has genuinely approved
+# changes behind it and must say so.
+#
+# It answers NO on anything it cannot prove, which is why each flag is compared as
+# a string with an explicit default instead of run as `$DOCTOR || $COMPAT || …`.
+# quit_run is the most-lifted function in the test suites — three harnesses stub it
+# and one extracts it — and a bare `$DOCTOR` in a harness that did not carry the
+# flag expands to an EMPTY command, which bash scores 0. That reads as "nothing
+# changed" for a run that may have changed plenty, and it is the one wrong answer
+# this predicate must never give.
+run_changes_nothing() {
+  [ "${DOCTOR:-false}" = "true" ] && return 0
+  [ "${COMPAT:-false}" = "true" ] && return 0
+  [ "${SHOW_QR:-false}" = "true" ] && return 0
+  return 1
+}
+
+# Stop cleanly; EXIT traps still report any exposure undo commands.
+#
+# The status is 3, not 0. A wrapper — a CI job, an agent driver, the Conduck app's
+# own launcher — has no other way to tell "the operator stopped this halfway" from
+# "the gateway is paired", and reading an abandoned setup as a success is the
+# expensive direction of that mistake. Choosing q at the WELCOME MENU is not this:
+# that is a completed choice and leaves by choose_main_action's exit arm at 0.
+#
+# It is also the last screen of an interrupted run, so it is the right place to
+# say the one thing the header promises and no user is ever told: coming back
+# costs nothing, because every step detects what is already done.
+quit_run() {
+  local reply
   say ""
-  note "Stopped here. No further setup actions will run."
-  note "This does not undo changes you already approved: config edits, restarts,"
-  note "services, folders, and commands stay in place."
-  note "If this run applied a tracked Tailscale exposure, its exact undo commands"
-  note "are printed below and kept for the next run. A Cloudflare or reverse-proxy"
-  note "command you ran remains yours to undo."
-  exit 0
+  if run_changes_nothing; then
+    note "Stopped here. Nothing was changed — this command edits no configuration, starts"
+    note "or stops no service, and publishes nothing."
+    # The one exception, and it is the operator's own shared folder rather than any
+    # configuration: --files writes probe files. It is named here because the removal
+    # runs from an EXIT trap that fires AFTER this screen (doctor_on_exit →
+    # doctor_files_cleanup_backstop), and the sentence is written to stay true whether
+    # or not that trap finds anything left to report. Compared as a string with a
+    # default for the same harness reason run_changes_nothing is.
+    if [ "${DOCTOR_FILES:-false}" = "true" ]; then
+      note "--files writes small conduck-check-* probe files to your shared folder and removes"
+      note "them again; if this run stopped between the two, their names are printed below."
+    fi
+    note "Re-run it any time; it saves nothing between runs, so it simply starts over."
+  else
+    note "Stopped here. No further setup actions will run."
+    note "This does not undo changes you already approved: config edits, restarts,"
+    note "services, folders, and commands stay in place."
+    note "If this run applied a tracked Tailscale exposure, its exact undo commands"
+    note "are printed below and kept for the next run. A Cloudflare or reverse-proxy"
+    note "command you ran remains yours to undo."
+    note "Re-run me any time; every step detects what's already done and reuses it."
+  fi
+  # Offered only to a run that CAME from the menu — see MENU_HUB. The default is
+  # still to stop: somebody who typed q wants out, and making them type it twice
+  # would be a worse trade than one extra line for the person who mis-stepped.
+  if [ "${MENU_HUB:-false}" = "true" ] && interactive_terminal; then
+    say ""
+    while true; do
+      read -r -p "  Enter = stop; m = back to the menu: " reply || break
+      case "$reply" in
+        '') break ;;
+        [mM]) exit "${MENU_RETURN_STATUS:-20}" ;;
+        *) warn "Press Enter to stop, or m to go back to the menu." ;;
+      esac
+    done
+  fi
+  exit 3
 }
 
 # Did a REJECTED answer look like a pasted credential rather than a typed one?
@@ -495,12 +1047,149 @@ warn_answer_looked_like_a_secret() {
   warn "one that shows nothing at all while you type." >&2
 }
 
-confirm() {  # confirm "question" [action-id] [allow-back] -> 0 yes / 1 no / 10 back
-  local reply action="${2:-general}" allow_back="${3:-false}" controls
-  controls="Enter = No; i = explain; q = stop"
-  case "$allow_back" in true|1|yes) controls="Enter = No; i = explain; b = back; q = stop" ;; esac
+# ------------------------------------------------------- the prompt contract --
+#
+# EVERY prompt in this tool offers the same controls, and every prompt shows the
+# ones it actually honours. The rule that keeps those two facts in sync: a key is
+# a control at a prompt IF AND ONLY IF that prompt's own suffix advertises it.
+# The suffix is rendered from the same parameters that decide the behaviour
+# (control_suffix below), so the two cannot drift.
+#
+#   i  explain this question, then ask it again
+#   b  go back — offered only where the caller can actually honour it
+#   q  stop the run
+#
+# The five value primitives (ask, ask_default, ask_secret, ask_url,
+# require_choice) are all captured by their callers with $(…), and that one fact
+# shapes the whole contract. The ANSWER has to travel on stdout, so the INTENT
+# travels on the exit status — a sentinel string on stdout cannot work, because a
+# user's real answer could legitimately be the single letter "q". And `q` cannot
+# stop the run from inside the primitive either: a die or an exit inside $(…)
+# kills the subshell only, and the wizard walks on with an empty answer.
+#
+#   rc 0   the value is on stdout
+#   rc 10  the user pressed b   (only reachable when the caller passed allow-back)
+#   rc 11  the user pressed q   → the CALLER must call quit_run
+#   rc 1   EOF / no answer      → the caller dies with "$NO_ANSWER"
+#
+# prompt_into (below) is the one-line caller side of all four cases. confirm and
+# print_and_wait are NOT captured, so they keep acting on q themselves.
+
+# read -r -p writes its prompt only when stdin is a terminal. Left to `read`
+# alone, every prompt in this tool is therefore invisible under a pipe, a here-doc
+# or an agent driver — the transcript shows a menu and then nothing, and the
+# machine on the other end cannot tell which question it is answering. Re-emit it
+# on stderr in exactly that case. With a newline, because nothing echoes the
+# answer back there and the next line of output would otherwise be glued to the
+# question.
+prompt_echo() { # prompt_echo <prompt-text>
+  [ -t 0 ] || printf '%s\n' "$1" >&2
+}
+
+control_keys() { # control_keys [allow-back] -> "i = explain[; b = back]; q = stop"
+  case "${1:-false}" in
+    true|1|yes) printf 'i = explain; b = back; q = stop' ;;
+    *)          printf 'i = explain; q = stop' ;;
+  esac
+}
+
+control_suffix() { # control_suffix <what-Enter-does> [allow-back]
+  printf 'Enter = %s; %s' "$1" "$(control_keys "${2:-false}")"
+}
+
+# A control key typed at a FREE-TEXT prompt is genuinely ambiguous: "q" is both
+# the stop key and a string somebody could want as a gateway name. Both silent
+# readings lose something real. Read as data, "q" names the gateway and mints the
+# permanent id `custom-q` — the id the systemd unit, the rclone credential and the
+# saved profile are all filed under, discovered long after the keystroke. Read as
+# a control, a legitimate answer disappears. So ask, once, with the CONTROL as the
+# Enter default: the overwhelmingly common reading costs no keystroke, and the
+# rare literal one costs a single "y".
+#
+# It reads y/n itself rather than calling confirm, because confirm honours i/b/q
+# too and would feed this question straight back into the ambiguity it exists to
+# resolve. Everything is on stderr: every caller is inside $(…).
+prompt_wants_literal() { # prompt_wants_literal <key> <what-the-control-does> -> 0 literal / 1 control / 2 no answer
+  local p reply
+  p="  Use \"$1\" as your answer instead of $2? [y/N] "
   while true; do
-    read -r -p "$1 [y/N] ($controls): " reply || return 1
+    prompt_echo "$p"
+    read -r -p "$p" reply || return 2
+    case "$reply" in
+      [yY]|[yY][eE][sS]) return 0 ;;
+      ''|[nN]|[nN][oO])  return 1 ;;
+      *) warn "Please answer y or n; Enter means no." >&2 ;;
+    esac
+  done
+}
+
+# The control decision for one reply at a free-text value prompt, shared by ask
+# and ask_default. Returns 0 = treat the reply as data, 2 = an explanation was
+# shown, ask again, and otherwise the prompt contract's own statuses.
+value_prompt_control() { # value_prompt_control <reply> [action-id] [allow-back]
+  local reply="$1" action="${2:-}" allow_back="${3:-false}"
+  case "$reply" in
+    [iI])
+      prompt_wants_literal "$reply" "showing an explanation"
+      case $? in 0) return 0 ;; 2) return 1 ;; esac
+      explain_prompt "$action" >&2
+      return 2 ;;
+    [qQ])
+      prompt_wants_literal "$reply" "stopping the run"
+      case $? in 0) return 0 ;; 2) return 1 ;; esac
+      return 11 ;;
+    [bB])
+      # Back is not advertised here, so it is not a control here — a prompt that
+      # took "b" as a control it never offered would be the same defect this
+      # contract exists to prevent, pointing the other way.
+      case "$allow_back" in true|1|yes) ;; *) return 0 ;; esac
+      prompt_wants_literal "$reply" "going back"
+      case $? in 0) return 0 ;; 2) return 1 ;; esac
+      return 10 ;;
+  esac
+  return 0
+}
+
+# The caller side of the contract, in one line per call site:
+#
+#   prompt_into GW_NAME ask "  A short name for it" "My gateway" "" "gateway.custom.name"
+#   prompt_into GW_URL ask_url "Its address" "https://ai.example.com" 0 "" "id" true || return 10
+#
+# It returns 0 with the answer in the named variable, or 10 when the user went
+# back — and 10 is only reachable if this call passed allow-back, so a call site
+# that never offers Back can ignore the failure branch entirely. It deliberately
+# does NOT return for q or for a closed stdin: acting on those is the whole reason
+# it exists, and it can only be done here, in the parent shell, outside the $(…)
+# the primitive ran in.
+prompt_into() { # prompt_into <variable> <primitive> [primitive args…]
+  local __var="$1" __value __rc=0
+  shift
+  __value=$("$@") || __rc=$?
+  case "$__rc" in
+    0)  printf -v "$__var" '%s' "$__value"; return 0 ;;
+    10) return 10 ;;
+    11) quit_run ;;
+    *)  die "$NO_ANSWER" ;;
+  esac
+}
+
+confirm() {  # confirm "question" [action-id] [allow-back] -> 0 yes / 1 no / 10 back
+  local reply action="${2:-general}" allow_back="${3:-false}" p question
+  p="$1 [y/N] ($(control_suffix "No" "$allow_back")): "
+  # Most call sites indent their question for the screen; the EOF line below
+  # quotes it mid-sentence, where that indent would read as a typo.
+  question="${1#"${1%%[![:space:]]*}"}"
+  while true; do
+    prompt_echo "$p"
+    if ! read -r -p "$p" reply; then
+      # No is the safe reading of a closed stdin, so that is the answer — but said
+      # out loud. Silently, it is indistinguishable from a deliberate No, and a
+      # truncated pipe then declines every gate in the run without a word. Naming
+      # the question is what makes the transcript diagnosable afterwards: a "No"
+      # attributed to the wrong step is guesswork three screens later.
+      warn "No answer — treating this as No: $question"
+      return 1
+    fi
     case "$reply" in
       [yY]|[yY][eE][sS]) return 0 ;;
       ''|[nN]|[nN][oO]) return 1 ;;
@@ -516,25 +1205,69 @@ confirm() {  # confirm "question" [action-id] [allow-back] -> 0 yes / 1 no / 10 
   done
 }
 
-ask() {  # ask "prompt" "default" [blank-meaning] -> echoes answer
-  local reply blank_meaning="${3:-leave blank}"
-  if [ -n "${2:-}" ]; then
-    read -r -p "$1 (Enter = $2): " reply
+# Free-text value prompt. Captured with $(…), so every human-facing line goes to
+# stderr and the controls travel out on the exit status (see the contract above).
+ask() {  # ask "prompt" "default" [blank-meaning] [action-id] [allow-back] -> answer on stdout
+  local reply default="${2:-}" blank_meaning="${3:-leave blank}"
+  local action="${4:-}" allow_back="${5:-false}" enter p rc
+  if [ -n "$default" ]; then enter="$default"; else enter="$blank_meaning"; fi
+  p="$1 ($(control_suffix "$enter" "$allow_back")): "
+  while true; do
+    prompt_echo "$p"
+    if ! read -r -p "$p" reply; then
+      ask_report_no_answer "$default" "$blank_meaning"
+      printf '%s' "$default"; return 0
+    fi
+    value_prompt_control "$reply" "$action" "$allow_back"; rc=$?
+    case "$rc" in
+      0) printf '%s' "${reply:-$default}"; return 0 ;;
+      2) continue ;;
+      1) ask_report_no_answer "$default" "$blank_meaning"
+         printf '%s' "$default"; return 0 ;;
+      *) return "$rc" ;;
+    esac
+  done
+}
+
+# EOF at a defaulted value prompt takes the default — that is what makes a
+# scripted run reproducible — but never in silence. A piped run that accepts
+# $HOME/.openclaw/workspace as "the agent's working folder" with nobody in the
+# room has to leave a trace that the question went unanswered; without one, the
+# transcript records a decision that no person made.
+ask_report_no_answer() { # ask_report_no_answer <default> <blank-meaning>
+  if [ -n "$1" ]; then
+    warn "No answer — using the default: $1" >&2
   else
-    read -r -p "$1 (Enter = $blank_meaning): " reply
+    warn "No answer — leaving this blank ($2)." >&2
   fi
-  printf '%s' "${reply:-${2:-}}"
 }
 
 # Value prompt with a clear, visually-distinct default (NOT a [y/N]). Echoes the
 # resolved value back so a mis-typed answer is obvious immediately.
-ask_default() {  # ask_default "prompt" "default" -> echoes resolved value
-  local reply
+ask_default() {  # ask_default "prompt" "default" [action-id] [allow-back] -> resolved value
+  local reply default="$2" action="${3:-}" allow_back="${4:-false}" p rc
   say "  $1" >&2
-  read -r -p "  Press Enter to use: $2  (or type a value) > " reply
-  reply="${reply:-$2}"
-  printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2
-  printf '%s' "$reply"
+  # "Press Enter to use: X" already says what Enter does, so only the keys are
+  # appended here — repeating "Enter = X" on the same line would read as a second,
+  # different default.
+  p="  Press Enter to use: $default  (or type a value; $(control_keys "$allow_back")) > "
+  while true; do
+    prompt_echo "$p"
+    if ! read -r -p "$p" reply; then
+      ask_report_no_answer "$default" ""
+      printf '%s' "$default"; return 0
+    fi
+    value_prompt_control "$reply" "$action" "$allow_back"; rc=$?
+    case "$rc" in
+      0) reply="${reply:-$default}"
+         printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2
+         printf '%s' "$reply"; return 0 ;;
+      2) continue ;;
+      1) ask_report_no_answer "$default" ""
+         printf '%s' "$default"; return 0 ;;
+      *) return "$rc" ;;
+    esac
+  done
 }
 
 # Secret prompt — never echoes the input to the terminal.
@@ -543,12 +1276,32 @@ ask_default() {  # ask_default "prompt" "default" -> echoes resolved value
 # keyless scheme, while EOF means nobody was asked at all. Callers that treat an
 # empty token as "keyless" MUST pair this with `|| die`, or a redirected run would
 # infer no-auth from a missing answer — the fail-closed-auth invariant.
-ask_secret() {  # ask_secret "prompt" "empty-meaning" -> secret (hidden); 1 on EOF
-  local reply rc=0 empty_meaning="${2:-leave empty}"
-  read -rs -p "  $1 (Enter = $empty_meaning): " reply || rc=1
-  printf '\n' >&2
-  printf '%s' "$reply"
-  return $rc
+#
+# `i` and `q` are read as controls here with NO "did you mean it literally?"
+# question, unlike the visible value prompts. A bearer token that is exactly one
+# character is not a real token, so there is nothing to disambiguate — and the two
+# failure modes are wildly asymmetric. Taking `q` as a control costs a stopped run
+# the operator asked for; taking it as data costs a run that authenticates with
+# the single byte "q", fails verification minutes later somewhere else entirely,
+# and gives nobody a reason to suspect the keystroke that caused it. Back is not
+# offered at all: a hidden prompt has no visible state to return to.
+ask_secret() {  # ask_secret "prompt" "empty-meaning" [action-id] -> secret (hidden); 1 EOF, 11 stop
+  local reply empty_meaning="${2:-leave empty}" action="${3:-}" p
+  p="  $1 (Enter = $empty_meaning; $(control_keys false)): "
+  while true; do
+    prompt_echo "$p"
+    if ! read -rs -p "$p" reply; then
+      printf '\n' >&2
+      return 1
+    fi
+    printf '\n' >&2
+    case "$reply" in
+      [iI]) explain_prompt "$action" >&2; continue ;;
+      [qQ]) return 11 ;;
+    esac
+    printf '%s' "$reply"
+    return 0
+  done
 }
 
 # A choice with NO Enter-default — loops until the answer matches the regex.
@@ -559,21 +1312,43 @@ ask_secret() {  # ask_secret "prompt" "empty-meaning" -> secret (hidden); 1 on E
 # must be the one to stop (every caller pairs this with `|| die`).
 # Optional 3rd arg names an action id or help function: answering `i` (or the
 # older `?` alias) prints it and re-asks. `q` is always recognised, even when the
-# caller's own regex does not list it. Because callers capture this function with
-# $(), it ECHOES the literal sentinel `q`; the parent caller must call quit_run.
+# caller's own regex does not list it, and leaves on rc 11 for the parent to act
+# on — the same status every other captured primitive uses.
 # Help is ADDITIVE only — it explains the same options in plain words, never
 # changes them (the canonical menu/prompt strings stay the single source).
 # The help function's stdout is redirected to stderr here, same $()-capture rule.
-require_choice() {  # require_choice "prompt" "regex" [action-id | help-fn] -> choice | q
-  local reply
+#
+# allow_back makes the PRIMITIVE render `b = back` and own the refusal wording,
+# so the one prompt where Back genuinely works cannot be the one whose control
+# list denies it. When it is off, `b` falls through to the caller's own regex, so
+# a menu whose pattern already admits it still honours it — the suffix never
+# claims a control this prompt would refuse, and never hides one it would accept.
+#
+# The Enter clause says what Enter DOES. "No default" would describe the
+# implementation — that no default value is bound here — in the one place the
+# reader is looking for an answer to "what happens if I press Enter?", and this is
+# the very first prompt the tool ever shows.
+require_choice() {  # require_choice "prompt" "regex" [action-id | help-fn] [allow-back] -> choice
+  local reply action="${3:-general}" allow_back="${4:-false}" p
+  p="  $1 ($(control_suffix "ask again" "$allow_back")): "
   while true; do
-    read -r -p "  $1 (Enter = no default; i = explain; q = stop): " reply \
+    prompt_echo "$p"
+    read -r -p "$p" reply \
       || return 1     # closed stdin — never spin the loop
     case "$reply" in
-      [iI]|\?) explain_prompt "${3:-general}" >&2; continue ;;
-      [qQ]) printf 'q'; return 0 ;;
+      [iI]|\?) explain_prompt "$action" >&2; continue ;;
+      [qQ]) return 11 ;;
+      [bB]) case "$allow_back" in true|1|yes) return 10 ;; esac ;;
+      # Enter is now an advertised no-op, so it re-asks without being told off;
+      # the reminder is a note rather than a warning because pressing Enter at a
+      # question with no default is not a mistake, it is a pause.
+      '') note "Nothing chosen — the options are above." >&2; continue ;;
     esac
     if [[ "$reply" =~ $2 ]]; then printf '%s' "$reply"; return 0; fi
+    case "$reply" in
+      [bB]) warn "Back is not available at this step; choose one of the options above, i for an explanation, or q to stop." >&2
+            continue ;;
+    esac
     if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
     warn "Please enter one of the listed options." >&2
   done
@@ -585,16 +1360,32 @@ NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask 
 # (or blank, when allow_blank=1, where leaving it out is a valid choice). Trims
 # whitespace, accepts a capitalised scheme, always shows an example. All human
 # output goes to stderr so $(...) captures only the URL.
-ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] -> URL or ""
+#
+# The controls are checked BEFORE any trimming or validation, and with no
+# "did you mean it literally?" question: nothing that fails the https:// test can
+# be a legal answer here, so `i`, `b` and `q` are unambiguous. Without them the
+# loop has no exit at all, and that matters more here than anywhere else — both
+# mandatory call sites sit immediately after a commitment the user may have made
+# wrongly, and Ctrl-C, the only remaining way out, throws away every answer given
+# so far, because nothing is saved until pairing.
+ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] [action-id] [allow-back] -> URL or ""
   local prompt="$1" example="$2" allow_blank="${3:-0}"
-  local blank_meaning="${4:-skip}" reply
+  local blank_meaning="${4:-skip}" action="${5:-}" allow_back="${6:-false}"
+  local reply enter p
   say "  $prompt" >&2
+  if [ "$allow_blank" = "1" ]; then enter="$blank_meaning"; else enter="ask again"; fi
+  p="  https URL (e.g. $example; $(control_suffix "$enter" "$allow_back")) > "
   while true; do
-    if [ "$allow_blank" = "1" ]; then
-      read -r -p "  https URL (e.g. $example; Enter = $blank_meaning) > " reply || return 1
-    else
-      read -r -p "  https URL (e.g. $example; Enter = no default) > " reply || return 1
-    fi
+    prompt_echo "$p"
+    read -r -p "$p" reply || return 1
+    case "$reply" in
+      [iI]) explain_prompt "$action" >&2; continue ;;
+      [qQ]) return 11 ;;
+      [bB])
+        case "$allow_back" in true|1|yes) return 10 ;; esac
+        warn "Back is not available at this step; type an https:// URL, i for an explanation, or q to stop." >&2
+        continue ;;
+    esac
     reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
     while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done   # trailing / would make //v1/… requests
     if [ -z "$reply" ]; then
@@ -853,19 +1644,29 @@ print_and_wait() {  # print_and_wait "action-id" "why" "command shown to user"
   printf '    %s%s%s\n' "$BOLD" "$command" "$RESET"
   say ""
   note "$why"
-  local reply
+  # Enter means NO here, exactly as it does at every confirm on screen, and the
+  # match is the whole point: this prompt and a mutation gate sit six lines apart
+  # in the gateway step. If Enter here asserted "yes, I already ran your command",
+  # anybody in Enter-rhythm would claim to have applied a config change they never
+  # applied — and the tool would diagnose the verification failure that causes as a
+  # gateway fault, sending them to look in the one place the problem is not. An
+  # assertion about what the user did costs a deliberate keystroke; skipping does
+  # not. `s` stays an alias for skip: it is the documented key and it still fits.
+  local reply p
+  p="  Did you run it? [y/N] ($(control_suffix "No, skip" false)): "
   while true; do
-    if ! read -r -p "  Enter = I ran it; s = skip; i = explain; q = stop: " reply; then
+    prompt_echo "$p"
+    if ! read -r -p "$p" reply; then
       warn "No answer — treating this step as skipped."
       return 1
     fi
     case "$reply" in
-      '') return 0 ;;
-      [sS]) return 1 ;;
+      [yY]|[yY][eE][sS]) return 0 ;;
+      ''|[nN]|[nN][oO]|[sS]) return 1 ;;
       [iI]|\?) explain_prompt "$action" ;;
       [qQ]) quit_run ;;
       *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
-         warn "Please press Enter only after running it, s to skip, i for an explanation, or q to stop." ;;
+         warn "Please answer y once you have run it, press Enter to skip it, i for an explanation, or q to stop." ;;
     esac
   done
 }
@@ -1132,246 +1933,462 @@ apply_gateway_url_normalization() { # rewrites GW_URL in place; says so when it 
     GW_URL="$norm"
   fi
 }
-
-OS="$(uname -s)"   # Linux | Darwin
-# ${HOME:-} so a check run in a HOME-less environment (a bare CI shell) doesn't
-# abort here under `set -u` on a path it never uses; the wizard would fail later
-# anyway if it genuinely needed a state dir, which is the correct place to notice.
-STATE_DIR="${XDG_CONFIG_HOME:-${HOME:-}/.config}/conduck"
 # ----------------------------------------------------------- explanations --
 
 # Small, reusable information panels for the interactive setup flow. The caller
 # decides when to offer them (normally the visible `i` affordance) and redirects
 # stdout to stderr when it is collecting an answer with command substitution.
 #
-# These panels explain ONE current decision. "Later" is deliberately about
+# These panels explain ONE current decision. "Afterwards" is deliberately about
 # persistence or a concrete inverse action, never a promise that Back, Ctrl-C, a
 # failed later step, or a re-run rolls the setup back. WHAT-IT-TOUCHES.md is the
 # detailed authority; this catalog is its concise, in-flow counterpart.
-explain_panel() { # explain_panel <about> <why> <does> [if-skipped] [later]
+#
+# THE WRITING RULE, and it is the whole point of the file: `i` is what a person
+# presses because a word on the screen defeated them. An explanation may
+# therefore never lean on a term the prompt it explains was already unclear
+# about — "port", "loopback", "exposure", "reverse proxy", "keyless", "WebDAV"
+# each get glossed in the sentence that first uses them, or they do not appear.
+# The bar to write to is `explain_exposure_paths` in 30-exposure.inc.sh: fixed
+# human labels, plain words, honest about cost, and it ends by telling an unsure
+# reader what to do. Every value prompt's panel ends the same way, with the
+# `unsure` field — because a person who does not know the answer needs a
+# direction more than they need a definition.
+#
+# TERMINOLOGY, fixed, because the app and this script have to agree:
+#   setup code       the QR/paste string the app scans. Never "pairing code" —
+#                    the app says "setup code" and has never said the other.
+#   conduck-connect  this program. Never "the connector", never "the helper".
+#   wizard           the `--setup` flow specifically, not the program.
+#   gateway          the user's own AI server. Glossed on first use in any
+#                    panel a first-time reader can reach.
+#
+# EVERY ARM HERE HAS A CALLER. Copy no prompt can reach is copy nobody
+# maintains against the screen it claims to describe, and it makes the catalog
+# look twice as covered as it is. When you add an arm, wire the call site in the
+# same change; when you delete a call site, delete its arm. Panels that describe
+# a whole COMMAND rather than one question live at the bottom of this file as
+# named functions instead — `explain_prompt` resolves a function name before it
+# tries the catalog, so those double as an opening block and as a prompt's `i`.
+
+explain_panel() { # explain_panel <about> <why> <does> [if-skipped] [afterwards] [unsure]
   local about="$1" why="$2" does="$3"
-  local skipped="${4:-}" later="${5:-}"
+  local skipped="${4:-}" afterwards="${5:-}" unsure="${6:-}"
 
   say ""
   say "  ${BOLD}About this step:${RESET} $about"
   [ -z "$why" ] || say "  ${BOLD}Why:${RESET} $why"
   [ -z "$does" ] || say "  ${BOLD}It does:${RESET} $does"
   [ -z "$skipped" ] || say "  ${BOLD}If skipped:${RESET} $skipped"
-  [ -z "$later" ] || say "  ${BOLD}Later:${RESET} $later"
+  # "Afterwards" rather than a shorter label, because the field answers "what is
+  # still true once this is done, and how do I put it back" — a purpose no
+  # reader could infer from a bare adverb, and the field is useless the moment
+  # its heading has to be guessed at.
+  [ -z "$afterwards" ] || say "  ${BOLD}Afterwards:${RESET} $afterwards"
+  # Last on purpose: it is what a stuck reader is looking for, so it is the line
+  # their eye lands on when the panel stops.
+  [ -z "$unsure" ] || say "  ${BOLD}Honestly unsure?${RESET} $unsure"
   say ""
 }
 
-# Copy catalog for the bounded choices and consent gates in setup. IDs are
-# internal, stable spellings for prompt call sites; they are never user input.
+# Copy catalog for the bounded choices, value prompts, and consent gates in
+# setup. IDs are internal, stable spellings for prompt call sites; they are
+# never user input.
 explain_action() { # explain_action <action-id>
   local action_id="${1:-}"
 
   case "$action_id" in
     general)
       explain_panel \
-        "Review the current setup question" \
-        "This choice controls only the action described immediately above it." \
-        "An explanation changes no answer and performs no action; the same question is shown again." \
-        "Saying No leaves this action undone." \
-        "No, Back, stop, and re-running do not undo actions you already approved."
+        "Review the question printed just above this" \
+        "Your answer controls only the one action described directly above the prompt — nothing else in the run, and nothing you already approved." \
+        "Reading an explanation changes no answer and does nothing to this machine; the same question comes back afterwards." \
+        "Saying No leaves that one action undone. The run carries on and tells you what it could not do." \
+        "No, Back, stopping, and re-running me do not undo changes you already approved."
       ;;
 
-    nav.main|main-menu)
-      explain_panel \
-        "Choose what conduck-connect should do" \
-        "Setup pairs a gateway; the two checks answer narrower compatibility questions; a saved code pairs another device." \
-        "Only setup may offer host changes. Checks send live requests, and showing a saved code runs live verification." \
-        "Nothing starts until you choose an option." \
-        "Gateway, user-owned configuration, and network exposure changes still have their own preview or approval; connector bookkeeping stays inside the setup action you chose."
+    nav.main)
+      # The entry point is not a step inside a wizard, and the
+      # About/Why/It does/If skipped template is the wrong shape for it: nobody
+      # standing at the front door has asked "what does this one question do".
+      # They have asked what the program is, what they are left holding, what it
+      # will touch, and how to look without committing — four questions, four
+      # labelled answers, in the order a stranger asks them.
+      say ""
+      say "  ${BOLD}What this is${RESET}"
+      say "  conduck-connect is a setup script. It takes an AI gateway that is already"
+      say "  running on this machine and connects it to the Conduck app on your phone,"
+      say "  tablet, or Mac. \"Gateway\" is just the program your AI actually runs in —"
+      say "  OpenClaw and Hermes are two of them, and so is anything that speaks the"
+      say "  OpenAI API (Ollama, LM Studio, LiteLLM, vLLM, something you wrote"
+      say "  yourself). If somebody installed one of those here for you, that is your"
+      say "  gateway, and option 1 is yours."
+      say ""
+      say "  ${BOLD}What you end up with${RESET}"
+      say "  Two things. An encrypted web address (one starting https://) that reaches"
+      say "  your gateway from outside this machine, and a setup code — printed as a"
+      say "  QR square you point your phone's camera at. One scan and the app is"
+      say "  connected: address, key, and file settings all imported, nothing to"
+      say "  retype. So keep the phone next to you, with Conduck already installed."
+      say ""
+      say "  ${BOLD}How long${RESET}"
+      say "  Usually ten to twenty minutes the first time, and most of that is reading"
+      say "  and deciding rather than waiting. Adding a second device afterwards takes"
+      say "  under a minute."
+      say ""
+      say "  ${BOLD}What changes on this machine${RESET}"
+      say "  At most four things: one setting switched on inside your gateway's own"
+      say "  config file, an encrypted front door for it (Tailscale or Cloudflare do"
+      say "  this for free), and — only if you ask for file transfer — one shared"
+      say "  folder plus one small file server. You are shown the exact command, or"
+      say "  the exact before-and-after text, and asked before each one."
+      say ""
+      # "No accounts, no telemetry" is absolute and stays unqualified. "Nothing goes
+      # anywhere except your own gateway" is NOT true and must never be said here:
+      # the sentence two lines up names Tailscale and Cloudflare, and choosing either
+      # runs the operator's own client against that vendor. Claiming otherwise in the
+      # same paragraph that names them is the kind of contradiction a skeptical reader
+      # finds first, and it costs more trust than the reassurance buys. So this says
+      # the part that is true absolutely, then names the one exception plainly.
+      say "  No accounts, and no telemetry ever — there is no collection endpoint"
+      say "  anywhere in this file. The only thing it talks to besides your own"
+      say "  gateway is the front-door tool you pick, and it asks first."
+      say ""
+      # The menu is a hub — every action ends by OFFERING the list again, on `m` —
+      # and a stranger cannot see that from three lines and a prompt. Without it,
+      # "which of these three am I" reads as a one-shot commitment, which is
+      # exactly the pressure that makes somebody guess. It says "offers", not
+      # "returns": the default at that last question is to finish, and a panel
+      # that promised an automatic return would be describing a keystroke the
+      # reader has to press.
+      say "  ${BOLD}If you pick the wrong one${RESET}"
+      say "  It costs you the time and nothing else. Options 2 and 3 only ask"
+      say "  questions and report — they change nothing at all — and every option"
+      say "  ends by offering you this list again, so one wrong turn costs one"
+      say "  action rather than the whole session. Setting up and pairing is the"
+      say "  only option that changes anything, and it asks before each change."
+      say ""
+      say "  ${BOLD}To look without committing${RESET}"
+      say "  Press q to stop, then run:"
+      say "    ${BOLD}bash conduck-connect.sh --setup --dry-run${RESET}"
+      say "  It asks the same questions, never asks for a password, and prints the"
+      say "  list of things a real run would do — without doing any of them."
+      say ""
       ;;
 
-    nav.gateway|gateway-selection)
+    nav.gateway)
       explain_panel \
-        "Choose the gateway Conduck will talk to" \
-        "The gateway supplies the chat or full agent turn behind the Conduck client." \
-        "Reads the usual OpenClaw and Hermes locations, reports what it finds, and records only your explicit choice for this run." \
-        "Setup cannot continue until a gateway is chosen." \
-        "Returning here changes the wizard's route only; host changes you already approved stay in place."
+        "Pick which AI gateway on this machine Conduck should talk to" \
+        "A gateway is the program your AI actually runs in; the Conduck app is only the phone, tablet, or Mac front end for it. OpenClaw and Hermes are two such programs this script knows by name and can configure for you. Anything else that speaks the OpenAI API — Ollama, LM Studio, LiteLLM, vLLM, an adapter you wrote — is the third option." \
+        "Looks in the usual install locations for OpenClaw and Hermes and reports what it found. Picking a name reads that gateway's own config file to learn its address and settings; it changes nothing yet." \
+        "Setup cannot go on without knowing which program to point the app at." \
+        "Coming back to this question changes only the route through the remaining questions. Anything you already approved stays applied." \
+        "If somebody set this machine up for you, the name they used is the answer. If you installed something yourself and it is not called OpenClaw or Hermes, take the third option — it covers everything else."
       ;;
 
     nav.saved_profile)
       explain_panel \
-        "Choose which saved gateway code to re-show" \
-        "Each non-secret profile records routing facts for one earlier successful setup." \
-        "Selects one profile for drift checks, secret re-derivation, live verification, and code output; this menu changes nothing." \
-        "No saved gateway is selected and no code is shown." \
-        "The profile is not rewritten, whichever one you choose."
+        "Pick which already-paired gateway to show the setup code for again" \
+        "Every finished setup leaves behind a small record of where that gateway lives and how to reach it — no passwords, just the routing. This is how you pair a second device without walking the whole setup again." \
+        "Takes the one you pick, re-reads its password from wherever that password really lives, checks that the address still answers, and prints the setup code. This menu itself does nothing." \
+        "No gateway is picked and no setup code is shown." \
+        "The saved record is not rewritten, whichever one you pick." \
+        "Pick the one whose name you recognise from the app. Picking the wrong one costs nothing — you can run this again."
       ;;
 
     nav.custom_gateway_pick)
       explain_panel \
-        "Choose whether this is a gateway you already set up, or a new one" \
-        "A gateway is filed under an id derived from its name, and that id also names its file-service and credential — so retyping a name inexactly would build a second gateway rather than change the first." \
-        "Selecting a listed gateway keeps its existing id and asks for its current address and token; choosing the last option starts a new gateway with a name not already in use." \
-        "No gateway is selected and setup cannot continue past this question." \
-        "Nothing is changed by choosing: a selected gateway's saved setup is only rewritten once this run verifies successfully."
+        "Say whether this is a server you set up here before, or a brand new one" \
+        "Each server is filed under a short internal name made from the name you typed, and that same internal name is used for its file service and its stored password. Retyping the name even slightly differently would build a SECOND server here rather than updating the first." \
+        "Picking one from the list keeps its existing internal name and just asks for its current address and password. Picking the last option starts a new one, under a name not already in use." \
+        "Nothing is picked and setup cannot continue past this question." \
+        "Choosing changes nothing by itself: a server you picked is only rewritten once this run has verified it end to end." \
+        "If you have paired this same machine's server before — even if its address has changed since — pick it from the list. Start a new one only for a server you have genuinely never paired."
       ;;
 
-    check.continue_setup|nav.continue_after_check|continue-after-check)
+    check.continue_setup)
       explain_panel \
-        "Continue from a passing check into setup and pairing" \
-        "The check proved this address speaks the wire format Conduck needs; setup can now make it reachable over HTTPS and print a code." \
-        "Reuses the checked URL and authentication in memory, then starts the normal consented setup flow." \
-        "The passing check ends without making setup changes." \
-        "The token is not saved by the check; setup still verifies the final app-facing address."
+        "Go straight from a passing check into setup and pairing" \
+        "The check just proved this address answers in the format the Conduck app needs. Setup is the next part: giving it an encrypted web address and printing the code your phone scans." \
+        "Reuses the address and password already in memory from the check, then starts the normal setup questions — each change still asks first." \
+        "The check ends here and nothing on this machine is set up or changed." \
+        "The check did not store the password; setup will still verify the final address the app is actually given." \
+        "Say yes. The check cost you the typing already, and setup asks before every change it makes."
       ;;
 
-    gateway.custom.has_https|gateway.custom.address|custom-address)
+    gateway.custom.has_https)
       explain_panel \
-        "Tell setup whether this server already has HTTPS" \
-        "Conduck accepts an HTTPS address; a loopback-only server still needs an exposure path." \
-        "Chooses whether to ask for an existing HTTPS URL or the server's local listening port." \
-        "Choosing No asks for the server's local port, then offers an HTTPS exposure path." \
-        "This choice changes no server configuration by itself."
+        "Say whether your server already answers on an address starting with https://" \
+        "The Conduck app talks only to encrypted addresses — that is what the s on the end of https means — and the encryption certificate has to be one your phone already trusts on its own. A server started at home normally answers only on the machine it runs on, which is not that." \
+        "Yes asks you for that address next. No asks instead for the port number your server listens on locally, and then helps you put an encrypted address in front of it — Tailscale and Cloudflare both do that part for free." \
+        "" \
+        "Either answer by itself changes nothing about your server." \
+        "Answer No, which is what Enter does. Unless you deliberately set up a domain name and a certificate for this server, or somebody handed you an https:// address for it, you do not have one — and No is the path that builds you one."
       ;;
 
-    gateway.custom.has_auth|gateway.custom.auth|gateway-auth)
+    # For the https:// address prompt itself (20-gateway.inc.sh, the ask_url that
+    # follows a Yes at gateway.custom.has_https). Its whole difficulty is that
+    # people paste the address of a chat page, or an address with /v1 on the end.
+    gateway.custom.address)
       explain_panel \
-        "Describe how this gateway authenticates clients" \
-        "Conduck must store an explicit bearer or keyless mode; a missing token is never silently treated as keyless." \
-        "Takes the token at a hidden prompt that shows nothing as you type, so a paste is never echoed to the screen or left in scroll-back; an empty answer asks you to confirm keyless rather than assuming it." \
-        "Choosing keyless means anyone who can reach the address can use what the gateway permits." \
-        "Setup refuses to publish a keyless gateway unless the expert override was supplied."
+        "Type the https:// address that already reaches this server from outside" \
+        "This is the address the app itself will call, from a phone that may be nowhere near this machine, so it has to work from the open internet or from your VPN — not just from this desk." \
+        "Give the BASE address only, with no /v1 and no other path on the end: this script and the app add the rest themselves (a pasted /v1 tail is trimmed off for you). A trailing slash is trimmed too." \
+        "" \
+        "Nothing about your server or your proxy is reconfigured; the address is checked and then used." \
+        "If you cannot name an https:// address you set up on purpose, you probably do not have one. Press b if it is offered, or stop with q and start again answering No at the previous question — setup will build you an encrypted address for free."
       ;;
 
-    gateway.custom.model|model-choice)
+    # For the "A short name for it (shown in the app)" prompts. The answer is a
+    # label and nothing more — but a lossy short form of it becomes the permanent
+    # id, so the derivation is stated in full rather than sketched. The cut at 32
+    # characters is the half that actually surprises people: two descriptive names
+    # that differ only in their tail land on ONE id, and a reader told merely that
+    # spaces become hyphens has no way to predict it. Stating the whole rule here
+    # is what makes it possible to pick a second name that will not collide; the
+    # refusal screen says the same thing, but only after the collision.
+    gateway.display_name)
       explain_panel \
-        "Choose the model name Conduck will send" \
-        "Some OpenAI-compatible servers require a model on every request; others choose their own default." \
-        "Stores the selected model in the pairing payload and sends it on later Conduck turns." \
-        "A blank value leaves model selection to the server." \
-        "This does not load, install, or change a model on the server."
+        "Give this gateway a short name for your own benefit" \
+        "It is a label, nothing else. It appears in the Conduck app's gateway list so you can tell this one apart from another, and it is what this script calls it the next time you run setup." \
+        "Records the name for the setup code and for the saved record. It contacts nothing and configures nothing. A short form of the name — lowercased, with every character that is not a letter or a digit turned into a hyphen, and then cut to the first 32 characters — is put after \"custom-\" to make the id this machine files the gateway's settings, its file service and its stored password under. That id is the \"Filed under\" line on the review screen a few questions from now." \
+        "" \
+        "That cut is worth one moment's thought: two names that read as obviously different can produce the same id if they match for their first 32 characters, and this machine can only hold one gateway per id. Setup refuses the second one rather than overwriting the first, and names which gateway it collided with. You can change the display name later by re-running setup and picking this gateway; the id it was first given stays as it is, so its settings, service, and stored password all keep matching." \
+        "Press Enter and take the suggested name. Nothing depends on it, and \"Mac mini\" or \"work agent\" beats a name you will not recognise in a month — or a long sentence whose first 32 characters are the same as the last gateway's."
+      ;;
+
+    gateway.custom.has_auth)
+      explain_panel \
+        "Say whether this server checks for a secret key before it answers" \
+        "Most servers want a key — a long random string, sometimes called an API key or a bearer token — sent with every request, and refuse anyone who cannot produce it. Some are set up with no key at all, which means anyone who can reach the address can use it." \
+        "Takes the key at a hidden prompt: nothing at all appears as you type, so a paste never lands on screen or in your scroll-back. The key rides inside the setup code your phone scans and is never written to this machine's saved record. Pressing Enter with nothing typed does not quietly mean \"no key\" — it opens a separate question that makes you say so." \
+        "" \
+        "No key means anyone who reaches the address can use whatever your gateway allows. Setup refuses to put a no-key server on a public address unless you explicitly override it." \
+        "Look at how the server was started, or at the config file your gateway was given. If you were handed a long random string when it was installed, that is the key. If you never saw one, and the server only answers on this machine, it is probably keyless."
+      ;;
+
+    # For the hidden token prompts themselves (the custom-gateway key, OpenClaw's
+    # and Hermes's, the two check commands' bearer prompt, and --show-code's
+    # re-entry). It answers the one question the hidden prompt cannot: where does
+    # this string come from.
+    #
+    # It must NOT promise one behaviour for Enter. Six prompts share this panel and
+    # they part company on exactly that keystroke: three stop the run because the
+    # gateway they are asking for cannot be keyless, one offers keyless behind a
+    # separate confirmation, and the two check commands grade the server keyless
+    # straight away. Naming one of the three would be false at four call sites and
+    # read as authoritative at all six, so the panel points at the Enter clause the
+    # prompt itself is already printing — the one statement that is right wherever
+    # the reader is standing.
+    gateway.token)
+      explain_panel \
+        "Paste the secret key your server checks on every request" \
+        "Without it the server answers every request with a refusal, and the app would be paired to an address it can never use." \
+        "Nothing appears on screen while you type or paste — that is deliberate, not a frozen prompt. The key travels inside the setup code your phone scans and is never written into the record this script saves, which is why --show-code has to ask you for it again." \
+        "" \
+        "Nothing on the server changes. If you later rotate the key, re-run setup or --show-code and pair the devices again with the new one." \
+        "It is wherever your gateway was configured: the line in its config file or its start-up command that names a key or token, or the string whoever installed it wrote down for you. If your server genuinely has no key, Enter is safe to try — an empty answer is never read as a quiet yes here. The prompt line above says what it does: stop, offer keyless and make you confirm it, or grade the server keyless and say so."
+      ;;
+
+    # Three prompts share this panel and they do NOT share an Enter: the
+    # three-way menu for a gateway being changed, a plain blank-means-blank prompt,
+    # and — where the server reported exactly one model — a prompt with that name
+    # already filled in. A flat "leave it blank" would be advice to delete the
+    # single correct answer at the third, so the panel sends the reader to the
+    # prompt's own Enter clause instead of naming one keystroke for all three.
+    gateway.custom.model)
+      explain_panel \
+        "Choose which model name the app should send with every message" \
+        "Some servers hold several models and insist that each request names the one to use; others have a single default and ignore what you name. A model name is a plain string like \"llama3.1\" or \"gpt-4o-mini\" — it is a label the server recognises, not a file you have to install." \
+        "Records the name and sends it in the app's later requests. It does not download, install, or switch a model on the server." \
+        "Where the prompt offers nothing, leaving it blank hands the choice to the server, which is right whenever the server has a default of its own." \
+        "This is stored with the gateway, so changing it later means re-running setup for this gateway." \
+        "Take whatever the prompt above says Enter does. Where your server reported exactly one model, that name is already filled in and is the answer; where nothing is offered, leave it blank — if the server needs a name it says so on the very first message, and re-running setup to add one takes a minute."
       ;;
 
     gateway.custom.port)
-      explain_panel \
-        "Enter the local port where this server listens" \
-        "Setup needs the loopback address before it can create or describe an HTTPS route to the server." \
-        "Validates a whole port number from 1 to 65535 and keeps it in memory for this run; it does not open, close, or rebind the port." \
-        "No local target is available for exposure or verification." \
-        "The server keeps its existing port configuration."
+      # The one question in the wizard whose reader most often does not know what
+      # the word in it means, so the panel starts from zero rather than from the
+      # program's own point of view. What the number IS and where to look come
+      # first; what setup then does with it is last, because nobody presses `i`
+      # here to learn about the script.
+      say ""
+      say "  ${BOLD}What a port number is${RESET}"
+      say "  One machine can run many programs that answer web requests at once. The"
+      say "  port number is how it keeps them apart — think of one street address"
+      say "  with numbered doors. Your AI server knocked on one of those doors when"
+      say "  it started, and I need to know which one so I can send requests to it"
+      say "  and to nothing else on this machine."
+      say ""
+      say "  ${BOLD}Where to find yours${RESET}"
+      say "  It is the number after the last colon in the address your server prints"
+      say "  when it starts up: listening on http://localhost:8080 means 8080. Look"
+      say "  in the terminal window where you started it, or in the notes of whoever"
+      say "  set it up."
+      say ""
+      say "  If the server names no address, these are the usual defaults:"
+      say "    Ollama      11434        LiteLLM   4000"
+      say "    LM Studio    1234        vLLM      8000"
+      say "  (Hermes's own agent server is 8642 — but if you run Hermes, stop and"
+      say "  start again choosing Hermes by name in Step 1, and I read its port"
+      say "  out of its config for you.)"
+      say ""
+      # The detected-ports picker in front of this reader is a shortlist, not an
+      # inventory, and both of its limits are invisible from the screen: it caps
+      # its rows, and it only offers the port range people normally start servers
+      # on. A reader whose server is missing concludes the machine is not running
+      # it — the one wrong conclusion this panel exists to prevent — so this
+      # section stays, and says WHY a real server can be absent from a list that
+      # looks complete. It is worded for both call sites: the picker, and the
+      # typed prompt reached by pressing `t` or by there being nothing to list.
+      # No count and no port range are quoted, because both live in
+      # 20-gateway.inc.sh and a number repeated here is a number that can drift.
+      say "  ${BOLD}If a list of listening programs did not have yours${RESET}"
+      say "  Where this machine has something obvious to offer, the question above"
+      say "  shows a shortlist of it and a ${BOLD}t${RESET} row for typing a number it did not"
+      say "  offer. The list is capped, and it skips the ports nobody starts an AI"
+      say "  server on, so a server can be missing from it and still be running"
+      say "  perfectly. To see everything this machine is listening on:"
+      if [ "${OS:-}" = "Darwin" ]; then
+        say "    ${BOLD}lsof -nP -iTCP -sTCP:LISTEN${RESET}"
+      else
+        say "    ${BOLD}ss -ltnp${RESET}   (or, if that is missing: ${BOLD}lsof -nP -iTCP -sTCP:LISTEN${RESET})"
+      fi
+      say "  Every listening program on this machine is printed with its port at the"
+      say "  end of the address column. Yours is the line naming your AI server."
+      say ""
+      say "  ${BOLD}What I do with it${RESET}"
+      say "  Only build the local address http://127.0.0.1:<your number>, which means"
+      say "  \"this machine, that door\", and use it to check the server answers and to"
+      say "  put an encrypted web address in front of it in the next step. Your server"
+      say "  is not restarted, moved, or reconfigured, and the number is not saved"
+      say "  anywhere until the whole setup succeeds."
+      say ""
+      say "  ${BOLD}Honestly unsure?${RESET}"
+      say "  Run the command above and try the likeliest number. Guessing wrong is"
+      say "  harmless: the next check simply reports that nothing answered there, and"
+      say "  you come straight back to this question."
+      say ""
       ;;
 
     gateway.custom.review)
       explain_panel \
-        "Review the custom gateway details gathered so far" \
-        "The next steps use this address, auth mode, and optional model to build the app-facing connection." \
-        "Shows the resolved choices for review; it does not contact or reconfigure the server by itself." \
-        "Setup does not proceed with details you have not accepted." \
-        "Returning to an earlier choice changes the wizard route only; approved host changes remain."
+        "Check the answers you have given before anything is applied" \
+        "This is the last point before setup starts using these details, and the cheapest place to catch a typed-in mistake — a mistyped model name or the wrong address costs a whole run to discover later." \
+        "Shows the answers back to you and waits. It does not contact your server or change anything at this point. \"Filed under\" is the one line you did not type: it is the id derived from the name, and it is what this machine's saved settings, file service and stored password are all named after — shown here because it is otherwise invisible until two gateways quietly share one." \
+        "" \
+        "Pressing b re-asks this short group of questions from the top and throws the draft away. Changes you approved earlier in the run stay applied." \
+        "Read the address line. If it names a machine and a number you recognise, press Enter; if anything on the screen surprises you, press b — re-answering costs a minute."
       ;;
 
-    gateway.openclaw.enable_chat|openclaw-chat-endpoint)
+    gateway.openclaw.enable_chat)
       explain_panel \
-        "Enable OpenClaw's OpenAI-compatible chat endpoint" \
-        "Without this endpoint the gateway can look healthy while Conduck has no chat route to call." \
-        "Uses OpenClaw's own config command to set the chat-completions flag. A JSON5 config may be rewritten as plain JSON and lose comments." \
-        "Conduck will not connect through this route." \
-        "Set the flag back to false and restart OpenClaw to reverse this specific change."
+        "Switch on OpenClaw's OpenAI-compatible chat endpoint" \
+        "OpenClaw ships with this switched off. Without it the gateway looks perfectly healthy while the Conduck app has no route to send a message to — the single most common reason a setup that looked fine does not work." \
+        "Runs OpenClaw's own config command to flip that one setting. If your config file is written in the JSON5 style, OpenClaw may rewrite it as plain JSON and drop any comments in it." \
+        "The app will not be able to connect through this gateway." \
+        "Set the same flag back to false and restart OpenClaw to reverse this one change."
       ;;
 
     gateway.openclaw.manual_enable_chat)
       explain_panel \
-        "Enable OpenClaw's chat endpoint on a non-standard install" \
-        "Without this endpoint the gateway can look healthy while Conduck has no chat route to call." \
-        "Prints OpenClaw's exact config command for you to run, followed by a restart using the method appropriate for your install." \
-        "The endpoint stays off and later verification is expected to fail." \
-        "Enter only reports that you ran it. The setting persists until you set it back to false and restart."
+        "Switch on OpenClaw's chat endpoint yourself, on an install I cannot drive" \
+        "Without that endpoint the gateway looks healthy while the Conduck app has no route to send a message to. Your OpenClaw is installed somewhere this script will not run commands against on your behalf." \
+        "Prints OpenClaw's exact config command for you to copy and run, then the restart appropriate to how yours was installed. This script runs neither of them." \
+        "Enter skips this step — the endpoint stays off, and the verification later in this run is expected to fail." \
+        "Answering y only tells me you ran it — I cannot see whether you did. Neither answer undoes anything already applied. Once the command has run, the setting stays on until you set it back to false and restart."
       ;;
 
-    gateway.hermes.accept_8645|hermes-proxy-port)
+    gateway.hermes.accept_8645)
       explain_panel \
-        "Continue with Hermes port 8645" \
-        "Port 8645 is the tool-less Hermes proxy, not the full-agent API server normally found on 8642." \
-        "Continues pairing a route that can chat but does not carry Hermes tools or skills." \
-        "Setup stops so you can correct API_SERVER_PORT first." \
-        "Changing to the full-agent port requires updating Hermes and re-running setup."
+        "Carry on using Hermes port 8645 anyway" \
+        "Hermes answers on two different doors, and they are not equivalent. 8645 is the plain proxy: it can chat, but it carries none of the agent's tools or skills. 8642 is the full agent server, which is normally what you want Conduck talking to." \
+        "Pairs the chat-only route. Everything will appear to work; the agent simply will not be able to use its tools." \
+        "Setup stops here so you can point API_SERVER_PORT at the full agent server first." \
+        "Switching to the full agent server later means changing that setting in Hermes and re-running setup." \
+        "Say no and fix the port. Chat-only is a real limitation you will run into within a day, and it is much easier to correct now than to diagnose later."
       ;;
 
-    gateway.hermes.enable_api|hermes-api-server)
+    gateway.hermes.enable_api)
       explain_panel \
-        "Enable the Hermes OpenAI API server" \
-        "Conduck needs Hermes's API-server route for full agent turns." \
-        "Appends the shown API_SERVER settings to ~/.hermes/.env, reuses an existing key or creates one if absent, then offers a restart." \
-        "The API server stays off and later verification is expected to fail." \
-        "Remove the dated conduck-connect block and restart Hermes to reverse this specific edit."
+        "Switch on Hermes's OpenAI-compatible API server" \
+        "That server is the route Conduck needs for full agent replies — the ones where the agent uses its tools rather than only chatting." \
+        "Adds exactly the settings shown above to ~/.hermes/.env. If a key already exists there it is reused; if none exists one is created. A restart is offered afterwards, separately." \
+        "The API server stays off and the verification later in this run is expected to fail." \
+        "Delete the dated conduck-connect block from that file and restart Hermes to reverse this edit."
       ;;
 
-    security.owned_file.chmod_0600|secret-file-mode)
+    security.owned_file.chmod_0600)
       explain_panel \
-        "Restrict a file that contains a gateway or file-lane secret" \
-        "Its current permissions let other accounts on this machine read the secret." \
-        "Runs the shown chmod 600 command; it changes file permissions, not file contents." \
-        "The secret remains readable by those accounts, and setup warns again." \
-        "The 0600 mode stays until you deliberately change it."
+        "Lock down a file that holds one of your secrets" \
+        "As it stands, other accounts on this machine can open that file and read the key inside it." \
+        "Runs the chmod 600 command shown above, which changes who may open the file. It does not read, move, or alter what is in it." \
+        "The secret stays readable by those accounts, and setup warns you about it again." \
+        "The restriction stays until you deliberately change it back."
       ;;
 
-    gateway.restart|gateway.openclaw.restart_chat|gateway.hermes.restart_api|file.openclaw.restart_tools|file.hermes.restart_config|service-restart)
+    gateway.openclaw.restart_chat|gateway.hermes.restart_api|file.openclaw.restart_tools|file.hermes.restart_config)
       explain_panel \
-        "Restart the gateway after an approved configuration change" \
-        "The running service may keep its old settings until it reloads them." \
-        "Restarts the named gateway service, which may be briefly unavailable while it comes back." \
-        "The file edit stays, but the live gateway may still use the old setting." \
-        "A restart does not undo or rewrite the configuration change."
+        "Restart the gateway now that its configuration has changed" \
+        "A running program keeps using the settings it read at start-up, so the edit you just approved has no effect until it reads them again." \
+        "Restarts that one gateway service. It is briefly unavailable while it comes back — a few seconds on a normal install." \
+        "The edit stays on disk, but the running gateway keeps its old behaviour until something restarts it." \
+        "A restart does not undo or rewrite the configuration change; it only makes it take effect."
       ;;
 
     gateway.hermes.manual_restart_api|file.hermes.manual_restart)
       explain_panel \
-        "Restart Hermes using the service method for this machine" \
-        "The approved file edit does not affect the running API server until Hermes reloads it." \
-        "Prints a suggested restart command for you to run; conduck-connect does not run it on this path." \
-        "The file stays changed, but live Hermes may still use the old setting." \
-        "Enter only reports that you restarted it. A restart does not undo or rewrite the file edit."
+        "Restart Hermes yourself, the way this machine starts it" \
+        "The edit you approved does not reach the running Hermes until it reloads its settings, and there is no single restart command that is correct on every machine." \
+        "Prints a suggested restart command for you to copy and run. This script does not run it on this path." \
+        "Enter skips this step — the file stays changed, but the live Hermes keeps its old behaviour." \
+        "Answering y only tells me you restarted it — I cannot see whether you did. Neither answer undoes anything already applied, and a restart does not undo or rewrite the edit either; it only makes it take effect."
       ;;
 
-    file.openclaw.allow_tools|gateway.openclaw.file_policy|openclaw-file-policy)
+    file.openclaw.allow_tools)
       explain_panel \
-        "Allow the OpenClaw agent to use Conduck's file lane" \
-        "A working WebDAV lane is not enough if OpenClaw's tool policy still denies the agent file reading and writing." \
-        "Shows the exact policy before and after, applies only the approved keys through OpenClaw's config command, then offers a restart." \
-        "Chat still works, but the agent may not read uploads or return files." \
-        "Restore the shown prior values and restart OpenClaw to reverse this policy edit."
+        "Let the OpenClaw agent read and write files in the shared folder" \
+        "Moving files into a folder is not enough on its own: OpenClaw keeps a separate list of what its agent is allowed to do, and if reading and writing files is not on that list, uploads simply sit there unopened." \
+        "Shows the exact policy before and after, then applies only the keys you approved, through OpenClaw's own config command. A restart is offered afterwards, separately." \
+        "Chat still works. The agent may not be able to open what you send it or hand a finished file back." \
+        "Put the shown earlier values back and restart OpenClaw to reverse this policy edit."
       ;;
 
     file.openclaw.manual_tools)
       explain_panel \
-        "Apply the OpenClaw file-tool policy on a non-standard install" \
-        "The agent needs read and write in its tool policy before Conduck's file lane is useful." \
-        "Prints the exact OpenClaw config commands for you to run, followed by a gateway restart using your install's method." \
-        "Chat still works, but the agent may not read uploads or return files." \
-        "Enter only reports that you completed the commands. Restore the shown prior values and restart to reverse the policy edit."
+        "Set OpenClaw's file permissions yourself, on an install I cannot drive" \
+        "The agent needs reading and writing on its allowed list before a shared folder is of any use to it, and your OpenClaw is installed somewhere this script will not run commands against on your behalf." \
+        "Prints the exact OpenClaw config commands for you to copy and run, then the restart appropriate to your install. This script runs neither." \
+        "Enter skips this step — chat still works, but the agent may not be able to open uploads or return files." \
+        "Answering y only tells me you ran them — I cannot see whether you did. Neither answer undoes anything already applied. To reverse the policy edit once it is in, put the shown earlier values back and restart."
       ;;
 
     file.openclaw.keep_unready)
       explain_panel \
-        "Continue with a file lane whose OpenClaw tool policy is not ready" \
-        "The byte transport can exist even while the agent is unable to read uploads or write returned files." \
-        "Keeps evaluating this lane without changing the OpenClaw policy; the later real agent test still has to pass before the lane reaches the code." \
-        "The optional lane is left out now; chat is unaffected." \
-        "Fix the policy and re-run setup. This choice does not undo earlier file-lane or gateway changes."
+        "Carry on with file transfer even though OpenClaw is not allowed to use it" \
+        "The plumbing that moves the bytes can be perfectly healthy while the agent on the other end is still forbidden from opening what arrives." \
+        "Keeps building the file lane without touching OpenClaw's permissions. A real end-to-end test later in this run still has to pass before file transfer reaches your setup code." \
+        "File transfer is left out of this run. Chat is unaffected either way." \
+        "Fix the permissions and re-run setup. This choice does not undo anything already applied." \
+        "Say no and let setup fix the permissions — it shows you the exact change first, and file transfer is the whole reason to run this step."
       ;;
 
-    file.hermes.apply_config|gateway.hermes.file_alignment|hermes-file-alignment)
+    file.hermes.apply_config)
       explain_panel \
-        "Align Hermes with Conduck's shared folder" \
-        "The agent and the file server must use the same folder, and the API-server scope must include file tools." \
-        "Applies the exact before and after for terminal.cwd and, only when needed, the API-server file toolset. If you staged recall removal in the preceding review, that same atomic edit removes only those shown recall entries too." \
-        "The byte transport may work while Hermes cannot open uploads or return outputs." \
-        "Restore the shown prior values and restart Hermes to reverse this edit."
+        "Point Hermes at the same folder Conduck will use" \
+        "The agent and the file server have to be looking at one folder, not two — and the agent's own permissions have to include file tools, or it will never open what you send." \
+        "Applies exactly the before-and-after shown above for terminal.cwd and, only where it is needed, the file toolset. If you asked for recall removal at the previous question, that same single edit removes only the entries you were shown." \
+        "The bytes may move while Hermes cannot open uploads or return finished files." \
+        "Put the shown earlier values back and restart Hermes to reverse this edit."
       ;;
 
-    gateway.hermes.remove_recall|gateway.hermes.recall|hermes-recall)
+    gateway.hermes.remove_recall)
       explain_panel \
-        "Remove Hermes recall from its API-server scope" \
-        "Conduck sends the full conversation each turn; Hermes recall can add hidden or duplicate context that Conduck did not send." \
-        "Removes only memory and session_search from the explicit list you were shown, then offers a restart." \
-        "Pairing can continue, but the API server may keep its own cross-chat recall." \
-        "Every client using this API server loses that recall; Hermes CLI and messaging memory stay. Put the shown entries back and restart to reverse it."
+        "Take Hermes's own memory tools out of the API server's allowed list" \
+        "Conduck sends the whole conversation with every message, so the thread is already complete. Hermes's recall can then add older or duplicate material the app never sent, which shows up as the agent answering something you did not ask." \
+        "Removes only memory and session_search from the exact list shown above, then offers a restart separately." \
+        "Pairing still works; the API server keeps its own cross-conversation recall." \
+        "Every client using this same API server loses that recall — Hermes on the command line and its messaging memory are untouched. Put the shown entries back and restart to reverse it."
       ;;
 
     gateway.hermes.show_recall_manual)
@@ -1382,173 +2399,229 @@ explain_action() { # explain_action <action-id>
       # free. What it prints depends on the shape of the config: an exact
       # replacement list where one can be proven safe, otherwise what to look for.
       explain_panel \
-        "Print the by-hand instructions for narrowing Hermes's memory scope" \
-        "Where this script cannot make the edit safely, the fix is yours to make, and the instructions run long enough to be worth asking about first." \
-        "Prints text only: what to change in ~/.hermes/config.yaml, the exact replacement list where one can be proven not to drop toolsets you configured, and what the global alternative costs. It writes nothing, restarts nothing, and changes no file." \
-        "Nothing happens and nothing changes; the finding above stays on screen and pairing continues either way." \
-        "Nothing to reverse — no file is touched. Re-run this script whenever you want the instructions."
+        "Print by-hand instructions for narrowing what Hermes remembers" \
+        "Where this script cannot make the edit and be sure it is safe, the change is yours to make — and the instructions run long enough to be worth asking before filling the screen with them." \
+        "Prints text and nothing else: what to change in ~/.hermes/config.yaml, the exact replacement list wherever one can be proven not to drop toolsets you configured, and what the simpler global alternative costs you. It writes nothing, restarts nothing, changes no file." \
+        "Nothing happens and nothing changes. What is already on screen stays, and pairing continues either way." \
+        "Nothing to reverse — no file is touched. Re-run this script whenever you want the instructions again." \
+        "Say yes. It only prints; you can read it and ignore it."
       ;;
 
     file.hermes.remove_recall)
       explain_panel \
-        "Include Hermes recall removal in the combined file-readiness edit" \
-        "Conduck sends the full conversation each turn; Hermes recall can add hidden or duplicate context that Conduck did not send." \
-        "Stages removal of only memory and session_search in the combined Hermes review. It changes no file and restarts nothing at this step." \
-        "The later review leaves the API-server scope unchanged unless you approve its exact combined edit." \
-        "The next Apply question performs one atomic config edit and then offers the restart; every client using this API server is affected if you approve it."
+        "Include the memory-tool removal in the one combined Hermes edit" \
+        "Conduck sends the whole conversation with every message, so Hermes's own recall can add older or duplicate material the app never sent." \
+        "Stages the removal of only memory and session_search, to be shown in the combined review coming next. It changes no file and restarts nothing here." \
+        "The review coming next leaves the allowed list alone unless you approve its exact combined edit." \
+        "The next Apply question makes one single edit and then offers the restart. Every client using this same API server is affected once you approve it."
       ;;
 
-    file.openclaw.guidance|file.hermes.guidance|gateway.agent_guidance|agent-guidance)
+    file.openclaw.guidance|file.hermes.guidance)
       # Shared with OpenClaw, whose block carries no PDF rule, so nothing here
       # names a specific command: the accurate statement for both agents is that
       # the block is text and may point the agent at tools it already has.
       explain_panel \
-        "Install Conduck file-transfer guidance for the agent" \
-        "The agent needs to know that uploads are already on disk, how to read what it is handed, and how to return a finished file to Conduck." \
-        "Adds or refreshes only the marked Conduck block in the selected agent context file; content outside the markers is untouched. The block is instructions only: it installs nothing and grants no new tool access, though it can direct the agent to use tools it already has, with the permissions it already has." \
-        "The transport may pass while the agent mishandles uploads, answers from a filename it never read, or returns no downloadable file." \
-        "New agent sessions read the block. Delete the block including both markers to remove it."
+        "Add a short set of file-handling instructions for your agent to read" \
+        "An agent that is handed a file it cannot see the point of tends to answer from the filename instead of opening it. This block tells it that uploads are already sitting on its own disk, how to read them, and where to write a finished file so Conduck can offer it back to you." \
+        "Adds or refreshes only the marked Conduck section of the agent's instruction file; everything outside those two markers is left exactly as it was. The block is instructions, not permissions: it installs nothing and grants nothing, though it can point the agent at tools it already has, with the access it already has." \
+        "Files may move perfectly while the agent mishandles them — answering from a filename it never opened, or producing nothing you can download." \
+        "New agent conversations pick the block up. Delete the block, including both marker lines, to remove it."
       ;;
 
-    exposure.choose|exposure-choice)
+    exposure.tailscale.make_private)
       explain_panel \
-        "Choose how Conduck reaches this gateway over HTTPS" \
-        "The phone, tablet, Mac, and sometimes a standalone Watch must be able to reach the final address." \
-        "Compares private Tailscale, public Funnel, Cloudflare, and an HTTPS address you already operate. The menu itself changes nothing." \
-        "No reachable app-facing address is selected." \
-        "Back returns to gateway selection; configuration changes already approved stay in place."
+        "Give the gateway an encrypted address only your own devices can reach" \
+        "Conduck needs an https:// address with a certificate your phone already trusts. Tailscale hands you one for free, and keeps the gateway invisible to everyone outside your own network of devices. Tailscale's own name for this is \"Serve\"." \
+        "Goes on to show you the exact Tailscale command and ask about it separately. If you approve it there, an encrypted address on your own private network is pointed at your gateway's local door. Every device running Conduck then needs to be signed in to that same Tailscale network; an Apple Watch rides along on its nearby iPhone." \
+        "The private address is not created, or an existing public one is left exactly as it is." \
+        "If this run later has to undo its network changes, the exact command to switch it off (or to put back what was there before) is printed for you. Nothing else on this machine is touched." \
+        "This is the safer of the two Tailscale choices, and you can re-run this script and switch later. Pick it unless you specifically need a standalone Apple Watch, or need to connect from a device you cannot install Tailscale on."
       ;;
 
-    exposure.scope|scope-classification)
+    exposure.tailscale.make_public)
       explain_panel \
-        "Classify an existing HTTPS address as public or private" \
-        "The answer controls safety checks, especially the refusal to publish a keyless gateway." \
-        "Records whether the address works from the open internet or only inside your network or VPN; it does not change the address." \
-        "Setup cannot apply the correct keyless-access guard." \
-        "If unsure, public is the stricter classification and does not weaken protection."
+        "Give the gateway an encrypted address anyone on the internet can reach" \
+        "A public address means no Tailscale app on your phone, and it means an Apple Watch works on its own with no iPhone nearby. Tailscale's own name for this is \"Funnel\"." \
+        "Goes on to show you the exact Tailscale command and ask about it separately. If you approve it there, a public encrypted address is pointed at your gateway's local door. Anyone who finds that address can knock on it; your gateway's secret key is the only lock, which is why setup refuses to do this for a gateway that has no key." \
+        "The gateway stays private, or unreachable by this route." \
+        "Switch that public address off, or put back the mapping setup shows you, to reverse this one change. Nothing else is affected." \
+        "Choose the private option instead unless you need a standalone Apple Watch or a device that cannot run Tailscale. You can re-run this script and change your mind."
       ;;
 
-    exposure.tailscale.make_private|exposure.tailscale.private|tailscale-private)
+    exposure.cleanup.stale_public)
       explain_panel \
-        "Create or switch to a private Tailscale Serve address" \
-        "Conduck needs trusted HTTPS without exposing the gateway to the open internet." \
-        "Continues to the exact Tailscale Serve command and its own approval. If approved there, it maps a tailnet-only HTTPS port to the gateway's loopback port. Each Conduck device needs Tailscale; a Watch relies on its nearby iPhone." \
-        "The private address is not created or an existing public mapping is left as it is." \
-        "The exact off or prior-mapping command is shown if this run later needs exposure cleanup; unrelated host edits remain."
-      ;;
-
-    exposure.tailscale.make_public|exposure.tailscale.public|tailscale-public)
-      explain_panel \
-        "Create or switch to a public Tailscale Funnel address" \
-        "A public address lets Conduck connect without Tailscale on each device and lets a standalone Watch connect directly." \
-        "Continues to the exact Tailscale Funnel command and its own approval. If approved there, it maps a public HTTPS port to the gateway's loopback port. Anyone who finds the URL can reach the gateway; its token is the lock." \
-        "The gateway remains private or unreachable through this path." \
-        "Turn that Funnel port off, or restore the prior mapping shown by setup, to reverse this exposure only."
-      ;;
-
-    exposure.cleanup.stale_public|exposure.stale_public.close|stale-public-exposure)
-      explain_panel \
-        "Close an older public Funnel that still targets this service" \
-        "Choosing a private path is not private while another matching Funnel remains open on a different port." \
-        "Turns off only the named public mapping after you approve it; mappings for other services are left alone." \
-        "That older public address stays reachable." \
-        "This is intentional cleanup and is not recreated by setup's exposure rollback. Recreating it later requires a new explicit Funnel command."
+        "Close an older public address that still points at this same service" \
+        "Choosing a private address is not actually private while a public one from an earlier run is still open on a different door pointing at the same place." \
+        "Switches off only the one public address named above, once you approve it. Addresses belonging to other services are left alone." \
+        "That older public address stays reachable from the internet." \
+        "This is deliberate tidying-up, and setup will not recreate it if this run later undoes its own changes. Bringing it back means running a new public command on purpose." \
+        "Say yes. If you had wanted that address you would not be choosing a private one now."
       ;;
 
     exposure.cleanup.orphaned)
       explain_panel \
-        "Resolve an exposure left by an interrupted earlier run" \
-        "The saved undo record says an earlier run may have left this exact Tailscale port mapped." \
-        "Re-reads live Tailscale state and, with your approval, applies only the recorded cleanup or prior private mapping for that port." \
-        "The mapping may stay reachable and the record remains for a later run." \
-        "This repairs the named exposure only; it does not restore configuration files, restarts, commands you ran, or intentional stale-Funnel cleanup."
+        "Deal with a network change an interrupted earlier run left behind" \
+        "This script keeps a note of network changes it makes, so that a run stopped halfway does not quietly leave your gateway reachable in a way you did not choose. That note says an earlier run may have left this exact door open." \
+        "Re-reads what Tailscale reports right now and, with your approval, applies only the recorded cleanup — or puts back the private mapping that was there before — for that one door." \
+        "The door may stay open and the note is kept for a later run to deal with." \
+        "This repairs the one named address only. It does not restore config files, restarts, commands you ran, or tidy-ups you asked for on purpose." \
+        "Say yes. It closes something an interrupted run opened, and nothing you set up deliberately depends on it."
       ;;
 
     exposure.tailscale.privileged_retry)
       explain_panel \
-        "Retry the shown Tailscale command with operator or elevated rights" \
-        "Tailscale refused the first attempt, commonly because this account may not change Serve or Funnel mappings." \
-        "Prints the exact sudo, doas, or root command for you to run; conduck-connect does not elevate silently." \
-        "The requested mapping or cleanup remains unconfirmed." \
-        "Enter only reports that you ran the command. It does not execute it or undo earlier changes."
+        "Run the shown Tailscale command again with administrator rights" \
+        "Tailscale refused the first attempt. The usual reason is that this account is not permitted to change which addresses Tailscale publishes." \
+        "Prints the exact command with sudo, doas, or root in front for you to copy and run. This script never raises its own privileges silently." \
+        "Enter skips the retry — the change Tailscale refused stays unmade." \
+        "Answering y only tells me you ran it — I cannot see whether you did. Neither answer undoes anything already applied."
       ;;
 
     exposure.tailscale.apply)
       explain_panel \
-        "Apply the Tailscale Serve or Funnel command shown above" \
-        "This is the step that turns the chosen HTTPS reachability into a live mapping." \
-        "Runs the exact displayed Tailscale command, then re-reads Tailscale status instead of assuming it worked." \
-        "No new mapping is confirmed; an existing mapping stays as reported above." \
-        "Setup records this exposure's exact prior state for bounded cleanup. It does not record or undo unrelated host changes."
+        "Run the Tailscale command shown above" \
+        "This is the step that actually turns the reachability you chose into a live address. Everything before it was preparation." \
+        "Runs exactly the command printed above, then asks Tailscale what its state is now rather than assuming the command worked." \
+        "No new address is created; anything already in place stays as reported above." \
+        "Setup records exactly what this address looked like beforehand, so it can be put back if the run has to undo itself. It records nothing about unrelated changes to this machine."
       ;;
 
     exposure.rollback.failed_run)
       explain_panel \
-        "Clean up Tailscale exposure changes from this failed run" \
-        "A setup code was not emitted, so a mapping opened or replaced during this run should not be left behind silently." \
-        "Runs only the listed exposure undo commands and verifies each affected port against live Tailscale state." \
-        "A public or private mapping from this run may remain live; the exact manual commands are printed again." \
-        "This cleanup is limited to recorded exposure mappings. Configuration edits, restarts, guidance blocks, and commands you ran stay in place."
+        "Undo the network changes this failed run made" \
+        "This run never got as far as printing a setup code, so an address it opened or replaced along the way should not be left behind without you knowing." \
+        "Runs only the undo commands listed above, and then checks each affected door against what Tailscale actually reports." \
+        "An address this run opened may stay live. The exact commands to close it by hand are printed again so you can do it yourself." \
+        "This cleanup covers recorded network addresses only. Config edits, restarts, instruction blocks, and commands you ran yourself stay in place." \
+        "Say yes. These are changes this run made and then could not finish using."
       ;;
 
-    exposure.cloudflare.gateway|exposure.cloudflare.manual|cloudflare-manual)
+    # The hostname QUESTION, which is not the route COMMAND below it and shares
+    # nothing with it but the word Cloudflare. Its reader is being asked to invent
+    # a name; the route panel's reader is being asked whether they ran something.
+    # They part company on Enter most of all: here Enter abandons Cloudflare and
+    # returns to the four ways of getting an encrypted address, which is the right
+    # answer for the commonest reader of this prompt — somebody who picked option 3
+    # without a domain in a Cloudflare account, for whom two of the other three
+    # options cost nothing and need no domain at all.
+    exposure.cloudflare.hostname)
       explain_panel \
-        "Add a Cloudflare Tunnel route for this service" \
-        "Cloudflare needs a hostname and ingress rule that forward to the local gateway or file-server port." \
-        "Prints the DNS/tunnel command for you to run. conduck-connect does not change Cloudflare configuration itself." \
-        "No Cloudflare hostname is connected to this service." \
-        "Enter only means you ran the command; it does not execute it or undo earlier changes."
+        "Invent the hostname you want this gateway to answer on" \
+        "Cloudflare routes by name, so before anything can be pointed at your gateway it needs a name to point. It is yours to choose — a subdomain of a domain that is already in your Cloudflare account, shaped like gateway.yourdomain.com — and it does NOT have to exist yet. The step straight after this is the command that creates it." \
+        "Records the name and nothing else. Nothing is contacted, nothing in your Cloudflare account changes, and no DNS record is created by typing it here. A pasted https:// address is trimmed back to just the host part for you." \
+        "Enter — a blank answer — leaves this path and puts the four ways of getting an encrypted address back on screen, with nothing changed by having looked at this one." \
+        "Nothing to reverse: no route exists until you run the command on the next screen, and the certificate for this hostname stays Cloudflare's business, renewals included." \
+        "This path only works if you already manage a domain inside a Cloudflare account. If you do not — or you are not sure what that would mean — press Enter and take Tailscale from the menu instead: it gives you a trusted encrypted address for free and needs no domain of your own."
+      ;;
+
+    exposure.cloudflare.gateway)
+      explain_panel \
+        "Add a Cloudflare route that points a hostname at this gateway" \
+        "Cloudflare needs to be told which of your hostnames belongs to this service and where on this machine to forward it. Only you can make that change — it lives in your Cloudflare account, not on this machine." \
+        "Prints the command for you to copy and run. This script never changes Cloudflare configuration itself." \
+        "Enter skips this step — no Cloudflare hostname is connected to this gateway, and setup cannot verify an address that does not exist yet." \
+        "Answering y only tells me you ran it — I cannot see whether you did. Neither answer undoes anything already applied."
       ;;
 
     file.cloudflare.route)
       explain_panel \
-        "Add a Cloudflare Tunnel route for the file lane" \
-        "Attachments need their own hostname and ingress rule pointing to the local file-server port." \
-        "Prints the DNS/tunnel command for you to run. conduck-connect does not change Cloudflare configuration itself." \
-        "The file lane is omitted or remains unreachable through Cloudflare; chat can still work." \
-        "Enter only means you ran the command. It does not execute it or undo earlier changes."
+        "Add a Cloudflare route for file transfer" \
+        "File transfer runs as its own small server on a separate door, so it needs its own hostname pointed at it — the gateway's hostname will not carry it." \
+        "Prints the command for you to copy and run. This script never changes Cloudflare configuration itself." \
+        "Enter skips this step — file transfer is left out, or stays unreachable through Cloudflare. Chat is unaffected." \
+        "Answering y only tells me you ran it — I cannot see whether you did. Neither answer undoes anything already applied."
       ;;
 
-    exposure.own_https|own-https)
-      explain_panel \
-        "Use an HTTPS address you already operate" \
-        "Conduck requires encryption and a certificate the device already trusts." \
-        "Validates the address and certificate, then records its reach for the pairing code. It does not reconfigure your proxy or certificate." \
-        "Setup stops before pairing this address." \
-        "A self-signed certificate cannot be accepted by an override; fix HTTPS or choose another exposure path."
+    exposure.own_https)
+      # Reachable as the `i` of the own-HTTPS address prompt. It carries three
+      # separate facts — what qualifies as an address, what that address has to
+      # REACH, and the one failure that looks like a broken gateway but is not —
+      # and the five-field template flattens them into one paragraph nobody
+      # finishes. The thing this path has never said anywhere is the middle one.
+      say ""
+      say "  ${BOLD}When this is your option${RESET}"
+      say "  Your gateway already sits behind a reverse proxy you configured, or on"
+      say "  a rented server with a domain name of your own. The certificate has to"
+      say "  be one your phone already trusts by itself — a free Let's Encrypt one"
+      say "  qualifies, a certificate you signed yourself does not, and there is no"
+      say "  way for the app to make an exception for it."
+      say ""
+      say "  ${BOLD}What the address has to reach${RESET}"
+      say "  Give the BASE address, with no /v1 and no other path on the end: the"
+      say "  script and the app add the rest themselves. Whatever sits in front has"
+      say "  to pass requests through to the gateway unchanged, so that"
+      say "    <your address>/v1/models"
+      say "  answers with the gateway's own list of models. If that one address"
+      say "  works in a browser, the rest of this will work."
+      say ""
+      say "  ${BOLD}The trap worth knowing about${RESET}"
+      say "  Some servers — Ollama is the common one — look at which hostname a"
+      say "  request was addressed to and refuse anything they do not recognise."
+      say "  The tell is that the server answers perfectly on this machine and"
+      say "  refuses the identical request through your public address. Fix it at"
+      say "  the proxy by rewriting that line; in nginx that is"
+      say "    ${BOLD}proxy_set_header Host 127.0.0.1:<the gateway's port>;${RESET}"
+      say ""
+      say "  ${BOLD}What setup does with it${RESET}"
+      say "  Checks the certificate, records how far the address reaches, and uses"
+      say "  it in the setup code. It never reconfigures your proxy or your"
+      say "  certificate — those stay entirely yours, renewals included."
+      say ""
+      say "  ${BOLD}Honestly unsure?${RESET}"
+      say "  If you did not deliberately set up a domain name, a certificate, and a"
+      say "  proxy for this server, this is not your option. Go back and let setup"
+      say "  build you an encrypted address instead — Tailscale and Cloudflare both"
+      say "  do it for free."
+      say ""
       ;;
 
-    file.setup.enable|files.setup|file-lane)
+    file.setup.enable)
       explain_panel \
-        "Set up optional file transfer between Conduck and the agent" \
-        "The file lane carries uploads to a shared folder and makes completed agent files downloadable in Conduck." \
-        "May create or reuse a shared folder, a loopback WebDAV service, credential files, and a separate HTTPS mapping." \
-        "Chat still works, including content that fits inline, but the pairing code carries no file server." \
-        "The folder may also be the agent's workspace. Stop the service and inspect the folder before deleting anything."
+        "Set up optional file transfer between Conduck and your agent" \
+        "Without it, chat still works and pasted images still work — but anything you attach reaches the agent as text inside the conversation rather than as a real file its tools can open, so a PDF, a spreadsheet, or a zip is of no use to it. It is also what lets the agent hand a finished file back for you to download." \
+        "May create or reuse one shared folder, a small password-protected file server that only answers on this machine, a couple of files holding its password, and a separate encrypted address for it. Each of those asks first." \
+        "Chat works exactly as before, including content that fits inside the message. Your setup code simply carries no file server." \
+        "The shared folder is often the agent's own working folder, with its own files in it. Stop the file service and look inside the folder before deleting anything." \
+        "Say yes if you ever plan to hand the agent a document. It is the part of setup people come back to add later, and adding it later means walking the whole wizard again."
+      ;;
+
+    # For the file lane's own https:// address prompt (40-file-lane.inc.sh). It
+    # is a DIFFERENT address from the gateway's, and that is the mistake it
+    # exists to prevent.
+    file.address.url)
+      explain_panel \
+        "Type the https:// address that reaches the file server" \
+        "File transfer runs as its own small server on its own door, so it needs its own address. The gateway's address will not reach it, and pasting the gateway's address here produces a setup code that fails on the first attachment." \
+        "Records the address, checks that the file server actually answers on it, and puts it in the setup code alongside the gateway's. Give the base address with no path on the end." \
+        "Pressing Enter with nothing typed goes on to a question about leaving file transfer out of this setup code entirely." \
+        "Nothing is reconfigured; the file server keeps running either way." \
+        "If you just created a Cloudflare route or a tunnel for the file server, this is that hostname. If you cannot name one, press Enter: the next question asks whether to leave file transfer out, and answering y there does it. Chat is unaffected either way and you can add it later."
       ;;
 
     file.address.skip)
       explain_panel \
         "Deliberately leave a working file lane out of this setup code" \
-        "A blank can mean you chose to omit file transfer, but it can also be a paste that did not land. This check prevents one stray Enter from silently discarding a lane that already passed its local tests." \
-        "Yes omits file transfer from this code and saved profile. It does not stop the file service, remove its folder, or undo a route you created." \
-        "No—or pressing Enter—returns to the address prompt so you can try again." \
-        "Adding the lane later requires re-running setup. Pressing q stops the run but leaves earlier approved changes in place."
+        "A blank answer can mean you chose to leave file transfer out — but it can just as easily be a paste that did not land. This question exists so that one stray Enter cannot silently throw away a file lane that already passed its tests." \
+        "Yes leaves file transfer out of this setup code and out of the saved record. It does not stop the file service, remove its folder, or undo a route you created." \
+        "No — which is what Enter does — takes you back to the address question so you can try again. After three blank answers in a row it stops asking and leaves file transfer out, saying so on screen." \
+        "Adding file transfer to a setup code afterwards means re-running setup. Pressing q stops the run and leaves everything already approved in place." \
+        "Press Enter and try the address again. Leaving out a lane that already works is almost never what someone means to do."
       ;;
 
-    file.folder.override|files.folder|shared-folder)
-      # This panel now answers TWO prompts, and they differ on the one thing an
+    file.folder.override)
+      # This panel answers TWO prompts, and they differ on the one thing an
       # operator reading it is about to do. OpenClaw and Hermes offer a default the
       # wizard knows and may create; every other gateway offers none and refuses a
       # path that is not already on this machine, because only the agent's own
       # folder can be the right answer there. A panel that promised creation would
       # be read by exactly the operator the refusal then bounces.
       explain_panel \
-        "Choose the folder shared by Conduck and the agent" \
-        "Every uploaded attachment lands here, and every file the agent returns must be written here, so it has to be the folder your agent itself reads and writes." \
-        "Records an absolute folder for the lane. On OpenClaw and Hermes, whose working folder this wizard knows, a new lane may create it with private permissions. On any other gateway the path must already exist on this machine and is refused if it does not; an existing folder keeps its own mode either way." \
-        "The default folder is used where one is shown. Where none is — any gateway other than OpenClaw and Hermes — there is nothing to fall back on, so a blank answer is refused and the question is asked again." \
-        "This folder may contain your own or the agent's files. Back, Ctrl-C, and re-running do not delete it. At the no-default prompt, q stops the run and leaves earlier approved changes in place."
+        "Name the one folder that Conduck and your agent both use" \
+        "Everything you attach lands in this folder, and everything the agent finishes has to be written into it to come back to you. So it has to be a folder the agent itself already reads and writes — not a new folder chosen for tidiness, which the agent would never look in." \
+        "Records one absolute path (a path starting with /). On OpenClaw and Hermes, whose working folder this script knows, a brand new lane may create that folder with private permissions. On any other gateway the folder has to exist on this machine already and is refused if it does not; an existing folder keeps whatever permissions it has either way." \
+        "Where a default is shown, that default is used. Where none is shown — every gateway other than OpenClaw and Hermes — there is nothing to fall back on, so a blank answer is refused and the question comes round again." \
+        "This folder may hold your own files or the agent's. Going back, stopping, and re-running never delete it. At the prompt with no default, q stops the run and leaves everything already approved in place." \
+        "Take the suggested folder where one is offered. Where none is, it is the folder your agent already works in — the one it saves things into when you ask it to write a file."
       ;;
 
     file.agent.unproved)
@@ -1561,122 +2634,180 @@ explain_action() { # explain_action <action-id>
       # HTTPS exposure this run applied for the lane. A blanket "nothing you
       # approved is touched" is read one line before the rollback prints.
       explain_panel \
-        "Include a file server the agent did not prove it can use" \
-        "Bytes moved through the folder, but the sentinel that proves your agent can USE it did not pass — which is what a server with no file tools always does, and also what a wrong folder, a container, one failed turn, or a probe the file server itself refused looks like. The screen you came from names which step fell short." \
-        "Yes puts the file server in this setup code; the code has no field for a caveat, so Conduck will show file transfer as enabled. No leaves it out of the code and closes an HTTPS route this run opened for the lane, so nothing stays reachable for a lane the code does not carry." \
-        "Attachments stay inline-only in Conduck. The file service, its folder, and its contents keep running untouched; a route this run opened for the lane is switched off again, and a mapping it replaced is put back." \
-        "Either answer leaves the running file server exactly as it is. Adding the lane to a code afterwards means re-running setup."
+        "Include a file server the agent never proved it can actually use" \
+        "The bytes moved through the folder, but the test that proves your agent can USE what lands there did not pass. That is what a server with no file tools always looks like — and it is also what a wrong folder, an agent in a container, one failed turn, or a file server that refused the test looks like. The screen you came from names which step fell short." \
+        "Yes puts the file server in this setup code. The code has no way to carry a caveat, so the Conduck app will show file transfer as working. No leaves it out and switches off an address this run opened for it, so nothing stays reachable that the code does not use." \
+        "Attachments stay inside the message in Conduck. The file service, its folder, and its contents keep running untouched; an address this run opened for it is switched off again, and anything it replaced is put back." \
+        "Either answer leaves the running file server exactly as it is. Adding it to a setup code afterwards means re-running setup." \
+        "Say no. A setup code that promises file transfer the agent cannot use fails later, in the app, where the reason is much harder to see than it is here."
       ;;
 
-    file.unit.repair_envfile|file.service.move_port|files.repair|file-lane-repair)
+    file.unit.repair_envfile|file.service.move_port)
       explain_panel \
-        "Repair a connector-owned file-server service" \
-        "The saved service definition is incomplete, unsafe to reuse, or conflicts with another connector-owned lane." \
-        "Rewrites only the named conduck-files service or moves it to the shown free loopback port, then verifies the live service." \
-        "File transfer stays unavailable or continues using the broken definition." \
-        "The connector-owned unit and credential remain until you stop and remove them explicitly."
+        "Repair a file server that this script set up earlier" \
+        "Its saved definition is incomplete, unsafe to start again, or is fighting with another file server this script created. Reusing it as it stands would fail in a way that looks like a gateway fault." \
+        "Rewrites only the one named conduck-files service, or moves it to the free door shown above, and then checks that the live service came back." \
+        "File transfer stays unavailable, or keeps running from the broken definition." \
+        "The service and its password file stay on this machine until you stop and remove them deliberately." \
+        "Say yes. This service was created by this script and is only used by it, so repairing it affects nothing else you run."
       ;;
 
-    file.exposure.make_public|files.expose_public|file-lane-public)
+    file.exposure.make_public)
       explain_panel \
-        "Expose the shared file lane to the public internet" \
-        "A public gateway needs a similarly reachable file lane for attachments to work away from your private network." \
-        "Continues to the exact public-exposure command and its own approval. If approved there, it publishes the file server's HTTPS route. Anyone who finds it can reach the login; the file credential is the lock." \
-        "The lane stays private or is omitted from the pairing code, while chat can still work." \
-        "This consent covers the file route only. Use the shown off or restore command to reverse that exposure."
+        "Let the file server be reached from the open internet" \
+        "Your gateway is on a public address, so a file server that only your private network can reach would leave attachments broken everywhere except at home." \
+        "Goes on to show you the exact command and ask about it separately. If you approve it there, the file server gets its own public encrypted address. Anyone who finds it reaches a login prompt; the file password is the only lock." \
+        "File transfer stays private, or is left out of the setup code. Chat is unaffected." \
+        "This approval covers the file server's address only. Use the switch-off command shown to reverse it."
       ;;
 
     file.exposure.keep_private)
       explain_panel \
-        "Keep the file lane private when the gateway is public" \
-        "No free Funnel port is available, but the existing Tailscale-only file lane can still serve your own tailnet devices." \
-        "Keeps the current private mapping and includes that narrower file address in the pairing code; it creates no new public exposure." \
-        "The file lane is omitted from the code; public chat still works." \
-        "Attachments work only on Tailscale-connected devices. A standalone Watch away from its iPhone cannot reach this private lane."
+        "Keep file transfer private even though the gateway is public" \
+        "There is no free public door left for it, but the existing private address still works perfectly for devices signed in to your own Tailscale network." \
+        "Keeps the current private address and puts that narrower one in the setup code. It creates no new public address." \
+        "File transfer is left out of the setup code entirely; public chat still works." \
+        "Attachments will work only on devices connected to your Tailscale network. An Apple Watch away from its iPhone cannot reach a private address." \
+        "Say yes if the devices you actually use are on your Tailscale network. Say no only if you need attachments from a device that is not."
       ;;
 
-    file.service.enable_linger|files.systemd_linger|systemd-linger)
+    file.service.enable_linger)
       explain_panel \
-        "Keep the Linux file-server service running after logout and reboot" \
-        "A user service without lingering stops after that user's last session, so attachments later fail while chat still works." \
-        "Runs the shown loginctl enable-linger command; this is the setup flow's one sudo action it may run for you." \
-        "The file lane works only while that user has an active session and may not return after reboot." \
-        "Run loginctl disable-linger for that user to reverse this setting."
+        "Keep the file server running after you log out and after a reboot" \
+        "On Linux, a service started under your account normally stops the moment your last session ends. The result is file transfer that works today and quietly fails next week, while chat keeps working — which makes it very hard to connect to a cause." \
+        "Runs the loginctl enable-linger command shown above. This is the one command in setup that may ask for your administrator password." \
+        "File transfer works only while that account has an active session, and may not come back after a reboot." \
+        "Run loginctl disable-linger for that account to reverse this setting."
       ;;
 
-    manual.command|manual-command)
+    verification.gateway_only)
       explain_panel \
-        "Run a command that changes infrastructure you own" \
-        "conduck-connect leaves this command to you because it touches your gateway, tunnel, proxy, or service outside the connector-owned boundary." \
-        "Prints the exact command and waits. Pressing Enter only reports that you ran it; it does not execute or verify the command." \
-        "The command is not run, and the dependent setup step may fail or remain incomplete." \
-        "Skipping this command does not undo changes already approved."
-      ;;
-
-    check.server|check-server)
-      explain_panel \
-        "Check existing OpenAI-compatible software against the Conduck app" \
-        "This answers whether the current app can use the server's model list and chat replies as-is." \
-        "Changes no host configuration, but sends real model and chat requests that may use quota and appear in provider or server history." \
-        "No compatibility result is produced." \
-        "A pass is app compatibility, not the stricter adapter-contract grade."
-      ;;
-
-    check.adapter|check-adapter)
-      explain_panel \
-        "Grade software built specifically for Conduck" \
-        "A purpose-built adapter must satisfy stricter auth, response, model, and stream rules than generic OpenAI software." \
-        "Sends live positive and negative-auth requests. The optional files profile also writes and removes exact named probe artifacts." \
-        "No adapter-contract result is produced." \
-        "Use check-server instead for software not built for Conduck."
-      ;;
-
-    verify.live|live-verification)
-      explain_panel \
-        "Verify the final address before printing a setup code" \
-        "The code should point only to a route the Conduck app can actually use." \
-        "Sends a model-list request and a real chat turn, which may use provider quota or enter logs/history. A configured file lane also gets temporary authenticated probes and one real agent copy test." \
-        "No setup code is printed until the required checks pass; approved configuration changes stay in place." \
-        "Probe files are removed, or their exact names are printed when cleanup cannot be proved."
-      ;;
-
-    show_code.run|show-code)
-      explain_panel \
-        "Re-show a saved pairing code" \
-        "This is the fast path for pairing another device without walking through setup choices again." \
-        "Reads a non-secret saved profile, re-derives credentials from their real homes, checks for drift, and runs live verification." \
-        "No code is shown." \
-        "It changes no configuration and never rewrites the saved profile, but its live probes may use quota and temporary file artifacts."
-      ;;
-
-    verification.gateway_only|show_code.gateway_only|gateway-only-code)
-      explain_panel \
-        "Print a pairing code without the failing file lane" \
-        "A healthy gateway can still provide chat when optional file transfer is unavailable." \
-        "Drops the fileServer block from this code only; it does not delete the saved lane, its service, folder, or credential." \
-        "No code is printed until the file lane is fixed or you make this choice." \
-        "The saved profile keeps its file lane, so a later show-code run checks it again."
-      ;;
-
-    pairing.code|pairing-code)
-      explain_panel \
-        "Bring the verified gateway into the Conduck app" \
-        "The app needs the gateway address, explicit auth mode, and optional file lane without asking you to retype them." \
-        "Prints a QR and paste string containing the gateway token and, when present, the file credential. It also saves a 0600 routing-only profile with no secrets." \
-        "The app is not paired from this run." \
-        "Treat the code like a password. Anyone holding it has the access those credentials grant until you rotate them."
+        "Print a setup code for chat only, leaving out the file transfer that failed" \
+        "A healthy gateway can still give you everything except attachments, and a working chat today is usually worth more than a perfect setup tomorrow." \
+        "Leaves the file server out of this one setup code. It does not delete the saved lane, its service, its folder, or its password." \
+        "No setup code is printed at all until either the file transfer is fixed or you make this choice." \
+        "The saved record keeps its file lane, so the next --show-code run checks it again — fix the cause and it comes back on its own." \
+        "Say yes. You get a working app now, and nothing about the file lane is thrown away."
       ;;
 
     *)
       explain_panel \
-        "Review the current setup action" \
-        "This choice controls only the step described immediately above the prompt." \
-        "Showing this explanation changes no answer and performs no action; the same prompt appears again." \
-        "Declining or stopping leaves this action undone." \
-        "No, Back, stop, and re-running do not undo actions you already approved."
+        "Review the action described just above this prompt" \
+        "Your answer controls only that one action — nothing else in the run." \
+        "Reading this explanation changes no answer and does nothing to this machine; the same prompt comes back." \
+        "Declining or stopping leaves that one action undone." \
+        "No, Back, stopping, and re-running me do not undo changes you already approved."
       return 0
       ;;
   esac
+}
+
+# --------------------------------------------------------- opening blocks --
+#
+# Panels that describe a whole COMMAND rather than one question. They read as
+# introductions, so they belong at the top of the command they describe, before
+# it asks anything — not behind an `i` at a prompt that has not happened yet.
+# Each is a plain function, which means `explain_prompt` will also accept its
+# name wherever a prompt inside that command wants it as its `i` copy.
+
+# Print at the top of --check-server, before the first question.
+explain_check_server() {
+  say ""
+  say "  ${BOLD}What this check answers${RESET}"
+  say "  Whether the Conduck app, as it ships today, can talk to the server you"
+  say "  point me at — can it read the server's list of models, and does a real"
+  say "  reply come back in the shape the app expects."
+  say ""
+  say "  ${BOLD}What it changes${RESET}"
+  say "  Nothing, on this machine or on the server. But it is not silent: it sends"
+  say "  real requests, including one real chat message. On a paid model that"
+  say "  costs a little quota, and the message may appear in your provider's or"
+  say "  your server's own history."
+  say ""
+  say "  ${BOLD}What a pass means${RESET}"
+  say "  That the app can use this server. It is not the stricter grade that"
+  say "  software written specifically for Conduck has to meet — that is what"
+  say "  --check-adapter is for."
+  say ""
+}
+
+# Print at the top of --check-adapter, before the first question.
+explain_check_adapter() {
+  say ""
+  say "  ${BOLD}What this check answers${RESET}"
+  say "  Whether software built specifically for Conduck meets the adapter rules:"
+  say "  stricter requirements on how it handles keys, replies, model lists, and"
+  say "  streaming than generic OpenAI-compatible software has to meet."
+  say ""
+  say "  ${BOLD}What it changes${RESET}"
+  say "  Nothing on this machine. It sends real requests, including deliberately"
+  say "  wrong-key ones to check they are refused. With the file profile enabled"
+  say "  it also writes and then removes a few clearly named test files."
+  say ""
+  say "  ${BOLD}Not the right check?${RESET}"
+  say "  If the software was NOT written for Conduck — OpenClaw, Hermes, Ollama,"
+  say "  LiteLLM, vLLM — use ${BOLD}--check-server${RESET} instead. Those legitimately do"
+  say "  things the adapter rules forbid, so failures here would mean nothing."
+  say ""
+}
+
+# Print before live verification starts, in setup and in --show-code. It is the
+# only place the tool warns that verification is not free.
+explain_live_verification() {
+  say ""
+  say "  ${BOLD}Why I verify before printing anything${RESET}"
+  say "  A setup code should only ever point at a route the app can genuinely use."
+  say "  Finding out in the app, on a phone, is much harder to diagnose than"
+  say "  finding out here."
+  say ""
+  say "  ${BOLD}What that costs${RESET}"
+  say "  I ask the gateway for its model list and then send one real chat message."
+  say "  On a paid model that uses a little quota, and the message can appear in"
+  say "  your provider's or your server's logs and history. If file transfer is"
+  say "  set up, I also make a few authenticated test requests and have the agent"
+  say "  copy one small test file."
+  say ""
+  say "  ${BOLD}Afterwards${RESET}"
+  say "  Test files are deleted. If I cannot prove a deletion worked, I print the"
+  say "  exact filenames so you can check yourself. Nothing you already approved"
+  say "  is undone by a verification failure."
+  say ""
+}
+
+# Print at the top of --show-code, before the profile picker.
+explain_show_code() {
+  say ""
+  say "  ${BOLD}What this does${RESET}"
+  say "  Re-shows the setup code for a gateway you already paired, so you can add"
+  say "  another phone, tablet, or Mac without answering the setup questions"
+  say "  again. This is the way to pair a second device."
+  say ""
+  say "  ${BOLD}What it changes${RESET}"
+  say "  No configuration, anywhere, and it never rewrites what it reads. It does"
+  say "  send live requests to check the address still works before handing you a"
+  say "  code — see the note about quota when it gets there."
+  say ""
+  say "  ${BOLD}Why it may still ask you something${RESET}"
+  say "  Secrets are deliberately not stored on this machine, so a gateway with a"
+  say "  secret key asks you to paste it again. That is the price of not keeping"
+  say "  your key in a file here."
+  say ""
+}
+
+# Print alongside the setup code itself, at the moment it appears on screen.
+# It is the only place the tool says what the code actually is.
+explain_setup_code_secrecy() {
+  say ""
+  say "  ${BOLD}Treat this code like a password.${RESET} It carries your gateway's secret key,"
+  say "  and the file password when file transfer is set up. Anyone who photographs"
+  say "  the QR square, or copies the text, has exactly the access those credentials"
+  say "  give — until you change them at the gateway. Do not paste it into a chat,"
+  say "  an issue, or a screenshot."
+  say ""
+  say "  What is saved on this machine is only the routing — the address, the"
+  say "  transport, the model name. No secret is written to disk by this script,"
+  say "  which is why re-showing the code later asks you for the key again."
+  say ""
 }
 # ------------------------------------------------------------- gateway phase --
 
@@ -1693,6 +2824,16 @@ GW_URL=""          # final https URL
 # freezes GW_ID: the name is display text from then on, and re-deriving an id
 # from an edited name is what creates a duplicate instead of an edit.
 GW_EDITING=false
+# True once this run has renamed a gateway it is editing. The id is frozen by
+# then (see GW_EDITING), so the review screen has to say that the rename is
+# display-only — otherwise the service and credential files keep a name the
+# operator has just been shown is no longer the gateway's.
+GW_RENAMED=false
+# True when the saved-gateway picker actually put a list on screen. It decides
+# whether the name prompt offers Back: with a list above it, Back returns to a
+# real question; without one, the name IS the first question and advertising a
+# control that leads nowhere is the defect this release exists to remove.
+GW_PICKER_SHOWN=false
 
 # A --check-server handoff pairs the ONE address the check graded, so its gateway
 # kind is "custom" no matter what answered — see prepare_setup_from_check. This
@@ -1703,6 +2844,45 @@ GW_EDITING=false
 # in for GW_KIND: an address match is not authority to run Hermes-specific
 # configuration steps the check never verified.
 CHECK_HANDOFF_LOCAL_HERMES=false
+
+# The two paths Step 1 actually reads, named in ONE place so the "found" report,
+# the "nothing found" notice and the recovery message after a wrong choice can
+# never cite a path the detector does not look at. Both live in THIS user
+# account's home folder, which is the whole reason a detection miss is so often
+# wrong in the user's eyes: somebody else installed the gateway, under their own
+# account, on the same machine.
+openclaw_config_file() { printf '%s' "$HOME/.openclaw/openclaw.json"; }
+hermes_config_dir()    { printf '%s' "$HOME/.hermes"; }
+
+# What to say when the operator picks a gateway whose configuration is not on
+# this machine. Dying here is the wrong shape and was the tool's single worst
+# dead end: it is the first real question, one keystroke in, and it is the most
+# likely wrong answer for exactly the person this wizard is written for — a
+# friend installed the gateway for them, so "which one is it" is a guess. So
+# every way out gets named and the run goes back to the same menu, which is a
+# question they have already been asked once and can now answer differently.
+gateway_not_here() { # gateway_not_here <display-name> <path-searched>
+  local name="$1" path="$2"
+  say ""
+  bad "I can't set up $name here — its settings aren't on this machine, under this user account."
+  say "  I looked for: $path"
+  say ""
+  say "  That almost always means one of three things:"
+  say "    • $name is installed under a DIFFERENT user account on this machine."
+  say "      Its settings live in that account's own home folder, so log in as that"
+  say "      user (or switch to them) and run me again there."
+  say "    • $name runs on ANOTHER machine. I configure the machine I'm running on,"
+  say "      so run me there instead — or, if that machine already answers on an"
+  say "      https:// address, choose option 3 below and give me that address."
+  say "    • $name was never finished setting up here. Run its own setup first;"
+  say "      this script never installs a gateway."
+  say ""
+  note "Not sure which of the three you have? Choose option 3. It works with anything that"
+  note "speaks the OpenAI API — OpenClaw and Hermes included — and it asks you for an"
+  note "address or a port instead of reading a config file."
+  say ""
+  note "↩ Back to the gateway choice. Nothing has been changed."
+}
 
 detect_gateway() {
   head_ "Step 1 — find your gateway"
@@ -1715,32 +2895,54 @@ detect_gateway() {
     say "  Configuring a server you set up yourself (skipping gateway detection)."
     return 0
   fi
+  local oc_cfg hm_dir choice
+  oc_cfg=$(openclaw_config_file)
+  hm_dir=$(hermes_config_dir)
   local found=()
-  [ -f "$HOME/.openclaw/openclaw.json" ] && found+=("openclaw")
-  { [ -f "$HOME/.hermes/.env" ] || [ -d "$HOME/.hermes" ]; } && found+=("hermes")
+  # Re-detected on every pass: an operator sent away to run a gateway's own
+  # onboarding can do it in another window and come straight back, and a menu
+  # still reporting the state from before that would be actively misleading.
+  while true; do
+    found=()
+    [ -f "$oc_cfg" ] && found+=("openclaw")
+    { [ -f "$hm_dir/.env" ] || [ -d "$hm_dir" ]; } && found+=("hermes")
 
-  if [ ${#found[@]} -gt 0 ]; then
-    say "  We found these on this machine: ${BOLD}${found[*]}${RESET}"
-    say "  You can choose one of them, or configure a different server."
-  else
-    say "  No OpenClaw or Hermes install detected in the usual places."
-    say "  You can still choose either one or configure a different server."
-  fi
+    if [ ${#found[@]} -gt 0 ]; then
+      say "  We found these on this machine: ${BOLD}${found[*]}${RESET}"
+      say "  You can choose one of them, or configure a different server."
+    else
+      # "the usual places" told a user whose gateway IS installed that the tool
+      # looked somewhere — without saying where — so they could neither check
+      # nor correct it. Naming both paths turns a dead end into something the
+      # operator can act on, usually by noticing the home folder is not theirs.
+      say "  I found no OpenClaw or Hermes install here. I looked for:"
+      say "    OpenClaw:  $oc_cfg"
+      say "    Hermes:    $hm_dir/"
+      say "  Those are this user account's own settings folders, so a gateway installed"
+      say "  under a different account — or running on another machine — doesn't show up."
+      say "  You can still pick one; I'll say exactly what I couldn't find."
+    fi
 
-  say ""
-  say "  Which gateway should Conduck talk to?"
-  say "    1) OpenClaw $( [[ " ${found[*]-} " == *" openclaw "* ]] && echo '(detected)' )"
-  say "    2) Hermes   $( [[ " ${found[*]-} " == *" hermes "* ]] && echo '(detected)' )"
-  say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, your own adapter, …)"
-  local choice
-  choice=$(require_choice "Choose 1-3" '^[123]$' "nav.gateway") || die "$NO_ANSWER"
-  [ "$choice" = "q" ] && quit_run
-  case "$choice" in
-    1) GW_KIND="openclaw" ;;
-    2) GW_KIND="hermes" ;;
-    3) GW_KIND="custom" ;;
-    *) die "Invalid choice." ;;   # unreachable; a silent fallthrough would leave GW_KIND unset
-  esac
+    say ""
+    say "  Which gateway should Conduck talk to?"
+    say "    1) OpenClaw $( [[ " ${found[*]-} " == *" openclaw "* ]] && echo '(detected)' )"
+    say "    2) Hermes   $( [[ " ${found[*]-} " == *" hermes "* ]] && echo '(detected)' )"
+    say "    3) Something else that speaks the OpenAI API (Ollama, LiteLLM, vLLM, your own adapter, …)"
+    prompt_into choice require_choice "Choose 1-3" '^[123]$' "nav.gateway"
+    case "$choice" in
+      # The same file configure_openclaw needs. Checking it HERE, where the menu
+      # is still on screen, is what turns "wrong keystroke" into "answer again".
+      1) [ -f "$oc_cfg" ] && { GW_KIND="openclaw"; return 0; }
+         gateway_not_here "OpenClaw" "$oc_cfg" ;;
+      # configure_hermes tests the directory, not the .env, because it can create
+      # the .env itself — so this gate has to test exactly the same thing.
+      2) [ -d "$hm_dir" ] && { GW_KIND="hermes"; return 0; }
+         gateway_not_here "Hermes" "$hm_dir" ;;
+      3) GW_KIND="custom"; return 0 ;;
+      *) die "Invalid choice." ;;   # unreachable; a silent fallthrough would leave GW_KIND unset
+    esac
+    say ""
+  done
 }
 
 # Resolve OpenClaw's loopback port. Precedence: a live --port override (unknowable from
@@ -1797,7 +2999,11 @@ _openclaw_prompt_secret() { # _openclaw_prompt_secret <ctx> <ask-prompt> <die-ms
     note "(dry-run: would prompt for the gateway credential)"
     return 0
   fi
-  GW_TOKEN=$(ask_secret "$ask" "stop; this credential is required")
+  # prompt_into, not a plain $(…): ask_secret answers `q` with rc 11, and acting
+  # on that has to happen in THIS shell — a quit_run inside a command
+  # substitution would stop the subshell and let the wizard walk on with an
+  # empty token.
+  prompt_into GW_TOKEN ask_secret "$ask" "stop; this credential is required" "gateway.token"
   [ -n "$GW_TOKEN" ] || die "$diemsg"
 }
 
@@ -1870,11 +3076,225 @@ openclaw_resolve_secret() { # openclaw_resolve_secret <ctx>
   esac
 }
 
+# --- one saved setup per first-class gateway ---------------------------------
+#
+# OpenClaw and Hermes are never asked for a name: their ids are the constants
+# "openclaw" and "hermes", so every run of either lands on the SAME saved
+# profile, the same file-server unit and the same credential. That single-setup
+# model is right for what a machine actually has — one OpenClaw per user account
+# — but it means a second run REPLACES the first run's saved record wholesale,
+# at the very end, inside write_profile, and nothing on screen said so. Options 1
+# and 2 are the paths the wizard leads with, and they were the two with no
+# collision gate at all; the custom path has had one since it grew a name prompt.
+#
+# This is a CONFIRMATION, not a refusal, and that difference is the whole design.
+# Re-running the wizard IS the supported way to repair a gateway whose address
+# moved — a Cloudflare quick tunnel's hostname is reassigned on every restart of
+# it, which is this tool's commonest real-world failure — so refusing the way the
+# custom path refuses a duplicate name would block the repair people come here
+# for. What the operator gets instead is the record they are about to lose, on
+# screen, before they answer, plus the shorter way round when only one value has
+# changed.
+#
+# It tests the PROFILE only, deliberately not gateway_id_is_taken. A leftover
+# unit or credential filed under a fixed id belongs to this same gateway by
+# construction — there is no second OpenClaw it could have come from — so
+# adopting it is correct, and the file lane already detects, reports and reuses
+# what it finds. The saved record is the one thing this run can destroy and
+# nothing can reconstruct, so it is the one thing gated.
+#
+# Read by the `i` panel below, which cannot take arguments. Set immediately
+# before the gate that uses them and never read anywhere else. EDITABLE carries
+# the one fact the panel cannot re-derive: whether the saved file is one this
+# version can parse, and so whether the edit-one-value alternative it recommends
+# actually exists for this operator.
+GW_REPLACE_ID=""
+GW_REPLACE_NAME="this gateway"
+GW_REPLACE_EDITABLE=true
+# The id this run has already put the replace screen up for. `b` at the exposure
+# menu returns to the gateway choice (99-main loops), so configure_openclaw can
+# run twice in one process — and a consent screen that comes round again on the
+# way back through a step nobody re-decided is how a reader learns to answer it
+# without reading. It also keeps --dry-run's plan from listing one replacement
+# twice. Keyed by id, so going back and choosing the OTHER gateway still asks.
+GW_REPLACE_ASKED_ID=""
+
+# What the saved record actually says, in the four lines the next few steps are
+# about to overwrite. Its own function so the gate reads as one thought, and
+# because the manage surface wants the same four facts (see the handoff note).
+gw_print_saved_setup_summary() { # gw_print_saved_setup_summary <profile-file>
+  local pf="$1" u t r m fsu fsf reach_note=""
+  u=$(json_get "$pf" "gateway.url")
+  t=$(json_get "$pf" "gateway.transport")
+  r=$(json_get "$pf" "gateway.reach")
+  m=$(json_get "$pf" "gateway.model")
+  # safe_display on every one of them: these come off disk as free text, and this
+  # is a terminal. Bounded generously — a model id is server-owned and a long
+  # legitimate one has to be recognisable, which is the only reason it is here.
+  say "    Address:       $(safe_display "${u:-—}" 4096)"
+  [ -n "$r" ] && reach_note=" ($(safe_display "$r" 20))"
+  # Transport and reach are one fact to a reader ("tailscale, private"), and two
+  # rows for them would put the answer to "can anyone else get at this?" on a
+  # line of its own where it reads as a separate setting.
+  [ -z "$t" ] || say "    Reached over:  $(safe_display "$t" 60)$reach_note"
+  if [ -n "$m" ]; then say "    Model:         $(safe_display "$m" 4096)"
+  else                 say "    Model:         whichever model your server picks"; fi
+  if [ "$(json_type "$pf" "fileServer")" = "object" ]; then
+    fsf=$(json_get "$pf" "fileServer.folder"); fsu=$(json_get "$pf" "fileServer.url")
+    say "    Shared folder: $(safe_display "${fsf:-—}" 200)"
+    say "                   reached at $(safe_display "${fsu:-—}" 4096)"
+  else
+    say "    Shared folder: none — attachments stay inside the conversation"
+  fi
+  return 0
+}
+
+# `i` at the replace gate. A named function rather than an id in the explanation
+# catalog because it has to name the gateway's own id in the line that matters
+# most (the --edit alternative), and the catalog's arms take no arguments.
+gw_explain_replace_saved_setup() {
+  local unsure
+  if [ "${GW_REPLACE_EDITABLE:-true}" = "true" ]; then
+    unsure="If only ONE value has changed — the web address moved, or you want a different model — say No, and run 'bash conduck-connect.sh --edit ${GW_REPLACE_ID:-<gateway>}' instead. That asks the one question, re-checks it, and leaves the rest of the saved setup alone."
+  else
+    # No alternative to offer, so none is invented: the edit surface reads saved
+    # setups through the same validator that has just refused this file.
+    unsure="There is no way to change one value inside a saved file this version cannot read — updating conduck-connect is what opens it again. Say No if that file is worth keeping; nothing else on this machine is waiting on this answer."
+  fi
+  explain_panel \
+    "Whether to replace the setup this machine has already saved for ${GW_REPLACE_NAME:-this gateway}" \
+    "One gateway, one saved setup. ${GW_REPLACE_NAME:-This gateway} is filed under a fixed id, so a second run writes over the record of the first instead of sitting beside it. Only a server you set up yourself (option 3 at the first question) can have several, because each of those is given a name and the name is what keeps them apart." \
+    "Yes carries on with setup. The steps after this one decide how this gateway is reached from outside — that is where its web address comes from — and whether it has a shared folder; what they produce is saved in place of the values printed above. Its port and its key are read from the gateway's own settings, so you never type those. No stops the run without writing anything." \
+    "The run stops there and makes no further change. Your saved setup stays exactly as it is, and so does the app on your phone. (It is not a claim that this run has changed nothing at all: before it reaches this question it offers to close any leftover Tailscale mapping from an earlier run, and you may already have said yes to that.)" \
+    "The old values are not kept anywhere — this script keeps no history of them, so the printout above is the last you see of them. Either way this question does not touch the gateway itself, the folder it works in, or the setup code already scanned into the app: that app keeps using the address and key it was given until you scan a new code." \
+    "$unsure"
+}
+
+# The gate itself. Called at the TOP of Step 2 for both first-class gateways —
+# before a config file is read, before a flag is switched, before anything is
+# exposed — because consent to lose the record has to come before the work that
+# depends on it. The cost of asking here is that this run's REPLACEMENT values
+# are not known yet, so the screen names the fields that will be replaced rather
+# than the values that will replace them. That trade is the right way round: a
+# review screen at the end would ask for consent after the host had already been
+# changed, which is the one thing the tool's per-mutation-consent model refuses.
+gw_guard_single_saved_setup() { # gw_guard_single_saved_setup <id> <display-name>
+  # Split, not one `local id=… pf=…$id…`: a mid-`local` self-reference reads the
+  # OUTER value (or nothing at all under `set -u`), which is the same trap
+  # report_gateway_id_collision documents a few functions down.
+  local id="$1" name="$2" pf="" readable=true
+  pf="$STATE_DIR/profile-$id.json"
+  [ -f "$pf" ] || return 0
+  # Defaulted like every other latch the test harnesses lift a function without:
+  # an unset global would abort the whole run under `set -u`, and this one has to
+  # be the safest possible read. Set BEFORE the branches, not after the answer:
+  # every exit below is "this screen has been shown for this id", including the
+  # two flag branches that never ask.
+  [ "${GW_REPLACE_ASKED_ID:-}" = "$id" ] && return 0
+  GW_REPLACE_ASKED_ID="$id"
+  GW_REPLACE_ID="$id"; GW_REPLACE_NAME="$name"; GW_REPLACE_EDITABLE=true
+  say ""
+  # The same validator the picker and --show-code use, so "can't read it" here
+  # means exactly what it means there — including for the edit surface, which is
+  # why the alternative below is offered only when this passes.
+  if show_qr_validate_profile "$pf"; then
+    warn "This machine already has a saved $name setup, and going on replaces it."
+    say ""
+    say "  ${BOLD}What is saved now:${RESET}"
+    gw_print_saved_setup_summary "$pf"
+  else
+    readable=false; GW_REPLACE_EDITABLE=false
+    # An unreadable file makes the replacement MORE consequential, not less: one
+    # this version cannot parse is one a NEWER conduck-connect wrote, and
+    # overwriting it is what makes the newer script's record unrecoverable. So
+    # the branch says what it cannot show, and names the file so the operator can
+    # copy it somewhere first.
+    warn "This machine already has a saved $name setup, in a file this version can't read."
+    note "$pf"
+    note "A newer conduck-connect wrote it, so its values can't be shown here. Updating this"
+    note "script is what recovers them; going on replaces the file and they are gone."
+  fi
+  say ""
+  say "  conduck-connect saves ONE setup per gateway, and $name is always filed"
+  say "  under the id '$id'. This run updates that one — it cannot add a second"
+  say "  $name beside it. (Servers you set up yourself, option 3, can sit side by"
+  say "  side: each of those is given a name, and the name keeps them apart.)"
+  say ""
+  # "Re-asks the address" would be wrong for these two: OpenClaw and Hermes are
+  # never asked for a web address or a model at all — the address is whatever
+  # Step 3 publishes, and the port and token come out of the gateway's own config
+  # file. So the sentence names the STEPS that produce the saved values, which is
+  # also what tells the reader where in the run the replacement gets decided.
+  say "  Going on re-does the steps that produced those values — how this gateway is"
+  say "  reached from outside, and whether it has a shared folder — and saves what"
+  if $readable; then
+    say "  this run ends up with in place of the values above."
+  else
+    say "  this run ends up with in place of whatever that file holds."
+  fi
+  say "  Not touched either way: $name itself, the folder it works in, and the setup code"
+  say "  already scanned into the app — that app keeps using the address and key it was"
+  say "  given until you scan a new code."
+  say ""
+  if $readable; then
+    # Named by what it does, not by the flag alone: somebody reading this has a
+    # working setup and one broken value in it, and "there is a flag" is not an
+    # answer to that. This is the moment the shorter way round is worth knowing.
+    say "  ${BOLD}Only one value to change${RESET} — an address that moved, a different model?"
+    say "    ${BOLD}bash conduck-connect.sh --edit $id${RESET}"
+    say "  asks that one question, re-checks it, and leaves the rest of the saved setup"
+    say "  alone. No exposure step, no new file server, no walk through this wizard."
+  else
+    # Offering the edit surface here would be offering a door that is locked from
+    # the same side: it reads saved setups through the validator that has just
+    # refused this one. The only thing that opens it is a newer script.
+    say "  Editing one value instead is not available for a file this version can't read —"
+    say "  updating conduck-connect is what opens it. Replacing it here is the other way,"
+    say "  and it is one-directional."
+  fi
+  say ""
+  # A dry run writes no profile at all (write_profile returns early), so there is
+  # nothing to consent to — but printing what a real run would do to this host is
+  # the entire job of --dry-run, and losing a saved setup is one of the larger
+  # entries on that list.
+  if $DRY_RUN; then
+    note "(dry-run: nothing is written, so the saved setup stays as it is — a real run asks first)"
+    # The plan is headed "in order", and this entry is added first while the
+    # replacement itself happens LAST — write_profile runs after a code has been
+    # emitted — so the line carries its own timing rather than borrowing the
+    # list's.
+    plan_add "REPLACE the saved setup in $pf with this run's answers (last, and only if the run ends in a working setup code)"
+    return 0
+  fi
+  # --reuse-only refuses configuration changes, and write_profile counts an
+  # existing profile as configuration: it keeps the file exactly as it is. There
+  # is nothing to lose here, so there is nothing to gate.
+  if $REUSE_ONLY; then
+    note "(--reuse-only: the saved setup above is kept exactly as it is — this run reuses what exists and rewrites no record)"
+    return 0
+  fi
+  # Enter is No, which is the safe direction: a closed stdin, or an operator in
+  # Enter-rhythm, stops the run rather than spending the record. Not a typed
+  # confirmation — that is reserved for removal, which takes the file server and
+  # the credential with it. This one only re-asks questions the operator is here
+  # to answer, and gating it behind typing would train the reflex out of the
+  # place it exists for.
+  confirm "  Replace the saved $name setup?" "gw_explain_replace_saved_setup" && return 0
+  say ""
+  note "↩ Stopping instead — your saved $name setup is exactly as it was."
+  $readable && note "To change one value in it without a full run:  bash conduck-connect.sh --edit $id"
+  quit_run
+}
+
 configure_openclaw() {
   head_ "Step 2 — OpenClaw: chat endpoint + token"
   GW_ID="openclaw"
   local cfg="$HOME/.openclaw/openclaw.json"
   [ -f "$cfg" ] || die "Cannot find $cfg — is OpenClaw onboarded on this machine? (Run its onboarding first; this script doesn't install gateways.)"
+  # Before the config is read and before any flag is touched: a second run of a
+  # first-class gateway replaces the first one's saved setup, and this is the
+  # only point in the run where saying so is still cost-free.
+  gw_guard_single_saved_setup "openclaw" "OpenClaw"
 
   # OpenClaw's config is JSON5 on read (comments + trailing commas legal); its own
   # 'config set' (which the enable-endpoint step below may run) rewrites the file as
@@ -1916,9 +3336,14 @@ configure_openclaw() {
         fi
       fi
     else
+      # Enter here means "no, I skipped it", so skipping is now the answer a
+      # reader in Enter-rhythm gives — and it has to be named rather than passed
+      # over in silence. The re-read just below is what settles the truth either
+      # way; this line only makes the transcript say which of the two happened.
       print_and_wait "gateway.openclaw.manual_enable_chat" \
         "Your OpenClaw doesn't look like the standard Docker setup, so apply the flag with your own install's CLI, then restart the gateway." \
-        "openclaw config set gateway.http.endpoints.chatCompletions.enabled true" || true
+        "openclaw config set gateway.http.endpoints.chatCompletions.enabled true" \
+        || note "(skipped — the chat endpoint stays off unless something else already turned it on)"
     fi
     if ! $DRY_RUN; then
       enabled=$(json_get "$cfg" "gateway.http.endpoints.chatCompletions.enabled")
@@ -1938,6 +3363,10 @@ configure_hermes() {
   GW_ID="hermes"
   local envf="$HOME/.hermes/.env"
   [ -d "$HOME/.hermes" ] || die "Cannot find ~/.hermes — is Hermes installed for this user? (This script doesn't install gateways.)"
+  # Same gate, same reason as configure_openclaw's: "hermes" is a fixed id, so a
+  # second run of this step replaces the saved setup of the first, and this is
+  # the last point where that costs nothing to say.
+  gw_guard_single_saved_setup "hermes" "Hermes"
 
   local enabled; enabled=$(env_get "$envf" "API_SERVER_ENABLED")
   GW_LOCAL_PORT=$(hermes_api_server_port)
@@ -2002,9 +3431,14 @@ configure_hermes() {
         run_step "gateway.hermes.restart_api" "restart Hermes so the API server starts" \
           systemctl --user restart hermes-gateway.service || true
       else
+        # Skipping is Enter, so it is the likely answer and gets said out loud:
+        # the .env is written either way, and a Hermes still running on the old
+        # settings fails verification for a reason that has nothing to do with
+        # the address or the key.
         print_and_wait "gateway.hermes.manual_restart_api" \
           "Restart Hermes however it runs on this machine so the new API server settings load." \
-          "systemctl --user restart hermes-gateway.service   # or your own restart method" || true
+          "systemctl --user restart hermes-gateway.service   # or your own restart method" \
+          || note "(not restarted — the settings are written, but Hermes keeps running with the old ones until it restarts)"
       fi
     else
       note "(skipped — verification below will fail if the API server is off)"
@@ -2015,7 +3449,8 @@ configure_hermes() {
   if [ -n "$GW_TOKEN" ]; then ok "Read API_SERVER_KEY from ~/.hermes/.env (not shown)."
   elif $DRY_RUN; then note "(dry-run: would prompt for the Hermes API server key)"
   else
-    GW_TOKEN=$(ask_secret "Paste the Hermes API server key (hidden)" "stop; Hermes requires a key")
+    prompt_into GW_TOKEN ask_secret "Paste the Hermes API server key (hidden)" \
+      "stop; Hermes requires a key" "gateway.token"
     [ -n "$GW_TOKEN" ] || die "An API key is required for Hermes."
   fi
 
@@ -2182,21 +3617,160 @@ try:
 except Exception: pass' 2>/dev/null
 }
 
-# A bounded value prompt, unlike the free-form name/model/token prompts. `b` is
-# safe here because a custom-server answer has changed nothing yet; it restarts
-# this short answer group. The answer is assigned directly so q can exit the
-# parent shell (a command substitution would trap that exit in a subshell).
-ask_custom_gateway_port() { # sets GW_LOCAL_PORT; 0 value / 10 back / 1 EOF
-  local reply
+# What is listening on this machine right now, as "<port>\t<program>" lines.
+#
+# This exists because the port question is the one value in the wizard its
+# intended reader most often cannot supply from memory, and the machine already
+# knows the answer. It is READ-ONLY and best-effort by design: every tool here is
+# run without privilege (so on macOS it sees only this user's own processes,
+# which is where their gateway almost certainly is), nothing is installed, and a
+# machine with none of these tools simply gets the typed prompt with no list and
+# no complaint. This must never become a dependency — `have` gates every branch.
+gw_scan_listening() { # -> "<port>\t<program>" lines on stdout, possibly none
+  case "${OS:-}" in
+    Darwin)
+      have lsof || return 0
+      # -n/-P skip DNS and service-name lookups (fast, and no outbound query);
+      # -w silences the warnings an unreadable process directory produces. The
+      # NAME column is the last field: "127.0.0.1:11434", "*:8080", "[::1]:631".
+      lsof -nP -w -iTCP -sTCP:LISTEN 2>/dev/null \
+        | awk 'NR>1 {
+            n=$NF; if (n ~ /^\(/) n=$(NF-1)      # the NAME column carries a trailing "(LISTEN)"
+            sub(/.*:/,"",n)
+            if (n ~ /^[0-9]+$/) printf "%s\t%s\n", n, $1
+          }'
+      ;;
+    *)
+      # ss first: it is what modern Linux ships and it needs no privilege to
+      # list sockets (only the OWNING PROGRAM is redacted without it, which
+      # costs a label, not a row). netstat is the fallback on older systems,
+      # lsof the last resort.
+      if have ss; then
+        ss -ltnp 2>/dev/null | awk '
+          $1=="LISTEN" {
+            a=$4; sub(/.*:/,"",a); prog="";
+            if (match($0, /users:\(\("[^"]+"/)) { prog=substr($0, RSTART+9, RLENGTH-9); gsub(/"/,"",prog) }
+            if (a ~ /^[0-9]+$/) printf "%s\t%s\n", a, prog
+          }'
+      elif have netstat; then
+        netstat -ltnp 2>/dev/null | awk '
+          /LISTEN/ {
+            a=$4; sub(/.*:/,"",a); prog=$NF; sub(/^[0-9]*\//,"",prog);
+            if (prog=="-" || prog ~ /:/) prog="";
+            if (a ~ /^[0-9]+$/) printf "%s\t%s\n", a, prog
+          }'
+      elif have lsof; then
+        lsof -nP -w -iTCP -sTCP:LISTEN 2>/dev/null \
+          | awk 'NR>1 {
+            n=$NF; if (n ~ /^\(/) n=$(NF-1)      # the NAME column carries a trailing "(LISTEN)"
+            sub(/.*:/,"",n)
+            if (n ~ /^[0-9]+$/) printf "%s\t%s\n", n, $1
+          }'
+      fi
+      ;;
+  esac
+}
+
+# The scan, deduplicated by port and ordered so the likeliest answer is row 1.
+#
+# The rank list is the ONLY place vendor port numbers appear in this module, and
+# it is deliberately invisible: it decides ordering, never wording, so it cannot
+# drift out of step with the numbers `gateway.custom.port`'s explanation panel
+# prints. A port that is not on it is still offered, one row lower.
+gw_port_candidates() { # -> "<port>\t<program>" lines, likeliest first
+  # Only IANA's registered range, 1024-49151, is offered. Below it are the
+  # system's own privileged services (ssh, printing, file sharing); above it is
+  # the dynamic range the operating system hands out to short-lived connections,
+  # which on a Mac is most of what a scan returns. Neither is where a person
+  # starts an AI server, and every one of them listed is a row the reader has to
+  # rule out by hand. A gateway genuinely on 80, 443 or 50000 is not lost: `t`
+  # takes any number at all, and a gateway already reachable over https belongs
+  # on the other branch of this question anyway.
+  gw_scan_listening | awk -F'\t' '
+    $1 >= 1024 && $1 <= 49151 && !seen[$1]++ {
+      likely = ($1==11434 || $1==1234 || $1==4000 || $1==8000 || $1==8642 || $1==18789) ? 0 : 1
+      printf "%d\t%s\t%s\n", likely, $1, $2
+    }' | sort -t"$(printf '\t')" -k1,1n -k2,2n | cut -f2-
+}
+
+GW_PORT_LIST_MAX=8   # a busy laptop listens on dozens of ports; a wall of them helps nobody
+
+# Offer the detected ports as a numbered list, the same shape
+# pick_existing_custom_gateway uses for saved profiles — with one deliberate
+# difference: the escape row is the letter `t`, not the next number. This list's
+# length depends on what the machine happens to be running, so a numbered escape
+# row would sit on a different key every run and on every machine. `t` is fixed,
+# and it is the same idiom as the welcome menu's `q) Exit`.
+gw_offer_listening_ports() { # 0 = GW_LOCAL_PORT set / 2 = no list, or "type it" / 10 back / 1 EOF
+  local rows=() line i n p pick rc extra=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if [ ${#rows[@]} -lt "$GW_PORT_LIST_MAX" ]; then rows+=("$line"); else extra=$((extra+1)); fi
+  done <<EOF
+$(gw_port_candidates)
+EOF
+  [ ${#rows[@]} -gt 0 ] || return 2
+
+  say ""
+  say "  ${BOLD}Programs listening on this machine right now:${RESET}"
+  i=1
+  for line in "${rows[@]}"; do
+    n="${line%%$'\t'*}"; p="${line#*$'\t'}"
+    # The program name comes from the operating system, so it is the one label
+    # here that cannot go stale — and it is what the reader actually recognises
+    # ("ollama", "python3"), far more than the number beside it.
+    if [ -n "$p" ]; then printf '    %d) port %-6s — %s\n' "$i" "$n" "$(safe_display "$p" 40)"
+    else                 printf '    %d) port %s\n' "$i" "$n"; fi
+    i=$((i+1))
+  done
+  say "    t) Not listed — I'll type the port number myself"
+  [ "$extra" = "0" ] || note "($extra more are listening than fit here; t takes any number.)"
+  say ""
   while true; do
-    read -r -p "  Local port (e.g. 11434; Enter = no default; i = explain; b = restart these answers; q = stop): " reply \
-      || return 1
+    # Explicit statuses rather than prompt_into: EOF has to travel back to
+    # configure_generic as 1 so it can say what was missing (see the header of
+    # ask_custom_gateway_port).
+    pick=$(require_choice "Which one is your AI server? Choose 1-$((i-1)), or t" '^([0-9]{1,3}|[tT])$' "gateway.custom.port" true); rc=$?
+    case "$rc" in
+      0)  ;;
+      10) return 10 ;;
+      11) quit_run ;;
+      *)  return 1 ;;
+    esac
+    case "$pick" in
+      [tT]) return 2 ;;
+    esac
+    if { [ "$pick" -ge 1 ] && [ "$pick" -lt "$i" ]; } 2>/dev/null; then
+      line="${rows[$((pick-1))]}"
+      GW_LOCAL_PORT="${line%%$'\t'*}"
+      p="${line#*$'\t'}"
+      if [ -n "$p" ]; then ok "Using port $GW_LOCAL_PORT — the one $(safe_display "$p" 40) is listening on."
+      else                 ok "Using port $GW_LOCAL_PORT."; fi
+      return 0
+    fi
+    warn "Please enter a number between 1 and $((i-1)), or t to type the port yourself."
+  done
+}
+
+# The typed port prompt. `t` is accepted as a no-op here so that the same answer
+# works whether or not a list was offered — a reader who has just been told
+# "press t to type it yourself" should not be told off for pressing it again.
+gw_read_port_number() { # sets GW_LOCAL_PORT; 0 value / 10 back / 1 EOF
+  local reply p
+  p="  Port number, 1-65535 ($(control_suffix "ask again" true)): "
+  while true; do
+    prompt_echo "$p"
+    read -r -p "$p" reply || return 1
     case "$reply" in
       [iI]|\?) explain_prompt "gateway.custom.port"; continue ;;
       [bB]) return 10 ;;
       [qQ]) quit_run ;;
-      '') warn "A local setup needs a port. Enter its number, or press b to restart these answers and choose HTTPS." ;;
-      *[!0-9]*) warn "That's not a port number — digits only (e.g. 11434)." ;;
+      [tT]) continue ;;
+      # Enter is an advertised no-op here (the suffix says "ask again"), so it is
+      # a note rather than a telling-off — pressing it at a question with no
+      # default is a pause, not a mistake.
+      '') note "Nothing entered — a server running on this machine needs its port number." ;;
+      *[!0-9]*) warn "That's not a port number — digits only." ;;
       # Length-bound BEFORE the numeric test (6+ digits can't be a port): bash
       # 3.2 errors out loudly on an integer comparison wider than intmax.
       ??????*) warn "Ports go from 1 to 65535." ;;
@@ -2209,6 +3783,25 @@ ask_custom_gateway_port() { # sets GW_LOCAL_PORT; 0 value / 10 back / 1 EOF
         ;;
     esac
   done
+}
+
+# The port question, in the order a reader needs it: what the number IS, then
+# what this machine can already tell us, then the typed fallback. `b` is safe
+# throughout because a custom-server answer has changed nothing yet; it returns
+# to the https:// question, which is the answer somebody who lands here by
+# mistake actually wants to change.
+#
+# EOF returns 1 rather than dying, so configure_generic can name what is missing.
+ask_custom_gateway_port() { # sets GW_LOCAL_PORT; 0 value / 10 back / 1 EOF
+  local rc
+  say "  Which port on this machine does your server listen on?"
+  say "  It's the number after the last colon in the address your server prints when"
+  say "  it starts up: http://localhost:8080 means 8080."
+  gw_offer_listening_ports; rc=$?
+  case "$rc" in
+    0|1|10) return "$rc" ;;
+  esac
+  gw_read_port_number
 }
 
 # Does anything on this machine already answer to this gateway id? The id keys
@@ -2241,10 +3834,10 @@ gateway_id_is_taken() { # gateway_id_is_taken <id> -> 0 when something already o
 # The name is not the identity — `slug` lowercases, folds punctuation and cuts at
 # 32 characters — so two names an operator reads as obviously different can land
 # on one id, and the refusal is unintelligible without naming the occupant.
-report_gateway_id_collision() { # report_gateway_id_collision <id>
+report_gateway_id_collision() { # report_gateway_id_collision <id> [name-just-typed]
   # Split, not one `local id=… pf=…$id…`: a mid-`local` self-reference is
   # unbound under `set -u` (the same trap tls_connect_target documents).
-  local id="$1" pf="" n=""
+  local id="$1" typed="${2:-}" pf="" n=""
   pf="$STATE_DIR/profile-$id.json"
   say ""
   # Readable-or-not is decided by the SAME validator the picker lists with, not by
@@ -2254,6 +3847,17 @@ report_gateway_id_collision() { # report_gateway_id_collision <id>
   if [ -f "$pf" ] && show_qr_validate_profile "$pf"; then
     n=$(json_get "$pf" "gateway.name")
     bad "That name belongs to a gateway you already set up: $(safe_display "${n:-$id}" 60)  (id: $id)"
+    # Two names that read as obviously different can produce one id, and without
+    # this the refusal is unanswerable: the operator is looking at a name they
+    # did not type, being told it is the name they did. The rule is stated
+    # rather than hinted at, because it is the only way to pick a name that
+    # will not collide again on the next try.
+    if [ -n "$typed" ] && [ -n "$n" ] && [ "$typed" != "$n" ]; then
+      say "  Those two names do read differently — but the identity here isn't the name."
+      say "  It's a short form of it: lowercased, anything that isn't a letter or digit"
+      say "  turned into a hyphen, and cut to 32 characters. Both of yours end up filed"
+      say "  as '$id'."
+    fi
     say "  Setting it up again from here would overwrite that one's saved setup and take"
     say "  over its file server — not add a second gateway."
   elif [ -f "$pf" ]; then
@@ -2261,9 +3865,31 @@ report_gateway_id_collision() { # report_gateway_id_collision <id>
     say "  Its saved file can't be read by this version, so it isn't offered in the list"
     say "  above — but the id stays reserved rather than being overwritten."
   else
-    bad "An earlier, unfinished run already claimed the id '$id' on this machine."
-    say "  Its file server and credential are still here even though no setup code was"
-    say "  saved, so reusing the id would silently adopt them."
+    # There are TWO ways to arrive here and the message named only one of them.
+    # The other is the most plausible piece of self-service cleanup this tool
+    # invites: profile-<id>.json is plain JSON with no secret in it, so deleting
+    # it looks exactly like deleting the gateway — and it is not. The file server
+    # keeps running, authenticated, over the agent's own working folder, and the
+    # id stays occupied by the unit and the credential nobody removed. Naming one
+    # cause made the message half-right in the case where being wrong costs the
+    # most, so it names both and then points at the one surface that can say
+    # which of them this machine has.
+    bad "Something on this machine already answers to the id '$id', with no saved setup beside it."
+    say "  A file server and its credential are filed under that id — left either by an"
+    say "  earlier, unfinished run, or by a saved setup that was deleted by hand while its"
+    say "  file server carried on running. Reusing the id would silently adopt them: the"
+    say "  same service, the same port, the same password."
+    # By what it does, not by the flag alone — and deliberately without promising
+    # which of the two causes it will report, because that is the inventory's
+    # answer to give.
+    note "To see what is left over on this machine — and the exact commands that stop and"
+    note "remove it:  bash conduck-connect.sh --list"
+    # This arm gets its own closing line. "Pick that gateway from the list" is the
+    # right advice in the two arms above and nonsense here: there is no saved
+    # gateway, so there is nothing in the list to pick. The two real ways forward
+    # are a different name now, or clearing the leftovers and coming back.
+    note "So: give this one a different name, or clear those leftovers first and re-run me."
+    return 0
   fi
   note "Either pick that gateway from the list to change it, or give this one a different name."
 }
@@ -2280,6 +3906,7 @@ report_gateway_id_collision() { # report_gateway_id_collision <id>
 # out loud, because their ids stay reserved and an operator who cannot see them
 # cannot understand why a name is later refused.
 pick_existing_custom_gateway() { # 0 = editing (globals set) / 1 = new gateway
+  GW_PICKER_SHOWN=false
   local pf cand=() hidden=0
   for pf in "$STATE_DIR"/profile-custom-*.json; do
     [ -e "$pf" ] || continue                 # no matches → the literal glob; skip it
@@ -2304,12 +3931,19 @@ pick_existing_custom_gateway() { # 0 = editing (globals set) / 1 = new gateway
   done
   printf '    %d) A different gateway — set up a new one\n' "$i"
   [ "$hidden" = "0" ] || note "($hidden more can't be read by this version and aren't listed; their names stay reserved.)"
-  local pick
+  GW_PICKER_SHOWN=true
+  local pick rc
   while true; do
     # {1,3} length-bounds the input so the numeric compare can't overflow bash 3.2's intmax.
-    pick=$(require_choice "Which one? Choose 1-$i" '^[0-9]{1,3}$' "nav.custom_gateway_pick") \
-      || die "$NO_ANSWER"
-    [ "$pick" = "q" ] && quit_run
+    # The statuses are read here rather than through prompt_into so that this
+    # function stays liftable on its own: it is the one gateway function the host
+    # suite exercises directly, against its own $STATE_DIR fixtures.
+    pick=$(require_choice "Which one? Choose 1-$i" '^[0-9]{1,3}$' "nav.custom_gateway_pick"); rc=$?
+    case "$rc" in
+      0)  ;;
+      11) quit_run ;;                # q — the primitive no longer echoes a sentinel
+      *)  die "$NO_ANSWER" ;;
+    esac
     { [ "$pick" -ge 1 ] && [ "$pick" -le "$i" ]; } 2>/dev/null && break
     warn "Please enter a number between 1 and $i."
   done
@@ -2352,9 +3986,11 @@ ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
     say "  Does this server require a token (API key) on every request?"
     say "    1) Yes — it requires a token"
     say "    2) No  — it is keyless"
-    local c; c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' "gateway.custom.has_auth") \
-      || die "$NO_ANSWER"
-    [ "$c" = "q" ] && quit_run
+    # No hand-rolled "('i' explains)" here: require_choice renders its own
+    # control list, and a second one beside it is what trains a reader to stop
+    # reading the suffix that carries the keys the prompt really honours.
+    local c
+    prompt_into c require_choice "Choose 1-2" '^[12]$' "gateway.custom.has_auth"
     if [ "$c" = "1" ]; then
       GW_AUTH="bearer"; GW_TOKEN="<token>"
       note "(dry-run: a real run asks for the token at a hidden prompt)"
@@ -2369,7 +4005,7 @@ ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
   fi
   while true; do
     say "  If this server needs a token (API key), paste it now — nothing appears as you type."
-    GW_TOKEN=$(ask_secret "Token" "this server is keyless") || die "$NO_ANSWER"
+    prompt_into GW_TOKEN ask_secret "Token" "this server is keyless" "gateway.token"
     # An all-whitespace answer is a fumbled paste, not a token and not a
     # deliberate Enter. Letting it through mints a setup code the app parses and
     # then refuses to save, which strands the operator a step later than here.
@@ -2404,24 +4040,27 @@ choose_saved_model() { # reads + rewrites GW_MODEL
   say "    1) Keep it"
   say "    2) Use a different model name"
   say "    3) Clear it — let the server pick"
-  local c; c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' "gateway.custom.model") \
-    || die "$NO_ANSWER"
-  [ "$c" = "q" ] && quit_run
+  local c
+  prompt_into c require_choice "Choose 1-3" '^[123]$' "gateway.custom.model"
   case "$c" in
     1) : ;;                                              # GW_MODEL already holds it
-    2) GW_MODEL=$(ask "  Model name" "" "let the server pick") ;;
+    2) prompt_into GW_MODEL ask "  Model name" "" "let the server pick" "gateway.custom.model" ;;
     3) GW_MODEL="" ;;
   esac
 }
 
 review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
-  local address auth model reply
+  local address auth model reply p
   if [ -n "$GW_URL" ]; then address="$GW_URL"
   else address="http://127.0.0.1:$GW_LOCAL_PORT (local; HTTPS comes next)"; fi
   if [ "$GW_AUTH" = "bearer" ]; then auth="Bearer token configured (hidden)"
   else auth="No token — allowed only on a private path unless explicitly overridden"; fi
+  # "Server/app default (no model fixed in the setup code)" described the wire
+  # payload, in a row headed by the word the reader typed nothing into — so the
+  # commonest, most correct answer here read as a report of something missing.
+  # This says the same fact as an outcome instead.
   if [ -n "$GW_MODEL" ]; then model=$(safe_display "$GW_MODEL" 4096)
-  else model="Server/app default (no model fixed in the setup code)"; fi
+  else model="Whichever model your server picks (you named none — that is normal)"; fi
 
   say ""
   if $GW_EDITING; then
@@ -2433,15 +4072,36 @@ review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
   # The id, not the name, is what the saved setup, the file-lane service and its
   # credential are filed under. Shown once, here, because it is derived from the
   # name by a lossy rule (lowercased, punctuation folded, cut at 32 characters)
-  # and is otherwise invisible until two gateways quietly share one.
-  say "    Id:             $GW_ID"
+  # and is otherwise invisible until two gateways quietly share one. "Id" was a
+  # bare field name for a value the operator never chose and never sees again,
+  # so the row now says what the value is FOR, which is the only reason it earns
+  # a line on a five-line screen.
+  say "    Filed under:    $GW_ID   ${DIM}(its settings and service files use this)${RESET}"
   say "    Address:        $(safe_display "$address" 4096)"
+  # 127.0.0.1 is the one value on this screen the tool put there itself, and a
+  # reader who has never seen it cannot tell whether it is their machine, a
+  # placeholder, or a mistake. Glossed only on the local branch: an operator who
+  # typed their own https:// address needs no help reading it back.
+  if [ -z "$GW_URL" ]; then
+    say "                    ${DIM}127.0.0.1 means this machine talking to itself, so${RESET}"
+    say "                    ${DIM}nothing outside reaches it yet — that is Step 3's job.${RESET}"
+  fi
   say "    Authentication: $auth"
   say "    Model:          $model"
+  # A rename here changes the label and nothing else, and the operator has just
+  # been shown the id it does NOT change. Saying so now is what makes a later
+  # "that name belongs to <the old name>" refusal readable instead of baffling.
+  if $GW_EDITING && $GW_RENAMED; then
+    say ""
+    note "The new name is what the Conduck app shows. This gateway stays filed under"
+    note "$GW_ID — its saved settings, its file service and its stored password"
+    note "all keep the old name, so they go on matching each other."
+  fi
   say ""
   while true; do
-    read -r -p "  Enter = continue; b = re-enter these answers; i = explain; q = stop: " reply \
-      || die "$NO_ANSWER"
+    p="  Enter = continue; b = re-enter these answers; i = explain; q = stop: "
+    prompt_echo "$p"
+    read -r -p "$p" reply || die "$NO_ANSWER"
     case "$reply" in
       '') return 0 ;;
       [bB]) return 10 ;;
@@ -2459,39 +4119,70 @@ configure_generic() {
     GW_ID=""; GW_NAME=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""
     GW_AUTH="bearer"; GW_TOKEN=""; GW_MODEL=""; GW_URL=""
 
-    GW_EDITING=false
+    GW_EDITING=false; GW_RENAMED=false
     if pick_existing_custom_gateway; then GW_EDITING=true; fi
 
+    # Back at the name is offered only when the picker put a list on screen —
+    # that is the question Back would return to. On a machine with nothing saved
+    # the name IS the first question, and a `b` that re-asks the same prompt is
+    # the kind of hollow control this release exists to remove.
+    local name_back=false; $GW_PICKER_SHOWN && name_back=true
     if $GW_EDITING; then
       # The name is DISPLAY only from here on: re-slugging an edited name would
       # mint a fresh id and rebuild the exact duplicate this picker exists to
       # prevent — and then the one thing the operator came here to fix, a
       # mistyped name, would be the one thing they cannot fix.
-      GW_NAME=$(ask "  A short name for it (shown in the app)" "$GW_NAME")
+      local prior_name="$GW_NAME"
+      prompt_into GW_NAME ask "  A short name for it (shown in the app)" "$GW_NAME" "" \
+        "gateway.display_name" "$name_back" \
+        || { say ""; note "↩ Back to the list of saved gateways."; continue; }
+      [ "$GW_NAME" = "$prior_name" ] || GW_RENAMED=true
     else
-      GW_NAME=$(ask "  A short name for it (shown in the app)" "My gateway")
+      prompt_into GW_NAME ask "  A short name for it (shown in the app)" "My gateway" "" \
+        "gateway.display_name" "$name_back" \
+        || { say ""; note "↩ Back to the list of saved gateways."; continue; }
       GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
       # A new gateway may never land on an occupied id. Warning and continuing is
       # not enough: the review screen's default is Enter, the file lane adopts the
       # occupant's credential before any profile is written, and write_profile
       # replaces the file atomically at the end — by then all three are gone.
       if gateway_id_is_taken "$GW_ID"; then
-        report_gateway_id_collision "$GW_ID"
+        report_gateway_id_collision "$GW_ID" "$GW_NAME"
         continue
       fi
     fi
-    if confirm "  Does it already have an https:// URL?" "gateway.custom.has_https"; then
-      GW_URL=$(ask_url "Its full https:// web address" "https://ai.example.com") || die "$NO_ANSWER"
-      apply_gateway_url_normalization
-    else
-      ask_custom_gateway_port
-      local port_rc=$?
-      if [ "$port_rc" = "10" ]; then
-        note "↩ Restarting the custom gateway answers. Nothing has been changed."
-        continue
-      fi
-      [ "$port_rc" = "0" ] || die "Need the local port (or an https URL)."
+
+    # The address group — the https:// gate and whichever question it leads to —
+    # in its own loop. Back at either of those questions returns to the gate
+    # that sent the operator there, not to the top: a wrong `y` here is the most
+    # likely wrong answer in Step 2, and until now it stranded the run at a URL
+    # prompt with no exit at all. Back at the gate itself restarts the group,
+    # which is where the name lives.
+    local addr_rc
+    while true; do
+      GW_URL=""; GW_LOCAL_PORT=""
+      confirm "  Does it already have an https:// URL?" "gateway.custom.has_https" true
+      addr_rc=$?
+      case "$addr_rc" in
+        10) break ;;                      # back at the gate → restart the group
+        0)  prompt_into GW_URL ask_url "Its full https:// web address" "https://ai.example.com" \
+              0 "" "gateway.custom.address" true && { apply_gateway_url_normalization; break; }
+            say ""; note "↩ Back to the https:// question."
+            continue ;;
+        *)  ask_custom_gateway_port; addr_rc=$?
+            [ "$addr_rc" = "0" ] && break
+            if [ "$addr_rc" = "10" ]; then
+              say ""; note "↩ Back to the https:// question."
+              continue
+            fi
+            die "Need the local port (or an https URL)." ;;
+      esac
+    done
+    if [ "$addr_rc" = "10" ]; then
+      say ""; note "↩ Restarting the custom gateway answers. Nothing has been changed."
+      continue
     fi
+
     GW_HEALTH_PATH=""   # no portable health endpoint on arbitrary servers
     ask_custom_gateway_auth
     if $GW_EDITING && [ -n "$GW_MODEL" ]; then
@@ -2501,9 +4192,10 @@ configure_generic() {
       say "  name a model in every request."
       local model_default=""; $DRY_RUN || model_default=$(probe_single_model "$GW_LOCAL_PORT")
       if [ -n "$model_default" ]; then
-        GW_MODEL=$(ask_default "Model name (your server reports exactly one):" "$model_default")
+        prompt_into GW_MODEL ask_default "Model name (your server reports exactly one):" \
+          "$model_default" "gateway.custom.model"
       else
-        GW_MODEL=$(ask "  Model name (leave blank if your server picks a default)" "")
+        prompt_into GW_MODEL ask "  Model name" "" "let your server pick" "gateway.custom.model"
       fi
     fi
 
@@ -2536,7 +4228,7 @@ FS_ROLLBACK_INCOMPLETE=false  # a file-lane exposure we applied could not be pro
 # PUBLIC Funnel in front of a tool-capable agent — while the only record of who
 # opened it dies with the shell, so no later run can find it. $STATE_DIR is the
 # sanctioned home for this class of data and is created only by ensure_state_dir.
-EXPOSURE_RECORD_VERSION=1
+EXPOSURE_RECORD_VERSION=2
 EXPOSURE_RUN_TAG=""            # per-run, so a whole-run purge only drops THIS run's files
 EXPOSURE_RECORD_SEQ=0          # zero-padded into the name, so restore order is recoverable
 EXPOSURE_RECORD_WARNED=false   # an unusable record is named once, and kept
@@ -2765,8 +4457,15 @@ snapshot_port() { # snapshot_port <port> <verb> [role] — record prior state + 
 # ------------------------------------------------- the on-disk undo record -----
 # One line per record, tab-separated, `prior` LAST because it is the one field
 # that legitimately contains a tab ("verb<TAB>proxy"):
-#   <format-version>  <role>  <port>  <applied-verb>  <applied-proxy>  <prior>
+#   <format-version>  <role>  <port>  <applied-verb>  <applied-proxy>  <gateway-id>  <prior>
 # Nothing else in this script reads these files.
+#
+# `gateway-id` is what makes a per-gateway teardown possible at all. Without it a
+# record says WHAT KIND of thing was exposed (a gateway, or a file lane) and on
+# which HTTPS port, but never WHICH gateway — so two gateways on one host leave
+# records nobody can tell apart, and the by-hand teardown in WHAT-IT-TOUCHES.md
+# has to ask the operator for a port number that nothing on their machine tells
+# them. It is written for identification only and never reaches a command line.
 
 # Every value read back out is interpolated into a `tailscale` command, so each is
 # checked against the ONLY shape this script ever writes rather than trusted: a
@@ -2783,22 +4482,28 @@ exposure_proxy_ok() { # exposure_proxy_ok <proxy>
 # Returns 1 for anything this version cannot use, WITHOUT deleting the file: an
 # unreadable record may still name a live public exposure, so it is kept for a
 # version that understands it, and never fed to a command.
-REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
+REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_GWID=""; REC_PRIOR=""
 read_exposure_record() { # read_exposure_record <file> -> 0 and sets REC_*, else 1
-  REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
-  local ver role port averb aproxy prior
-  IFS=$'\t' read -r ver role port averb aproxy prior < "$1" 2>/dev/null || return 1
+  REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_GWID=""; REC_PRIOR=""
+  local ver role port averb aproxy gwid prior
+  IFS=$'\t' read -r ver role port averb aproxy gwid prior < "$1" 2>/dev/null || return 1
   [ "${ver:-}" = "$EXPOSURE_RECORD_VERSION" ] || return 1
   case "${role:-}" in gateway|file) ;; *) return 1 ;; esac
   case "${port:-}" in ''|*[!0-9]*) return 1 ;; esac
   case "${averb:-}" in serve|funnel) ;; *) return 1 ;; esac
   exposure_proxy_ok "${aproxy:-}" || return 1
+  # Every id this script writes is `openclaw`, `hermes`, a `custom-<slug>` from
+  # slug(), or the literal `unknown` — all of them this charset. A record whose id
+  # is any other shape was not written by a version of this script, and the whole
+  # file is refused rather than half-trusted.
+  case "${gwid:-}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   case "${prior:-}" in
     EMPTY) ;;
     serve$'\t'*|funnel$'\t'*) exposure_proxy_ok "${prior#*$'\t'}" || return 1 ;;
     *) return 1 ;;
   esac
-  REC_ROLE="$role"; REC_PORT="$port"; REC_AVERB="$averb"; REC_APROXY="$aproxy"; REC_PRIOR="$prior"
+  REC_ROLE="$role"; REC_PORT="$port"; REC_AVERB="$averb"; REC_APROXY="$aproxy"
+  REC_GWID="$gwid"; REC_PRIOR="$prior"
 }
 
 # Is the exposure a record describes STILL the one live on that port? The whole
@@ -2826,10 +4531,17 @@ persist_exposure_record() { # persist_exposure_record <port> <applied-verb> <app
   # exposure itself as its own prior state and make the undo a no-op.
   [ -n "$prior" ] || prior=$(ts_target_for_port "$port")
   local f; f=$(printf '%s/exposure-%s-%03d.pending' "$STATE_DIR" "$EXPOSURE_RUN_TAG" "$EXPOSURE_RECORD_SEQ")
+  # The owning gateway is read from the global rather than passed: every caller is
+  # downstream of the gateway phase, so GW_ID is already the id this exposure is
+  # being opened for — including on the adopt path, where taking an earlier run's
+  # mapping over makes it this gateway's. `unknown` keeps the field's shape when a
+  # caller somehow has no id; a record that identifies nothing is still readable,
+  # and refusing to write one would trade a naming gap for a lost undo.
+  local gwid="${GW_ID:-}"; [ -n "$gwid" ] || gwid="unknown"
   # 0600 like everything else in here: the line names a gateway's port and backend.
   ( umask 077
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$EXPOSURE_RECORD_VERSION" "$role" "$port" "$averb" "$aproxy" "${prior:-EMPTY}" >"$f"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$EXPOSURE_RECORD_VERSION" "$role" "$port" "$averb" "$aproxy" "$gwid" "${prior:-EMPTY}" >"$f"
   ) 2>/dev/null || return 0
 }
 
@@ -3227,7 +4939,7 @@ reconcile_orphaned_exposures() {
   # Two passes so the operator sees the full scope before answering: collect the
   # still-live records as undo entries (the shape print_undo_hints and
   # undo_exposure_entry both take), retiring the rest as we go.
-  local live=() files=() backends=() roles=() entry public=false host=""
+  local live=() files=() backends=() roles=() entry public=false host="" owner=""
   for f in "$STATE_DIR"/exposure-*.pending; do
     [ -f "$f" ] || continue
     if ! read_exposure_record "$f"; then
@@ -3244,7 +4956,11 @@ reconcile_orphaned_exposures() {
     backends+=("${REC_APROXY#http://127.0.0.1:}")   # the local port it fronts, for the report
     # What sits behind it decides how alarming this is: an agent gateway answers
     # prompts and runs tools, a file lane hands out files.
-    if [ "$REC_ROLE" = "file" ]; then roles+=("your shared folder"); else roles+=("your gateway"); fi
+    # Which gateway it belonged to, when the record knows: on a machine with two of
+    # them "your gateway" alone does not say which, and this listing is where the
+    # operator decides whether a leftover exposure is one they still want.
+    owner=""; [ "$REC_GWID" = "unknown" ] || owner=" — $REC_GWID"
+    if [ "$REC_ROLE" = "file" ]; then roles+=("your shared folder$owner"); else roles+=("your gateway$owner"); fi
     [ "$REC_AVERB" = "funnel" ] && public=true
   done
   [ ${#live[@]} -gt 0 ] || return 0
@@ -3349,8 +5065,8 @@ explain_exposure_paths() {
   say "  3) Cloudflare Tunnel — PUBLIC"
   say "     Who can reach it:  anyone on the internet — same lock: the gateway's token."
   say "     What to install:   nothing on your devices; needs a domain you manage in"
-  say "                        Cloudflare (~\$8/yr for the domain) and Cloudflare's"
-  say "                        connector program (cloudflared) on this machine."
+  say "                        Cloudflare (~\$8/yr for the domain) and Cloudflare's own"
+  say "                        tunnel program (cloudflared) on this machine."
   say "     Who sees traffic:  Cloudflare can read it — your HTTPS ends at their servers;"
   say "                        the onward leg to this machine rides their encrypted tunnel."
   say "     Apple Watch:       works on its own, anywhere."
@@ -3366,7 +5082,88 @@ explain_exposure_paths() {
   say "     devices already trust, and it needs no domain of your own."
   say "     Apple Watch:       works on its own IF that address works without a VPN."
   say ""
-  say "  You can re-run this script any time and pick a different path."
+  # Naming `b` here rather than only "re-run the script": the menu this panel
+  # explains is a loop that re-asks after every path it cannot take, so stepping
+  # back is a keystroke, and a comparison that ends by pointing at a re-run
+  # teaches the opposite.
+  say "  None of the four is applied until you pick it. b at the menu backs out of this"
+  say "  step, and you can re-run this script later and choose differently — every step"
+  say "  detects what is already in place and reuses it."
+  say ""
+}
+
+# Is a Tailscale path (menu options 1 and 2) usable on this machine right now?
+# Prints the reason and returns 1 when it is not. Neither blocker is something
+# this script fixes — installing a background program and signing a machine in to
+# a tailnet are both the operator's to do — but a path this machine cannot take
+# today is a reason to ask the question again, not to end the run: three other
+# ways to reach the gateway are still on the menu, and the user has just been
+# shown the one that is closed. The instructions therefore point back at the menu
+# rather than at a re-run, and the caller re-reads `have tailscale` on the next
+# pass, so a user who installs it in another window can pick 1 without restarting.
+exposure_tailscale_ready() {
+  if ! have tailscale; then
+    say ""
+    # "background program" rather than "daemon": the sentence exists to reassure a
+    # novice, and it cannot do that around a word they have to look up. The claim is
+    # narrowed to match what the script actually promises in README §What it never
+    # does — it creates service units for programs you already have (the file lane's
+    # rclone is one), so the honest line is that it installs nothing NEW.
+    warn "Tailscale isn't installed, and installing it is yours to do — this script never"
+    warn "installs a background program you don't already have. It's one command from"
+    warn "https://tailscale.com/download — install it, then choose 1 or 2 again and I'll"
+    warn "look for it fresh. Or pick another path from the menu below."
+    return 1
+  fi
+  if [ -z "$(tailscale_dns_name)" ]; then
+    say ""
+    warn "Tailscale is installed but not logged in on this machine."
+    # Unlike the three failure handlers, `tailscale up` has NOT been tried yet,
+    # so a bare command is the right print when this shell is already root.
+    local up_priv; up_priv=$(priv_prefix)
+    warn "Run '${up_priv:+$up_priv }tailscale up' to connect it to your tailnet (your private Tailscale"
+    warn "network) — it opens a browser link to sign in the first time. Then choose 1 or 2"
+    warn "again, or pick another path from the menu below."
+    [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$up_priv" ] \
+      || note "This shell is not root and has neither sudo nor doas — run that from a root shell."
+    return 1
+  fi
+  return 0
+}
+
+# The same courtesy for menu option 3. Setting a Cloudflare tunnel up is a longer
+# errand than installing Tailscale, so the user is even more likely to want one of
+# the other three paths once they read this.
+exposure_cloudflared_ready() {
+  have cloudflared && return 0
+  say ""
+  warn "cloudflared isn't installed. Set it up per Cloudflare's quickstart"
+  warn "(https://developers.cloudflare.com/cloudflare-one/), then choose 3 again — or"
+  warn "pick another path from the menu below."
+  return 1
+}
+
+# The two facts a reverse-proxy operator needs BEFORE typing an address, in the
+# short form. Both already exist in the project and neither was anywhere near this
+# prompt: the base-URL contract only surfaces in a note that fires AFTER a URL has
+# been rewritten, and the Host-header rule sits 250 lines into the README. The
+# Host one earns the space because the failure it prevents is a 403 — the one
+# status a user reads as "my token is wrong", which sends them to look in the one
+# place the problem is not.
+# Deliberately the short form: the `i` of the prompt below (exposure.own_https)
+# carries the full version, so this stays scannable enough to be read at all.
+explain_own_https_target() {
+  say ""
+  say "  Two things worth knowing before you type it:"
+  say "    • Give the ${BOLD}base${RESET} address — no /v1 and no other endpoint on the end."
+  say "      ${BOLD}<that address>/v1/models${RESET} has to reach your gateway. A path prefix of"
+  say "      your own is fine: https://example.com/ai works."
+  say "    • If the gateway itself listens only on 127.0.0.1, whatever sits in front of it"
+  say "      (Caddy, nginx, a tunnel) usually has to rewrite the Host header: a server like"
+  say "      that often refuses a request arriving under any other name, and it refuses it"
+  say "      with 403 — which reads like a token problem and is not one. In nginx:"
+  say "      ${BOLD}proxy_set_header Host 127.0.0.1:<the gateway's port>;${RESET}"
+  say "  Press i at the prompt below for the longer version."
   say ""
 }
 
@@ -3383,147 +5180,196 @@ choose_exposure() {
   fi
 
   head_ "Step 3 — how should your phone reach this gateway?"
-  ts_targets
-  local ts_state="not installed" cf_state="not installed"
-  if have tailscale; then
-    if [ -n "$(tailscale_dns_name)" ]; then ts_state="✓ detected and running"
-    else ts_state="installed, but not running/logged in"; fi
-  fi
-  have cloudflared && cf_state="✓ cloudflared found"
 
-  say ""
-  say "  1) ${BOLD}Tailscale${RESET} — private, free  ($ts_state)"
-  say "     Only devices on your own Tailscale network reach it; each device needs the Tailscale app."
-  say ""
-  say "  2) ${BOLD}Tailscale Funnel${RESET} — public, free  ($ts_state)"
-  say "     Reachable from anywhere; nothing to install on your devices."
-  say ""
-  say "  3) ${BOLD}Cloudflare Tunnel${RESET} — public  ($cf_state)"
-  say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
-  say ""
-  # The parenthetical names the commonest casual exposure of all, `cloudflared tunnel
-  # --url`. Its address belongs to option 4; unnamed here, a quick-tunnel user reads
-  # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
-  # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
-  # would hide it whenever the tunnel runs from another terminal, host, or PATH.
-  say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
-  say "     You give the https:// address; its certificate has to be one your devices already trust."
-  say ""
-  if $SETUP_FROM_CHECK; then
-    say "  ${DIM}b) stop this setup (the completed check remains unchanged)${RESET}"
-  else
-    say "  ${DIM}b) go back to the gateway choice (earlier approved changes stay in place)${RESET}"
-  fi
-  say ""
-  say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
-  say "  only if that address is reachable from anywhere."
-  say ""
-  local back_word="goes back"
-  $SETUP_FROM_CHECK && back_word="stops setup"
-  local choice; choice=$(require_choice "Choose 1-4 ('i' compares them, 'b' $back_word)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
-  [ "$choice" = "q" ] && quit_run
-  [[ "$choice" =~ ^[bB]$ ]] && return 10   # back/stop — no exposure change has happened yet
-  $DRY_RUN || note "From here I may apply changes to this machine. q/Ctrl-C stops; neither undoes an earlier approved change."
+  # The menu is a loop, not a one-shot. Every way out of it that is not a chosen
+  # transport — a path this machine cannot take, an address the user decides not to
+  # give — comes back here instead of ending the run, because the decision is
+  # unchanged: this gateway still needs an HTTPS address, and three other ways to
+  # get one are still on offer. What still leaves without a transport: `b` (rc 10),
+  # `q`, and the refusals that are meant to be final — a keyless gateway on a public
+  # address, a certificate the machine will not trust. Every `continue` in here is
+  # placed before that pass has planned, printed or run anything, so an abandoned
+  # pass leaves nothing for the next one to inherit.
+  local ts_state cf_state mutation_notice=false
+  local choice funnel host gw_https existing everb h tunnel tname
+  while true; do
+    # Every pass starts from "no transport chosen". Each branch does set both
+    # before anything reads them, so this changes no outcome today — but in a loop
+    # "some later branch overwrites it" is a property nobody can check by reading
+    # one case arm, and an abandoned pass leaving a half-answer behind is the class
+    # of bug this whole function was rewritten into.
+    TRANSPORT=""; SCOPE=""
+    # Detection runs on EVERY pass, which is most of what makes the re-ask worth
+    # having: a user who reads "not installed", installs Tailscale in a second
+    # terminal and picks 1 again gets the fresh answer without restarting. It is
+    # also why a refused row needs no separate "you already tried this" marker —
+    # the state column IS that marker, and one derived from a live re-read cannot
+    # go stale the way a remembered flag does.
+    ts_targets
+    ts_state="not installed"; cf_state="not installed"
+    if have tailscale; then
+      if [ -n "$(tailscale_dns_name)" ]; then ts_state="✓ detected and running"
+      else ts_state="installed, but not running/logged in"; fi
+    fi
+    have cloudflared && cf_state="✓ cloudflared found"
 
-  case "$choice" in
-    1|2)
-      local funnel=false; [ "$choice" = "2" ] && funnel=true
-      TRANSPORT=$($funnel && echo funnel || echo tailscale)
-      SCOPE=$($funnel && echo public || echo private)
-      if ! have tailscale; then
-        say ""
-        warn "Tailscale isn't installed, and installing it is yours to do (we never"
-        warn "install daemons). It's one command from https://tailscale.com/download —"
-        warn "then re-run this script; it picks up where you left off."
-        exit 0
-      fi
-      if [ -z "$(tailscale_dns_name)" ]; then
-        say ""
-        warn "Tailscale is installed but not logged in on this machine."
-        # Unlike the three failure handlers, `tailscale up` has NOT been tried yet,
-        # so a bare command is the right print when this shell is already root.
-        local up_priv; up_priv=$(priv_prefix)
-        warn "Run '${up_priv:+$up_priv }tailscale up' to connect it to your tailnet (your private Tailscale"
-        warn "network) — it opens a browser link to sign in the first time. Then re-run this"
-        warn "script; it picks up where you left off."
-        [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$up_priv" ] \
-          || note "This shell is not root and has neither sudo nor doas — run that from a root shell."
-        exit 0
-      fi
-      keyless_public_guard
-      local host; host=$(tailscale_dns_name)
-      pick_public_port "$TRANSPORT" "$GW_LOCAL_PORT" "gateway"; local gw_https="$PICKED_PORT"
-      ok "Chosen public port for the gateway: $gw_https"
-      # A verb flip changes who can reach the gateway — say so, in BOTH directions.
-      local existing; existing=$(ts_target_for_port "$gw_https")
-      if [ -n "$existing" ]; then
-        local everb="${existing%%$'\t'*}"
-        if $funnel && [ "$everb" = "serve" ]; then
-          warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
-          warn "https://$host:$gw_https reachable from the public internet."
-          confirm "  Make it public?" "exposure.tailscale.make_public" \
-            || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
-        elif ! $funnel && [ "$everb" = "funnel" ]; then
-          warn "Port $gw_https is currently PUBLIC (Tailscale Funnel). Going private turns the"
-          warn "public URL off — afterwards only devices on your tailnet reach this gateway."
-          confirm "  Make it private (turn the public URL off)?" "exposure.tailscale.make_private" \
-            || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
+    say ""
+    say "  1) ${BOLD}Tailscale${RESET} — private, free  ($ts_state)"
+    say "     Only devices on your own Tailscale network reach it; each device needs the Tailscale app."
+    say ""
+    say "  2) ${BOLD}Tailscale Funnel${RESET} — public, free  ($ts_state)"
+    say "     Reachable from anywhere; nothing to install on your devices."
+    say ""
+    say "  3) ${BOLD}Cloudflare Tunnel${RESET} — public  ($cf_state)"
+    say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
+    say ""
+    # The parenthetical names the commonest casual exposure of all, `cloudflared tunnel
+    # --url`. Its address belongs to option 4; unnamed here, a quick-tunnel user reads
+    # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
+    # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
+    # would hide it whenever the tunnel runs from another terminal, host, or PATH.
+    say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
+    say "     You give the https:// address; its certificate has to be one your devices already trust."
+    say ""
+    if $SETUP_FROM_CHECK; then
+      # "back out of", not "stop": on this route `b` returns to the offer that
+      # started the setup, so the check's result — which cost real chat turns on
+      # somebody's provider account — survives the keystroke and can still be
+      # accepted. Promising a stop here would make the one recoverable exit read
+      # like the irreversible one.
+      say "  ${DIM}b) back out of this setup (the completed check remains unchanged)${RESET}"
+    else
+      say "  ${DIM}b) go back to the gateway choice (earlier approved changes stay in place)${RESET}"
+    fi
+    say ""
+    say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
+    say "  only if that address is reachable from anywhere."
+    say ""
+    # No hand-written control prose. The primitive renders `b = back` from the same
+    # argument that makes `b` work, so the one prompt in this tool where Back is
+    # genuinely available cannot be the one whose control list denies it. What `b`
+    # MEANS here still differs by how the run started, and the two b) lines above
+    # own that difference — the suffix only advertises the key.
+    prompt_into choice require_choice "Choose 1-4" '^[1-4]$' explain_exposure_paths true \
+      || return 10   # back/stop — no exposure change has happened yet
+
+    # Availability is graded BEFORE anything else, so a refused path leaves no
+    # trace: no mutation warning for changes that cannot happen, and no half-set
+    # TRANSPORT/SCOPE carried into whatever the user picks next.
+    case "$choice" in
+      1|2) exposure_tailscale_ready   || continue ;;
+      3)   exposure_cloudflared_ready || continue ;;
+    esac
+
+    if ! $DRY_RUN && ! $mutation_notice; then
+      note "From here I may apply changes to this machine. q/Ctrl-C stops; neither undoes an earlier approved change."
+      mutation_notice=true
+    fi
+
+    case "$choice" in
+      1|2)
+        funnel=false; [ "$choice" = "2" ] && funnel=true
+        TRANSPORT=$($funnel && echo funnel || echo tailscale)
+        SCOPE=$($funnel && echo public || echo private)
+        keyless_public_guard
+        host=$(tailscale_dns_name)
+        pick_public_port "$TRANSPORT" "$GW_LOCAL_PORT" "gateway"; gw_https="$PICKED_PORT"
+        ok "Chosen public port for the gateway: $gw_https"
+        # A verb flip changes who can reach the gateway — say so, in BOTH directions.
+        existing=$(ts_target_for_port "$gw_https")
+        if [ -n "$existing" ]; then
+          everb="${existing%%$'\t'*}"
+          if $funnel && [ "$everb" = "serve" ]; then
+            warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
+            warn "https://$host:$gw_https reachable from the public internet."
+            confirm "  Make it public?" "exposure.tailscale.make_public" \
+              || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
+          elif ! $funnel && [ "$everb" = "funnel" ]; then
+            warn "Port $gw_https is currently PUBLIC (Tailscale Funnel). Going private turns the"
+            warn "public URL off — afterwards only devices on your tailnet reach this gateway."
+            confirm "  Make it private (turn the public URL off)?" "exposure.tailscale.make_private" \
+              || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
+          fi
         fi
-      fi
-      tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
-        || { cleanup_exposures; die "Gateway exposure not confirmed — cannot continue without an HTTPS URL."; }
-      GW_URL="https://$host"; [ "$gw_https" != "443" ] && GW_URL="https://$host:$gw_https"
-      if [ "$SCOPE" = "private" ]; then
-        sweep_stale_public_funnels "$GW_LOCAL_PORT" "$gw_https" "$host"
-      fi
-      ;;
-    3)
-      TRANSPORT="cloudflare"; SCOPE="public"
-      keyless_public_guard
-      if ! have cloudflared; then
+        tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
+          || { cleanup_exposures; die "Gateway exposure not confirmed — cannot continue without an HTTPS URL."; }
+        GW_URL="https://$host"; [ "$gw_https" != "443" ] && GW_URL="https://$host:$gw_https"
+        if [ "$SCOPE" = "private" ]; then
+          sweep_stale_public_funnels "$GW_LOCAL_PORT" "$gw_https" "$host"
+        fi
+        ;;
+      3)
+        TRANSPORT="cloudflare"; SCOPE="public"
+        keyless_public_guard
         say ""
-        warn "cloudflared isn't installed. Set up a tunnel per Cloudflare's quickstart"
-        warn "(https://developers.cloudflare.com/cloudflare-one/), then re-run me."
-        exit 0
-      fi
-      local tunnel; tunnel=$(cloudflared tunnel list 2>/dev/null | awk 'NR>1{print $2}' | head -2)
-      local tname="<your-tunnel>"
-      [ "$(printf '%s\n' "$tunnel" | grep -c .)" = "1" ] && tname="$tunnel"
-      say ""
-      say "  Your tunnel config (usually ~/.cloudflared/config.yml) needs one 'ingress rule'"
-      say "  per service — a line that tells Cloudflare to send requests for a hostname to a"
-      say "  local port. For the gateway:"
-      say ""
-      say "      - hostname: ${BOLD}gateway.YOURDOMAIN${RESET}"
-      say "        service: http://127.0.0.1:$GW_LOCAL_PORT"
-      note "(127.0.0.1 means \"this same machine\" — keep it as-is if the gateway runs on this host.)"
-      say ""
-      if $REUSE_ONLY; then
-        note "(reuse-only: assuming your gateway ingress rule already exists — I won't guide changes)"
-      else
-        print_and_wait "exposure.cloudflare.gateway" \
-          "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
-          "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
-      fi
-      local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "" "stop this option without a hostname")
-      case "$h" in http://*|https://*) h="${h#*://}" ;; esac   # tolerate a pasted URL — keep the host part
-      while [ "${h%/}" != "$h" ]; do h="${h%/}"; done
-      [ -n "$h" ] || die "No hostname given. This option needs a domain already added to your Cloudflare account; if you don't have one yet, re-run and pick Tailscale instead, or add a domain in Cloudflare first."
-      GW_URL="https://$h"
-      apply_gateway_url_normalization
-      ;;
-    4)
-      # One option for "I run my own HTTPS." It is a GATE, not a fork: the
-      # certificate is either one this machine trusts (which is the bar the app
-      # applies too) or the run stops.
-      GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com") || die "$NO_ANSWER"
-      apply_gateway_url_normalization
-      scope_choice
-      keyless_public_guard
-      classify_own_https   # sets TRANSPORT=public, or STOPs and names the free routes
-      ;;
-    *) die "Invalid choice." ;;
-  esac
+        say "  This path answers on a hostname of your own, in a domain you manage in"
+        say "  Cloudflare — something shaped like ${BOLD}gateway.YOURDOMAIN${RESET}. Name the one you want"
+        say "  first; it does not have to exist yet, and the step after this is the command"
+        say "  that points it at this gateway."
+        say ""
+        # The hostname is asked for BEFORE anything is printed to run or recorded in
+        # the dry-run plan, because leaving this option has to stay free right up to
+        # the last moment it costs nothing. Asked afterwards — as it reads naturally,
+        # "the hostname you configured" — an abandoned pass leaves a public Cloudflare
+        # route the operator has already created, and a run that then finishes on
+        # private Tailscale reports "private" over a live public address it never
+        # mentions again; --dry-run keeps the abandoned command in its plan on the
+        # same path. Asking first also makes the command below exact rather than a
+        # YOURDOMAIN template the operator has to edit by hand.
+        prompt_into h ask "  The hostname you want this gateway to answer on (e.g. gateway.example.com)" \
+          "" "go back to the four ways above" "exposure.cloudflare.hostname"
+        case "$h" in http://*|https://*) h="${h#*://}" ;; esac   # tolerate a pasted URL — keep the host part
+        while [ "${h%/}" != "$h" ]; do h="${h%/}"; done
+        # Blank returns to the menu rather than ending the run: a user who gets
+        # here without a Cloudflare domain has picked the wrong path, and the two
+        # paths that need no domain of their own are one keystroke away.
+        if [ -z "$h" ]; then
+          note "No hostname given. This option needs a domain already added to your Cloudflare"
+          note "account; without one, Tailscale (1 or 2) gives you an address for free."
+          continue
+        fi
+        tunnel=$(cloudflared tunnel list 2>/dev/null | awk 'NR>1{print $2}' | head -2)
+        tname="<your-tunnel>"
+        [ "$(printf '%s\n' "$tunnel" | grep -c .)" = "1" ] && tname="$tunnel"
+        say ""
+        say "  Your tunnel config (usually ~/.cloudflared/config.yml) needs one 'ingress rule'"
+        say "  per service — a line that tells Cloudflare to send requests for a hostname to a"
+        say "  local port. For the gateway:"
+        say ""
+        say "      - hostname: ${BOLD}$h${RESET}"
+        say "        service: http://127.0.0.1:$GW_LOCAL_PORT"
+        note "(127.0.0.1 means \"this same machine\" — keep it as-is if the gateway runs on this host.)"
+        say ""
+        if $REUSE_ONLY; then
+          note "(reuse-only: assuming your gateway ingress rule already exists — I won't guide changes)"
+        else
+          print_and_wait "exposure.cloudflare.gateway" \
+            "Adds the ingress rule's DNS side: it points $h at your tunnel. Add the ingress rule itself to the config file and restart cloudflared." \
+            "cloudflared tunnel route dns $tname $h" || true
+        fi
+        GW_URL="https://$h"
+        apply_gateway_url_normalization
+        ;;
+      4)
+        # One option for "I run my own HTTPS." It is a GATE, not a fork: the
+        # certificate is either one this machine trusts (which is the bar the app
+        # applies too) or the run stops.
+        explain_own_https_target
+        # Back returns to the menu. Without it this prompt is a loop whose only
+        # exit is a valid https:// URL or Ctrl-C — and it sits directly under a
+        # commitment ("I already run my own HTTPS") the user may have made wrongly,
+        # which is exactly when un-committing has to be possible.
+        prompt_into GW_URL ask_url "The https:// web address that reaches your gateway" \
+          "https://ai.example.com" 0 "" "exposure.own_https" true || continue
+        apply_gateway_url_normalization
+        scope_choice
+        keyless_public_guard
+        classify_own_https   # sets TRANSPORT=public, or STOPs and names the free routes
+        ;;
+      *) die "Invalid choice." ;;
+    esac
+    break   # a transport is chosen and applied; the menu's work is done
+  done
 }
 
 # The plain-words help behind the reach question's `?`. The safety stakes are
@@ -3566,8 +5412,10 @@ scope_choice() {
   note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
   say "    1) Public — reachable from the open internet"
   say "    2) Private — only my own network / VPN (Tailscale, home or office LAN)"
-  local c; c=$(require_choice "Is this address public or private? Choose 1-2 ('i' explains)" '^[12]$' explain_scope_choice) || die "$NO_ANSWER"
-  [ "$c" = "q" ] && quit_run
+  # No back here: the address this question is about has already been given, and
+  # the two callers reach it from opposite directions (the menu's option 4 and the
+  # ready-URL shortcut), so there is no one step to return to.
+  local c; prompt_into c require_choice "Is this address public or private? Choose 1-2" '^[12]$' explain_scope_choice
   if [ "$c" = "1" ]; then SCOPE="public"; else SCOPE="private"; fi
 }
 
@@ -3777,31 +5625,54 @@ FS_FOLDER_REFUSAL=""
 state_cred_file() { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$GW_ID"; }
 state_env_file()  { printf '%s/fileserver-%s.env'  "$STATE_DIR" "$GW_ID"; }
 
+# Every connector-owned unit and plist path in this file is rooted at "${HOME:-}",
+# never at a bare "$HOME", and the difference is not cosmetic.
+#
+# These lookups started life inside the interactive setup, where a person is
+# standing at a terminal and $HOME is a certainty. They are not only there any
+# more: fs_all_units is what --list walks to report file servers with no saved
+# setup behind them, and --list is the command --help and every refusal screen
+# advertise as the entry point for an environment with nobody at a terminal. A CI
+# or container shell legitimately runs with XDG_CONFIG_HOME set and HOME unset —
+# $STATE_DIR is spelled "${HOME:-}/.config" for exactly that case — and under
+# `set -u` a bare "$HOME" there does not fail politely. It kills whatever subshell
+# reached it, so --list prints a raw `HOME: unbound variable` into the middle of
+# the operator's inventory and then reports NO leftovers at all: a live,
+# authenticated WebDAV server over the agent's working folder, restarted at every
+# boot, goes unmentioned by the one surface whose whole job is to mention it.
+#
+# An empty root is the honest answer rather than a fallback: a host with no home
+# directory has no per-user systemd or LaunchAgents directory either, so the globs
+# match nothing and the scan reports what is really there. The default is spelled
+# at each expansion rather than snapshotted into a global at file-scope, because a
+# snapshot answers with the HOME that was set when this file was READ — wrong for
+# any caller that points HOME somewhere else before calling, which the readiness
+# harness does for every case it lifts these functions into.
 linux_unit_candidates() {
   printf '%s\n' \
-    "$HOME/.config/systemd/user/conduck-files-$GW_ID.service" \
-    "$HOME/.config/systemd/user/conduck-files.service" \
-    "$HOME/.config/systemd/user/conduck-fileserver.service"
+    "${HOME:-}/.config/systemd/user/conduck-files-$GW_ID.service" \
+    "${HOME:-}/.config/systemd/user/conduck-files.service" \
+    "${HOME:-}/.config/systemd/user/conduck-fileserver.service"
 }
 mac_unit_candidates() {
   printf '%s\n' \
-    "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist" \
-    "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
-    "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"
+    "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist" \
+    "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
+    "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"
 }
 
 fs_all_units() {
   local f
   if [ "$OS" = "Linux" ]; then
-    for f in "$HOME"/.config/systemd/user/conduck-files-*.service \
-             "$HOME/.config/systemd/user/conduck-files.service" \
-             "$HOME/.config/systemd/user/conduck-fileserver.service"; do
+    for f in "${HOME:-}"/.config/systemd/user/conduck-files-*.service \
+             "${HOME:-}/.config/systemd/user/conduck-files.service" \
+             "${HOME:-}/.config/systemd/user/conduck-fileserver.service"; do
       [ -f "$f" ] && printf '%s\n' "$f"
     done
   else
-    for f in "$HOME"/Library/LaunchAgents/ai.gigaduck.conduck-files-*.plist \
-             "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
-             "$HOME/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"; do
+    for f in "${HOME:-}"/Library/LaunchAgents/ai.gigaduck.conduck-files-*.plist \
+             "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
+             "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"; do
       [ -f "$f" ] && printf '%s\n' "$f"
     done
   fi
@@ -4001,7 +5872,7 @@ fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
   warn "I can't serve $1 — ${FS_FOLDER_REFUSAL:-I could not resolve that path on this machine}."
   note "The shared folder is served over WebDAV with read AND write access to everything inside it."
   note "It has to be the agent's working folder, never your whole account: served from / or your home"
-  note "directory, anything holding the file password can read your keys — and this connector's own"
+  note "directory, anything holding the file password can read your keys — and this script's own"
   note "credential files — and write into them."
 }
 
@@ -4009,21 +5880,33 @@ fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
 # `ask` is not merely unhelpful here, it is unusable: it resolves a blank answer
 # to its default, and a prompt with NO default would then read a stray Enter — or
 # a closed stdin — as an answer, which is the whole defect this prompt exists to
-# remove. It also carries no `i`, so the panel that says what this folder IS has
-# never been reachable for the one operator who has to supply the path cold.
+# remove.
+#
+# The suffix is built by control_suffix like every other prompt, so this question
+# states what Enter does instead of being the one place in the wizard that leaves
+# it out — the banner promises every prompt says so, and a prompt whose answer
+# only the operator can know is the worst one to break that promise at.
+#
 # $()-captured by its caller, so every human-facing line goes to stderr and only
-# the path reaches stdout. `q` is handed BACK rather than acted on: quit_run
-# inside a command substitution would stop the subshell and let the run continue.
-fs_ask_shared_folder() { # -> absolute path | 'q' on stdout; 1 on a closed stdin
-  local reply
+# the path reaches stdout, and it answers on the shared prompt contract: 11 for q,
+# 1 for a closed stdin. Acting on either from in here would stop the command
+# substitution's subshell and let the run walk on, so prompt_into does it in the
+# parent. Back is not offered: the gate that would receive it — "use a different
+# folder than X?" — is asked only where a default exists, and the absence of a
+# default is the entire reason this prompt is reached.
+fs_ask_shared_folder() { # -> absolute path on stdout; 11 on q, 1 on a closed stdin
+  local reply p
+  p="  Absolute path to the folder your agent reads and writes ($(control_suffix "ask again" false)): "
   while true; do
-    read -r -p "  Absolute path to the folder your agent reads and writes (no default; i = explain; q = stop): " reply \
+    prompt_echo "$p"
+    read -r -p "$p" reply \
       || return 1     # closed stdin — never spin a loop nobody is there to answer
     case "$reply" in
       [iI]|\?) explain_prompt "file.folder.override" >&2; continue ;;
-      [qQ]) printf 'q'; return 0 ;;
+      [qQ]) return 11 ;;
       /*) printf '%s' "$reply"; return 0 ;;
-      "") warn "This gateway has no default folder — only you know where your agent reads and writes." >&2 ;;
+      # Enter is an advertised no-op here, so it re-asks without being told off.
+      "") note "This gateway has no default folder — only you know where your agent reads and writes." >&2 ;;
       *)  warn "Please give an absolute path (starting with /)." >&2 ;;
     esac
   done
@@ -4171,8 +6054,8 @@ ensure_existing_fs_envfile_linux() {
       fs_envfile_exposure_warning
       return 1 ;;
     *)
-      warn "The existing file-server unit has an EnvironmentFile form this connector will not rewrite."
-      warn "Repair or remove that exact connector-owned unit, then re-run setup."
+      warn "The existing file-server unit has an EnvironmentFile form this script will not rewrite."
+      warn "Repair or remove that exact file-server unit, then re-run setup."
       fs_envfile_exposure_warning
       return 1 ;;
   esac
@@ -4186,7 +6069,7 @@ ensure_existing_fs_envfile_linux() {
   fi
   [ "$status" = "ready" ] && return 0
 
-  warn "This connector-owned unit uses the old quoted EnvironmentFile form."
+  warn "A file server this script set up earlier uses the old quoted EnvironmentFile form."
   # Wording verified against rclone 1.74: `--user conduck` with no password does
   # NOT serve openly. It demands an EMPTY password, so the saved credential gets
   # 401 like every other one. Calling that "unauthenticated" sends the operator
@@ -4199,19 +6082,19 @@ ensure_existing_fs_envfile_linux() {
   note "then reload and restart this unit."
   if $DRY_RUN; then
     plan_add "REPAIR legacy quoted EnvironmentFile in $FS_UNIT; daemon-reload + restart"
-    note "(dry-run: a real run asks before repairing that connector-owned unit)"
+    note "(dry-run: a real run asks before repairing that file-server unit)"
     return 0
   fi
   if $REUSE_ONLY; then
     warn "(reuse-only: not repairing the legacy unit; leaving the file lane out)"
     return 1
   fi
-  if ! confirm "  Repair this connector-owned unit now?" "file.unit.repair_envfile"; then
+  if ! confirm "  Repair that file-server unit now?" "file.unit.repair_envfile"; then
     note "Leaving the file lane out; chat is unaffected."
     fs_envfile_exposure_warning
     return 1
   fi
-  mutate_guard "repair the legacy connector-owned EnvironmentFile directive" || return 1
+  mutate_guard "repair the legacy EnvironmentFile directive in that file-server unit" || return 1
   fs_repair_systemd_envfile_exact "$FS_UNIT" "$expected" || {
     warn "The exact legacy directive changed or could not be repaired safely."
     fs_envfile_exposure_warning
@@ -4260,7 +6143,7 @@ fs_owned_unit_ports_safe() {
   while IFS= read -r unit; do
     p=$(fs_unit_port "$unit" 2>/dev/null || true)
     if [ -z "$p" ]; then
-      FS_PORT_ALLOCATION_REASON="Found connector-owned unit $unit, but its loopback port cannot be read safely. Repair or remove that unit before adding another file lane."
+      FS_PORT_ALLOCATION_REASON="Found the file-server unit $unit, which this script set up earlier, but its loopback port cannot be read safely. Repair or remove that unit before adding another file lane."
       return 1
     fi
   done < <(fs_all_units)
@@ -4463,7 +6346,7 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
     warn "The file credential or selected paths contain characters this systemd unit cannot encode safely."
     return 1
   fi
-  FS_UNIT="$HOME/.config/systemd/user/conduck-files-$GW_ID.service"
+  FS_UNIT="${HOME:-}/.config/systemd/user/conduck-files-$GW_ID.service"
   # Two mkdirs, deliberately: the systemd unit directory is shared with the rest
   # of the user's units and keeps the ambient mode, while $STATE_DIR goes through
   # ensure_state_dir — it holds fileserver-*.cred/.env and profile-*.json, so it
@@ -4523,7 +6406,7 @@ write_fs_unit_mac() { # write_fs_unit_mac <workspace>
     warn "The file credential contains control characters and cannot be stored safely."
     return 1
   }
-  FS_UNIT="$HOME/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
+  FS_UNIT="${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
   # Split for the same reason as the Linux twin: LaunchAgents is shared with the
   # user's other agents and keeps the ambient mode; $STATE_DIR holds credentials
   # and profile-*.json, so it goes through ensure_state_dir.
@@ -4609,9 +6492,16 @@ fs_unit_state() { # fs_unit_state -> active | inactive | unknown
 # Fails closed on `unknown`: an exposure is created from this answer.
 fs_unit_active() { [ "$(fs_unit_state)" = "active" ]; }
 
-# The exact commands that remove ONE connector-owned file server. Shared by every
-# caller so they cannot drift, and printed rather than run: this tool has no
+# The exact commands that remove ONE file server this script set up. Shared by
+# every caller so they cannot drift, and printed rather than run: this tool has no
 # removal command, so copy-pasteable text IS the mechanism.
+#
+# The saved profile is deliberately NOT in this list — see fs_print_lane_record_note
+# for the one caller that needs it. A file server can be removed for two different
+# reasons, and only one of them touches the profile: abandoning the lane leaves the
+# saved record advertising an address that no longer answers, while MOVING the lane
+# to another port leaves that record entirely correct. Folding an `rm` of the
+# profile in here would hand the port-move path a command that deletes the gateway.
 fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file…]
   local unit="$1" name f; shift
   if [ -n "$unit" ]; then
@@ -4633,6 +6523,36 @@ fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file�
   done
 }
 
+# The half of the teardown that lives in $STATE_DIR rather than in a service
+# manager. profile-<id>.json is what --show-code reads, so an operator who runs
+# the commands above and stops there keeps a saved gateway that still advertises a
+# file lane: every later --show-code prints a code whose file address answers
+# nothing, and the failure surfaces in the app, on a phone, days later.
+#
+# Only printed when the saved record actually carries a fileServer block, because
+# the usual case is the harmless one — this run goes on to pair chat-only, and
+# write_profile rewrites the record without the lane on its own. It is the runs
+# that DON'T reach a new profile that strand it: a failed verification, a run
+# stopped at a prompt, a --reuse-only pass, or a lane a check dropped, all of which
+# leave the previous profile deliberately untouched.
+#
+# Re-running setup is offered first and the rm second, and that order is the point:
+# re-running rewrites the same record without the lane, while the rm throws away
+# the gateway's address, model and transport along with it.
+fs_print_lane_record_note() {
+  [ -n "${GW_ID:-}" ] || return 0
+  local pf="$STATE_DIR/profile-$GW_ID.json"
+  [ -f "$pf" ] || return 0
+  [ "$(json_type "$pf" "fileServer")" = "object" ] || return 0
+  say ""
+  warn "Your saved record for this gateway still lists that file lane:"
+  note "$pf"
+  note "Until it is updated, --show-code keeps printing a code whose file address answers nothing."
+  say "  Re-run me after removing the file server and I rewrite that record without the lane."
+  say "  Or, to forget this gateway entirely (its address, model and transport go too):"
+  printf '    %srm -f %s%s\n' "$BOLD" "$(fs_shell_arg "$pf")" "$RESET"
+}
+
 # A lane that is BUILT but never shipped leaves a live, authenticated WebDAV
 # server over the agent's working folder, a credential on disk, and — on the
 # transports whose HTTPS route the operator creates by hand — a route still
@@ -4640,7 +6560,7 @@ fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file�
 # exposure this connector applies itself), so on the other transports the run
 # otherwise ends green and never mentions the server, the credential, or the
 # route again. Same shape whether a Step-5 probe failed or the run was
-# interrupted between the unit and the pairing code.
+# interrupted between the unit and the setup code.
 #
 # It removes nothing: the usual repair is "fix what failed and re-run me", and
 # that re-run reuses this exact unit and credential. So name what exists and hand
@@ -4698,6 +6618,10 @@ fs_lane_residue_note() {
   note "own working directory."
   note "Leaving it running is fine too: fix what failed, re-run me, and this same lane ships again"
   note "with the same credential."
+  # Last, because it is the one part of the residue that is not on this machine's
+  # service manager, and the one a reader who stopped at the commands above will
+  # otherwise never learn about.
+  fs_print_lane_record_note
   return 0
 }
 
@@ -5017,16 +6941,24 @@ fs_warn_quick_tunnel_url() {
 # this propagates so the caller's `|| die "$NO_ANSWER"` still fires.
 #
 # This helper deliberately runs in the PARENT shell and returns its value through
-# ASK_FS_URL_RESULT. The confirmation accepts q, and `quit_run` must exit the real
+# ASK_FS_URL_RESULT. Both prompts accept q, and `quit_run` must exit the real
 # setup process—not a command-substitution subshell that would turn q into an
 # empty successful URL and continue as though the operator deliberately skipped.
+# That is why the URL prompt's rc 11 is acted on here rather than folded into the
+# EOF branch: the two arrive as different statuses precisely so they can lead to
+# different endings, and "the operator pressed q" must not print "no answer".
 ASK_FS_URL_RESULT=""
 ask_fs_url() { # ask_fs_url <prompt> -> sets ASK_FS_URL_RESULT; 1 on URL-prompt EOF
-  local prompt="$1" u tries=0
+  local prompt="$1" u tries=0 rc
   ASK_FS_URL_RESULT=""
   while [ "$tries" -lt 3 ]; do
     tries=$((tries + 1))
-    u=$(ask_url "$prompt" "https://files.example.com" 1 "review omitting file transfer") || return 1
+    u=$(ask_url "$prompt" "https://files.example.com" 1 "review omitting file transfer" "file.address.url"); rc=$?
+    case "$rc" in
+      0)  ;;
+      11) quit_run ;;
+      *)  return 1 ;;
+    esac
     if [ -n "$u" ]; then ASK_FS_URL_RESULT="$u"; return 0; fi
     warn "No address was entered."
     confirm "  Leave file transfer OUT of this setup code?" "file.address.skip" && return 0
@@ -5127,6 +7059,12 @@ explain_fs_mismatch() {
 
 # Resolve a scope mismatch: align / omit / include as-is. Sets FS_URL on inclusion,
 # clears FS_CRED on omit. Under --reuse-only the align option is withheld (it mutates).
+#
+# All four menus go through prompt_into, which is the only place q can be acted on:
+# require_choice runs inside $(…), so a quit_run it called itself would stop the
+# subshell and let this function carry on choosing for the operator. The prompt text
+# is bare "Choose 1-N" — require_choice renders the control list from the same
+# parameters that decide the behaviour, and a caller-written copy of it can only drift.
 resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3" c
   if [ "$SCOPE" = "public" ]; then
@@ -5136,8 +7074,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    1) Leave the file lane out — chat still works everywhere; no attachments"
       say "    2) Include it as-is  (advanced) — attachments only on your Tailscale devices"
       note "(Making it public would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
-      [ "$c" = "q" ] && quit_run
+      prompt_into c require_choice "Choose 1-2" '^[12]$' explain_fs_mismatch
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -5150,8 +7087,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat still works everywhere; no attachments"
     say "    3) Include it as-is  (advanced) — attachments only on your Tailscale devices;"
     say "       the file server itself stays private"
-    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
-    [ "$c" = "q" ] && quit_run
+    prompt_into c require_choice "Choose 1-3" '^[123]$' explain_fs_mismatch
     case "$c" in
       1) fs_promote_public "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out — its reach doesn't match the public gateway."
@@ -5165,8 +7101,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
       say "    2) Keep it public anyway  (advanced) — the file server stays reachable"
       say "       from the whole internet, unlike the gateway"
       note "(Making it private would change an exposure; --reuse-only forbids changes — re-run without it to do that.)"
-      c=$(require_choice "Choose 1-2 ('i' explains)" '^[12]$' explain_fs_mismatch) || die "$NO_ANSWER"
-      [ "$c" = "q" ] && quit_run
+      prompt_into c require_choice "Choose 1-2" '^[12]$' explain_fs_mismatch
       case "$c" in
         1) FS_CRED=""; note "Leaving the file lane out."
            fs_note_existing_mapping "$ehttps" "$everb"; fs_lane_residue_note ;;
@@ -5179,8 +7114,7 @@ resolve_fs_scope_mismatch() { # resolve_fs_scope_mismatch <existing-https-port> 
     say "    2) Leave the file lane out — chat unaffected; no attachments"
     say "    3) Keep it public anyway  (advanced) — the file server stays reachable"
     say "       from the whole internet, unlike the gateway"
-    c=$(require_choice "Choose 1-3 ('i' explains)" '^[123]$' explain_fs_mismatch) || die "$NO_ANSWER"
-    [ "$c" = "q" ] && quit_run
+    prompt_into c require_choice "Choose 1-3" '^[123]$' explain_fs_mismatch
     case "$c" in
       1) fs_demote_private "$ehttps" "$everb" "$host" ;;
       2) FS_CRED=""; note "Leaving the file lane out."
@@ -5954,7 +7888,16 @@ PY
 }
 
 setup_file_lane() {
-  head_ "Step 4 — agent file lane (optional, recommended)"
+  # The heading does NOT say "recommended". Enter declines this step, and a
+  # heading that recommends what the default refuses leaves a user who trusts
+  # defaults unable to tell whether they just made a mistake. Enter is what has to
+  # stay: yes here mints a credential and starts a boot-persistent authenticated
+  # file server over the agent's working folder, and a change of that size is one
+  # this tool always makes the operator ask for. The recommendation is still true,
+  # so it stays on screen as advice with its price attached — which is the part a
+  # single word could never carry, and the part that makes declining a real choice
+  # rather than the cheapest keystroke.
+  head_ "Step 4 — agent file lane (optional)"
   say "  Lets Conduck hand your agent real files (PDF/CSV/zip…) for its tools, and"
   say "  download files the agent writes back. Skipping is fine — chat (including"
   say "  pasted images) still works; the agent's tools just can't open attachments"
@@ -5962,7 +7905,13 @@ setup_file_lane() {
   say "  How: a small password-protected file server (rclone WebDAV — a standard way"
   say "  to read and write files over the web) over the agent's working folder,"
   say "  shared the same way as the gateway."
-  if ! confirm "  Set it up?" "file.setup.enable"; then note "Skipped — Conduck works without it (inline-only attachments)."; return 0; fi
+  say "  Adding it afterwards means walking this whole wizard again, so it is worth"
+  say "  the minute now if you ever plan to hand the agent a document."
+  if ! confirm "  Set it up?" "file.setup.enable"; then
+    note "Skipped — Conduck works without it (inline-only attachments)."
+    note "Re-run me whenever you want it; nothing you approved today is undone by adding it later."
+    return 0
+  fi
 
   # rclone FIRST, because asking is free: without it no lane can be built at all,
   # and changing a foreign gateway's tool policy (and restarting it) for a lane
@@ -6023,7 +7972,7 @@ setup_file_lane() {
     workspace="$FS_FOLDER"
     # The served root is re-certified and re-published on every run, so a root the
     # doctor refuses to grade must not pass here either — this is the one gate
-    # between a mis-pointed unit and a pairing code that publishes it.
+    # between a mis-pointed unit and a setup code that publishes it.
     if ! fs_resolve_shared_folder "$FS_FOLDER"; then
       fs_folder_refusal_warn "$FS_FOLDER"
       warn "That is what this unit serves, so I won't expose it or put it in a setup code."
@@ -6096,54 +8045,77 @@ setup_file_lane() {
       hermes)   workspace="$HOME/.hermes/files" ;;
       *)        workspace="" ;;
     esac
+    # The folder questions are the one re-askable group in this step, and the only
+    # place in it where Back costs nothing: at this point the lane exists solely as
+    # a port number held in memory, so walking back out writes nothing and undoes
+    # nothing. `b` at the path prompt returns to "use a different folder?", and `b`
+    # there re-asks the step's own yes/no — the QUESTION only, never the detection
+    # above it. Re-running that would re-open the OpenClaw tool-policy step and ask
+    # the operator to approve a gateway change they already answered.
+    #
     # No default means there is nothing to confirm keeping, so the confirm is
     # skipped rather than answered — and the explanation it carries moves onto the
     # prompt itself (fs_ask_shared_folder's `i`), which is where an operator with
-    # no default to fall back on actually needs it.
-    if [ -z "$workspace" ] || confirm "  Use a different folder than $workspace?" "file.folder.override"; then
-      while true; do
-        local w
-        if [ -n "$workspace" ]; then
-          w=$(ask "  Absolute path to the agent's working folder" "$workspace")
-        else
-          w=$(fs_ask_shared_folder) || die "$NO_ANSWER"
-          [ "$w" = "q" ] && quit_run
-        fi
-        case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
-        if ! fs_resolve_shared_folder "$w"; then
-          fs_folder_refusal_warn "$w"
-          continue
-        fi
-        # Only for the no-default gateways, and only because the question is a
-        # different one there. OpenClaw and Hermes are asked for a folder the
-        # wizard is helping to SET UP, so creating it is part of the job; a custom
-        # operator is naming a folder their agent ALREADY uses, so a path that is
-        # not on this machine is a typo or a path the agent will never see. Left to
-        # run, it becomes an empty folder nothing writes to, served by a lane that
-        # proves only that bytes moved — the exact false green this step removes.
-        if [ -z "$workspace" ] && [ ! -d "$FS_FOLDER_RESOLVED" ]; then
-          warn "$w does not exist on this machine."
-          note "This has to be the folder your agent ALREADY reads and writes. Create it and point your"
-          note "agent at it first, or give me the path it uses today."
-          continue
-        fi
-        [ "$FS_FOLDER_RESOLVED" != "$w" ] \
-          && note "$w resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path, so a later change to the link can't move the served folder under a running server."
-        workspace="$FS_FOLDER_RESOLVED"; break
-      done
-    else
-      # The default is resolved on exactly the same terms: `~/.openclaw/workspace`
-      # is a path like any other, and it can be a link to $HOME too.
-      if ! fs_resolve_shared_folder "$workspace"; then
-        fs_folder_refusal_warn "$workspace"
-        warn "Leaving the optional file lane out; chat is unaffected."
+    # no default to fall back on actually needs it. That prompt offers no `b` for
+    # the same reason: there is no gate above it to go back to.
+    local w folder_gate
+    while true; do
+      folder_gate=0
+      [ -n "$workspace" ] \
+        && { confirm "  Use a different folder than $workspace?" "file.folder.override" true || folder_gate=$?; }
+      if [ "$folder_gate" = "10" ]; then
+        say ""; note "↩ Back to the file-lane question."
+        if confirm "  Set it up?" "file.setup.enable"; then continue; fi
+        note "Skipped — Conduck works without it (inline-only attachments)."
+        note "Re-run me whenever you want it; nothing you approved today is undone by adding it later."
         FS_CRED=""; FS_URL=""; FS_FOLDER=""
         return 0
       fi
-      [ "$FS_FOLDER_RESOLVED" != "$workspace" ] \
-        && note "$workspace resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path."
-      workspace="$FS_FOLDER_RESOLVED"
-    fi
+      if [ "$folder_gate" = "0" ]; then
+        while true; do
+          if [ -n "$workspace" ]; then
+            prompt_into w ask "  Absolute path to the agent's working folder" "$workspace" "" "file.folder.override" true \
+              || continue 2
+          else
+            prompt_into w fs_ask_shared_folder
+          fi
+          case "$w" in /*) ;; *) warn "Please give an absolute path (starting with /)."; continue ;; esac
+          if ! fs_resolve_shared_folder "$w"; then
+            fs_folder_refusal_warn "$w"
+            continue
+          fi
+          # Only for the no-default gateways, and only because the question is a
+          # different one there. OpenClaw and Hermes are asked for a folder the
+          # wizard is helping to SET UP, so creating it is part of the job; a custom
+          # operator is naming a folder their agent ALREADY uses, so a path that is
+          # not on this machine is a typo or a path the agent will never see. Left to
+          # run, it becomes an empty folder nothing writes to, served by a lane that
+          # proves only that bytes moved — the exact false green this step removes.
+          if [ -z "$workspace" ] && [ ! -d "$FS_FOLDER_RESOLVED" ]; then
+            warn "$w does not exist on this machine."
+            note "This has to be the folder your agent ALREADY reads and writes. Create it and point your"
+            note "agent at it first, or give me the path it uses today."
+            continue
+          fi
+          [ "$FS_FOLDER_RESOLVED" != "$w" ] \
+            && note "$w resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path, so a later change to the link can't move the served folder under a running server."
+          workspace="$FS_FOLDER_RESOLVED"; break
+        done
+      else
+        # The default is resolved on exactly the same terms: `~/.openclaw/workspace`
+        # is a path like any other, and it can be a link to $HOME too.
+        if ! fs_resolve_shared_folder "$workspace"; then
+          fs_folder_refusal_warn "$workspace"
+          warn "Leaving the optional file lane out; chat is unaffected."
+          FS_CRED=""; FS_URL=""; FS_FOLDER=""
+          return 0
+        fi
+        [ "$FS_FOLDER_RESOLVED" != "$workspace" ] \
+          && note "$workspace resolves to $FS_FOLDER_RESOLVED — I'll serve and record the resolved path."
+        workspace="$FS_FOLDER_RESOLVED"
+      fi
+      break
+    done
     FS_FOLDER="$workspace"   # new lane knows its own folder — recorded in the profile
     new_fs=true
   fi
@@ -6362,7 +8334,17 @@ setup_file_lane() {
         h2="$ASK_FS_URL_RESULT"
         if [ -n "$h2" ]; then FS_URL="$h2"; fs_warn_quick_tunnel_url
         else warn "File transfer is NOT in this setup code — chat still works."; FS_CRED=""; fs_lane_residue_note; fi
-      else FS_CRED=""; fs_lane_residue_note; fi
+      else
+        # Enter at that prompt means "no, I didn't add the route", so this branch is
+        # now the one a hurried operator lands in — it has to say what it decided
+        # rather than fall through in silence. It is still the right ending: without
+        # the ingress rule there is no address that reaches the file server, so a
+        # code claiming one would fail on the first attachment.
+        warn "File transfer is NOT in this setup code — chat still works."
+        note "Add the ingress rule whenever you like and re-run me to put file transfer in a new code."
+        FS_CRED=""
+        fs_lane_residue_note
+      fi
       ;;
     public)
       say ""
@@ -6469,7 +8451,7 @@ HERMES_ANALYSIS_CHANGE_KINDS=()
 # narrowing those is not this connector's business.
 #
 # JSON-quoted because that is the only inline form the scanner above reads back:
-# a bare flow sequence is refused as "YAML syntax this connector will not guess
+# a bare flow sequence is refused as "YAML syntax this script will not guess
 # at", and the refusal names the key, not the quoting — so an operator told to
 # write `[web, file]` types the exact line the next run refuses, with nothing on
 # screen to explain it. Quoted is also what hermes_config_analysis's own rewrite
@@ -7133,12 +9115,12 @@ manual = []
 changes = []
 
 if unsupported_root_form():
-    manual.append("config.yaml uses a document-root YAML form outside this connector's conservative plain block-map subset")
+    manual.append("config.yaml uses a document-root YAML form outside the conservative plain block-map subset this script edits")
 
 if any(ANCHOR_OR_ALIAS.search(unquoted_yaml_code(content(line))) or
        MERGE_KEY.search(unquoted_yaml_code(content(line)))
        for line in lines):
-    manual.append("YAML anchors, aliases, or merge keys can change the effective target paths; this connector will not edit through them")
+    manual.append("YAML anchors, aliases, or merge keys can change the effective target paths; this script will not edit through them")
 
 # Whether the document itself is inside the editable subset. Captured before the
 # path-specific reasons below so a workspace mismatch never makes the toolset
@@ -7198,7 +9180,7 @@ if action == "recall":
 remove_targets = []
 if scope_expect is not None:
     if recall_fix != "literal" or pst != "OK":
-        manual.append("the API-server recall entries are not in the plain list form this connector edits")
+        manual.append("the API-server recall entries are not in the plain list form this script edits")
     else:
         try:
             expected = json.loads(scope_expect)
@@ -7214,7 +9196,7 @@ if not recall_only:
     if bst == "OK" and backend not in ("", "local"):
         manual.append("terminal.backend is %r; a host WebDAV folder is not proven inside that backend" % backend)
     elif bst in ("AMBIG", "FLOW"):
-        manual.append("terminal.backend uses YAML syntax this connector will not guess at")
+        manual.append("terminal.backend uses YAML syntax this script will not guess at")
 
     cst, cwd = scalar("terminal", "cwd")
     if cst == "OK":
@@ -7224,7 +9206,7 @@ if not recall_only:
     elif cst in ("MISSING",):
         changes.append(("cwd", "terminal.cwd: (absent) -> %s" % json.dumps(workspace)))
     else:
-        manual.append("terminal.cwd uses YAML syntax this connector will not guess at")
+        manual.append("terminal.cwd uses YAML syntax this script will not guess at")
 
 file_bundles = {"file", "all", "*", "hermes-api-server", "hermes-cli"}
 if pst == "OK":
@@ -7237,7 +9219,7 @@ if pst == "OK":
         changes.append(("toolset", "platform_toolsets.api_server: %s -> %s" %
                         (json.dumps(pvals), json.dumps(want))))
 elif pst in ("AMBIG", "FLOW"):
-    manual.append("platform_toolsets.api_server uses YAML syntax this connector will not guess at")
+    manual.append("platform_toolsets.api_server uses YAML syntax this script will not guess at")
 # Missing or null api_server means Hermes's own full API-server default remains
 # authoritative, so its file tools are there. The live sentinel still proves the
 # installed version rather than trusting that default on faith.
@@ -7256,7 +9238,7 @@ if not recall_only:
             manual.append("agent.disabled_toolsets globally disables %s; removing it would broaden other Hermes platforms" %
                           ", ".join(sorted(blocked)))
     elif st in ("AMBIG", "FLOW"):
-        manual.append("agent.disabled_toolsets uses YAML syntax this connector will not guess at")
+        manual.append("agent.disabled_toolsets uses YAML syntax this script will not guess at")
 
 if manual:
     print("status\tmanual")
@@ -8576,7 +10558,7 @@ check() { # check "label" <command...>  (command's exit code decides)
 # The bearer token rides a stdin curl config, never argv (argv shows in `ps`).
 curl_gw() { # curl_gw <curl args…>
   local extra=()
-  # `-q` MUST be curl's first arg. Every connector request ignores curl config,
+  # `-q` MUST be curl's first arg. Every request this script makes ignores curl config,
   # so a stray `proxy`/`output`/redirect/include line there can neither reroute
   # a secret nor make curl read/write files absent from our effects manifest.
   # Diagnostics additionally refuse ALL proxy environment variables because
@@ -9212,6 +11194,13 @@ agent_file_lane_gate() {
 
 verify_all() {
   head_ "Step 5 — verify (real requests, before you touch your phone)"
+  # The only place in the whole tool that says verification is not free: it spends
+  # a little provider quota and the test message can land in a server's own
+  # history. Printed HERE rather than at either caller because both --setup and
+  # --show-code arrive through this function, and one copy cannot drift from the
+  # other. It prints unconditionally — the cost is incurred on every path, so a
+  # gate would only hide it from somebody.
+  explain_live_verification
   # Proof belongs to THIS run's measurements. Cleared here rather than only at
   # declaration so a second verify_all in one process — a re-check, a test, a
   # future menu loop — can never inherit a green claim from an earlier lane.
@@ -9532,6 +11521,39 @@ doctor_not_yours_hint() {
   say "  wrong. Ask the question you actually have instead:"
   say "    ${BOLD}bash conduck-connect.sh --check-server${RESET}   — can the app talk to this server?"
   say "    ${BOLD}bash conduck-connect.sh --setup${RESET}          — pair it; a failed grade here doesn't block that"
+  # This hint prints on a scripted FAIL too, and the second command is the one a
+  # machine cannot finish. Naming the blocker in that case keeps a build loop from
+  # following the line into an exit 1 it would report as a broken pairing. Only
+  # the extra sentence is conditional — the two commands stay put for everyone, so
+  # a human reader sees exactly what they saw before.
+  interactive_terminal \
+    || say "  That last one needs a person: it ends in a QR code someone scans with a phone."
+}
+
+# What to do with a green check — said differently to the two readers who get one.
+# Shared by both check commands, because both used to end a passing run with the
+# same unqualified line and both have the same two audiences.
+#
+# An interactive operator is about to be asked "continue with setup and pairing?"
+# and can simply answer yes; the command is here for the one who answers no.
+#
+# A machine gets the blocker instead of the command. Handed `--setup` unqualified,
+# a scripted run follows it — that is what a scripted run is for — and exits 1 on
+# a message about stdin, so its transcript reads green check, instruction,
+# failure, and it reports a pairing as broken when nothing is. "Run me from a
+# terminal" states a fact about stdin, not the reason: setup ENDS in a QR code
+# that a person scans with the Conduck app on a phone, and no answer a machine can
+# supply finishes that. Naming the real blocker, and naming who to hand the
+# command to, is the difference between a dead end and a handover.
+check_setup_next_step() {
+  if interactive_terminal; then
+    say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
+    return 0
+  fi
+  say "  ${BOLD}Setup needs a person, not a script.${RESET} It ends by showing a QR code that someone"
+  say "  scans with the Conduck app on a phone, so there is no answer a machine can give that"
+  say "  finishes it — a scripted run stops at the first question. Hand your operator:"
+  say "      ${BOLD}bash conduck-connect.sh --setup${RESET}"
 }
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
@@ -9627,13 +11649,42 @@ doctor_accept_url() { # doctor_accept_url <candidate>
   printf 'http://%s' "$rest"; return 0
 }
 
-doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stderr)
-  local reply url
+# The address prompt shared by both check commands. It honours the same prompt
+# contract as the primitives in 10-utilities (rc 0 = the URL is on stdout, 11 =
+# the operator pressed q, 1 = the input ended), because both call sites capture it
+# with $(…) and a `q` acted on inside that subshell would kill the subshell only.
+# Callers should reach it through prompt_into, which turns 11 into quit_run in the
+# parent shell.
+#
+# The argument is what `i` shows. Both commands pass their own opening block by
+# FUNCTION NAME — explain_prompt resolves a function before it consults the
+# explanation catalogue — because the block that says what this command wants an
+# address for is the same block that opened the command, and someone pressing i
+# here has scrolled past it.
+#
+# Back is not offered: this is the first question either check asks, so there is
+# no earlier answer to return to. `b` is still intercepted rather than validated
+# as an address — nothing that fails the https test can be a legal answer here, so
+# the letter is unambiguous, and the refusal names the keys that do work. That
+# mirrors ask_url, whose wording this reuses verbatim.
+doctor_ask_url() {  # doctor_ask_url [action-id | help-fn] -> URL on stdout (every human line to stderr)
+  local action="${1:-}" reply url p
   say "  Where is the server? Its base address, without any /v1 tail (I strip that myself)." >&2
   say "  Plain http:// is fine toward this machine (127.0.0.1/localhost) — test locally first," >&2
   say "  expose over HTTPS after." >&2
+  p="  URL (e.g. http://127.0.0.1:8080; $(control_suffix "ask again" false)) > "
   while true; do
-    read -r -p "  URL (e.g. http://127.0.0.1:8080; Enter = no default) > " reply || return 1   # EOF: caller dies
+    prompt_echo "$p"
+    read -r -p "$p" reply || return 1   # EOF: the caller reports it
+    case "$reply" in
+      [iI]) explain_prompt "$action" >&2; continue ;;
+      [qQ]) return 11 ;;
+      [bB]) warn "Back is not available at this step; type an https:// URL, i for an explanation, or q to stop." >&2
+            continue ;;
+      # Enter is an advertised no-op here, so it re-asks without being told off:
+      # pausing at a question with no default is not a mistake.
+      '') note "Nothing entered — the server's address goes on this line." >&2; continue ;;
+    esac
     if url=$(doctor_accept_url "$reply"); then
       printf '  %s→ testing %s%s\n' "$DIM" "$url" "$RESET" >&2
       printf '%s' "$url"; return 0
@@ -11438,16 +13489,63 @@ run_doctor_files() {
   return 0
 }
 
-# The frozen machine line (schema=3) — printed as the LAST line of EVERY
-# adapter-check exit, green, red, or an early die: fixed field order, ASCII enums,
-# no ANSI. Consumers (build loops, CI, the builder guide's definition of
-# done) key on this + the exit code — never on check counts, which change
-# between harness versions. Any grammar change bumps schema=; renaming the
-# prefix CONDUCK_DOCTOR -> CONDUCK_CHECK_ADAPTER is such a change, which is why
-# schema went 2 -> 3. Exactly ONE summary line is emitted (consumers use
-# `tail -1`), so the retired prefix is never dual-emitted. The three file
-# meters are NOT_REQUESTED without --files; with it they grade independently
-# (NOT_RUN|PASS|FAIL|ERROR — see the --files block above).
+# The frozen machine line (schema=3), and the published grammar for it.
+#
+# Printed as the LAST line of EVERY adapter-check exit — green, red, or an early
+# die: fixed field order, ASCII enums, no ANSI. Any key added, removed, renamed or
+# given a new value bumps schema=, so a consumer pins the number it parses and
+# ignores a line carrying one it does not know. Renaming the prefix
+# CONDUCK_DOCTOR -> CONDUCK_CHECK_ADAPTER was such a change, which is why schema
+# went 2 -> 3. Exactly ONE summary line is emitted (consumers use `tail -1`), so
+# the retired prefix is never dual-emitted.
+#
+# The domains are written HERE, in the one artifact a consumer is guaranteed to
+# have: the adapter build brief tells an agent to curl this script and nothing
+# else, so a grammar that lives only in the README is a grammar it cannot read.
+#
+#   schema=3            this grammar
+#   contract=v1         the adapter contract family being graded
+#   revision=<n.n>      the contract revision this harness implements
+#   harness=<version>   conduck-connect's own version; informational, never a gate
+#   profile=            basic | deep — deep adds the semantic image probe
+#   core=               PASS | FAIL | NOT_RUN — the core wire contract's roll-up.
+#                       IMAGE_INPUT and every file check are excluded from it by
+#                       design: they grade optional capabilities
+#   history_image=      PASS | FAIL | NOT_RUN
+#   stream=             PASS | FAIL | NOT_RUN
+#   image_input=        VERIFIED | DECLINED | UNVERIFIED | FAIL | NOT_RUN
+#   file_transport=     NOT_REQUESTED | NOT_RUN | PASS | FAIL | ERROR
+#   file_access=        same domain
+#   file_e2e=           same domain
+#   checks=<n>          counted verdict lines
+#   failed=<n>          how many of them went red
+#   exit=<n>            see below
+#
+# Never key on checks= or failed= as absolute numbers: they move whenever a check
+# is added, and a loop pinned to "checks=10" breaks on a harness upgrade that
+# fixed nothing about the adapter. Key on the meters and the exit status.
+#
+# NOT_RUN vs NOT_REQUESTED, because that is precisely what a retry loop branches
+# on. NOT_RUN means "this run never got far enough to measure it" — a prerequisite
+# stopped the tier, or the probe failed for a cause this run could not tell apart
+# from another rule's failure. Fix what went red above and run again; it never
+# means "fine". NOT_REQUESTED means "you did not ask for this profile", which is
+# not a problem and must never be retried: only the three file meters emit it, and
+# only when --files was absent. A capability the run could not measure is never
+# reported as failing it — the run-level verdict lives in core=, failed= and
+# exit=, and a red verdict line is what says the adapter is non-conformant.
+#
+# exit=<n> versus the process exit status:
+#   * In a NON-INTERACTIVE run — the only kind a machine gets, including any run
+#     under CI=1 — this line is the LAST line and exit= IS the process status.
+#   * In an interactive run the summary prints BEFORE the optional setup handoff,
+#     and it grades the CHECK: exit=0 says every check passed, while the process
+#     walks on into setup and finally exits on setup's own result. Read exit=
+#     there as this check's verdict, never as a prediction about the process.
+# The statuses: 0 every check passed · 1 a check failed, or the run broke · 2 a
+# usage error caught after the check began (a malformed URL — a bad FLAG is
+# refused by the argument parser before any check exists, so it carries no summary
+# at all) · 3 an operator stopped the run at a prompt · 128+signal for HUP/INT/TERM.
 doctor_summary() { # doctor_summary <exit-code>
   local rc="${1:-1}" core="NOT_RUN"
   if $DOCTOR_CORE_RAN; then
@@ -11491,22 +13589,30 @@ run_doctor() {
   preflight
 
   say "${BOLD}conduck-connect $VERSION — --check-adapter${RESET}"
-  say "Checks whether an adapter built for Conduck follows the rules at"
-  say "${BOLD}conduck.com/setup/adapter/v1/${RESET} — real requests, graded strictly against contract"
+  # The opening block, printed on the machine path too. An adapter build loop is
+  # exactly where nobody read a README first, and this is the only place the
+  # command says out loud that its checks send real turns that can cost quota and
+  # land in a server's own history. The lines under it are the facts the shared
+  # block cannot carry: which contract revision this harness grades, and what
+  # --files does to the shared folder in concrete terms.
+  explain_check_adapter
+  say "  Graded against contract revision $DOCTOR_CONTRACT_REV: ${BOLD}conduck.com/setup/adapter/v1/${RESET}"
   if $DOCTOR_FILES; then
-    say "revision $DOCTOR_CONTRACT_REV. The chat checks change no host configuration; --files then writes and"
-    say "removes small conduck-check-* files in the configured shared folder, and asks the"
-    say "selected agent to copy one — I clean up after myself, but I can't promise a"
-    say "MISBEHAVING agent touches nothing else."
-  else
-    say "revision $DOCTOR_CONTRACT_REV. Changes no host configuration; sends live adapter turns"
-    say "that may consume compute or enter server-side history."
+    say "  --files writes and removes small conduck-check-* files in the configured shared folder,"
+    say "  and asks the selected agent to copy one. I clean up after myself, but I can't promise a"
+    say "  MISBEHAVING agent touches nothing else."
   fi
   note "Building your own adapter? Loop me from a shell — exit code 0 means every check passed."
   if interactive_terminal; then
     note "A CONDUCK_CHECK_ADAPTER machine summary prints before the optional setup handoff."
   else
     note "The last line is always a CONDUCK_CHECK_ADAPTER machine summary — scripts key on it."
+    # Where the grammar is, said to the only reader who needs it. A machine is
+    # told to download this script and nothing else, so "see the README" is a
+    # pointer it cannot follow; the comment above doctor_summary in this very file
+    # is one it can. The function name is the anchor because it is stable — prose
+    # in a comment is not.
+    note "Its key/value domains are in this script, in the comment above doctor_summary."
   fi
 
   # Target: the positional URL if one was given, else ask.
@@ -11515,7 +13621,14 @@ run_doctor() {
       || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
   else
     say ""
-    GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
+    # explain_check_adapter is the prompt's `i` copy, passed by FUNCTION NAME
+    # rather than as an action id: explain_prompt resolves a function before it
+    # consults the explanation catalogue, and the block that says what this
+    # command wants an address for is the block that opened the command.
+    # prompt_into, not $(…), so a `q` here stops the run in THIS shell — inside
+    # the subshell it would kill the subshell and the check would walk on with an
+    # empty address.
+    prompt_into GW_URL doctor_ask_url explain_check_adapter
   fi
   apply_gateway_url_normalization
 
@@ -11533,8 +13646,19 @@ run_doctor() {
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — this server has no token") \
-      || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
+    # Two failures, two different meanings, and they must not share a message.
+    # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
+    # supply a token, so printing it to someone who deliberately stopped is both
+    # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
+    # still emits the machine summary, with exit=3.
+    local token_rc=0
+    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — this server has no token" "gateway.token") \
+      || token_rc=$?
+    case "$token_rc" in
+      0)  ;;
+      11) quit_run ;;
+      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+    esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi
   # Plain TLS validation, the same rule the app applies. For a certificate this
@@ -11619,9 +13743,7 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   say ""
   if [ "$DOCTOR_FAILS" = "0" ]; then
     ok "Adapter check: PASS — $DOCTOR_CHECKS/$DOCTOR_CHECKS checks green. This adapter follows Conduck's rules."
-    if ! interactive_terminal; then
-      say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
-    fi
+    check_setup_next_step
     return 0
   fi
   bad "Adapter check: FAIL — $DOCTOR_FAILS of $DOCTOR_CHECKS checks failed."
@@ -11661,6 +13783,12 @@ COMPAT_RAN=false
 COMPAT_CHECKS=0; COMPAT_FAILS=0
 COMPAT_MODELS="NOT_RUN"; COMPAT_CHAT="NOT_RUN"; COMPAT_HISTORY_IMAGE="NOT_RUN"
 COMPAT_IMAGE_INPUT="NOT_RUN"; COMPAT_MODEL_FIELD="NOT_RUN"
+# Did a request that NAMED a model select it? Kept for the closing FAIL, which owes
+# the reader an honest split between the reds that block pairing and the reds that
+# merely limit it — and a model-selection failure is the second kind whenever a
+# model-less turn works. Deliberately NOT a summary key: the schema=2 grammar is
+# frozen per schema number, so a new field would break every consumer pinned to 2.
+COMPAT_MODEL_SELECT="NOT_RUN"
 
 # WHICH model these verdicts describe. A fan-out gateway is one endpoint in
 # front of hundreds of upstream models, and /v1/models lists them in an order
@@ -11825,6 +13953,56 @@ pats = (r"support.*image", r"image.*input", r"unsupported.*content", r"image.*no
 sys.exit(0 if any(re.search(p, text, re.I | re.S) for p in pats) else 1)' 2>/dev/null
 }
 
+# The machine summary — schema=2, and the published grammar for it.
+#
+# One line, ASCII only, no ANSI, fixed key order, printed from the EXIT trap so it
+# rides EVERY exit: pass, fail, usage error, Ctrl-C, or an operator's q. The
+# grammar is frozen per schema number — any key added, removed, renamed, or given
+# a new value bumps schema= — so a consumer pins the number it parses and ignores
+# a line carrying a number it does not know.
+#
+# The domains are written here, in the one artifact a consumer is guaranteed to
+# have: the build brief tells an agent to curl this script and nothing else, so a
+# grammar that lives only in the README is a grammar it cannot read.
+#
+#   schema=2            this grammar
+#   harness=<version>   conduck-connect's own version; informational, never a gate
+#   wire=               PASS | FAIL | NOT_RUN — the roll-up of every counted check
+#   models=             PASS | FAIL | NOT_RUN
+#   chat=               PASS | FAIL | NOT_RUN
+#   history_image=      PASS | FAIL | NOT_RUN
+#   image_input=        VERIFIED | IGNORED | DECLINED | OPAQUE | NOT_RUN
+#                       informational: it never moves wire=, failed=, or the exit
+#   model=              optional | required | none_advertised | NOT_RUN
+#                       whether this server needs a "model" field to answer
+#   model_ids=<n>       how many usable ids /v1/models advertised (0 = none)
+#   auth=               bearer | none | NOT_RUN — what this run actually sent
+#   checks=<n>          counted verdict lines
+#   failed=<n>          how many of them went red
+#   exit=<n>            see below
+#
+# Never key on checks= or failed= as absolute numbers: they move whenever a check
+# is added, and a loop pinned to "checks=4" breaks on a harness upgrade that fixed
+# nothing about the server. Key on the meters and the exit status.
+#
+# NOT_RUN vs NOT_REQUESTED, because that is exactly what a retry loop branches on:
+# NOT_RUN means "this run never got far enough to measure it — fix what went red
+# above and run me again", and it never means "fine". NOT_REQUESTED means "you did
+# not ask for this profile", which is not a problem and must never be retried;
+# only --check-adapter's optional file profile emits it (schema=3). --check-server
+# has no optional profile, so NOT_REQUESTED never appears here.
+#
+# exit=<n> versus the process exit status:
+#   * In a NON-INTERACTIVE run — the only kind a machine gets, including any run
+#     under CI=1 — this line is the LAST line and exit= IS the process status.
+#   * In an interactive run the summary prints BEFORE the optional setup handoff,
+#     and it grades the CHECK: exit=0 says the check passed, while the process
+#     continues into setup and finally exits on setup's own result. There, read
+#     exit= as this check's verdict and not as a prediction about the process.
+# The statuses: 0 every check passed · 1 a check failed, or the run broke · 2 a
+# usage error caught after the check began (a malformed URL — a bad FLAG is
+# refused by the argument parser before any check exists, so it carries no summary
+# at all) · 3 an operator stopped the run at a prompt · 128+signal for HUP/INT/TERM.
 compat_summary() { # compat_summary <exit-code>
   local rc="${1:-1}" wire="NOT_RUN"
   if $COMPAT_RAN; then
@@ -11851,13 +14029,26 @@ compat_on_exit() {
 # the exit. Same acceptance rule as the first prompt — https anywhere, plain http
 # only toward this machine — so the retry can't relax what the first ask enforced.
 compat_reask_url() {
-  local reply url
+  local reply url p
   interactive_terminal || return 1
   say ""
-  say "  Another address to try? The token you already entered is kept — Enter to stop."
+  say "  Another address to try? The token you already entered is kept."
+  # Enter and q both end the asking, and they are two different endings, which is
+  # why both are offered: Enter says "I am done trying, give me the verdict" and
+  # leaves the FAIL summary and its exit 1 behind, while q stops the run outright.
+  # This prompt runs in the parent shell (it assigns $GW_URL directly), so q can
+  # call quit_run here rather than travelling out on an exit status.
+  # No prompt_echo here, unlike every other prompt in the tool: the
+  # interactive_terminal gate above has already proved stdin is a terminal, so
+  # `read -p` writes the prompt itself and the non-tty re-emit could never fire.
+  p="  URL ($(control_suffix "stop trying and take the FAIL" false)) > "
   while true; do
-    read -r -p "  URL (Enter to stop) > " reply || return 1
-    case "$reply" in '') return 1 ;; esac
+    read -r -p "$p" reply || return 1
+    case "$reply" in
+      '') return 1 ;;
+      [iI]) explain_check_server; continue ;;
+      [qQ]) quit_run ;;
+    esac
     if url=$(doctor_accept_url "$reply"); then
       GW_URL="$url"
       apply_gateway_url_normalization
@@ -11959,31 +14150,48 @@ run_compat() {
   preflight
 
   say "${BOLD}conduck-connect $VERSION — --check-server${RESET}"
-  say "Asks ONE question: does this OpenAI-compatible server speak the core wire the"
-  say "current Apple Conduck app needs? It changes no host configuration. It sends live"
-  say "model/chat/image requests that may consume compute or enter server-side history."
-  say "The check matches the app's request/response acceptance at the directly addressed"
-  say "endpoint. It does not follow redirects or forward credentials to Location targets;"
-  say "use the final server URL directly. This is NOT the adapter contract:"
-  say "${BOLD}--check-adapter${RESET} grades adapters built FOR Conduck,"
-  say "and generic servers fail it on rules the app never exercises. A pass here does NOT"
-  say "make this server a Conduck adapter."
+  # The opening block, printed on the machine path too. It carries the only
+  # statement anywhere in this command that the check spends real provider quota
+  # and lands in a server's own history — and a scripted run is precisely where
+  # nobody read a README first. The two facts below are the ones it leaves out,
+  # both of which decide what the operator types next.
+  explain_check_server
+  say "  It grades the address you give me DIRECTLY: no redirect is followed and your credential"
+  say "  is never forwarded to a Location target, so give me the FINAL server URL."
+  say "  And a red ${BOLD}--check-adapter${RESET} here would mean nothing: those rules are written for software"
+  say "  built FOR Conduck, and generic servers are expected to fail them."
   if interactive_terminal; then
     note "A CONDUCK_CHECK_SERVER machine summary prints before the optional setup handoff."
   else
     note "The last line is always a CONDUCK_CHECK_SERVER machine summary — scripts key on it."
+    # Where the grammar is, said to the only reader who needs it. A machine is
+    # told to download this script and nothing else, so "see the README" is a
+    # pointer it cannot follow; the comment above compat_summary in this very file
+    # is one it can. The function name is the anchor because it is stable — prose
+    # in a comment is not.
+    note "Its key/value domains are in this script, in the comment above compat_summary."
   fi
   note "What this can't see: a server that keeps its OWN chat history will pass and still"
   note "double-count context — Conduck resends the full history every turn (client-owned)."
   note "This grades ONE model path. Set CONDUCK_CHECK_SERVER_MODEL=<id> to grade the model"
   note "you actually plan to use — otherwise a multi-model server is judged on one sample."
 
+  # auth= in the summary must describe what this run SENT. GW_AUTH is initialised
+  # to "bearer" for the wizard, and a check that dies before the token step below
+  # would otherwise report a credential mode it never used; empty makes the
+  # summary's own NOT_RUN fallback fire, which is the honest reading.
+  GW_AUTH=""
+
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
       || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
   else
     say ""
-    GW_URL=$(doctor_ask_url) || die "$NO_ANSWER"
+    # explain_check_server is passed as the prompt's `i` copy, not an action id:
+    # explain_prompt resolves a function name before it consults the catalogue,
+    # and the block that says what this command wants an address FOR is the same
+    # block that opened the command. Someone who pressed i here scrolled past it.
+    prompt_into GW_URL doctor_ask_url explain_check_server
   fi
   apply_gateway_url_normalization
 
@@ -12001,8 +14209,19 @@ run_compat() {
   else
     say ""
     note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode") \
-      || die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately."
+    # Two failures, two different meanings, and they must not share a message.
+    # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
+    # supply a token, so printing it to someone who deliberately stopped is both
+    # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
+    # still emits the machine summary, with exit=3.
+    local token_rc=0
+    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode" "gateway.token") \
+      || token_rc=$?
+    case "$token_rc" in
+      0)  ;;
+      11) quit_run ;;
+      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+    esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
       GW_AUTH="none"
       note "Keyless: mirroring the app's explicit no-auth scheme — sensible only on an isolated network."
@@ -12029,7 +14248,17 @@ run_compat() {
     compat_reask_url && continue
     say ""
     bad "Server check: FAIL — the app's Test Connection fails here, so nothing else can work."
-    say "  Fix that first, then re-run me. Testing an adapter you BUILT? Use ${BOLD}--check-adapter${RESET}."
+    # Be specific about what this red costs, because this is the one --check-server
+    # failure that genuinely blocks pairing: the app asks every gateway for its
+    # model list before it will talk to it, so there is no "pair it anyway" here.
+    # The closing FAIL below is the opposite case and says so — telling both stories
+    # the same way would make one of them a lie.
+    say "  ${BOLD}This blocks pairing.${RESET} The app asks a gateway for its model list before it"
+    say "  will talk to it, so pairing this address would only move the same failure onto your"
+    say "  phone. The ✗ line above says what went wrong; fix that, then re-run me:"
+    say "      ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+    say "  Wrote this server yourself, FOR Conduck? ${BOLD}--check-adapter${RESET} grades it against the"
+    say "  adapter rules instead: ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
     exit 1
   done
 
@@ -12118,8 +14347,10 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     local named_what="the first advertised model id"
     [ -n "$COMPAT_WANTED_MODEL" ] && named_what="the model you named"
     if [ "$b_ok" = "true" ]; then
+      COMPAT_MODEL_SELECT="PASS"
       c_ok SERVER_MODEL_SELECT "$named_what selects (the app sends what the user picked)"
     else
+      COMPAT_MODEL_SELECT="FAIL"
       c_bad SERVER_MODEL_SELECT "a request naming $named_what fails — $b_reason"
       if [ -n "$COMPAT_WANTED_MODEL" ] && ! $MODELS_WANTED_FOUND; then
         # Don't blame the server's picker for an id the server never offered.
@@ -12280,7 +14511,7 @@ print(json.dumps(req))') \
     if [ "$COMPAT_MODEL_SOURCE" = "explicit" ]; then
       # The setup handoff pairs $COMPAT_MODEL_ID — the model this run actually
       # graded — so a deliberately-graded model is the one that gets carried.
-      note "Continuing into setup? The pairing code carries the model you named here."
+      note "Continuing into setup? The setup code carries the model you named here."
     fi
     # Statefulness is invisible ON THE WIRE, not always invisible: when the address
     # that just passed matches this machine's own Hermes API-server settings, the
@@ -12296,9 +14527,7 @@ print(json.dumps(req))') \
         say "  whether this gateway keeps a memory of its own."
       fi
     fi
-    if ! interactive_terminal; then
-      say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
-    fi
+    check_setup_next_step
     return 0
   fi
   bad "Server check: FAIL — $COMPAT_FAILS of $COMPAT_CHECKS wire checks failed."
@@ -12312,8 +14541,54 @@ print(json.dumps(req))') \
     say "  That is not yet a verdict on the server: it advertises $MODELS_ID_COUNT model ids and this run"
     say "  graded one path. CONDUCK_CHECK_SERVER_MODEL=<id> grades the model you plan to use."
   fi
-  say "  Building your own adapter instead? ${BOLD}--check-adapter${RESET} grades that:"
-  say "  ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
+  # Which of these reds actually stops you pairing? The sibling command answers
+  # that on every red exit (doctor_not_yours_hint); this one pointed only at the
+  # adapter contract — written for a different audience entirely — and left
+  # someone whose server merely mishandles photos believing the app cannot be
+  # used with it at all.
+  #
+  # Three answers, not two, because the middle one is where a two-way split lies:
+  #   · a model-less turn failed AND a model-NAMED turn worked — the app sends
+  #     whatever model a gateway is set to, so that route is reachable and this is
+  #     not a blocker
+  #   · every chat turn failed — nothing to pair; the app would never get a reply
+  #   · a chat turn worked — the rest are LIMITS on a gateway that otherwise works
+  # Honest, not generous: each branch claims exactly what this run measured, and
+  # saying which is which is what stops a fixable annoyance reading as a dead end.
+  say ""
+  if [ "$COMPAT_CHAT" = "FAIL" ] && [ "$COMPAT_MODEL_SELECT" = "PASS" ]; then
+    # The middle case, and the one a two-way split gets confidently wrong: the
+    # model-less turn failed for a reason that is NOT the missing-model kind, yet
+    # the turn that NAMED a model answered. The app can be told to always send a
+    # model, so that route is reachable — calling this a blocker would be false.
+    say "  ${BOLD}Pairing may still work, if you name a model.${RESET} The plain request failed, but the one"
+    say "  that named a model answered — and the app sends whatever model you set for a gateway."
+    say "  Set one in the app after pairing, or fix the failure above and re-check:"
+    say "      ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+    check_setup_next_step
+  elif [ "$COMPAT_CHAT" = "FAIL" ]; then
+    say "  ${BOLD}This blocks pairing.${RESET} The app could not get a reply out of this server at all,"
+    say "  so a paired gateway would fail on the first message you send it. Fix the chat failure"
+    say "  above, then re-run me:"
+    say "      ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+  else
+    say "  ${BOLD}You can still pair this server.${RESET} A plain text round-trip worked; what failed above"
+    say "  limits it rather than blocking it:"
+    [ "$COMPAT_HISTORY_IMAGE" = "FAIL" ] \
+      && say "    · once a chat contains a photo, the turns after it fail the same way. Other chats are fine."
+    # "try a different one", never "pick a different one": nothing in this run
+    # tested a second model, so promising one that works would be inventing
+    # evidence.
+    [ "$COMPAT_MODEL_SELECT" = "FAIL" ] \
+      && say "    · naming this model in the app fails. Leave the model blank, or try a different one."
+    say "  Re-check after a fix:  ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+    # The setup line goes through the shared helper rather than being printed
+    # straight, so this branch cannot hand a machine the one command a machine
+    # can't finish — the same trap the PASS ending exists to close.
+    check_setup_next_step
+  fi
+  say "  Wrote this server yourself, FOR Conduck? Then ${BOLD}--check-adapter${RESET} is the grade you want,"
+  say "  against the rules at ${BOLD}https://conduck.com/setup/adapter/v1/${RESET}"
   exit 1
 }
 # -------------------------------------------------------------- pairing emit --
@@ -12342,7 +14617,11 @@ write_profile() {
     # the reuse-only paths that leave a still-running file lane out of THIS code would
     # otherwise delete the record of that live lane for good.
     if $REUSE_ONLY; then
-      note "Kept the saved pairing profile exactly as it is — --reuse-only changes nothing, and this file counts."
+      # Names the directory for the same reason the success branch below does:
+      # this run ends with a working code and no failure, so it is one of the
+      # screens where an operator would otherwise never learn their setups exist
+      # as files they can read, copy or remove.
+      note "Kept the saved pairing profile in $STATE_DIR exactly as it is — --reuse-only changes nothing, and this file counts."
       note "Re-run me without --reuse-only to refresh what it records."
       return 0
     fi
@@ -12357,7 +14636,7 @@ write_profile() {
     # Recording "no file lane" here is what makes one transient probe failure a
     # permanent deletion — the exact outcome --show-code's guard above exists to avoid.
     if $FS_LANE_DROPPED_BY_CHECK && [ "$(json_type "$pf" "fileServer")" = "object" ]; then
-      note "Left the saved pairing profile untouched, so the file lane it records survives this run's probe failure."
+      note "Left the saved pairing profile in $STATE_DIR untouched, so the file lane it records survives this run's probe failure."
       note "Nothing from this run is saved to it — re-run me once the file server answers again to refresh it."
       return 0
     fi
@@ -12397,7 +14676,11 @@ PY
   # rename(2) within the same directory is atomic, so readers see old or new, never half.
   if ( umask 077; printf '%s\n' "$out" > "$pf.tmp" && mv -f "$pf.tmp" "$pf" ) 2>/dev/null; then
     chmod 600 "$pf" 2>/dev/null || true       # belt-and-suspenders; umask 077 already made it 0600
-    note "Saved a non-secret pairing profile (no token) — re-show this code later with:  bash conduck-connect.sh --show-code"
+    # Names the directory, because this is the last screen of a successful run and
+    # $STATE_DIR otherwise reaches the operator only inside a permissions warning —
+    # so somebody who never hits a failure never learns where their setups live.
+    note "Saved a non-secret pairing profile (no token) in $STATE_DIR."
+    note "Re-show this code — to pair another device, or after something changes — with:  bash conduck-connect.sh --show-code"
   else
     rm -f "$pf.tmp" 2>/dev/null || true        # never leave a partial temp behind
     warn "Couldn't save the pairing profile to $pf — pairing is still complete."
@@ -12475,31 +14758,37 @@ emit_payload() {
     # scrolled away, and this epilogue is what the operator is reading when they
     # decide whether to undo a change that was correct.
     gw_restart_timing_note
-    # Custom targets only. Route by provenance: existing OpenAI-compatible
-    # software uses the app-compatibility grader; adapters written for Conduck
-    # use the stricter contract grader. OpenClaw/Hermes users need neither hint.
-    # Both address the PUBLIC url, because that is the route that just failed and
-    # the only one the app ever takes. Aimed at loopback they PASS on every fault
-    # that lives in the HTTPS front — the operator then watches the recommended
-    # diagnostic go green after a red run and concludes the wizard is broken. A
-    # recovery that proves the wrong thing is worse than no recovery at all.
-    # The loopback run is offered SECOND and named as a comparison, because the
-    # split between the two is itself the diagnosis. One loopback command, not
-    # two: it answers "the server, or the route?", and a second grader beside it
-    # would bury that question under four near-identical lines.
+    # The diagnostic every failed run gets, whatever the gateway is. Which route it
+    # addresses is the load-bearing part: the PUBLIC url, because that is the route
+    # that just failed and the only one the app ever takes. Aimed at loopback these
+    # PASS on every fault that lives in the HTTPS front — the operator then watches
+    # the recommended diagnostic go green after a red run and concludes the wizard is
+    # broken. A recovery that proves the wrong thing is worse than no recovery.
+    # The loopback run is offered SECOND and named as a comparison, because the split
+    # between the two is itself the diagnosis. One loopback command, not two: it
+    # answers "the server, or the route?", and a second grader beside it would bury
+    # that question under four near-identical lines.
+    #
+    # The app-compatibility grader is offered to EVERY kind. It asks whether the
+    # app's own wire protocol survives this route, and an OpenClaw or Hermes user
+    # staring at a red verification needs that answer exactly as much as a custom
+    # one does — leaving them with "fix those first" and no command to run is the
+    # dead end this release is about. Only the adapter grade stays custom-gated: it
+    # holds software written FOR Conduck to Conduck's rules, and OpenClaw and Hermes
+    # are not that, so a FAIL there would be noise on top of a failure.
+    local lb; lb=$(gw_loopback_base)
+    say ""
+    say "  Check app compatibility on the route that failed:"
+    say "    ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
     if [ "$GW_KIND" = "custom" ]; then
-      local lb; lb=$(gw_loopback_base)
-      say ""
-      say "  Existing OpenAI-compatible server? Check app compatibility on the route that failed:"
-      say "    ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
       say "  Adapter built for Conduck? Grade that same route against the stricter contract:"
       say "    ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
-      if [ -n "$lb" ]; then
-        say "  Then compare it against the server itself, skipping the HTTPS route in front of it:"
-        say "    ${BOLD}bash conduck-connect.sh --check-server $lb${RESET}"
-        note "Green there and red above means the server is fine and the HTTPS route is refusing or"
-        note "changing the request — fix the route, not the server."
-      fi
+    fi
+    if [ -n "$lb" ]; then
+      say "  Then compare it against the server itself, skipping the HTTPS route in front of it:"
+      say "    ${BOLD}bash conduck-connect.sh --check-server $lb${RESET}"
+      note "Green there and red above means the server is fine and the HTTPS route is refusing or"
+      note "changing the request — fix the route, not the server."
     fi
     exit 1
   fi
@@ -12519,18 +14808,19 @@ emit_payload() {
   # user cannot check, and omitting it when it IS in the code understates what they hold.
   warn "The setup code below CONTAINS YOUR GATEWAY TOKEN — both the QR and the plain-text string."
   if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
-    warn "It also carries the FILE-SERVER CREDENTIAL for your shared folder."
-    warn "Treat it like a password: whoever holds it can do anything your gateway allows and can"
-    warn "read or change files in that folder, and it keeps working until you rotate those secrets."
-  else
-    warn "Treat it like a password: whoever holds it can do anything your gateway allows, and it"
-    warn "keeps working until you rotate that secret."
+    warn "It also carries the FILE-SERVER CREDENTIAL for your shared folder, so whoever holds"
+    warn "this code can read and change the files in it."
   fi
-  warn "Handing the code to another person hands them that same access. Devices sharing one token"
-  warn "cannot be cut off one at a time — rotating it cuts off every device using that token."
-  warn "Show it to your own phone only. Note: over SSH, Ctrl-L only clears the visible screen —"
-  warn "the code stays in your scroll-back, so close the terminal (or clear scroll-back) when"
-  warn "you're done, and never paste it into chat or a bug report."
+  # What the code IS, said in the one place every route to a code passes through:
+  # setup's own emission and --show-code's re-emission both land here. It states
+  # the password rule and the fact behind every "why is it asking me again?" —
+  # that nothing secret is written to this machine — and it replaces the two
+  # hand-written sentences that used to say the first half twice, once per branch.
+  explain_setup_code_secrecy
+  warn "Devices sharing one token cannot be cut off one at a time — rotating it at the gateway"
+  warn "cuts off every device using that token."
+  warn "Note: over SSH, Ctrl-L only clears the visible screen — the code stays in your"
+  warn "scroll-back, so close the terminal (or clear scroll-back) when you're done."
   say ""
 
   render_qr "$pairing" || true   # prints a QR, or its own "widen/paste" note; string still follows
@@ -12586,17 +14876,29 @@ emit_payload() {
     note "Make it survive logout and reboot:  ${lpriv:+$lpriv }loginctl enable-linger $lu"
   fi
   say "  Run this script again any time to check the connection or show the code again."
-  # Custom targets only (see the matching gate in emit_payload's failure branch).
-  # Both address the PUBLIC url: it is the route the app takes and the one verification
-  # just proved, so a re-check grades what this pairing actually uses. A loopback target
-  # would grade a route neither the app nor this script ever takes, and a front that
-  # breaks these requests is exactly what the operator needs to hear about.
-  # The adapter line rides a SUCCESS screen, so it needs the outcome named with it:
-  # this pairing already works, and a user who runs the strict grader on generic
-  # software gets a FAIL that means nothing about the setup they just proved.
+  # Both lines address the PUBLIC url: it is the route the app takes and the one
+  # verification just proved, so a re-check grades what this pairing actually uses. A
+  # loopback target would grade a route neither the app nor this script ever takes,
+  # and a front that breaks these requests is exactly what the operator needs to hear
+  # about.
+  #
+  # The compatibility line is UNCONDITIONAL. Gating it on a custom gateway meant that
+  # OpenClaw and Hermes users — options 1 and 2, the paths the wizard leads with —
+  # finished setup having never learned the check commands exist, and so had nothing
+  # to reach for on the day the connection stopped working. Nothing about that grade
+  # is custom-only: it asks whether the app's wire protocol survives this route, which
+  # is as answerable for OpenClaw as for Ollama.
+  say "  Is it still working later? Grade this same route any time:"
+  say "    ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
+  note "Real requests, no configuration changes — it costs a little provider quota."
+  # The adapter grade stays custom-gated, because it genuinely does not apply: it
+  # holds software written FOR Conduck to Conduck's own rules, and OpenClaw and Hermes
+  # are not that. Riding a SUCCESS screen it also needs the outcome named with it — a
+  # user who runs the strict grader on generic software gets a FAIL that says nothing
+  # about the setup they just proved.
   if [ "$GW_KIND" = "custom" ]; then
-    say "  Existing OpenAI-compatible server? Re-check that route with:  ${BOLD}bash conduck-connect.sh --check-server $GW_URL${RESET}"
-    say "  Adapter built for Conduck? Grade that same route with:        ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
+    say "  Adapter built for Conduck? Grade that same route against its contract:"
+    say "    ${BOLD}bash conduck-connect.sh --check-adapter $GW_URL${RESET}"
     note "The adapter grade only fits software built for Conduck: generic servers (Ollama, LiteLLM,"
     note "Open WebUI) fail rules that are correct for them — that does not undo the pairing above."
   fi
@@ -13651,7 +15953,35 @@ print_plan() {
   fi
   say ""
   note "No secrets were prompted, no credentials minted, no requests sent, no QR emitted (the QR appears only on a real run)."
-  say "  Re-run without --dry-run to apply and show the QR (each change still asks first)."
+  print_plan_real_run_command
+}
+
+# The command this was a dry run OF, printed at the moment the reader decides to
+# commit. "Re-run without --dry-run" is an instruction to edit a command line that
+# may have scrolled away, or that a driving agent composed and discarded — and the
+# flags are not decoration: --allow-keyless-public dropped by accident turns a run
+# the operator planned into one the wizard refuses, and --reuse-only dropped by
+# accident turns a plan that changes nothing into one that changes the host.
+#
+# So the line is RECONSTRUCTED from the flags this run is actually holding rather
+# than quoted from a template. Everything except --dry-run survives; --dry-run is
+# the one flag whose whole meaning is "not this time".
+print_plan_real_run_command() {
+  local cmd="bash conduck-connect.sh --setup"
+  $REUSE_ONLY && cmd="$cmd --reuse-only"
+  $ALLOW_KEYLESS_PUBLIC && cmd="$cmd --allow-keyless-public"
+  say ""
+  say "  ${BOLD}Ready? Run:${RESET}"
+  say "    ${BOLD}$cmd${RESET}"
+  if $LEGACY_GENERIC; then
+    # --generic is the retired spelling the shipped app still emits. The real run
+    # above is the current one, and it asks the gateway question --generic answers
+    # silently, so say which answer keeps this plan intact.
+    note "You used --generic, which is the older name for custom-server setup. The command"
+    note "above asks the gateway question instead: choose the OpenAI-compatible option."
+  fi
+  note "A plan banks nothing: the real run asks all of these questions again, and each"
+  note "change still asks before it happens. Nothing above is saved anywhere."
 }
 # ------------------------------------------------------------- --show-code fast path --
 # Re-emit a SAVED profile's QR while skipping the SETUP questions and making ZERO
@@ -13691,8 +16021,50 @@ url_host_lc() { # url_host_lc <https-url>
   printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
 }
 
+# What a saved setup IS, in the lines an operator needs to recognise it: the name
+# the app shows, the address the code will point at, and how that address is
+# reached. Printed for a lone profile as well as for a list — auto-selecting the
+# only saved setup is right, showing it anyway is the other half of right. The very
+# next thing --show-code does on a custom gateway is ask for a bearer token, and
+# being asked for a password before being told what it unlocks is how somebody
+# pastes the key to a different gateway.
+show_qr_describe_saved_setup() { # show_qr_describe_saved_setup <profile-file>
+  local pf="$1" k n u t
+  k=$(json_get "$pf" "gateway.kind"); n=$(json_get "$pf" "gateway.name")
+  u=$(json_get "$pf" "gateway.url");  t=$(json_get "$pf" "gateway.transport")
+  say "    ${k:-?}${n:+ ($n)} — ${u:-?}"
+  [ -n "$t" ] && note "reached over: $t"
+  return 0
+}
+
+# A Cloudflare quick tunnel's hostname is REASSIGNED every time the tunnel
+# restarts — a reboot, a crash, a Ctrl-C in its terminal — and this tool's most
+# common real-world failure is a saved setup that was correct last night and points
+# at a hostname that no longer resolves this morning. That is also the most likely
+# reason somebody typed --show-code at all.
+#
+# Said HERE, before the live check, because from there on a dead quick tunnel looks
+# exactly like a broken gateway: the same connection error, none of the cause.
+# 30-exposure's own predicate on purpose — a second copy of a host-matching rule is
+# how the two drift apart.
+show_qr_warn_quick_tunnel() { # show_qr_warn_quick_tunnel <profile-file>
+  local pf="$1" u f hit=false
+  u=$(json_get "$pf" "gateway.url"); f=$(json_get "$pf" "fileServer.url")
+  is_quick_tunnel_url "$u" && hit=true
+  [ -n "$f" ] && is_quick_tunnel_url "$f" && hit=true
+  $hit || return 0
+  say ""
+  warn "This saved setup rides a Cloudflare QUICK TUNNEL, and that hostname is reassigned"
+  warn "every time the tunnel restarts. If the app stopped connecting, check that first:"
+  warn "the address saved here is the one this machine last published, not necessarily the"
+  warn "one the tunnel answers on now — and the new one appears in no file I can read."
+  note "Keep that tunnel running, or move to a named tunnel (re-run setup) for an address"
+  note "that survives a restart."
+  return 0
+}
+
 # Discover saved profiles and set PROFILE_FILE. None → friendly die; one → use
-# it; several → numbered pick via require_choice.
+# it (and say which); several → numbered pick.
 # Dies directly (not via $()) so a "no profile" die halts the whole script.
 PROFILE_FILE=""
 show_qr_pick_profile() {
@@ -13714,14 +16086,22 @@ show_qr_pick_profile() {
     fi
   done
   if [ ${#cand[@]} -eq 0 ]; then
-    [ "$rejected" = "1" ] && die "There IS a saved pairing profile on this machine, and this version ($VERSION) can't use it. $reason"
-    [ "$rejected" = "0" ] || die "There are $rejected saved pairing profiles on this machine, and this version ($VERSION) can't use any of them. The first one says: $reason"
-    die "No usable saved pairing profile on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick a profile, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
+    [ "$rejected" = "1" ] && die "There IS a saved setup code on this machine, and this version ($VERSION) can't use it. $reason"
+    [ "$rejected" = "0" ] || die "There are $rejected saved setup codes on this machine, and this version ($VERSION) can't use any of them. The first one says: $reason"
+    die "No usable saved setup code on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick one, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
   fi
   local k
-  if [ ${#cand[@]} -eq 1 ]; then PROFILE_FILE="${cand[0]}"; return 0; fi
+  if [ ${#cand[@]} -eq 1 ]; then
+    PROFILE_FILE="${cand[0]}"
+    # Auto-selected, and shown anyway: there is nothing to decide, but there is
+    # something to recognise before the questions that follow.
+    say ""
+    say "  ${BOLD}The one saved setup on this machine:${RESET}"
+    show_qr_describe_saved_setup "$PROFILE_FILE"
+    return 0
+  fi
   say ""
-  say "  ${BOLD}Saved pairing profiles on this machine:${RESET}"
+  say "  ${BOLD}Saved setups on this machine:${RESET}"
   local i=1 n u
   for pf in "${cand[@]}"; do
     k=$(json_get "$pf" "gateway.kind"); n=$(json_get "$pf" "gateway.name"); u=$(json_get "$pf" "gateway.url")
@@ -13731,8 +16111,9 @@ show_qr_pick_profile() {
   local pick
   while true; do
     # {1,3} length-bounds the input so the numeric compare below can't overflow bash 3.2's intmax.
-    pick=$(require_choice "Which profile? Choose 1-$((i-1))" '^[0-9]{1,3}$' "nav.saved_profile") || die "$NO_ANSWER"
-    [ "$pick" = "q" ] && quit_run
+    # prompt_into, not $(…): q at this prompt has to stop the RUN, and a quit_run
+    # inside a command substitution stops only the subshell that ran the prompt.
+    prompt_into pick require_choice "Which one? Choose 1-$((i-1))" '^[0-9]{1,3}$' "nav.saved_profile"
     { [ "$pick" -ge 1 ] && [ "$pick" -le $((i-1)) ]; } 2>/dev/null && break
     warn "Please enter a number between 1 and $((i-1))."
   done
@@ -13779,30 +16160,60 @@ show_qr_resolve_file_reach() { # saved file reach (possibly empty), gateway reac
 # then rejected only after the user chooses it.
 PROFILE_VALIDATION_ERROR=""
 show_qr_profile_invalid() { PROFILE_VALIDATION_ERROR="$1"; return 1; }
+
+# The same rejection, told to somebody who can act on it: which file, which field,
+# and that repairing the one line is an alternative to rebuilding the whole file.
+#
+# "Re-run setup" as the sole advice is actively harmful here, and it is the advice
+# every one of these branches used to give: setup REWRITES profile-<id>.json, so it
+# destroys the state the operator opened this command to recover — over one wrong
+# character the validator can point straight at. The schemaVersion branch already
+# knew this (it says update the script first) and this makes the rest agree.
+#
+# The offer can be made without qualification because write_profile records routing
+# facts only: no token, no file-lane credential, nothing that must not be opened in
+# an editor. Setup stays in the message as the other road, with what it costs said
+# out loud.
+#
+# One line, no column-0 `}`, exactly like the setter above it. The host-environment
+# suite lifts these helpers out of this file with a `sed` range that ends at the
+# first `^}`, and that range has to keep reaching show_qr_validate_profile below —
+# a multi-line body here silently truncates it.
+# show_qr_profile_field_invalid <file> <field-phrase> <what is wrong>
+# "holds no secret" is true of every profile this tool writes and false of one it can
+# read: a hand-edited address of the form https://user:pass@host puts a password in the
+# file, which is exactly why the inventory redacts userinfo before printing a URL. An
+# invalid gateway.url is the most likely way that profile reaches this message, so the
+# one case that most often reads the reassurance is the one it would be wrong about.
+# The claim is therefore scoped rather than dropped — a reader deciding whether it is
+# safe to open the file in an editor still gets an answer.
+show_qr_profile_field_invalid() { show_qr_profile_invalid "$3 $2. The file is $1 — you can correct that line in a text editor (it is plain JSON, and holds no secret unless an address in it carries a password), or re-run setup (bash conduck-connect.sh --setup) to rebuild it, which REPLACES everything in it."; }
 show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   local pf="$1" sv kind id name auth transport reach url port
   local gateway_type file_type fsurl fsreach fsport
   PROFILE_VALIDATION_ERROR=""
   [ -f "$pf" ] || {
-    show_qr_profile_invalid "That saved profile is missing — run setup again (bash conduck-connect.sh --setup) to recreate it."
+    show_qr_profile_invalid "That saved setup is missing — the file $pf is not there. Run setup again (bash conduck-connect.sh --setup) to recreate it."
     return 1
   }
 
   sv=$(json_get "$pf" "schemaVersion")
   if [ "$sv" != "1" ]; then
-    show_qr_profile_invalid "That saved profile uses schema version '${sv:-unknown}', which this script ($VERSION) doesn't understand — a newer conduck-connect wrote it. Update this script, then try again (or run setup once to rewrite it)."
+    show_qr_profile_invalid "That saved setup uses schema version '${sv:-unknown}', which this script ($VERSION) doesn't understand — a newer conduck-connect wrote $pf. Update this script, then try again (or run setup once to rewrite it, which REPLACES everything in that file)."
     return 1
   fi
   gateway_type=$(json_type "$pf" "gateway")
   file_type=$(json_type "$pf" "fileServer")
   if [ "$gateway_type" != "object" ]; then
-    show_qr_profile_invalid "That saved profile has no usable gateway object — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The field is "gateway", which has to be a JSON object' \
+      "That saved setup has no usable gateway object."
     return 1
   fi
   case "$file_type" in
     null|object) ;;
     *)
-      show_qr_profile_invalid "That saved profile's fileServer value must be either an object or null — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      show_qr_profile_field_invalid "$pf" 'The field is "fileServer"' \
+        "That saved setup's fileServer value has to be either a JSON object or null."
       return 1 ;;
   esac
 
@@ -13815,62 +16226,81 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   url=$(json_get "$pf" "gateway.url")
   port=$(json_get "$pf" "gateway.localPort")
 
-  if [ -z "$kind" ] || [ -z "$id" ] || [ -z "$url" ] || [ -z "$transport" ] ||
-     [ -z "$reach" ] || [ -z "$auth" ]; then
-    show_qr_profile_invalid "That saved profile is missing required fields (kind/id/url/transport/reach/auth) — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+  # Named one by one rather than as a set: the operator is being sent to a text
+  # editor, and "one of these six is empty" is a search, not an address.
+  local missing=""
+  [ -n "$kind" ]      || missing="$missing gateway.kind"
+  [ -n "$id" ]        || missing="$missing gateway.id"
+  [ -n "$url" ]       || missing="$missing gateway.url"
+  [ -n "$transport" ] || missing="$missing gateway.transport"
+  [ -n "$reach" ]     || missing="$missing gateway.reach"
+  [ -n "$auth" ]      || missing="$missing gateway.auth"
+  if [ -n "$missing" ]; then
+    show_qr_profile_field_invalid "$pf" "The missing fields are${missing}" \
+      "That saved setup has no value for something it cannot be used without."
     return 1
   fi
   case "$kind" in
     openclaw|hermes|custom) ;;
     *)
-      show_qr_profile_invalid "That saved profile names an unknown gateway kind '$kind' — this tool pairs only openclaw, hermes, or custom gateways. Re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      show_qr_profile_field_invalid "$pf" 'The field is "gateway.kind"' \
+        "That saved setup names an unknown gateway kind '$kind' — this tool pairs only openclaw, hermes, or custom gateways."
       return 1 ;;
   esac
   case "$id" in
     *[!a-z0-9-]*|'')
-      show_qr_profile_invalid "That saved profile's gateway id isn't a safe lowercase id — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      show_qr_profile_field_invalid "$pf" 'The field is "gateway.id", which may hold only lowercase letters, digits and hyphens' \
+        "That saved setup's gateway id isn't a safe lowercase id."
       return 1 ;;
   esac
   case "$kind:$id" in
     openclaw:openclaw|hermes:hermes|custom:custom-*) ;;
     *)
-      show_qr_profile_invalid "That saved profile's gateway kind and id don't agree — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      show_qr_profile_field_invalid "$pf" 'The fields are "gateway.kind" and "gateway.id" — openclaw pairs with the id openclaw, hermes with hermes, and custom with an id starting custom-' \
+        "That saved setup's gateway kind and id don't agree."
       return 1 ;;
   esac
   if [ "$kind" = "custom" ] && [ -z "$(printf '%s' "$name" | tr -d '[:space:]')" ]; then
-    show_qr_profile_invalid "That saved profile is a custom gateway but stores no name (or only whitespace) — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The field is "gateway.name"' \
+      "That saved setup is a custom gateway but stores no name (or only whitespace)."
     return 1
   fi
   case "$auth" in
     bearer|none) ;;
     *)
-      show_qr_profile_invalid "That saved profile has an unknown auth mode '$auth' — it must be 'bearer' or 'none'. Re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      show_qr_profile_field_invalid "$pf" 'The field is "gateway.auth", which must be "bearer" or "none"' \
+        "That saved setup has an unknown auth mode '$auth'."
       return 1 ;;
   esac
   show_qr_is_https_host "$url" || {
-    show_qr_profile_invalid "That saved profile's gateway URL isn't a valid https:// address with a host — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The field is "gateway.url"' \
+      "That saved setup's gateway URL isn't a valid https:// address with a host."
     return 1
   }
   case "$transport" in
     tailscale|funnel|cloudflare|public) ;;
     *)
-      show_qr_profile_invalid "That saved profile has an unrecognized transport '$transport' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      show_qr_profile_field_invalid "$pf" 'The field is "gateway.transport", which must be tailscale, funnel, cloudflare or public' \
+        "That saved setup has an unrecognized transport '$transport'."
       return 1 ;;
   esac
   case "$reach" in
     private|public) ;;
     *)
-      show_qr_profile_invalid "That saved profile has an unrecognized gateway reach '$reach' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+      show_qr_profile_field_invalid "$pf" 'The field is "gateway.reach", which must be private or public' \
+        "That saved setup has an unrecognized gateway reach '$reach'."
       return 1 ;;
   esac
   if { [ "$transport" = "tailscale" ] && [ "$reach" != "private" ]; } ||
      { case "$transport" in funnel|cloudflare) true ;; *) false ;; esac &&
        [ "$reach" != "public" ]; }; then
-    show_qr_profile_invalid "That saved profile's gateway transport and reach don't agree — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The fields are "gateway.transport" and "gateway.reach" — tailscale is private; funnel and cloudflare are public' \
+      "That saved setup's gateway transport and reach don't agree."
     return 1
   fi
   if [ -n "$port" ] && ! show_qr_is_port "$port"; then
-    show_qr_profile_invalid "That saved profile's gateway local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The field is "gateway.localPort"' \
+      "That saved setup's gateway local port isn't a number in 1-65535."
     return 1
   fi
   # A Tailscale mapping is compared with its loopback target. OpenClaw/Hermes
@@ -13879,7 +16309,8 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   if [ "$kind" = "custom" ] && [ -z "$port" ]; then
     case "$transport" in
       tailscale|funnel)
-        show_qr_profile_invalid "That saved custom gateway uses Tailscale but stores no local port, so its live mapping cannot be verified — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+        show_qr_profile_field_invalid "$pf" 'The missing field is "gateway.localPort" — the port on 127.0.0.1 that Tailscale forwards to' \
+          "That saved custom gateway uses Tailscale but stores no local port, so its live mapping cannot be verified."
         return 1 ;;
     esac
   fi
@@ -13888,23 +16319,27 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
   fsreach=$(json_get "$pf" "fileServer.reach")
   fsport=$(json_get "$pf" "fileServer.localPort")
   if [ "$file_type" = "object" ] && [ -z "$fsurl" ]; then
-    show_qr_profile_invalid "That saved profile's file-server object is missing its URL — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The missing field is "fileServer.url" (setting "fileServer" to null drops file transfer entirely)' \
+      "That saved setup's file-server object has no URL."
     return 1
   fi
   if [ -n "$fsurl" ] && ! show_qr_is_https_host "$fsurl"; then
-    show_qr_profile_invalid "That saved profile's file-server URL isn't a valid https:// address with a host — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The field is "fileServer.url"' \
+      "That saved setup's file-server URL isn't a valid https:// address with a host."
     return 1
   fi
   if [ -n "$fsreach" ]; then
     case "$fsreach" in
       private|public) ;;
       *)
-        show_qr_profile_invalid "That saved profile has an unrecognized file-server reach '$fsreach' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+        show_qr_profile_field_invalid "$pf" 'The field is "fileServer.reach", which must be private or public' \
+          "That saved setup has an unrecognized file-server reach '$fsreach'."
         return 1 ;;
     esac
   fi
   if [ -n "$fsport" ] && ! show_qr_is_port "$fsport"; then
-    show_qr_profile_invalid "That saved profile's file-server local port isn't a number in 1-65535 — re-run setup (bash conduck-connect.sh --setup) to refresh it."
+    show_qr_profile_field_invalid "$pf" 'The field is "fileServer.localPort"' \
+      "That saved setup's file-server local port isn't a number in 1-65535."
     return 1
   fi
   return 0
@@ -13964,7 +16399,7 @@ show_qr_recover_gateway_secret() {
   case "$GW_AUTH" in
     none)   GW_TOKEN=""; note "This gateway has no token (auth=none in the saved profile)."; return 0 ;;
     bearer) ;;
-    *)      die "The saved profile has an unknown auth mode '$GW_AUTH' — re-run the wizard (bash conduck-connect.sh) to refresh it." ;;
+    *)      die "The saved profile has an unknown auth mode '$GW_AUTH' — re-run setup (bash conduck-connect.sh --setup) to refresh it." ;;
   esac
   case "$GW_KIND" in
     openclaw)
@@ -13983,8 +16418,13 @@ show_qr_recover_gateway_secret() {
       # Custom gateway: nothing on disk to read (by design — this tool never stores tokens).
       say ""
       note "Custom gateways have no config file I can read, and this tool deliberately never stores your token."
-      GW_TOKEN=$(ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" "stop; the saved profile requires a token")
-      [ -n "$GW_TOKEN" ] || die "A token is required (the saved profile says auth=bearer). Re-run when you have it."
+      # prompt_into so q here stops the RUN. Inside $(…) a quit_run kills only the
+      # subshell, and the parent then reads the empty answer as "no token given" and
+      # dies with the wrong reason. The action-id gives `i` the token panel — the one
+      # shared by all six hidden-token prompts in the tool.
+      prompt_into GW_TOKEN ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" \
+        "stop; this saved setup requires a token" "gateway.token"
+      [ -n "$GW_TOKEN" ] || die "A token is required (this saved setup says auth=bearer). Re-run when you have it."
       ;;
   esac
 }
@@ -14013,10 +16453,10 @@ show_qr_recover_file_lane() {
     warn "The saved profile includes a file lane at $fsurl, but I can't recover its credential on this machine"
     warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
     if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?" "verification.gateway_only"; then
-      note "Leaving the file lane out of this QR — re-run the wizard (bash conduck-connect.sh) to rebuild it."
+      note "Leaving the file lane out of this QR — re-run setup (bash conduck-connect.sh --setup) to rebuild it."
       FS_URL=""; FS_CRED=""; FS_FOLDER=""
     else
-      die "Stopped — re-run the wizard (bash conduck-connect.sh) to rebuild the file lane and refresh the profile."
+      die "Stopped — re-run setup (bash conduck-connect.sh --setup) to rebuild the file lane and refresh the profile."
     fi
   fi
 }
@@ -14059,7 +16499,7 @@ show_qr_assert_mapping() { # show_qr_assert_mapping <host-lc> <https-port> <loca
 # matches the saved profile. READS ONLY — no serve/funnel/config mutations. Runs
 # BEFORE verify_all so drift reads as "your setup changed", not a generic failure.
 show_qr_stale() {
-  die "Your setup changed since this profile was saved — re-run the wizard (bash conduck-connect.sh) to reconcile and refresh it."
+  die "Your setup changed since this profile was saved — re-run setup (bash conduck-connect.sh --setup) to reconcile and refresh it."
 }
 show_qr_check_live() {
   head_ "Checking your saved setup still matches this machine"
@@ -14101,7 +16541,7 @@ show_qr_check_live() {
       note "This transport has no local exposure to introspect — reachability is proven by the real requests below."
       ;;
     *)
-      die "The saved profile has an unrecognized transport '$TRANSPORT' — re-run the wizard (bash conduck-connect.sh) to refresh it."
+      die "The saved profile has an unrecognized transport '$TRANSPORT' — re-run setup (bash conduck-connect.sh --setup) to refresh it."
       ;;
   esac
 }
@@ -14130,8 +16570,17 @@ show_qr_recall_scope() {
 # verify_all's output then separates the finding from the code itself rather than
 # interrupting the operator at the moment of payoff.
 run_show_qr() {
-  head_ "Re-show your pairing code — skips setup and changes no configuration"
+  head_ "Re-show a saved setup code — skips setup and changes no configuration"
+  # The opening block, before the first question: what this command is for (pairing
+  # a SECOND device is the reason it exists, and nothing on this screen used to say
+  # so), what it changes, and why a command that promises to ask nothing may still
+  # ask for a key.
+  explain_show_code
   show_qr_pick_profile
+  # Said before the token prompt and long before the live check, because from the
+  # live check onwards a reassigned quick-tunnel hostname is indistinguishable from
+  # a gateway that stopped working.
+  show_qr_warn_quick_tunnel "$PROFILE_FILE"
   # This path reads $STATE_DIR exactly the way the wizard does — it parses the
   # saved profile and re-derives the gateway token and the file-lane credential
   # from it — so it owes the same exposure report the wizard gives. It runs AFTER
@@ -14148,6 +16597,1880 @@ run_show_qr() {
   show_qr_recall_scope
   verify_all
   emit_payload
+  show_qr_next_steps
+}
+
+# The last screen of --show-code, which used to be a total dead end: it named no
+# other command, and never said the thing it is FOR — that scanning this same code
+# on a second phone, tablet or Mac is how a device gets added. A user who does not
+# know that runs the whole wizard again for their iPad.
+#
+# The "not connecting?" half deliberately does NOT reprint a --check-server line:
+# emit_payload above prints exactly that command, with this same address, on every
+# successful emission. Two copies of one command on one screen is how an operator
+# starts skimming the screen.
+show_qr_next_steps() {
+  say ""
+  say "  ${BOLD}Pairing another device${RESET}"
+  say "  Scan this same code, or paste it, on every device you want connected — a second"
+  say "  phone, an iPad, a Mac. There is no per-device setup and nothing else to run."
+  note "They share one token, so rotating it at the gateway cuts off all of them together."
+  say ""
+  say "  ${BOLD}Still not connecting?${RESET} The --check-server line above grades exactly the route"
+  say "  this code points at, and changes nothing on your machine or your server."
+}
+# ------------------------------------------------------ managing saved setups --
+#
+# The wizard writes a setup and then has no way to look at one again. Everything
+# it leaves behind — a profile, a credential, a boot-persistent WebDAV server over
+# the agent's working folder, sometimes a public HTTPS route — is reachable only by
+# walking the whole wizard a second time, and the source says so out loud in
+# fs_print_teardown: "this tool has no removal command, so copy-pasteable text IS
+# the mechanism." This module is the other half: see what is saved, change one
+# field of it, and remove one completely.
+#
+# Three rules shape everything below, and they are the reason this file is longer
+# than its function list suggests:
+#
+#   1. NOTHING here prints a token, a WebDAV password, or a setup code as a side
+#      effect. Listing and editing read $STATE_DIR, which holds two live secrets;
+#      a surface whose whole job is "show me what I have" is exactly where one
+#      leaks into a scroll-back or a pasted transcript.
+#   2. Removal takes a TYPED confirmation, never [y/N]. It is the only irreversible
+#      action in a program whose entire muscle memory is pressing Enter, and Enter
+#      is No at every other gate precisely so that rhythm is safe — a [y/N] here
+#      would make the one keystroke that has always been safe the one that is not.
+#   3. Anything this module cannot PROVE it removed is reported as not removed,
+#      with the exact command, and with the sentence "I did not run it". A removal
+#      surface that overstates itself leaves a live authenticated file server on a
+#      machine whose owner has been told it is gone.
+
+# --json for --list. Owned here rather than in the argument parser because the
+# parser sets a command and an argument and nothing else — every mode flag this
+# surface honours is defined next to the code that reads it.
+MANAGE_JSON=false
+# The id the picker last resolved. Callers that pass their own variable name get
+# it there too; this is the fallback channel for a caller that does not care to
+# name one, and it is what makes manage_pick_profile usable from a one-liner.
+MANAGE_ID=""
+
+# The id charset, checked at EVERY entry point that takes one from outside.
+# `$STATE_DIR/profile-$id.json` and `conduck-files-$id.service` are both built by
+# concatenation, so an id containing `/` or `..` addresses a file this tool has no
+# business touching — and the one command here that deletes files takes its id
+# straight from the command line. The charset is the one show_qr_validate_profile
+# already enforces on gateway.id, so nothing this script ever wrote can fail it.
+manage_id_ok() { # manage_id_ok <id>
+  case "${1:-}" in
+    ''|*[!a-z0-9-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+manage_profile_path() { printf '%s/profile-%s.json' "$STATE_DIR" "$1"; }
+manage_cred_path()    { printf '%s/fileserver-%s.cred' "$STATE_DIR" "$1"; }
+manage_env_path()     { printf '%s/fileserver-%s.env' "$STATE_DIR" "$1"; }
+
+# The service file for ONE gateway, by id. The id-bearing form only: the two
+# legacy unnamed units (conduck-files.service, ai.gigaduck.conduck-fileserver.plist)
+# belong to no id at all, which is why they are reported by the leftovers scan
+# rather than removed by an id-addressed teardown.
+manage_unit_path() { # manage_unit_path <id>
+  if [ "$OS" = "Linux" ]; then
+    printf '%s/.config/systemd/user/conduck-files-%s.service' "${HOME:-}" "$1"
+  else
+    printf '%s/Library/LaunchAgents/ai.gigaduck.conduck-files-%s.plist' "${HOME:-}" "$1"
+  fi
+}
+
+# The gateway id a unit file is filed under — empty for the legacy unnamed units,
+# which is the answer that matters: an id nothing can be derived from is an id no
+# teardown can be attributed to, and the scan says exactly that instead of guessing.
+manage_unit_id() { # manage_unit_id <unit-path>
+  local b; b=$(basename "$1")
+  case "$b" in
+    conduck-files-*.service)           b="${b#conduck-files-}"; printf '%s' "${b%.service}" ;;
+    ai.gigaduck.conduck-files-*.plist) b="${b#ai.gigaduck.conduck-files-}"; printf '%s' "${b%.plist}" ;;
+  esac
+}
+
+# fs_unit_state answers about $FS_UNIT, a global the file-lane phase owns. Setting
+# it as a LOCAL here means bash's dynamic scoping hands the value down to
+# fs_unit_state (and to fs_unit_label under it) while the caller's own FS_UNIT —
+# which may belong to a live setup run in the same process — is restored the moment
+# this returns. Every function in this file that borrows a file-lane global does it
+# this way, and does it for that reason.
+manage_unit_state() { # manage_unit_state <unit-path> -> active | inactive | unknown | absent
+  local FS_UNIT="$1"
+  [ -f "$FS_UNIT" ] || { printf 'absent'; return 0; }
+  fs_unit_state
+}
+
+# The served folder recorded in a unit, or empty when it cannot be read
+# structurally. Never guessed from a text match: fs_unit_field is the same parser
+# the file-lane phase trusts, and a folder recovered by any other means is a path
+# this surface would print as fact.
+manage_unit_folder() { # manage_unit_folder <unit-path>
+  [ -f "$1" ] || return 0
+  fs_unit_field "$1" folder 2>/dev/null || true
+}
+
+# Every saved setup on this machine, readable or not, one profile path per line.
+# `profile-*.json`, not `profile-custom-*.json`: openclaw and hermes are saved the
+# same way and have never appeared in any list this tool prints, which is how an
+# operator ends up believing the tool forgot the gateway it set up for them.
+manage_saved_profiles() {
+  local pf
+  for pf in "$STATE_DIR"/profile-*.json; do
+    [ -f "$pf" ] || continue          # no matches → the literal glob
+    printf '%s\n' "$pf"
+  done
+}
+
+# The id a profile FILE is filed under, taken from its name rather than from
+# gateway.id inside it. The filename is the operative one: write_profile names the
+# file after $GW_ID, and the file-lane unit, its credential and its environment
+# file are all named after that same value — so a hand-edited gateway.id would send
+# a teardown at files that belong to something else.
+manage_profile_id() { # manage_profile_id <profile-path>
+  local b; b=$(basename "$1"); b="${b#profile-}"; printf '%s' "${b%.json}"
+}
+
+# A saved URL on its way to a screen or to the JSON, with any `user:pass@` in it
+# removed first.
+#
+# The wizard never writes such a URL — `ask_url` refuses userinfo and the profile
+# validator refuses it again on the way back in. But these surfaces deliberately
+# read profiles the validator REJECTS, because their whole job is to show and to
+# remove setups this version cannot otherwise use, and a hand-edited or
+# older-version profile can carry `https://conduck:PASSWORD@files.example`. Printing
+# that in an inventory, or emitting it into JSON an agent will log, publishes a
+# password on a surface whose first rule is that it never prints one.
+#
+# The authority ends at the first /, ? or # — the same parse url_has_userinfo uses,
+# so the two cannot disagree about where the credential was.
+#
+# The userinfo ends at the LAST `@` in that authority, never the first. A password
+# is allowed to contain `@` — `https://conduck:pa@ss@gw.example` is one address, not
+# two — and cutting at the first `@` publishes `ss@gw.example`: the tail of the
+# password, still shaped like a `user:pass@host` authority, on the one surface whose
+# first rule is that it prints no password. A host may not contain `@` at all, so
+# the last one is always the separator and everything before it is the credential.
+manage_safe_url() { # manage_safe_url <url> [max-chars]
+  local u="$1" scheme rest auth
+  if url_has_userinfo "$u"; then
+    scheme="${u%%://*}"; rest="${u#*://}"
+    auth="${rest%%[/?#]*}"
+    u="$scheme://${auth##*@}${rest#"$auth"}   [a username and password were in this saved address; not shown]"
+  fi
+  safe_display "$u" "${2:-200}"
+}
+
+manage_kind_label() { # manage_kind_label <kind>
+  case "$1" in
+    openclaw) printf 'OpenClaw' ;;
+    hermes)   printf 'Hermes' ;;
+    custom)   printf 'OpenAI-compatible server' ;;
+    *)        printf '%s' "$(safe_display "${1:-unknown}" 40)" ;;
+  esac
+}
+
+# How the address is reached, in the words the exposure menu used when it was
+# chosen. The reach word is repeated even when the transport implies it, because
+# "public" is the fact an operator scanning this list is looking for and a
+# transport name is not a synonym anybody should have to know.
+manage_transport_label() { # manage_transport_label <transport> <reach>
+  case "$1" in
+    tailscale) printf 'Tailscale — private (your tailnet only)' ;;
+    funnel)    printf 'Tailscale Funnel — PUBLIC (reachable from the internet)' ;;
+    cloudflare) printf 'Cloudflare Tunnel — %s' "${2:-public}" ;;
+    public)    printf 'your own HTTPS front — %s' "${2:-public}" ;;
+    *)         printf '%s — %s' "$(safe_display "${1:-unknown}" 40)" "${2:-unknown}" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ --list --
+
+# The inventory. rc 0 ALWAYS, including for an empty state directory: "you have
+# saved nothing" is a complete and correct answer to "what have I saved", and a
+# nonzero status there would make every wrapper treat a fresh machine as a fault.
+manage_list() {
+  if $MANAGE_JSON; then manage_list_json; return 0; fi
+
+  head_ "Saved setups on this machine"
+
+  # $STATE_DIR is named FIRST, before anything in it. Today the path reaches the
+  # screen only inside a permissions warning and on the last line of a successful
+  # pairing, so an operator who never hits a failure and has scrolled past the end
+  # of one wizard run has genuinely never been told where their configuration is.
+  say ""
+  say "  ${BOLD}Where your configuration lives${RESET}"
+  say "  $STATE_DIR"
+  if [ -d "$STATE_DIR" ]; then
+    note "One profile-<id>.json per saved setup. They hold routing facts only — address,"
+    note "transport, model, folder — and are readable plain JSON."
+  else
+    note "That folder does not exist yet; the first finished setup creates it."
+  fi
+
+  local pf ids=() rejected_ids=() rejected_reasons=()
+  while IFS= read -r pf; do
+    [ -n "$pf" ] || continue
+    if show_qr_validate_profile "$pf"; then
+      ids+=("$(manage_profile_id "$pf")")
+    else
+      rejected_ids+=("$(manage_profile_id "$pf")")
+      rejected_reasons+=("$PROFILE_VALIDATION_ERROR")
+    fi
+  done <<EOF
+$(manage_saved_profiles)
+EOF
+
+  if [ ${#ids[@]} -eq 0 ] && [ ${#rejected_ids[@]} -eq 0 ]; then
+    say ""
+    note "No saved setups yet."
+    say "  Pair one and it appears here:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
+    manage_leftovers_scan
+    return 0
+  fi
+
+  local i id
+  for (( i=0; i<${#ids[@]}; i++ )); do
+    id="${ids[$i]}"
+    say ""
+    manage_print_one "$id" "$((i+1))"
+  done
+
+  if [ ${#rejected_ids[@]} -gt 0 ]; then
+    say ""
+    warn "Saved here but not usable by this version ($VERSION):"
+    # Both halves go through safe_display, and the REASON needs it as much as the
+    # id does: the validator's message quotes the profile's own path back, so an
+    # id with an escape byte in it arrives here twice, once as itself and once
+    # inside a sentence. The reason is a full sentence rather than a field, so it
+    # is bounded generously — the cap is there to stop a pathological file, not to
+    # abbreviate a message the operator is being sent to a text editor with.
+    for (( i=0; i<${#rejected_ids[@]}; i++ )); do
+      say "    $(safe_display "${rejected_ids[$i]}" 60)"
+      note "$(safe_display "${rejected_reasons[$i]}" 4096)"
+    done
+    note "Their ids stay taken, which is why setup can refuse a name that looks free."
+  fi
+
+  manage_leftovers_scan
+
+  # The two things a reader of this screen actually wants to do next. Printed
+  # unconditionally, including when the only entries are unreadable ones — forget
+  # is exactly the command for a profile this version cannot repair.
+  say ""
+  say "  ${BOLD}What you can do from here${RESET}"
+  say "  Change one thing (address, model, folder):  ${BOLD}bash conduck-connect.sh --edit${RESET}"
+  say "  Remove one completely:                      ${BOLD}bash conduck-connect.sh --forget <id>${RESET}"
+  note "--edit asks which setup if you leave the id out. Both ask before changing anything."
+  return 0
+}
+
+# One saved setup, as the rows an operator needs to recognise it and to judge
+# whether it is still doing what they think. The live service state is read here
+# rather than remembered, because the one question a saved record cannot answer is
+# whether the thing it describes is still running.
+manage_print_one() { # manage_print_one <id> [ordinal]
+  local id="$1" ord="${2:-}" pf name kind url transport reach model auth
+  local fsurl fsfolder fsreach unit state folder
+  pf=$(manage_profile_path "$id")
+  name=$(json_get "$pf" "gateway.name")
+  kind=$(json_get "$pf" "gateway.kind")
+  url=$(json_get "$pf" "gateway.url")
+  transport=$(json_get "$pf" "gateway.transport")
+  reach=$(json_get "$pf" "gateway.reach")
+  model=$(json_get "$pf" "gateway.model")
+  auth=$(json_get "$pf" "gateway.auth")
+  fsurl=$(json_get "$pf" "fileServer.url")
+  fsfolder=$(json_get "$pf" "fileServer.folder")
+  fsreach=$(json_get "$pf" "fileServer.reach")
+
+  # safe_display on every field: these come off disk as free text an earlier run
+  # accepted at a prompt, the file is editable by its owner, and this is a
+  # terminal — an embedded escape here would repaint the inventory it appears in.
+  #
+  # The id is no exception, and it is the one a reader will assume is already
+  # clean. It is the FILENAME's id (see manage_profile_id), and the validator
+  # that let this profile through checks the charset of gateway.id INSIDE the
+  # file, never the name of the file itself — so `profile-<ESC>[2J.json` holding a
+  # perfectly conformant gateway object reaches this line and clears the screen
+  # the inventory is being drawn on. For an id this tool wrote, safe_display is a
+  # no-op.
+  local safe_id; safe_id=$(safe_display "$id" 60)
+  if [ -n "$ord" ]; then
+    say "  ${BOLD}$ord) $(safe_display "${name:-$id}" 60)${RESET}   ${DIM}($safe_id)${RESET}"
+  else
+    say "  ${BOLD}$(safe_display "${name:-$id}" 60)${RESET}   ${DIM}($safe_id)${RESET}"
+  fi
+  say "     Gateway:       $(manage_kind_label "$kind")"
+  say "     Web address:   $(manage_safe_url "${url:-?}" 200)"
+  say "     Reached by:    $(manage_transport_label "$transport" "$reach")"
+  if [ -n "$model" ]; then
+    say "     Model:         $(safe_display "$model" 200)"
+  else
+    say "     Model:         ${DIM}whichever model the server picks (none pinned)${RESET}"
+  fi
+  # Said out loud, on every setup, every time. Its absence from $STATE_DIR is a
+  # deliberate design decision — this tool writes no token to disk — and an
+  # operator who is not told that assumes the tool lost it, or worse, assumes it
+  # IS here and treats the folder accordingly.
+  #
+  # The second half of the row is per-KIND, because "you re-enter it" is true of
+  # exactly one of the three and this is the most security-relevant line on a
+  # screen whose entire purpose is telling somebody what is and is not on their
+  # disk. show_qr_recover_gateway_secret is the authority: openclaw reads the
+  # credential back out of OpenClaw's own config (or its compose .env), hermes
+  # reads API_SERVER_KEY out of ~/.hermes/.env, and only a custom gateway has
+  # nothing on this machine to read and therefore asks. Telling an OpenClaw or
+  # Hermes operator they will be asked for a token invites the opposite of the
+  # truth: that nothing on this disk can produce one.
+  if [ "$auth" = "none" ]; then
+    say "     Token:         ${DIM}not stored — this gateway is keyless${RESET}"
+  else
+    case "$kind" in
+      openclaw) say "     Token:         ${DIM}not saved here — a code re-reads it from OpenClaw's own config${RESET}" ;;
+      hermes)   say "     Token:         ${DIM}not saved here — a code re-reads it from ~/.hermes/.env${RESET}" ;;
+      *)        say "     Token:         ${DIM}not saved here — you re-enter it when a code is printed${RESET}" ;;
+    esac
+  fi
+
+  unit=$(manage_unit_path "$id")
+  state=$(manage_unit_state "$unit")
+  folder="$fsfolder"
+  [ -n "$folder" ] || folder=$(manage_unit_folder "$unit")
+  if [ -n "$fsurl" ]; then
+    say "     Shared folder: $(safe_display "${folder:-?}" 200)"
+    say "     File address:  $(manage_safe_url "$fsurl" 200)${fsreach:+   ${DIM}($fsreach)${RESET}}"
+  elif [ -n "$folder" ]; then
+    # A unit exists for this gateway but the saved code carries no file address:
+    # the server is running and the app was never told about it.
+    say "     Shared folder: $(safe_display "$folder" 200)   ${DIM}(not in the saved setup code)${RESET}"
+  else
+    say "     Shared folder: ${DIM}none — chat only${RESET}"
+  fi
+  case "$state" in
+    active)   say "     File server:   running   ${DIM}$(safe_display "$(basename "$unit")" 120)${RESET}" ;;
+    inactive) say "     File server:   ${YELLOW}not running${RESET}   ${DIM}$(safe_display "$(basename "$unit")" 120)${RESET}" ;;
+    unknown)  say "     File server:   ${DIM}installed; this shell cannot ask whether it is running${RESET}" ;;
+    absent)   [ -n "$fsurl" ] && say "     File server:   ${YELLOW}no service file for it on this machine${RESET}" ;;
+  esac
+}
+
+# --------------------------------------------------------------- leftovers --
+
+# A file server whose gateway is gone. This is the single worst thing $STATE_DIR
+# can hide: rclone keeps serving the agent's working folder over authenticated
+# WebDAV, restarted at every boot or login, for as long as the machine lives —
+# and nothing in this tool has ever mentioned it, because the only surface that
+# knew the unit existed was the setup run that created it.
+#
+# Nearly free, because fs_unit_state and fs_all_units already exist. rc 0 always,
+# including when it finds nothing: a scan that reports "clean" as a failure would
+# make the inventory that calls it nonzero on a healthy machine.
+manage_leftovers_scan() {
+  local unit id known=" " pf orphan_units=() orphan_ids=() unnamed=()
+  while IFS= read -r pf; do
+    [ -n "$pf" ] || continue
+    known="$known$(manage_profile_id "$pf") "
+  done <<EOF
+$(manage_saved_profiles)
+EOF
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || continue
+    id=$(manage_unit_id "$unit")
+    # An id this command cannot ADDRESS goes in the same bucket as no id at all,
+    # and the two really are one case. The entries below differ in exactly one
+    # thing — the first prescribes `--forget <id>`, the second prints a by-hand
+    # teardown — so an id that --forget will refuse (manage_id_ok is the same
+    # gate, and every id this tool has ever written passes it) must not land in
+    # the branch that prescribes it. The alternative is an inventory that tells
+    # somebody to run a command and a command that answers "that is not a saved
+    # setup id", with nothing on either screen explaining the contradiction.
+    if [ -z "$id" ] || ! manage_id_ok "$id"; then unnamed+=("$unit"); continue; fi
+    case "$known" in *" $id "*) continue ;; esac
+    orphan_units+=("$unit"); orphan_ids+=("$id")
+  done <<EOF
+$(fs_all_units)
+EOF
+  [ ${#orphan_units[@]} -gt 0 ] || [ ${#unnamed[@]} -gt 0 ] || return 0
+
+  local i state folder
+  say ""
+  warn "File servers with no saved setup behind them:"
+  say "  Each one is a live, authenticated WebDAV server over your agent's working"
+  say "  folder, started again at every boot or login, for as long as this machine"
+  say "  runs. Nothing removes it on its own."
+  for (( i=0; i<${#orphan_units[@]}; i++ )); do
+    unit="${orphan_units[$i]}"; id="${orphan_ids[$i]}"
+    state=$(manage_unit_state "$unit")
+    folder=$(manage_unit_folder "$unit")
+    say ""
+    # The id and the path are both FILENAME-derived, which is to say chosen by
+    # whoever could write to ~/.config/systemd/user or ~/Library/LaunchAgents,
+    # and this is a terminal: an escape byte in a unit's name repaints the very
+    # inventory that is reporting it, which is the one thing the safe_display
+    # rule two hundred lines above exists to prevent. Everything past the loop
+    # above is a saved-setup id (safe_display is a no-op on those), so this costs
+    # nothing on a healthy machine and is the whole defence on an unhealthy one.
+    say "    ${BOLD}$(safe_display "$id" 60)${RESET}   ${DIM}$(safe_display "$unit" 400)${RESET}"
+    case "$state" in
+      active)   say "      State:  ${YELLOW}running right now${RESET}" ;;
+      inactive) say "      State:  not running (it starts again at the next boot or login)" ;;
+      *)        say "      State:  this shell cannot ask whether it is running" ;;
+    esac
+    if [ -n "$folder" ]; then
+      say "      Serves: $(safe_display "$folder" 200)"
+    else
+      note "      Its served folder could not be read from that file."
+    fi
+    say "      Remove it: ${BOLD}bash conduck-connect.sh --forget $id${RESET}"
+  done
+  for (( i=0; i<${#unnamed[@]}; i++ )); do
+    unit="${unnamed[$i]}"
+    state=$(manage_unit_state "$unit")
+    folder=$(manage_unit_folder "$unit")
+    say ""
+    say "    ${BOLD}$(safe_display "$(basename "$unit")" 120)${RESET}   ${DIM}$(safe_display "$unit" 400)${RESET}"
+    say "      This one carries no gateway id I can address, so I cannot attribute it to"
+    say "      any saved setup and will not remove it for you.${folder:+ It serves $(safe_display "$folder" 200).}"
+    case "$state" in
+      active) say "      State:  ${YELLOW}running right now${RESET}" ;;
+      inactive) say "      State:  not running (it starts again at the next boot or login)" ;;
+      *) say "      State:  this shell cannot ask whether it is running" ;;
+    esac
+    # The teardown block is the one thing on this screen that is NOT for reading:
+    # it is meant to be copied into a shell verbatim, so fs_print_teardown quotes
+    # the path for the shell rather than sanitising it for the terminal — the two
+    # are opposite jobs and only one of them can be done to a string that has to
+    # still work when pasted. A path carrying a control byte therefore cannot be
+    # both printable and correct, and printing it anyway would hand the terminal
+    # the very bytes the display above is filtering out. So that path gets the
+    # folder and a sentence instead of a command that would repaint the screen.
+    say "      To remove it yourself:"
+    case "$unit" in
+      *[[:cntrl:]]*)
+        say "      Its real filename holds characters a terminal would ACT on rather than"
+        say "      print, so no copy-pasteable command for it can be shown here without"
+        say "      handing your terminal those same characters. The name above is that"
+        say "      filename with those characters taken out; the real one lives in:"
+        say "        $(safe_display "$(dirname "$unit")" 400)"
+        say "      Stop the service and delete that file by hand — a file manager, or a"
+        say "      shell with tab-completion, will fill the name in for you." ;;
+      *)
+        fs_print_teardown "$unit" ;;
+    esac
+    note "I did not run any of that — this is a file I cannot prove belongs to a setup of mine."
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ --list --json --
+
+# The agent-facing inventory. python3 is already a hard dependency and it is the
+# only correct way to emit this: a hand-rolled JSON writer in shell gets a folder
+# name containing a quote or a backslash wrong, and the reader of this output is a
+# machine that will not notice until it does something destructive with the value.
+#
+# Every object carries every key, with null where the value is unknown, so a
+# consumer can address a field without first testing whether it exists. Three
+# shapes have to stay parseable and each is a real state: an empty $STATE_DIR, a
+# corrupt profile (readable:false plus the validator's own reason), and a service
+# unit with no profile behind it (the leftovers array).
+#
+# No secrets: the profile itself holds none, and the two files that do — the .cred
+# and, on macOS, the plist — are never opened here.
+manage_list_json() {
+  local pf id readable problem unit state args=() known=" "
+  args+=("$STATE_DIR")
+  while IFS= read -r pf; do
+    [ -n "$pf" ] || continue
+    id=$(manage_profile_id "$pf")
+    known="$known$id "
+    if show_qr_validate_profile "$pf"; then readable=true; problem=""
+    else readable=false; problem="$PROFILE_VALIDATION_ERROR"; fi
+    unit=$(manage_unit_path "$id")
+    state=$(manage_unit_state "$unit")
+    # Six argv slots per setup rather than a delimited line: a served folder or a
+    # $STATE_DIR under a path with a tab in it is legal, and argv is the one
+    # channel into python that cannot be re-split by accident.
+    args+=("setup" "$pf" "$id" "$readable" "$problem" "$unit" "$state")
+  done <<EOF
+$(manage_saved_profiles)
+EOF
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || continue
+    id=$(manage_unit_id "$unit")
+    [ -n "$id" ] || { args+=("leftover" "" "$unit" "$(manage_unit_state "$unit")"); continue; }
+    case "$known" in *" $id "*) continue ;; esac
+    args+=("leftover" "$id" "$unit" "$(manage_unit_state "$unit")")
+  done <<EOF
+$(fs_all_units)
+EOF
+  python3 - "${args[@]}" <<'PY'
+import json, sys
+
+# The shell twin of manage_safe_url, applied to every URL that leaves here. These
+# rows deliberately include profiles the validator REJECTS, and a rejected profile
+# is exactly where a hand-edited `https://user:pass@host` survives — this output is
+# read by agents and lands in logs, so a credential may not travel in it. Same
+# authority parse as the shell: it ends at the first /, ? or #, and the userinfo
+# ends at the LAST @ in it — a password may contain @, a host may not, so rsplit is
+# what keeps `https://conduck:pa@ss@gw.example` from emitting `ss@gw.example`.
+def safe_url(value):
+    if not isinstance(value, str) or "://" not in value:
+        return value
+    scheme, _, rest = value.partition("://")
+    cut = len(rest)
+    for ch in "/?#":
+        pos = rest.find(ch)
+        if pos != -1:
+            cut = min(cut, pos)
+    authority, tail = rest[:cut], rest[cut:]
+    if "@" not in authority:
+        return value
+    return "%s://%s%s" % (scheme, authority.rsplit("@", 1)[1], tail)
+
+state_dir = sys.argv[1]
+argv = sys.argv[2:]
+setups, leftovers = [], []
+i = 0
+while i < len(argv):
+    tag = argv[i]
+    if tag == "setup":
+        path, gid, readable, problem, unit, state = argv[i + 1:i + 7]
+        i += 7
+        row = {
+            "id": gid, "profile": path, "readable": readable == "true",
+            "problem": problem or None,
+            "kind": None, "name": None, "url": None, "transport": None,
+            "reach": None, "model": None, "auth": None, "tokenStored": False,
+            "fileServer": None,
+            "service": {"unit": unit, "state": state},
+        }
+        try:
+            with open(path) as fh:
+                doc = json.load(fh)
+        except Exception:
+            doc = None
+        if isinstance(doc, dict):
+            gw = doc.get("gateway")
+            if isinstance(gw, dict):
+                for key in ("kind", "name", "url", "transport", "reach", "model", "auth"):
+                    value = gw.get(key)
+                    row[key] = value if isinstance(value, str) and value else None
+                row["url"] = safe_url(row["url"])
+            fs = doc.get("fileServer")
+            if isinstance(fs, dict):
+                row["fileServer"] = {
+                    key: (fs.get(key) if isinstance(fs.get(key), str) and fs.get(key) else None)
+                    for key in ("url", "localPort", "reach", "folder")
+                }
+                row["fileServer"]["url"] = safe_url(row["fileServer"]["url"])
+        elif row["readable"]:
+            # The shell validator passed and the file will not parse — the two
+            # disagree only if something rewrote it between the two reads, and a
+            # row that claims to be readable while carrying no fields is worse
+            # than one that says so.
+            row["readable"] = False
+            row["problem"] = row["problem"] or "The profile could not be parsed as JSON."
+        setups.append(row)
+    elif tag == "leftover":
+        gid, unit, state = argv[i + 1:i + 4]
+        i += 4
+        leftovers.append({"id": gid or None, "unit": unit, "state": state})
+    else:
+        break
+
+print(json.dumps({
+    "schemaVersion": 1,
+    "stateDir": state_dir,
+    "tokenStored": False,
+    "setups": setups,
+    "leftovers": leftovers,
+}, indent=1))
+PY
+}
+
+# ----------------------------------------------------------------- picker --
+
+# The shared picker. pick_existing_custom_gateway is the pattern, but it globs
+# profile-custom-* because its caller is deciding whether to edit or mint a CUSTOM
+# gateway id. This one lists every saved setup including openclaw and hermes: they
+# have exactly the same profile, the same file-lane unit and the same credential,
+# and no inventory surface in this tool has ever shown them.
+#
+# 0 = an id is in the named variable · 1 = nothing to pick (said so on screen) ·
+# 10 = the operator pressed b. Never returns for q: prompt_into raises that in the
+# parent, which is the whole reason the choice goes through it.
+manage_pick_profile() { # manage_pick_profile <variable-name>
+  local __mp_var="$1" __mp_pf __mp_pick __mp_i=1
+  local __mp_ids=() __mp_hidden=0
+  while IFS= read -r __mp_pf; do
+    [ -n "$__mp_pf" ] || continue
+    if show_qr_validate_profile "$__mp_pf"; then
+      __mp_ids+=("$(manage_profile_id "$__mp_pf")")
+    else
+      __mp_hidden=$((__mp_hidden+1))
+    fi
+  done <<EOF
+$(manage_saved_profiles)
+EOF
+  if [ ${#__mp_ids[@]} -eq 0 ]; then
+    say ""
+    if [ "$__mp_hidden" = "0" ]; then
+      note "No saved setups on this machine yet."
+      say "  Pair one first:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
+    else
+      note "This machine has $__mp_hidden saved setup(s) this version ($VERSION) cannot read, so"
+      note "there is nothing to pick. Run --list to see what each one says is wrong."
+    fi
+    return 1
+  fi
+  # One saved setup is still SHOWN rather than silently assumed. There is nothing
+  # to decide, but there is something to recognise: the next screen offers to
+  # remove it, and "the only one" is not a good enough answer to "which one?".
+  if [ ${#__mp_ids[@]} -eq 1 ]; then
+    say ""
+    say "  ${BOLD}The one saved setup on this machine:${RESET}"
+    manage_print_one "${__mp_ids[0]}"
+    printf -v "$__mp_var" '%s' "${__mp_ids[0]}"
+    MANAGE_ID="${__mp_ids[0]}"
+    return 0
+  fi
+  say ""
+  say "  ${BOLD}Saved setups on this machine:${RESET}"
+  for (( __mp_i=0; __mp_i<${#__mp_ids[@]}; __mp_i++ )); do
+    say ""
+    manage_print_one "${__mp_ids[$__mp_i]}" "$((__mp_i+1))"
+  done
+  [ "$__mp_hidden" = "0" ] || { say ""; note "($__mp_hidden more can't be read by this version and aren't listed; --list says why.)"; }
+  say ""
+  while true; do
+    # {1,3} length-bounds the answer so the numeric compare cannot overflow bash
+    # 3.2's intmax; allow-back is on because every caller of this picker has a
+    # screen behind it worth returning to.
+    prompt_into __mp_pick require_choice "Which one? Choose 1-${#__mp_ids[@]}" '^[0-9]{1,3}$' explain_manage_pick true \
+      || return 10
+    { [ "$__mp_pick" -ge 1 ] && [ "$__mp_pick" -le ${#__mp_ids[@]} ]; } 2>/dev/null && break
+    warn "Please enter a number between 1 and ${#__mp_ids[@]}."
+  done
+  printf -v "$__mp_var" '%s' "${__mp_ids[$((__mp_pick-1))]}"
+  MANAGE_ID="${__mp_ids[$((__mp_pick-1))]}"
+  return 0
+}
+
+# ------------------------------------------------------------------- edit --
+
+# Everything write_profile reads, loaded from one saved profile. Assigns into the
+# CALLER's locals (bash 3.2 has no `declare -n`, and every name here is already a
+# global the rest of the script owns) — so the caller declares them `local` and
+# this run's edits cannot leak into a setup run sharing the process.
+#
+# FS_CRED is the one that matters and the one a reader will not expect. It is the
+# WebDAV password, it is NOT in the profile, and write_profile records a fileServer
+# block only when FS_URL and FS_CRED are both set — so loading a profile without
+# it and saving a changed address would silently drop file transfer from the saved
+# setup, and the operator would find out on a phone, days later. Returns 1 when a
+# lane is recorded but its password cannot be recovered, because saving is then a
+# destructive act dressed as an address change.
+manage_load_profile() { # manage_load_profile <id> -> 1 when a recorded file lane cannot be preserved
+  local id="$1" pf; pf=$(manage_profile_path "$id")
+  GW_ID="$id"
+  GW_KIND=$(json_get "$pf" "gateway.kind")
+  GW_NAME=$(json_get "$pf" "gateway.name")
+  GW_AUTH=$(json_get "$pf" "gateway.auth")
+  TRANSPORT=$(json_get "$pf" "gateway.transport")
+  SCOPE=$(json_get "$pf" "gateway.reach")
+  GW_URL=$(json_get "$pf" "gateway.url")
+  GW_LOCAL_PORT=$(json_get "$pf" "gateway.localPort")
+  GW_MODEL=$(json_get "$pf" "gateway.model")
+  FS_URL=$(json_get "$pf" "fileServer.url")
+  FS_LOCAL_PORT=$(json_get "$pf" "fileServer.localPort")
+  FS_REACH=$(json_get "$pf" "fileServer.reach")
+  FS_FOLDER=$(json_get "$pf" "fileServer.folder")
+  FS_CRED=""
+  [ -n "$FS_URL" ] || return 0
+  # The same three sources, in the same order, that existing_fs_config uses: the
+  # 0600 state credential file, then the environment file, then the service unit
+  # itself — parsed structurally by fs_unit_field, never text-matched.
+  #
+  # The unit is included, and the reason is what FS_CRED is FOR here. Nothing on
+  # this screen writes it anywhere: write_profile reads it as a BOOLEAN and
+  # nothing else — `if e("FS_URL") and e("FS_CRED")` decides whether the record
+  # keeps its fileServer block, and the credential itself is never a field of the
+  # profile. (Option 4's code emission does need the real value, and gets its own
+  # copy from show_qr_recover_file_lane; the value loaded here never reaches a
+  # payload.) So a password recovered from a service file is not "written into a
+  # record on a guess" — it is evidence that the lane exists, and the unit is the
+  # most direct evidence there is.
+  #
+  # Refusing it is the expensive answer, because the lane whose password lives
+  # ONLY in its unit is not an exotic case: it is every lane whose .cred was
+  # cleaned up, and on macOS the plist is a first-class home for that password
+  # (manage_forget's disclosure says so out loud). Without the third source those
+  # setups get an edit screen on which EVERY option refuses to save, including
+  # the address repair that is the whole reason this screen exists — so the
+  # operator most likely to need it is the one who cannot use it.
+  #
+  # Id-addressed only, never the legacy unnamed units existing_fs_config also
+  # falls back to: a unit carrying no id belongs to no setup this function was
+  # asked about (see manage_unit_path), and borrowing its password would decide
+  # a neighbour's file lane survives on the strength of a file nothing ties to it.
+  local credf envf unit cand
+  credf=$(manage_cred_path "$id"); envf=$(manage_env_path "$id")
+  unit=$(manage_unit_path "$id")
+  if [ -f "$credf" ]; then FS_CRED=$(cat "$credf" 2>/dev/null || true)
+  elif [ -f "$envf" ]; then FS_CRED=$(env_get "$envf" "RCLONE_PASS")
+  elif [ -f "$unit" ]; then
+    for cand in argv_cred env_cred; do
+      FS_CRED=$(fs_unit_field "$unit" "$cand" 2>/dev/null || true)
+      # credential_value_safe is the same gate existing_fs_config applies before
+      # it trusts a recovered value: a credential carrying a control byte cannot
+      # ride curl's stdin config or a systemd EnvironmentFile, so a value that
+      # fails it is not one this record may claim a working lane on.
+      credential_value_safe "$FS_CRED" && break
+      FS_CRED=""
+    done
+  fi
+  [ -n "$FS_CRED" ] || return 1
+  return 0
+}
+
+# Save the caller's GW_*/FS_* back to disk through write_profile — never by
+# editing the JSON in place. write_profile is the single encoder for this file: it
+# builds the document with a real JSON encoder, writes 0600 under umask 077, and
+# renames it into place atomically so an interrupt cannot leave half a profile that
+# the picker would offer and --show-code would then reject.
+#
+# Its three "don't overwrite" guards are all about a run that has NOT proven what
+# it is recording, and none of them describes this one — so they are neutralised
+# LOCALLY, which is also what stops them leaking into a setup run in the same
+# process. $DRY_RUN and $REUSE_ONLY are deliberately left alone: those two mean
+# "change nothing", and this is a change.
+#
+# The id is an ARGUMENT, and it is re-asserted as a local $GW_ID, because $GW_ID is
+# the only thing that decides WHICH FILE write_profile writes. The operator picked
+# a setup by name on the screen behind this; nothing between that choice and this
+# write may redirect it at a neighbour's file, and re-asserting it here costs one
+# line and does not depend on every function in between keeping its hands to itself.
+manage_save_profile() { # manage_save_profile <id>
+  local SHOW_QR=false VERIFY_FAILED=false FS_LANE_DROPPED_BY_CHECK=false
+  local GW_ID="$1"
+  write_profile
+}
+
+# Save, then PROVE the save landed by reading the field back off the disk.
+#
+# write_profile WARNS and returns 0 on every failure it can hit — a $STATE_DIR it
+# cannot create, a python that would not build the document, a temp file it could
+# not write or rename. That is right for the wizard, where a pairing is complete
+# whether or not the convenience record got saved. It is wrong here, where the save
+# IS the action: an edit screen that prints "Saved." over a warning tells the
+# operator the address was recorded when the file still holds the old one, and they
+# find out days later on a phone. The removal half of this module already refuses
+# to report anything it has not re-read (see manage_forget_apply); this is the same
+# standard applied to the half that writes.
+#
+# 0 = the disk agrees · 1 = it does not, and the operator has been told so.
+manage_save_and_prove() { # manage_save_and_prove <id> <json-path> <expected-value>
+  manage_save_profile "$1"
+  local pf; pf=$(manage_profile_path "$1")
+  [ "$(json_get "$pf" "$2")" = "$3" ] && return 0
+  say ""
+  warn "NOT saved. The write did not land, and $pf was not changed."
+  warn "A folder or file this account may not write, a full disk, or a file something else"
+  warn "is holding are the usual reasons; a line just above may name the real one."
+  note "Nothing else on this machine was changed, and nothing here retries on its own."
+  return 1
+}
+
+# Does the saved address still answer? The check code already exists — the one
+# --check-server's first probe uses — so this asks the same question rather than
+# inventing a second opinion about what "reachable" means.
+#
+# Deliberately UNAUTHENTICATED: the profile stores no token, and asking for one
+# here would put a hidden secret prompt inside an edit screen whose entire promise
+# is that it does not make you re-enter things. That costs nothing real, because
+# the four outcomes below are all the operator needs to know whether an address
+# change worked — a 401 from the right host is the correct, expected answer from a
+# bearer gateway and proves the route as well as a 200 would.
+#
+# 0 = answered as a gateway · 1 = answered and asked for a token · 2 = answered,
+# but not like an OpenAI-compatible gateway · 3 = did not answer at all.
+manage_probe_address() { # manage_probe_address <https-url>
+  local GW_AUTH="none" GW_TOKEN="" rc=0
+  models_is_json "$1" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2|3) return 2 ;;                       # HTML, or JSON in the wrong envelope
+  esac
+  [ "${MODELS_CURL_RC:-0}" = "0" ] || return 3
+  case "${MODELS_HTTP_CODE:-}" in
+    401|403) return 1 ;;
+    '')      return 3 ;;
+    *)       return 2 ;;
+  esac
+}
+
+# Say what the probe found, in one place, so the address prompt and any later
+# caller cannot describe the same four outcomes differently.
+manage_report_probe() { # manage_report_probe <rc> <url>
+  case "$1" in
+    0) ok "That address answers, and it answers like a gateway the app can use." ;;
+    1) ok "That address answers and asks for a token — which is exactly right for this"
+       note "gateway; the token is not saved here, so I cannot go further than that." ;;
+    2) warn "That address answers, but not the way an OpenAI-compatible gateway does"
+       warn "(HTTP ${MODELS_HTTP_CODE:-?}). Something is listening there — a login page, a"
+       warn "different service, or the tunnel's own error page." ;;
+    *) warn "Nothing answered at that address. If the tunnel or the gateway behind it is"
+       warn "not running yet, that is expected — start it and check again with:"
+       say  "    ${BOLD}bash conduck-connect.sh --check-server $2${RESET}" ;;
+  esac
+}
+
+# The per-setup screen: change ONE field, and re-run only the verification that
+# field affects. The pattern is choose_saved_model's — a bounded choice, one
+# prompt, one write — repeated for the fields an operator actually comes back for.
+#
+# The motivating case is this tool's most common real failure and it is worth
+# naming: `cloudflared tunnel --url` mints a NEW *.trycloudflare.com hostname every
+# time it restarts, so a setup that verified green last night points at a hostname
+# that no longer resolves this morning. Re-pointing it is a one-field change, and
+# without this screen it costs a full walk through the wizard.
+manage_edit() { # manage_edit [<id>]
+  # FIRST, before anything is read or printed. Every line of this screen is a
+  # question, so there is nothing here for a run with nobody to answer it — and
+  # asked any later, the no-id path has already validated every profile on the
+  # machine, drawn the whole inventory, and READ an answer off the pipe before
+  # refusing. That last part is the one that matters: `printf '1\n' | --edit`
+  # consumes the 1, so a driver's transcript shows the picker taking its choice
+  # and then exit 4, which reads as a tool that changed its mind rather than one
+  # that was never able to run. nobody_can_answer at the dispatcher catches the
+  # closed-stdin case; a PIPE gets past it and lands here, which is why this
+  # gate exists at all and why it belongs on the first line.
+  interactive_terminal || manage_refuse_without_a_terminal "Changing a saved setup"
+  local id="${1:-}"
+  if [ -z "$id" ]; then
+    manage_pick_profile id || return 0     # 1 = nothing saved (said so), 10 = back
+  fi
+  manage_id_ok "$id" || { warn "\"$(safe_display "${id}" 60)\" is not a saved setup id. Run --list to see them."; return 1; }
+  local pf; pf=$(manage_profile_path "$id")
+  if ! show_qr_validate_profile "$pf"; then
+    say ""
+    warn "$PROFILE_VALIDATION_ERROR"
+    note "Nothing here can edit a profile it cannot read. --forget $id removes it."
+    return 1
+  fi
+
+  # Declared HERE, in the scope the whole screen runs in, so every edit and every
+  # save works on this one setup's values and the process's own GW_*/FS_* globals —
+  # which may belong to a setup run that dispatched us — are untouched on return.
+  local GW_ID GW_KIND GW_NAME GW_AUTH TRANSPORT SCOPE GW_URL GW_LOCAL_PORT GW_MODEL
+  local FS_URL FS_CRED FS_LOCAL_PORT FS_REACH FS_FOLDER
+  local lane_preserved=true
+  manage_load_profile "$id" || lane_preserved=false
+
+  local choice
+  while true; do
+    say ""
+    manage_print_one "$id"
+    if ! $lane_preserved; then
+      say ""
+      warn "This setup records a file lane, and its stored password is not in $STATE_DIR."
+      warn "Saving any change would rewrite the record WITHOUT file transfer, so nothing on"
+      warn "this screen will save until that is resolved. Re-run setup for this gateway to"
+      warn "rebuild the lane, or use --forget $id to remove the setup entirely."
+    fi
+    # The quick-tunnel case gets its own banner because from the app's side it is
+    # indistinguishable from a broken gateway, and it is the reason most people
+    # open this screen at all.
+    if is_quick_tunnel_url "${GW_URL:-}"; then
+      say ""
+      warn "This setup rides a Cloudflare QUICK TUNNEL. That hostname is reassigned every"
+      warn "time the tunnel restarts — a reboot, a crash, a Ctrl-C in its terminal — and"
+      warn "nothing on this machine learns the new one. If the app stopped connecting,"
+      warn "option 1 is what you came for: paste the address cloudflared prints now."
+    fi
+    say ""
+    say "  ${BOLD}Change one thing${RESET}"
+    say "    1) Web address — the https:// address the app calls"
+    say "    2) Model"
+    say "    3) Shared folder for file transfer"
+    say "    4) Show this setup's code again (to pair a device, or after a change)"
+    say "    5) Remove this setup from this machine"
+    prompt_into choice require_choice "Choose 1-5" '^[1-5]$' explain_manage_edit true || return 0
+    case "$choice" in
+      1) manage_edit_address "$id" "$lane_preserved" ;;
+      2) manage_edit_model "$id" "$lane_preserved" ;;
+      3) manage_edit_folder "$id" ;;
+      4) manage_show_code "$id" ;;
+      5) if manage_forget "$id"; then return 0; fi ;;
+    esac
+  done
+}
+
+# The address change. Re-verifies the ADDRESS and nothing else — the model, the
+# transport, the file lane and the token are untouched, so re-running their checks
+# would spend the operator's time and possibly their provider's quota on questions
+# this edit did not raise.
+manage_edit_address() { # manage_edit_address <id> <lane-preserved>
+  local id="$1" lane_ok="$2" old="$GW_URL" new rc transport_mismatch=false
+  say ""
+  say "  ${BOLD}The web address${RESET}"
+  say "  Currently: $(safe_display "${old:-?}" 200)"
+  note "This is the address the Conduck app calls. Changing it here does not move any"
+  note "tunnel or route — it records where the address now is."
+  prompt_into new ask_url "  The https:// address that reaches this gateway now" \
+    "https://ai.example.com" 0 "" explain_manage_address true || return 0
+  if [ "$new" = "$old" ]; then
+    note "Same address as before — nothing to save."
+    return 0
+  fi
+
+  # The one inconsistency this screen can detect on its own. A saved Tailscale
+  # setup asserts its live mapping at --show-code time, so an address that is not
+  # a tailnet name will be refused there rather than here, and being told that now
+  # is much cheaper than being told after the code is printed.
+  case "$TRANSPORT" in
+    tailscale|funnel)
+      case "$(url_host_lc "$new")" in
+        *.ts.net) ;;
+        *) transport_mismatch=true
+           say ""
+           warn "This setup is recorded as reached over Tailscale, and that address is not a"
+           warn "tailnet name. --show-code asserts the live Tailscale mapping before it prints"
+           warn "a code, so it will refuse this. If the gateway has genuinely moved to another"
+           warn "route, re-run setup so the transport is recorded with the address." ;;
+      esac ;;
+  esac
+
+  say ""
+  note "Checking whether that address answers (one request; nothing is changed)."
+  manage_probe_address "$new"; rc=$?
+  manage_report_probe "$rc" "$new"
+  # The confirmation gate covers BOTH doubts, and the transport one is the graver
+  # of the two. "Nothing answered" is often just a tunnel that is not up yet, and
+  # the operator is right to save ahead of it. A tailnet transport with a
+  # non-tailnet address is the opposite: it is a mismatch this screen has already
+  # PROVEN, and the certain consequence is that the one command which could carry
+  # the change to the phone refuses to run. Saving it unasked because the address
+  # happened to answer would be the tool acting on the weaker of the two facts it
+  # just printed.
+  if $transport_mismatch || [ "$rc" = "3" ] || [ "$rc" = "2" ]; then
+    say ""
+    if $transport_mismatch; then
+      warn "Saving this leaves a record no setup code can be printed from, so the paired"
+      warn "device keeps the old address with no way to be told the new one."
+    fi
+    if ! confirm "  Save it anyway?" explain_manage_address; then
+      note "Left the saved address as it was."
+      return 0
+    fi
+  fi
+
+  $lane_ok || { say ""; warn "Not saved — see the file-lane warning above."; return 0; }
+  mutate_guard "record a new web address for the saved setup $id"
+  GW_URL="$new"
+  # Not saved until the disk says so — and on a failed write the in-memory value is
+  # put back, because everything after this point (the file-lane follow-up, the
+  # offer of a code) is built from it and would otherwise carry an address this
+  # machine has no record of.
+  if ! manage_save_and_prove "$id" "gateway.url" "$new"; then
+    GW_URL="$old"
+    return 0
+  fi
+  ok "Saved. $(manage_profile_path "$id") now points at $(safe_display "$new" 200)."
+
+  manage_follow_file_address "$id" "$old" "$new"
+
+  # No code offer for an address this screen has already proven --show-code will
+  # refuse. The offer below runs the real pipeline, and its first step on a
+  # Tailscale transport asserts the live mapping and DIES when the host is not a
+  # tailnet name — so accepting it would answer a friendly question with a fatal
+  # error, one screen after the operator was told this exact thing would happen.
+  if $transport_mismatch; then
+    say ""
+    warn "No setup code can be printed from this record while the transport says Tailscale"
+    warn "and the address does not. Re-run setup for this gateway — it records the"
+    warn "transport and the address together, which is what makes a code printable again."
+    return 0
+  fi
+
+  # The phone still holds the OLD address, and nothing pushes a change to it. This
+  # offer is the whole reason the address edit is worth having: without it the
+  # operator saves a correct record and the app stays broken.
+  say ""
+  say "  The device you already paired still has the old address — a setup code is a"
+  say "  snapshot, not a subscription. Scanning a new one updates it."
+  if confirm "  Show the new setup code now?" explain_manage_show_code; then
+    manage_show_code "$id"
+  else
+    note "Whenever you want it:  bash conduck-connect.sh --show-code"
+  fi
+}
+
+# The same URL with a different host, keeping the port and everything after the
+# authority. That combination is what a moved address actually looks like on the
+# one transport where the file lane shares the gateway's hostname: Tailscale puts
+# the file server on the SAME tailnet name and a different HTTPS port, so the port
+# is the part that must survive the substitution.
+manage_url_with_host() { # manage_url_with_host <https-url> <new-host>
+  local rest auth tail port=""
+  rest="${1#https://}"
+  auth="${rest%%[/?#]*}"
+  tail="${rest#"$auth"}"
+  case "$auth" in
+    \[*\]:*) port=":${auth##*\]:}" ;;
+    \[*\])   port="" ;;
+    *:*)     port=":${auth##*:}" ;;
+  esac
+  printf 'https://%s%s%s' "$2" "$port" "$tail"
+}
+
+# A moved gateway address usually moves the FILE address with it, and saving one
+# without the other is the quiet half-repair this screen exists to prevent: the
+# next setup code would carry a working gateway and a file address that answers
+# nothing, and the operator would find out when an attachment fails on a phone.
+#
+# The rule is the hostname. When the file lane sits on the same host as the
+# gateway — always true on Tailscale, and true of a quick tunnel that fronts both —
+# the new host is the answer and the whole address is shown before anything is
+# written. When the hosts differ, the file lane is on a route of its own that this
+# edit has no opinion about, so it is named and left alone. Nothing is derived
+# silently in either branch.
+manage_follow_file_address() { # manage_follow_file_address <id> <old-gateway-url> <new-gateway-url>
+  local id="$1" old_host new_host fs_host candidate previous
+  [ -n "${FS_URL:-}" ] || return 0
+  old_host=$(url_host_lc "$2"); new_host=$(url_host_lc "$3")
+  fs_host=$(url_host_lc "$FS_URL")
+  say ""
+  if [ -z "$fs_host" ] || [ "$fs_host" != "$old_host" ]; then
+    note "The file address in this setup is on a different host and is untouched:"
+    note "$(manage_safe_url "$FS_URL" 200)"
+    note "If that route moved too, re-run setup — it rebuilds the file lane's address."
+    return 0
+  fi
+  candidate=$(manage_url_with_host "$FS_URL" "$new_host")
+  warn "The file address in this setup rides the same hostname you just changed, so it"
+  warn "now points somewhere that no longer answers:"
+  note "$(manage_safe_url "$FS_URL" 200)"
+  say "  Moving it to the new hostname, keeping its port and path, gives:"
+  say "    ${BOLD}$(safe_display "$candidate" 200)${RESET}"
+  if ! confirm "  Update the file address too?" explain_manage_address; then
+    warn "Left as it was. Until it is fixed, a setup code from this setup carries a file"
+    warn "address that answers nothing — chat still works."
+    return 0
+  fi
+  previous="$FS_URL"
+  FS_URL="$candidate"
+  if ! manage_save_and_prove "$id" "fileServer.url" "$candidate"; then
+    FS_URL="$previous"
+    warn "The gateway address above did save; this file address did not. Until it is"
+    warn "fixed, a setup code from this setup carries a file address that answers"
+    warn "nothing — chat still works."
+    return 0
+  fi
+  ok "Saved. The file address is now $(safe_display "$candidate" 200)."
+  note "Nothing was restarted or re-routed — this records where the address is."
+}
+
+# The model. choose_saved_model is exactly this edit already — a bounded three-way
+# choice over one field — so it is called rather than re-written; the only thing
+# added here is the save, which the wizard does at the end of its own run.
+#
+# It is called under the SAME guard its other caller uses (20-gateway.inc.sh, the
+# custom-gateway branch: `if $GW_EDITING && [ -n "$GW_MODEL" ]`), because it is
+# written for a gateway that HAS a pinned model and reads as nonsense without one.
+# Its first line is "This gateway last used the model: " with the value on the
+# end, and its menu offers "1) Keep it" and "3) Clear it — let the server pick";
+# on a setup that pins nothing that is a sentence ending in a colon followed by
+# two options that do the identical nothing. $GW_EDITING is not tested here — a
+# saved setup is by definition one being edited — so the guard is the model.
+#
+# The un-pinned branch asks the plain question instead. It does NOT copy the
+# wizard's probe_single_model shortcut: that probe reads http://127.0.0.1:<port>
+# and it needs a token this screen deliberately never loads, so against the bearer
+# gateway that is the common case it would send a request nobody was told about
+# and come back with nothing to show for it.
+manage_edit_model() { # manage_edit_model <id> <lane-preserved>
+  local id="$1" lane_ok="$2" old="$GW_MODEL"
+  if [ -n "$GW_MODEL" ]; then
+    choose_saved_model
+  else
+    say ""
+    say "  ${BOLD}The model${RESET}"
+    say "  This setup pins none, so the app asks for whichever model your server picks."
+    say "  Some servers (Ollama, vLLM, LiteLLM without a default) need one named in"
+    say "  every request instead."
+    prompt_into GW_MODEL ask "  Model name" "" "keep letting the server pick" \
+      "gateway.custom.model" true || return 0
+  fi
+  if [ "$GW_MODEL" = "$old" ]; then
+    note "Model unchanged — nothing to save."
+    return 0
+  fi
+  $lane_ok || { say ""; warn "Not saved — see the file-lane warning above."; GW_MODEL="$old"; return 0; }
+  mutate_guard "record a new model for the saved setup $id"
+  # Same proof as the address edit, and the same restore on failure: the screen
+  # behind this reprints the setup from these locals, so a model the disk never
+  # accepted would be shown as this setup's model for the rest of the session.
+  if ! manage_save_and_prove "$id" "gateway.model" "$GW_MODEL"; then
+    GW_MODEL="$old"
+    return 0
+  fi
+  if [ -n "$GW_MODEL" ]; then
+    ok "Saved. This setup now pins the model $(safe_display "$GW_MODEL" 200)."
+  else
+    ok "Saved. This setup pins no model — the server picks."
+  fi
+  say ""
+  note "The paired device keeps the old model until it scans a new code:  bash conduck-connect.sh --show-code"
+}
+
+# The shared folder. Deliberately NOT edited in place — see the handoff note; the
+# short version is on screen because the operator deserves the real reason rather
+# than a missing menu item.
+manage_edit_folder() { # manage_edit_folder <id>
+  local id="$1" unit state folder
+  unit=$(manage_unit_path "$id"); state=$(manage_unit_state "$unit")
+  folder="$FS_FOLDER"; [ -n "$folder" ] || folder=$(manage_unit_folder "$unit")
+  say ""
+  say "  ${BOLD}The shared folder${RESET}"
+  if [ -n "$folder" ]; then
+    say "  Currently: $(safe_display "$folder" 200)"
+  else
+    say "  This setup has no file transfer — chat only."
+  fi
+  say ""
+  say "  Moving it is not one field. The folder is named in three places that have to"
+  say "  agree, or attachments land somewhere the agent never looks:"
+  say "    • the file server's own service definition ($(basename "$unit"))"
+  say "    • this saved setup, which is what a setup code is built from"
+  say "    • your agent's own configuration, which decides where IT reads and writes"
+  say ""
+  say "  Setup does all three and asks before each one, and it reuses what is already"
+  say "  here — the same service, the same port, the same password:"
+  say "    ${BOLD}bash conduck-connect.sh --setup${RESET}"
+  case "$state" in
+    active)   note "The file server for this setup is running now; setup will reuse it." ;;
+    inactive) note "The file server for this setup is installed but not running." ;;
+    absent)   [ -n "$folder" ] && note "No service file for this setup's file server is present on this machine." ;;
+  esac
+  return 0
+}
+
+# Re-emit this setup's code, for THIS id, with no "which one?" question — the
+# operator has already answered that by being on this screen.
+#
+# It is run_show_qr's pipeline minus its picker and its own opening block. $SHOW_QR
+# is set as a LOCAL, which is what makes the whole sequence honest: it is the flag
+# write_profile reads to refuse rewriting saved state, and the flag
+# run_changes_nothing reads so that a q here says "nothing was changed" instead of
+# the wizard's warning about approved edits. As a local it reverts on return, so
+# the edit screen behind this can still save.
+#
+# Every OTHER global this pipeline writes is declared local too, at the value a
+# fresh `--show-code` process would start it with — so this runs on its own copy of
+# the wizard's state and hands nothing back. That is a correctness requirement, not
+# tidiness, because the caller is the edit screen and its GW_*/FS_* locals ARE the
+# record about to be saved:
+#
+#   • show_qr_recover_file_lane clears FS_URL/FS_CRED/FS_FOLDER when it cannot
+#     recover the lane's password and the operator accepts a gateway-only code —
+#     a correct answer for ONE emission. Landing in the edit screen's frame, it
+#     turns the next address change into a permanent deletion of file transfer
+#     from the saved setup, reported on screen as a green "Saved."
+#   • show_qr_load_profile takes GW_ID from the in-file gateway.id, which nothing
+#     requires to equal the id in the filename (see manage_profile_id). Landing in
+#     the edit screen's frame, the next save writes profile-<gateway.id>.json —
+#     ANOTHER setup's file — while the ok line names the path the operator chose.
+#
+# Locals rather than a save/restore pair because a restore has to be reached: this
+# pipeline dies on a stale mapping, an unrecoverable token or a failed verification,
+# and bash unwinds locals on every one of those paths for free.
+manage_show_code() { # manage_show_code <id>
+  local SHOW_QR=true PROFILE_FILE
+  local GW_KIND="" GW_ID="" GW_NAME="" GW_LOCAL_PORT="" GW_HEALTH_PATH=""
+  local GW_AUTH="bearer" GW_TOKEN="" GW_MODEL="" GW_URL=""
+  local TRANSPORT="" SCOPE="unknown"
+  local FS_URL="" FS_CRED="" FS_LOCAL_PORT="" FS_REACH="" FS_UNIT="" FS_FOLDER=""
+  local FS_CRED_LEGACY_ARGV=false FS_EXISTING_UNSAFE=false
+  local VERIFY_FAILED=false FS_LANE_DROPPED_BY_CHECK=false FS_AGENT_PROOF=""
+  PROFILE_FILE=$(manage_profile_path "$1")
+  preflight
+  say ""
+  head_ "The setup code for $1"
+  note "(changes no configuration; live gateway checks run, and a configured file lane gets one small PUT → GET → DELETE probe)"
+  show_qr_warn_quick_tunnel "$PROFILE_FILE"
+  ensure_state_dir
+  show_qr_load_profile
+  show_qr_recover_gateway_secret
+  show_qr_recover_file_lane
+  show_qr_check_live
+  show_qr_recall_scope
+  verify_all
+  emit_payload
+  show_qr_next_steps
+}
+
+# ----------------------------------------------------------------- forget --
+
+# Remove ONE saved setup and everything this script created for it.
+#
+# rc 0 = removed · 1 = refused or nothing to remove · 3 = the operator backed out.
+#
+# The order of operations is the safety property. The full disclosure — what goes,
+# what stays, and the exact commands — is printed BEFORE the confirmation, so the
+# typed answer is consent to a list the operator has read rather than to a word.
+# Then the service is stopped before its file is deleted, because on macOS that
+# file is the second home of the WebDAV password and an unloaded-but-present plist
+# is a secret still on disk while launchd holds the old one in memory.
+manage_forget() { # manage_forget <id>
+  local id="${1:-}"
+  manage_id_ok "$id" || {
+    warn "\"$(safe_display "${id:-}" 60)\" is not a saved setup id."
+    note "Ids are lowercase letters, digits and hyphens — run --list to see the real ones."
+    return 1
+  }
+  local pf credf envf unit state folder
+  pf=$(manage_profile_path "$id")
+  credf=$(manage_cred_path "$id")
+  envf=$(manage_env_path "$id")
+  unit=$(manage_unit_path "$id")
+  state=$(manage_unit_state "$unit")
+  folder=$(manage_unit_folder "$unit")
+  [ -n "$folder" ] || folder=$(json_get "$pf" "fileServer.folder")
+
+  if [ ! -f "$pf" ] && [ ! -f "$unit" ] && [ ! -f "$credf" ] && [ ! -f "$envf" ]; then
+    say ""
+    note "Nothing on this machine is filed under \"$id\" — no saved setup, no file server,"
+    note "no stored password. Run --list to see what is here."
+    return 1
+  fi
+  interactive_terminal || manage_refuse_without_a_terminal "Removing a saved setup"
+
+  say ""
+  # An id can reach here with no profile behind it — that is exactly the leftovers
+  # case, a file server whose gateway is already gone — and heading that screen
+  # "Remove the saved setup" would name something the operator can see is not there.
+  if [ -f "$pf" ]; then
+    head_ "Remove the saved setup \"$id\""
+    say ""; manage_print_one "$id"
+  else
+    head_ "Remove the leftover file server \"$id\""
+    note "There is no saved setup under that id — only what its file server left behind."
+  fi
+
+  # The exposure records this setup owns. Field 6 of the v2 record is the gateway
+  # id, and it exists for exactly this: without it a record says a gateway was
+  # exposed on some HTTPS port but never which gateway, so two setups on one host
+  # leave mappings nobody can tell apart. Records belonging to another id, and
+  # records whose id is the literal `unknown`, are read and then left completely
+  # alone — an exposure that cannot be attributed is not one this command may
+  # close on a guess.
+  #
+  # A record this version cannot READ at all is collected separately and reported.
+  # read_exposure_record refuses anything whose format-version is not the current
+  # one, and the id field this teardown depends on arrived with the CURRENT version
+  # — so every record an older conduck-connect wrote is unreadable here, and every
+  # machine set up by one carries them. Skipping them silently is the worst outcome
+  # this file can produce: the profile, the unit and the credential go, the address
+  # in front of the port stays open — a Funnel is PUBLIC — and nothing left on disk
+  # names it. They cannot be torn down either, because a record without a gateway id
+  # cannot be shown to belong to this setup, and closing a stranger's public route
+  # on a guess is the mistake in the other direction. So they are named, with their
+  # paths, and left exactly as they are.
+  local live=() files=() backends=() roles=() unattributed=0 unreadable=()
+  local pending_seen=false ts_reason="" f
+  if [ -n "${STATE_DIR:-}" ]; then
+    for f in "$STATE_DIR"/exposure-*.pending; do
+      [ -f "$f" ] && { pending_seen=true; break; }
+    done
+  fi
+  # Only asked when there is something to ask about. A gateway behind Cloudflare or
+  # a reverse proxy of the operator's own has no record here at all, and telling
+  # them Tailscale could not be read would send them to check a program that has
+  # nothing to do with their setup.
+  if $pending_seen; then
+    if ! have tailscale; then
+      ts_reason="the 'tailscale' command is not on this shell's PATH"
+    else
+      ts_targets
+      if ! $TS_STATE_KNOWN; then
+        ts_reason="'tailscale serve status --json' could not be read"
+      else
+        for f in "$STATE_DIR"/exposure-*.pending; do
+          [ -f "$f" ] || continue
+          read_exposure_record "$f" || { unreadable+=("$f"); continue; }
+          if [ "$REC_GWID" = "unknown" ]; then unattributed=$((unattributed+1)); continue; fi
+          [ "$REC_GWID" = "$id" ] || continue
+          exposure_record_is_live || continue
+          live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
+          files+=("$f")
+          backends+=("${REC_APROXY#http://127.0.0.1:}")
+          [ "$REC_ROLE" = "file" ] && roles+=("your shared folder") || roles+=("your gateway")
+        done
+      fi
+    fi
+  fi
+
+  say ""
+  say "  ${BOLD}This removes, on this machine:${RESET}"
+  [ -f "$pf" ]    && say "    the saved setup        $pf"
+  if [ -f "$unit" ]; then
+    say "    the file server        $unit"
+    case "$state" in
+      active)   say "                           ${YELLOW}(running now — it is stopped first)${RESET}" ;;
+      inactive) say "                           (not running)" ;;
+      *)        say "                           (this shell cannot ask whether it is running)" ;;
+    esac
+  fi
+  [ -f "$credf" ] && say "    its stored password    $credf"
+  [ -f "$envf" ]  && say "    its environment file   $envf"
+  # The single most important line on this screen. On macOS the LaunchAgent plist
+  # carries EnvironmentVariables.RCLONE_PASS — the same WebDAV password as the
+  # .cred file, in cleartext — so an operator who deletes the .cred by hand and
+  # stops there has left the secret exactly where it was.
+  if [ "$OS" != "Linux" ] && [ -f "$unit" ]; then
+    say ""
+    warn "That service file holds a SECOND cleartext copy of the file-server password."
+    warn "Removing the .cred alone would leave it on disk; both go together here."
+  fi
+  local i entry port rest averb
+  for (( i=0; i<${#live[@]}; i++ )); do
+    entry="${live[$i]}"
+    port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"; averb="${rest%%$'\t'*}"
+    if [ "$averb" = "funnel" ]; then
+      say "    a ${BOLD}PUBLIC${RESET} address      port $port → 127.0.0.1:${backends[$i]} (${roles[$i]}), Tailscale Funnel"
+    else
+      say "    a private address      port $port → 127.0.0.1:${backends[$i]} (${roles[$i]}), Tailscale Serve"
+    fi
+  done
+
+  say ""
+  say "  ${BOLD}This does NOT touch:${RESET}"
+  if [ -n "$folder" ]; then
+    say "    the shared folder $(safe_display "$folder" 200) or anything in it."
+    say "      On OpenClaw and Hermes that folder is the agent's own working directory."
+  else
+    say "    any folder on this machine, or anything in one."
+  fi
+  say "    your agent's TOOLS.md, or any gateway configuration this script edited."
+  say "    the gateway itself — it keeps running, on the same port, with the same token."
+  say "    the pairing already on your phone, tablet or Mac. That device still holds this"
+  say "      gateway's address and its token, and nothing here can reach it: remove the"
+  say "      connection in the app too. If you are removing this because the token leaked,"
+  say "      rotate the token at the gateway — that is the only thing that revokes it."
+  if [ "$unattributed" -gt 0 ]; then
+    say ""
+    note "$unattributed recorded exposure(s) here name no gateway, so I cannot tell whether they"
+    note "belong to this setup. They are left exactly as they are; a normal run offers to"
+    note "close leftover exposures it can identify."
+  fi
+  if [ ${#unreadable[@]} -gt 0 ]; then
+    say ""
+    warn "This machine holds ${#unreadable[@]} recorded exposure(s) in a format this version cannot read —"
+    warn "an older conduck-connect wrote them, and they name no gateway at all. So I cannot"
+    warn "tell whether one of them is the address in front of THIS gateway, and I will not"
+    warn "close a route I cannot prove is yours. They are left exactly as they are:"
+    # Filesystem-derived, like every other name this module prints: these paths
+    # come out of an `exposure-*.pending` glob, so the middle of each one is
+    # whatever a file in $STATE_DIR is called. Same safe_display rule as the
+    # inventory — a name is read here, never acted on.
+    for f in ${unreadable[@]+"${unreadable[@]}"}; do
+      say "    $(safe_display "$f" 400)"
+    done
+    warn "One of them may be a PUBLIC Tailscale Funnel that outlives this removal. What is"
+    warn "actually live is the authority on that, not those files — read it with:"
+    printf '    %stailscale serve status%s\n' "$BOLD" "$RESET"
+    printf '    %stailscale funnel status%s\n' "$BOLD" "$RESET"
+    say "  Anything there you no longer want, closed by hand, per HTTPS port:"
+    printf '    %stailscale funnel --https=<port> off%s   # remove a PUBLIC exposure\n' "$BOLD" "$RESET"
+    printf '    %stailscale serve --https=<port> off%s\n' "$BOLD" "$RESET"
+    note "I did not run those."
+  fi
+  if [ -n "$ts_reason" ]; then
+    say ""
+    warn "This machine has recorded Tailscale exposures, and $ts_reason,"
+    warn "so I cannot tell whether any of them belongs to this setup. Every one of them is"
+    warn "left exactly as it is. Check 'tailscale serve status' and 'tailscale funnel status'."
+  fi
+
+  # --reuse-only means "change nothing", and this whole command is a change.
+  # Refused before the typed prompt, never after: asking somebody to type an id
+  # and then declining to act on it is the worst possible order.
+  mutate_guard "remove the saved setup $id, its file server, and its stored password"
+
+  # A TYPED confirmation, not [y/N]. Enter is No at every gate in this program so
+  # that pressing it in rhythm is always safe; the one irreversible action must not
+  # be reachable by that same reflex. Typing the id also answers a second question
+  # the y/N never could — WHICH setup — which is the mistake that matters on a
+  # machine with two of them.
+  #
+  # Typed or not, it is still a prompt, so it keeps the prompt contract: a key is
+  # a control here IF AND ONLY IF this suffix advertises it, and the suffix comes
+  # from control_suffix — the one renderer every other prompt's suffix comes from,
+  # so the two cannot drift apart. Back is not offered and so is not advertised;
+  # i is, and it earns its place at this prompt more than at any other in the tool,
+  # because this is the only answer that cannot be taken back. q stops the RUN
+  # rather than merely cancelling: a key advertised as "stop" that quietly does
+  # what Enter already does is exactly the drift the contract exists to prevent.
+  #
+  # No prompt_echo: manage_forget refused a run without an interactive terminal
+  # several screens ago, so `read -r -p` always has a terminal to write its prompt
+  # to and the re-emission would be unreachable.
+  local reply p
+  say ""
+  p="  Type ${BOLD}$id${RESET} to remove it ($(control_suffix "cancel")): "
+  while true; do
+    if ! read -r -p "$p" reply; then
+      say ""
+      note "No answer — nothing was removed."
+      return 3
+    fi
+    # A one-character id can BE a control key: ids are lowercase letters, digits
+    # and hyphens, so "q" is a legal id and this prompt is the one place in the
+    # program where the two readings of that keystroke are "stop" and "delete
+    # irreversibly". Neither may be chosen silently, so the same primitive every
+    # ambiguous free-text prompt uses asks once, with the control as the default.
+    case "$reply" in
+      [iI]|\?|[qQ])
+        if [ "$reply" = "$id" ]; then
+          case "$reply" in
+            [qQ]) prompt_wants_literal "$reply" "stopping the run" ;;
+            *)    prompt_wants_literal "$reply" "showing an explanation" ;;
+          esac
+          case $? in
+            0) break ;;                                    # they meant the id
+            2) say ""; note "No answer — nothing was removed."; return 3 ;;
+          esac
+        fi
+        case "$reply" in
+          [qQ]) quit_run ;;
+          *)    explain_prompt explain_manage_forget ;;
+        esac
+        continue ;;
+    esac
+    case "$reply" in
+      "$id") break ;;
+      '') note "Cancelled — nothing was removed."; return 3 ;;
+      *) warn "That is not \"$id\". Type it exactly, press Enter to cancel, or i to read"
+         warn "what removal does and does not touch." ;;
+    esac
+  done
+
+  # Only the record FILES travel across the confirmation, never the entries read
+  # from them. The typed prompt can sit on screen for minutes, and an exposure that
+  # belonged to this gateway during the disclosure may belong to another one by the
+  # time the operator answers — so the mapping to be closed is re-read and
+  # re-attributed on the far side of the pause, immediately before it is touched.
+  manage_forget_apply "$id" "$pf" "$credf" "$envf" "$unit" "${files[@]+"${files[@]}"}"
+}
+
+# The removal itself, after consent. Split out so the disclosure above reads as one
+# screen and so a test can drive the destructive half against a fixture directory
+# without answering a prompt.
+#
+# It deletes whatever paths it is HANDED and validates none of them — the id check
+# and the path construction both live in manage_forget, which is the only caller
+# and the only place an id from outside ever arrives. A second caller would have to
+# do the same, and a test that drives this directly proves nothing about the safety
+# of the paths it made up.
+#
+# Everything here is act-then-PROVE: each command may fail for reasons this script
+# cannot see (a service manager refusing the domain, a file another account owns),
+# so nothing is reported as removed until the state is RE-READ — the service from
+# fs_unit_state, the files from a fresh stat, the exposure from a fresh
+# `tailscale serve status`. An exit code is never the evidence.
+manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> [exposure-record-file…]
+  local id="$1" pf="$2" credf="$3" envf="$4" unit="$5"; shift 5
+  local live=() files=() f
+  # Re-read every candidate record from scratch, against a FRESHLY read Tailscale
+  # status. The disclosure's list is a disclosure; THIS list is what gets acted on,
+  # so it re-checks the version, the owning gateway id and the liveness as they are
+  # right now. `exposure_record_is_live` compares against TS_PORTS, so a stale
+  # ts_targets would reproduce the very window this re-read exists to close.
+  if [ $# -gt 0 ] && have tailscale; then
+    ts_targets
+    if $TS_STATE_KNOWN; then
+      for f in "$@"; do
+        [ -f "$f" ] || continue
+        read_exposure_record "$f" || continue
+        [ "$REC_GWID" = "$id" ] || continue
+        exposure_record_is_live || continue
+        live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
+        files+=("$f")
+      done
+    else
+      warn "Tailscale's live state could not be read just now, so no address in front of"
+      warn "this gateway is touched. Check 'tailscale serve status' afterwards."
+    fi
+  fi
+
+  # What was actually here, captured BEFORE anything is touched — the success line
+  # names only these. Asked now because after the removal every one of them is
+  # indistinguishable from "there was never one".
+  local had_profile=false had_unit=false had_cred=false had_env=false
+  [ -f "$pf" ]    && had_profile=true
+  [ -f "$unit" ]  && had_unit=true
+  [ -f "$credf" ] && had_cred=true
+  [ -f "$envf" ]  && had_env=true
+
+  local unit_name unit_stopped=true stop_reason=""
+  say ""
+  # The exposure first: an HTTPS route in front of a file server that is about to
+  # stop would otherwise spend a moment answering 502 to the internet, and a public
+  # one is the thing on this list with the shortest fuse.
+  if [ ${#live[@]} -gt 0 ]; then
+    local i
+    for (( i=${#live[@]}-1; i>=0; i-- )); do
+      undo_exposure_entry "${live[$i]}"
+    done
+    ts_targets
+    local leftover=() entry port want t
+    for (( i=0; i<${#live[@]}; i++ )); do
+      entry="${live[$i]}"; port="${entry%%$'\t'*}"
+      want=$(undo_target_for_entry "$entry")
+      t=$(ts_target_for_port "$port")
+      if ! $TS_STATE_KNOWN || [ "${t:-}" != "$want" ]; then
+        leftover+=("$entry")
+      else
+        [ "$i" -lt ${#files[@]} ] && rm -f "${files[$i]}" 2>/dev/null || true
+        if [ -n "$want" ]; then
+          ok "Port $port is back to the private mapping it carried before."
+        else
+          ok "Port $port is no longer exposed."
+        fi
+      fi
+    done
+    if [ ${#leftover[@]} -gt 0 ]; then
+      warn "Could not confirm every address in front of this gateway was closed — often"
+      warn "missing operator or root rights. To close them by hand:"
+      print_undo_hints "${leftover[@]}"
+      local rp; rp=$(priv_prefix)
+      [ -n "$rp" ] && note "If Tailscale refuses those, prefix each with '$rp'."
+      note "I ran the same commands and could not prove they took effect."
+    fi
+  fi
+
+  # Stop and disable BEFORE deleting. A systemd unit whose file vanishes while it
+  # is enabled leaves a `failed` entry that only reset-failed clears, and a loaded
+  # LaunchAgent whose plist vanishes keeps running with the password it already
+  # read — which would make "the password is gone" false in the one way that
+  # matters.
+  #
+  # The stop command's EXIT CODE is not the evidence, in either direction.
+  # `launchctl unload` answers nonzero for a plist that was never loaded (the
+  # ordinary case for a stopped service), and it can also answer zero while the job
+  # survives in another domain. So the command runs, and then fs_unit_state is
+  # asked again: the unit file is deleted only once the supervisor says the service
+  # is no longer running. A still-running service keeps its file, and the report
+  # says so — deleting it would strand a live WebDAV server holding a password
+  # nothing on disk records any more.
+  if [ -f "$unit" ]; then
+    unit_name=$(basename "$unit")
+    if [ "$OS" = "Linux" ]; then
+      if have systemctl; then
+        systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
+        systemctl --user reset-failed "$unit_name" >/dev/null 2>&1 || true
+      else
+        unit_stopped=false; stop_reason="no-supervisor"
+      fi
+    else
+      if have launchctl; then
+        launchctl unload "$unit" >/dev/null 2>&1 || true
+      else
+        unit_stopped=false; stop_reason="no-supervisor"
+      fi
+    fi
+    if $unit_stopped; then
+      case "$(manage_unit_state "$unit")" in
+        active)  unit_stopped=false; stop_reason="still-running" ;;
+        unknown) unit_stopped=false; stop_reason="unprovable" ;;
+      esac
+    fi
+    if $unit_stopped; then
+      rm -f "$unit" 2>/dev/null || true
+      if [ "$OS" = "Linux" ] && have systemctl; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  # A symlink is removed as a LINK — `rm -f` unlinks it and the file it points at
+  # survives, while the `[ -f ]` proof below follows the link, finds nothing, and
+  # would report the password gone. Nothing this script writes is ever a symlink,
+  # so reaching this is somebody's own arrangement; it is named rather than
+  # followed, because chasing a link to delete whatever is on the far end is not a
+  # thing a removal command may do on its own.
+  local l
+  for l in "$credf" "$envf"; do
+    [ -L "$l" ] || continue
+    warn "$l is a symbolic link. I remove the link; the file it points at is not touched,"
+    warn "and it still holds the file-server password."
+  done
+
+  rm -f "$credf" 2>/dev/null || true
+  rm -f "$envf" 2>/dev/null || true
+  rm -f "$pf" 2>/dev/null || true
+
+  # PROVE it, file by file. An `rm` that returned nothing still tells us nothing
+  # about a file another account owns or a read-only mount, and this command's
+  # whole value is that its report can be believed.
+  local still=() still_files=()
+  [ -f "$pf" ]    && { still+=("$pf");    still_files+=("$pf"); }
+  [ -f "$credf" ] && { still+=("$credf"); still_files+=("$credf"); }
+  [ -f "$envf" ]  && { still+=("$envf");  still_files+=("$envf"); }
+  # The unit goes in `still` but NOT in `still_files`: fs_print_teardown takes it
+  # as its first argument and prints the disable/unload block for it, so listing it
+  # again among the plain `rm -f` targets would hand the operator the same deletion
+  # twice — once correctly sequenced, once not.
+  [ -f "$unit" ]  && still+=("$unit")
+
+  if [ ${#still[@]} -eq 0 ]; then
+    # Name only what actually existed. "its profile, its file server, and its
+    # stored password" is a lie on a chat-only setup, and a removal report that
+    # overstates by one clause is one an operator learns to stop reading.
+    local removed="" last="" subject="the saved setup"
+    $had_profile || subject="the leftover file server"
+    $had_profile && last="its profile"
+    $had_unit    && { removed="${removed:+$removed, }$last"; last="its file server"; }
+    { $had_cred || $had_env; } && { removed="${removed:+$removed, }$last"; last="its stored password"; }
+    removed="${removed:+$removed and }$last"
+    ok "Removed $subject \"$id\"${removed:+: $removed}."
+    # Names the two files it removed rather than claiming "both copies are gone".
+    # The absolute claim cannot be made from here: a legacy unnamed unit
+    # (conduck-files.service / ai.gigaduck.conduck-fileserver.plist) can hold the
+    # same RCLONE_PASS and belongs to no id, so nothing addressed by id can speak
+    # for it. manage_leftovers_scan below is what actually looks.
+    if [ "$OS" != "Linux" ] && $had_unit && $had_cred; then
+      note "That removed both copies this id owned — $(basename "$credf") and the copy inside"
+      note "$(basename "$unit")."
+    fi
+    manage_warn_legacy_password_copy
+  else
+    say ""
+    warn "Some of it is still here. I could not remove:"
+    local s
+    for s in "${still[@]}"; do say "    $s"; done
+    # Three different reasons the service file is still there, and they need three
+    # different next moves. Collapsing them into one "could not remove it" is how
+    # an operator with a live file server reads their way past the fact.
+    case "$stop_reason" in
+      no-supervisor)
+        if [ "$OS" = "Linux" ]; then
+          warn "This shell has no 'systemctl', so I did not stop or disable the service and did"
+          warn "not delete its file — deleting an enabled unit leaves systemd in a failed state."
+        else
+          warn "This shell has no 'launchctl', so I did not unload the service and did not delete"
+          warn "its file — the running server would keep the password it already read."
+        fi ;;
+      still-running)
+        warn "I asked the supervisor to stop that file server and it is STILL RUNNING, so I"
+        warn "left its file in place: deleting it now would leave a live WebDAV server over"
+        warn "your agent's folder with nothing on disk left to describe it. Stop it by hand"
+        warn "with the commands below, then re-run --forget $id." ;;
+      unprovable)
+        warn "I could not get an answer about whether that file server is still running, so I"
+        warn "left its file alone rather than delete it on a guess." ;;
+    esac
+    say ""
+    say "  To finish it by hand:"
+    fs_print_teardown "$([ -f "$unit" ] && printf '%s' "$unit")" \
+      ${still_files[@]+"${still_files[@]}"}
+    note "I did not run those commands."
+    # The list above is a list of paths; this says what one of them MEANS. A
+    # surviving .cred, a surviving .env, or — on macOS — a surviving plist each
+    # hold the WebDAV password in cleartext, and "I could not remove three files"
+    # is not a sentence an operator reads as "a live password is still here".
+    local secret_left=false
+    { [ -f "$credf" ] || [ -f "$envf" ]; } && secret_left=true
+    { [ "$OS" != "Linux" ] && [ -f "$unit" ]; } && secret_left=true
+    if $secret_left; then
+      warn "The file-server password is STILL on this disk, in the file(s) listed above — it"
+      warn "opens a WebDAV server over your agent's folder. Until they are gone, treat that"
+      warn "password as live."
+    fi
+    return 1
+  fi
+
+  # The last word is about the device that is not on this machine and that nothing
+  # here can reach. Repeated after the fact, not only before it, because the
+  # operator has just typed an id and read a success line — this is the moment the
+  # remaining action is actually theirs.
+  say ""
+  say "  Still to do, on the paired device: remove this gateway's connection in the"
+  say "  Conduck app. It holds the address and the token, and nothing on this machine"
+  say "  can reach it."
+  note "Your configuration folder is $STATE_DIR — run --list to see what is left."
+  return 0
+}
+
+# A removal addressed by id cannot speak for the two LEGACY unnamed units, which
+# carry no id in their names and which an older setup run could have created for
+# this very gateway — and on macOS such a plist holds the same cleartext
+# RCLONE_PASS as the .cred that was just deleted. So after a clean removal, look,
+# and say plainly that a copy may still be there. Silence here is the one way a
+# successful-looking removal leaves a live password behind.
+manage_warn_legacy_password_copy() {
+  local u legacy_unit=""
+  if [ "$OS" = "Linux" ]; then
+    for u in "${HOME:-}/.config/systemd/user/conduck-files.service" \
+             "${HOME:-}/.config/systemd/user/conduck-fileserver.service"; do
+      [ -f "$u" ] && legacy_unit="$u"
+    done
+  else
+    for u in "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files.plist" \
+             "${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-fileserver.plist"; do
+      [ -f "$u" ] && legacy_unit="$u"
+    done
+  fi
+  [ -n "$legacy_unit" ] || return 0
+  say ""
+  warn "There is also a file server here that carries no gateway id in its name:"
+  note "$legacy_unit"
+  warn "It may be an older service for this same gateway, and on this system such a file"
+  warn "can hold its own cleartext copy of the file-server password. I cannot attribute it"
+  warn "to any id, so I did not touch it. Run --list to see its state and its folder."
+  return 0
+}
+
+# --------------------------------------------------------- terminal refusal --
+
+# Exit 4 is the documented "this action needs an interactive terminal" status.
+# refuse_without_a_terminal is not reused: its copy is about setup ending in a QR
+# code a person scans, which is true of neither editing nor removing — and the
+# scriptable alternative it names is a pair of check commands, when the real answer
+# for a machine that wants to know what is saved here is one flag away.
+manage_refuse_without_a_terminal() { # manage_refuse_without_a_terminal <subject>
+  say ""
+  printf '%sError:%s %s\n' "$RED" "$RESET" "$1 needs a person at a terminal." >&2
+  say "  It asks which setup, asks what to change, and — for a removal — asks you to"
+  say "  type the id back. None of that has a safe unattended answer."
+  say ""
+  say "  ${BOLD}What runs with no terminal at all:${RESET}"
+  say "    bash conduck-connect.sh --list --json"
+  note "One JSON object: every saved setup, where they live, and any file server left"
+  note "running with no setup behind it. It reads only, and prints no secrets."
+  exit 4
+}
+
+# ----------------------------------------------------------- explanations --
+#
+# These live here rather than in the explanation catalogue because explain_prompt
+# resolves a FUNCTION name before it consults the catalogue, and a manage screen
+# that shipped with catalogue ids nobody had written yet would answer `i` with the
+# generic "review the action above" panel — which is exactly the hollow control
+# this release exists to remove.
+
+explain_manage_pick() {
+  say ""
+  say "  ${BOLD}What you are choosing${RESET}"
+  say "  One of the setups this machine has already paired. Every finished setup"
+  say "  leaves a small record of where that gateway lives and how it is reached —"
+  say "  no passwords, just the routing."
+  say ""
+  say "  ${BOLD}What happens next${RESET}"
+  say "  You get a screen for that one setup where you can change a single thing"
+  say "  about it, show its code again, or remove it. Picking does nothing by"
+  say "  itself, and picking the wrong one costs nothing: b goes back."
+  say ""
+}
+
+explain_manage_edit() {
+  say ""
+  say "  ${BOLD}What this screen changes${RESET}"
+  say "  One field of one saved setup, and only what that field affects. Changing"
+  say "  the address re-checks the address; it does not re-run the gateway setup,"
+  say "  touch your tunnel, or restart anything."
+  say ""
+  say "  ${BOLD}Why the app does not update on its own${RESET}"
+  say "  A setup code is a snapshot your device imported once, not a live link. So"
+  say "  when you change something here, the paired device keeps the old value"
+  say "  until it scans a new code — which is what option 4 prints."
+  say ""
+  say "  ${BOLD}Honestly unsure?${RESET}"
+  say "  If the app simply stopped connecting and nothing on this machine changed,"
+  say "  the address is the usual culprit — especially on a Cloudflare quick"
+  say "  tunnel, whose hostname is different after every restart."
+  say ""
+}
+
+# The one prompt in this program whose answer cannot be taken back, so this is the
+# one explanation that is read AFTER a disclosure rather than instead of it: the
+# screen above already lists the exact files, so this says what those files MEAN,
+# what the removal cannot reach, and how to leave without removing anything.
+explain_manage_forget() {
+  say ""
+  say "  ${BOLD}What typing the id does${RESET}"
+  say "  Removes the four things listed above, on this machine, and nothing else:"
+  say "  the saved setup, its file server, its stored password, and its environment"
+  say "  file. Each one is re-read afterwards, and anything still there is reported"
+  say "  as still there, with the command to finish it by hand."
+  say ""
+  say "  ${BOLD}Why you type the id instead of pressing y${RESET}"
+  say "  Enter means No at every other question here, so pressing it in rhythm is"
+  say "  always safe. This is the only step that cannot be undone, and it must not"
+  say "  be reachable by that same reflex — typing the id also says WHICH setup,"
+  say "  which is the mistake that matters on a machine with two of them."
+  say ""
+  say "  ${BOLD}What it cannot reach${RESET}"
+  say "  Your shared folder and everything in it. Your gateway, which keeps running"
+  say "  with the same token. And the pairing already on your phone or Mac — that"
+  say "  device holds this gateway's address and token, and nothing here can talk"
+  say "  to it, so remove the connection in the app too. If a token leaked, rotate"
+  say "  it at the gateway; that is the only thing that revokes it."
+  say ""
+  say "  ${BOLD}Honestly unsure?${RESET}"
+  say "  Press Enter. Nothing is removed, nothing is written, and the setup is"
+  say "  exactly as it was — you can read it again with --list and come back."
+  say ""
+}
+
+explain_manage_address() {
+  say ""
+  say "  ${BOLD}What to type${RESET}"
+  say "  The https:// address that reaches this gateway from outside this machine —"
+  say "  the base address, with no /v1 and no other endpoint on the end. If you run"
+  say "  a Cloudflare quick tunnel, it is the *.trycloudflare.com line cloudflared"
+  say "  prints when it starts."
+  say ""
+  say "  ${BOLD}What it does${RESET}"
+  say "  Sends one request to that address to see whether anything answers, then"
+  say "  saves it. It creates no tunnel and moves no route — it records where the"
+  say "  address already is."
+  say ""
+  say "  ${BOLD}If nothing answers${RESET}"
+  say "  You are still offered the save, because setting the address before the"
+  say "  tunnel is up is a normal order to work in. The check just cannot vouch"
+  say "  for it."
+  say ""
+  say "  ${BOLD}Honestly unsure?${RESET}"
+  say "  Press b. Nothing is saved until you answer this, and the old address keeps"
+  say "  working exactly as well or as badly as it did a minute ago."
+  say ""
+}
+
+explain_manage_show_code() {
+  say ""
+  say "  ${BOLD}What a setup code is${RESET}"
+  say "  A QR square carrying the address, the key and the file settings, so a"
+  say "  device imports the lot in one scan. Treat it like a password: anyone who"
+  say "  photographs it has everything the app has."
+  say ""
+  say "  ${BOLD}Why now${RESET}"
+  say "  You just changed something the paired device cannot learn on its own."
+  say "  Until it scans a new code it keeps using the old value."
+  say ""
+  say "  ${BOLD}What it costs${RESET}"
+  say "  Printing a code re-runs the live checks, which send real requests to your"
+  say "  gateway. On a metered model that spends a little quota. Saying no here"
+  say "  changes nothing — bash conduck-connect.sh --show-code prints it later."
+  say ""
 }
 # ----------------------------------------------------------------------- main --
 
@@ -14220,7 +18543,122 @@ print("%s\t%s" % (u.port or 80, u.path.rstrip("/")))' 2>/dev/null) \
   esac
 
   CHECKED_PATH_PREFIX="$checked_path"
+  # The address as the operator TYPED it, kept for the copy-pasteable re-check line
+  # a declined setup prints. $GW_URL cannot serve that purpose: the local-port branch
+  # above deliberately empties it, so by the time somebody backs out of the exposure
+  # menu the only surviving spelling of "the thing you just graded" is this one.
+  SETUP_FROM_CHECK_URL="$checked_url"
   note "Reusing the checked address and authentication in memory; your token is not saved."
+}
+
+# The two endings that leave a COMPLETED check behind without pairing anything: the
+# offer right after the check, and that same question re-asked when Back walks out
+# of the exposure menu. Both are a deliberate No, so both say the same thing — the
+# check proved something and it is not free to prove again.
+#
+# The re-check line carries the address. The operator's next move is usually to
+# change one thing on the server and grade it again, and rebuilding
+# `--check-server https://…` out of scroll-back is the friction that turns a
+# two-minute retry into a re-read of the whole transcript.
+check_declined_next_steps() { # check_declined_next_steps <server|adapter>
+  local kind="$1" flag="--check-server" url
+  [ "$kind" = "adapter" ] && flag="--check-adapter"
+  url="${SETUP_FROM_CHECK_URL:-${GW_URL:-}}"
+  say ""
+  say "  ${BOLD}What you can do from here${RESET}"
+  say "  Set it up and pair whenever you like:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
+  if [ -n "$url" ]; then
+    say "  Grade this same address again:         ${BOLD}bash conduck-connect.sh $flag $url${RESET}"
+  else
+    say "  Grade an address again:                ${BOLD}bash conduck-connect.sh $flag${RESET}"
+  fi
+  note "Nothing from this check is saved. Setup asks its own questions and sends its own"
+  note "requests, so coming back later costs the same quota this check just spent."
+}
+
+# The last question of a menu-entered action: one more turn at the hub, or done.
+#
+# The status is the ONLY channel out of the subshell menu_hub_loop runs each action
+# in, which is why this exits rather than returning a value somebody has to thread
+# back through six call frames. A run started by flag prints nothing here: MENU_HUB
+# is false, and there is no menu behind it to return to — the operator is standing
+# at the shell prompt they launched from.
+offer_menu_return() {
+  local reply
+  [ "${MENU_HUB:-false}" = "true" ] || return 0
+  interactive_terminal || return 0
+  say ""
+  while true; do
+    read -r -p "  Enter = done; m = back to the menu: " reply || return 0
+    case "$reply" in
+      '')   return 0 ;;
+      [mM]) exit "${MENU_RETURN_STATUS:-20}" ;;
+      *)    warn "Press Enter to finish, or m to go back to the menu." ;;
+    esac
+  done
+}
+
+# Can anybody answer a question in this run?
+#
+# NOT the same question as interactive_terminal, and the difference is the whole
+# point: piping answers into --setup is a supported way to drive it (the test
+# suites do exactly that), so "stdin is not a tty" must not by itself refuse a run
+# that is about to be answered perfectly well. Two things do prove nobody is there:
+# CI declares itself a machine, and a stdin that is a character device while not
+# being a terminal is /dev/null — a stream that will never deliver a byte, no
+# matter how long the wizard waits.
+# Anything else — a pipe, a file, a here-doc — may be carrying answers, so it is
+# allowed through and fails, if it fails at all, at the prompt that runs dry.
+nobody_can_answer() {
+  case "${CI:-}" in 1|true|TRUE|yes|YES) return 0 ;; esac
+  [ -t 0 ] && return 1
+  [ -c /dev/stdin ] 2>/dev/null && return 0
+  return 1
+}
+
+# Exit 4 — "this action requires an interactive terminal" — is a documented status
+# in --help and in the file header, and a documented status nothing emits is worse
+# than an undocumented one: it tells a wrapper author to write a branch that never
+# runs. Setup asks questions and ends in a QR code somebody points a phone at, so
+# there is no version of it a machine finishes.
+#
+# The refusal names what IS scriptable rather than stopping at "no". A driver that
+# reaches this line wants an answer about a gateway, and three of this tool's
+# commands give one with no terminal at all.
+#
+# The reason a machine cannot finish is a PARAMETER, because the commands that
+# refuse do not all refuse for the same reason and a wrong reason is worse than a
+# terse one: setup and the menu end in a code somebody scans with a phone, while
+# --edit and --forget end in a question about a specific saved setup that only a
+# person can answer. Passing no reason keeps the wizard's wording, which is what
+# the two original callers want.
+refuse_without_a_terminal() { # refuse_without_a_terminal <subject> [reason-line …]
+  local subject="$1" line
+  shift
+  say ""
+  printf '%sError:%s %s\n' "$RED" "$RESET" "$subject needs a person at a terminal." >&2
+  if [ "$#" -gt 0 ]; then
+    for line in "$@"; do say "  $line"; done
+  else
+    say "  There are questions to answer, and setup ends in a setup code somebody scans"
+    say "  with the Conduck app on a phone, or pastes into the Mac app — so there is no"
+    say "  point in this run at which a machine could finish it."
+  fi
+  say ""
+  say "  ${BOLD}What runs with no terminal at all:${RESET}"
+  say "    CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-server https://ai.example.com"
+  say "    CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-adapter https://ai.example.com"
+  note "Both end in one machine-readable summary line and never wait for an answer."
+  note "CONDUCK_TOKEN keeps the bearer token out of argv and shell history; drop it for"
+  note "a gateway with no key."
+  say ""
+  say "    bash conduck-connect.sh --list --json"
+  note "Reports the setups this machine has already saved, and asks nothing. It is the"
+  note "way to find the id that --edit and --forget want."
+  say ""
+  say "  From a terminal, to see every change setup would make and make none of them:"
+  say "    ${BOLD}bash conduck-connect.sh --setup --dry-run${RESET}"
+  exit 4
 }
 
 # The gateway identity for a check → setup handoff, asked under the setup lock.
@@ -14246,10 +18684,18 @@ resolve_setup_from_check_identity() {
       GW_MODEL="$checked_model"
       return 0
     fi
+    # The action-id is what makes `i` answer THIS question rather than the generic
+    # panel: the name is the label the app shows in its gateway list, it is not the
+    # gateway's address and it is not a secret, and gateway.display_name is the one
+    # place that is written down. prompt_into rather than $(…) so that q here stops
+    # the run in this shell — inside $(…) it would kill only the subshell and the
+    # wizard would walk on with the literal answer as the gateway's name.
     if [ "$SETUP_FROM_CHECK_KIND" = "adapter" ]; then
-      GW_NAME=$(ask "  A short name for this adapter (shown in the app)" "My Conduck adapter")
+      prompt_into GW_NAME ask "  A short name for this adapter (shown in the app)" \
+        "My Conduck adapter" "" "gateway.display_name"
     else
-      GW_NAME=$(ask "  A short name for this server (shown in the app)" "My gateway")
+      prompt_into GW_NAME ask "  A short name for this server (shown in the app)" \
+        "My gateway" "" "gateway.display_name"
     fi
     GW_ID="custom-$(slug "$GW_NAME")"; [ "$GW_ID" = "custom-" ] && GW_ID="custom-gateway"
     gateway_id_is_taken "$GW_ID" || return 0
@@ -14267,6 +18713,10 @@ apply_checked_path_prefix() {
 }
 
 run_setup() {
+  # Before the banner, because a refusal that arrives four screens into a wizard
+  # nobody is reading is a worse refusal. A check that handed off has already
+  # cleared interactive_terminal, so this only ever fires on a direct --setup.
+  nobody_can_answer && refuse_without_a_terminal "Setup"
   say "${BOLD}conduck-connect $VERSION${RESET} — pair your self-hosted AI gateway with Conduck."
   if $LEGACY_GENERIC; then
     warn "--generic is the older name for custom-server setup. Continuing with custom-server setup."
@@ -14309,13 +18759,29 @@ run_setup() {
     # Under the lock, and before any port is picked or unit written: which saved
     # gateway is this, or is it a new one?
     resolve_setup_from_check_identity
-    choose_exposure
-    local exposure_rc=$?
-    if [ "$exposure_rc" = "10" ]; then
-      note "Setup stopped. The completed check changed nothing on your server."
-      exit 0
-    fi
-    [ "$exposure_rc" = "0" ] || exit "$exposure_rc"
+    # Back at the exposure menu returns to the OFFER that started this setup, not
+    # to the shell. The check that got here sent real chat requests — quota spent,
+    # a message in somebody's provider history — and its result is still in memory,
+    # so ending the process throws away something that costs money to reproduce.
+    # The identity question stays outside the loop: it was answered under the lock
+    # and nothing about going back to the exposure menu unanswers it.
+    local exposure_rc
+    while true; do
+      choose_exposure && break
+      exposure_rc=$?
+      [ "$exposure_rc" = "10" ] || exit "$exposure_rc"
+      say ""
+      # The same question as the offer that started this setup, so a No here means
+      # exactly what a No there meant: the check was the whole errand. It leaves by
+      # the same ending and the same exit status, because a wrapper cannot be asked
+      # to tell two spellings of one decision apart.
+      if ! confirm "  Continue with setup and pairing after all?" "check.continue_setup"; then
+        note "Setup stopped. The completed check changed nothing on your server."
+        check_declined_next_steps "$SETUP_FROM_CHECK_KIND"
+        offer_menu_return
+        exit 0
+      fi
+    done
     apply_checked_path_prefix
   else
     # Gateway selection → configure → transport, looped so the transport menu's
@@ -14348,6 +18814,9 @@ run_setup() {
   hermes_recall_post_file_lane_step
   if $DRY_RUN; then
     print_plan
+    # A plan is a decision aid, so the hub is exactly where its reader wants to be
+    # next: they came to look before committing, and the commit is one menu item away.
+    offer_menu_return
     exit 0
   fi
 
@@ -14376,8 +18845,14 @@ finish_successful_check() { # finish_successful_check <server|adapter>
   trap on_exit EXIT
 
   say ""
+  # The highest-traffic ending in the whole check path: the default is No, and Enter
+  # is what a reader presses at a [y/N] after ten green lines. It used to be the
+  # quietest ending too — while the machine that will never read it was handed the
+  # "To set it up later" line one screen earlier, gated on NOT being interactive.
   if ! confirm "  Would you like to continue with setup and pairing?" "check.continue_setup"; then
     note "Check complete. No setup changes were made."
+    check_declined_next_steps "$kind"
+    offer_menu_return
     exit 0
   fi
 
@@ -14396,30 +18871,108 @@ finish_successful_check() { # finish_successful_check <server|adapter>
   run_setup
 }
 
+# Every action, in ONE place, reached identically by a flag and by the welcome
+# menu. It is a function because the menu is a hub: menu_hub_loop runs it in a
+# subshell so that each action's `exit` becomes a status the loop can read, and so
+# that the next action starts from the globals the script was launched with rather
+# than a half-filled draft an abandoned setup left behind.
+#
+# Nothing in here knows which entry it came from. That is deliberate — the moment a
+# command has to ask "was I chosen from the menu?", the menu stops being a way to
+# reach the same program and becomes a second one. The manage commands hold that
+# line too: their id comes from $MANAGE_ID, which validate_cli fills from argv, and
+# a menu-entered one simply finds it empty and asks.
+dispatch_menu_command() {
+  local rc=0
+  case "$COMMAND" in
+    check-adapter)
+      run_doctor
+      finish_successful_check "adapter"
+      ;;
+    check-server)
+      run_compat
+      finish_successful_check "server"
+      ;;
+    show-code)
+      preflight
+      say "${BOLD}conduck-connect $VERSION${RESET} — re-show a saved setup code."
+      note "(changes no configuration; live gateway checks run, and a configured file lane gets one small PUT → GET → DELETE probe)"
+      run_show_qr
+      offer_menu_return
+      exit 0
+      ;;
+    setup)
+      preflight
+      run_setup
+      offer_menu_return
+      ;;
+    # The three manage commands. Each ends at offer_menu_return, so a run that came
+    # from the hub can go straight back to it — somebody who has just read their
+    # inventory almost always wants to act on one line of it, and a tool that exits
+    # after answering makes them start the program again to do so.
+    list)
+      # --list is scriptable and must answer with stdin closed, so it neither calls
+      # nobody_can_answer nor asks anything. It also skips preflight: that gate
+      # demands curl and openssl, which the wizard needs to mint credentials and
+      # probe a gateway, and a command that only reads files on this disk has no
+      # business refusing to run on a host without them. python3 is the one it
+      # genuinely cannot do without — the saved profiles are JSON.
+      need python3 || die "--list reads the saved setups with python3, and this host doesn't have it."
+      manage_list
+      offer_menu_return
+      exit 0
+      ;;
+    edit)
+      # Exit 4, not a prompt that reads EOF and guesses: an edit re-asks ONE value
+      # and then re-verifies against a live gateway, so a driver that reached here
+      # without a person would be answering a question about which saved setup to
+      # change — and the wrong answer rewrites a working pairing.
+      nobody_can_answer && refuse_without_a_terminal "Changing a saved setup" \
+        "It asks what the new value should be — and, with no id, which saved setup you" \
+        "mean — then rewrites and re-verifies only what that changed. There is no" \
+        "version of it a machine can finish safely."
+      preflight
+      # No id means "ask me", which is the shape of the ABI rather than an accident:
+      # passing an empty string as an id would make the manage module tell the two
+      # cases apart by inspecting a value, and this way it never has to.
+      if [ -n "$MANAGE_ID" ]; then manage_edit "$MANAGE_ID" || rc=$?
+      else manage_edit || rc=$?; fi
+      offer_menu_return
+      exit "$rc"
+      ;;
+    forget)
+      nobody_can_answer && refuse_without_a_terminal "Removing a saved setup" \
+        "Removal is the one thing here that cannot be undone, and it is confirmed by" \
+        "typing the id — deliberately not by pressing Enter — so it never completes" \
+        "without a person deciding."
+      # preflight would demand curl and openssl here. Removal sends no request and
+      # mints no credential, and refusing to clean up a machine because it lacks the
+      # tools for setting one up is exactly the dead end this command exists to end.
+      need python3 || die "--forget reads the saved setup with python3 to know what to stop, and this host doesn't have it."
+      # The status comes straight back out: 0 removed, 1 refused or no such setup,
+      # 3 the operator backed out. Those are already this tool's contract for
+      # success / runtime failure / stopped by the operator, which is why the manage
+      # ABI was written to those three numbers rather than to its own.
+      manage_forget "$MANAGE_ID" || rc=$?
+      offer_menu_return
+      exit "$rc"
+      ;;
+  esac
+}
+
+# The menu is a HUB: menu_hub_loop draws it, dispatches, and draws it again, so a
+# wrong turn costs one action instead of the session. It returns only when the
+# operator chooses to leave, and the two lines below then run exactly as they do
+# for a flag-entered run — q at the welcome menu is a completed choice and still
+# exits 0.
 if [ "$COMMAND" = "menu" ]; then
-  choose_main_action
+  # Same refusal as --setup, one screen earlier: a menu nobody can answer is the
+  # same dead end as a wizard nobody can answer, and "No answer (the input ended)"
+  # at exit 1 tells a driver neither what went wrong nor what it could have run.
+  nobody_can_answer && refuse_without_a_terminal "The welcome menu"
+  menu_hub_loop
 fi
 validate_cli
 [ "$COMMAND" = "exit" ] && { note "Nothing changed."; exit 0; }
 
-case "$COMMAND" in
-  check-adapter)
-    run_doctor
-    finish_successful_check "adapter"
-    ;;
-  check-server)
-    run_compat
-    finish_successful_check "server"
-    ;;
-  show-code)
-    preflight
-    say "${BOLD}conduck-connect $VERSION${RESET} — re-show a saved setup code."
-    note "(changes no configuration; live gateway checks run, and a configured file lane gets one small PUT → GET → DELETE probe)"
-    run_show_qr
-    exit 0
-    ;;
-  setup)
-    preflight
-    run_setup
-    ;;
-esac
+dispatch_menu_command

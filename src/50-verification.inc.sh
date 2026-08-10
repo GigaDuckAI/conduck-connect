@@ -28,7 +28,7 @@ check() { # check "label" <command...>  (command's exit code decides)
 # The bearer token rides a stdin curl config, never argv (argv shows in `ps`).
 curl_gw() { # curl_gw <curl args…>
   local extra=()
-  # `-q` MUST be curl's first arg. Every connector request ignores curl config,
+  # `-q` MUST be curl's first arg. Every request this script makes ignores curl config,
   # so a stray `proxy`/`output`/redirect/include line there can neither reroute
   # a secret nor make curl read/write files absent from our effects manifest.
   # Diagnostics additionally refuse ALL proxy environment variables because
@@ -664,6 +664,13 @@ agent_file_lane_gate() {
 
 verify_all() {
   head_ "Step 5 — verify (real requests, before you touch your phone)"
+  # The only place in the whole tool that says verification is not free: it spends
+  # a little provider quota and the test message can land in a server's own
+  # history. Printed HERE rather than at either caller because both --setup and
+  # --show-code arrive through this function, and one copy cannot drift from the
+  # other. It prints unconditionally — the cost is incurred on every path, so a
+  # gate would only hide it from somebody.
+  explain_live_verification
   # Proof belongs to THIS run's measurements. Cleared here rather than only at
   # declaration so a second verify_all in one process — a re-check, a test, a
   # future menu loop — can never inherit a green claim from an earlier lane.

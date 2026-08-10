@@ -137,6 +137,39 @@ doctor_not_yours_hint() {
   say "  wrong. Ask the question you actually have instead:"
   say "    ${BOLD}bash conduck-connect.sh --check-server${RESET}   — can the app talk to this server?"
   say "    ${BOLD}bash conduck-connect.sh --setup${RESET}          — pair it; a failed grade here doesn't block that"
+  # This hint prints on a scripted FAIL too, and the second command is the one a
+  # machine cannot finish. Naming the blocker in that case keeps a build loop from
+  # following the line into an exit 1 it would report as a broken pairing. Only
+  # the extra sentence is conditional — the two commands stay put for everyone, so
+  # a human reader sees exactly what they saw before.
+  interactive_terminal \
+    || say "  That last one needs a person: it ends in a QR code someone scans with a phone."
+}
+
+# What to do with a green check — said differently to the two readers who get one.
+# Shared by both check commands, because both used to end a passing run with the
+# same unqualified line and both have the same two audiences.
+#
+# An interactive operator is about to be asked "continue with setup and pairing?"
+# and can simply answer yes; the command is here for the one who answers no.
+#
+# A machine gets the blocker instead of the command. Handed `--setup` unqualified,
+# a scripted run follows it — that is what a scripted run is for — and exits 1 on
+# a message about stdin, so its transcript reads green check, instruction,
+# failure, and it reports a pairing as broken when nothing is. "Run me from a
+# terminal" states a fact about stdin, not the reason: setup ENDS in a QR code
+# that a person scans with the Conduck app on a phone, and no answer a machine can
+# supply finishes that. Naming the real blocker, and naming who to hand the
+# command to, is the difference between a dead end and a handover.
+check_setup_next_step() {
+  if interactive_terminal; then
+    say "  To set it up later:  ${BOLD}bash conduck-connect.sh --setup${RESET}"
+    return 0
+  fi
+  say "  ${BOLD}Setup needs a person, not a script.${RESET} It ends by showing a QR code that someone"
+  say "  scans with the Conduck app on a phone, so there is no answer a machine can give that"
+  say "  finishes it — a scripted run stops at the first question. Hand your operator:"
+  say "      ${BOLD}bash conduck-connect.sh --setup${RESET}"
 }
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
@@ -232,13 +265,42 @@ doctor_accept_url() { # doctor_accept_url <candidate>
   printf 'http://%s' "$rest"; return 0
 }
 
-doctor_ask_url() {  # -> echoes the URL ($()-captured: every human line to stderr)
-  local reply url
+# The address prompt shared by both check commands. It honours the same prompt
+# contract as the primitives in 10-utilities (rc 0 = the URL is on stdout, 11 =
+# the operator pressed q, 1 = the input ended), because both call sites capture it
+# with $(…) and a `q` acted on inside that subshell would kill the subshell only.
+# Callers should reach it through prompt_into, which turns 11 into quit_run in the
+# parent shell.
+#
+# The argument is what `i` shows. Both commands pass their own opening block by
+# FUNCTION NAME — explain_prompt resolves a function before it consults the
+# explanation catalogue — because the block that says what this command wants an
+# address for is the same block that opened the command, and someone pressing i
+# here has scrolled past it.
+#
+# Back is not offered: this is the first question either check asks, so there is
+# no earlier answer to return to. `b` is still intercepted rather than validated
+# as an address — nothing that fails the https test can be a legal answer here, so
+# the letter is unambiguous, and the refusal names the keys that do work. That
+# mirrors ask_url, whose wording this reuses verbatim.
+doctor_ask_url() {  # doctor_ask_url [action-id | help-fn] -> URL on stdout (every human line to stderr)
+  local action="${1:-}" reply url p
   say "  Where is the server? Its base address, without any /v1 tail (I strip that myself)." >&2
   say "  Plain http:// is fine toward this machine (127.0.0.1/localhost) — test locally first," >&2
   say "  expose over HTTPS after." >&2
+  p="  URL (e.g. http://127.0.0.1:8080; $(control_suffix "ask again" false)) > "
   while true; do
-    read -r -p "  URL (e.g. http://127.0.0.1:8080; Enter = no default) > " reply || return 1   # EOF: caller dies
+    prompt_echo "$p"
+    read -r -p "$p" reply || return 1   # EOF: the caller reports it
+    case "$reply" in
+      [iI]) explain_prompt "$action" >&2; continue ;;
+      [qQ]) return 11 ;;
+      [bB]) warn "Back is not available at this step; type an https:// URL, i for an explanation, or q to stop." >&2
+            continue ;;
+      # Enter is an advertised no-op here, so it re-asks without being told off:
+      # pausing at a question with no default is not a mistake.
+      '') note "Nothing entered — the server's address goes on this line." >&2; continue ;;
+    esac
     if url=$(doctor_accept_url "$reply"); then
       printf '  %s→ testing %s%s\n' "$DIM" "$url" "$RESET" >&2
       printf '%s' "$url"; return 0

@@ -120,6 +120,32 @@ secure_owned_file_mode() { return 0; }
 eval "$(sed -n '/^file_mode_is_open()/,/^}/p;/^ensure_state_dir()/,/^}/p' "$ROOT/src/10-utilities.inc.sh")"
 declare -F ensure_state_dir >/dev/null || { echo "could not lift ensure_state_dir out of src/10-utilities.inc.sh" >&2; exit 2; }
 
+# The prompt contract's caller side, and the three pieces of it the file lane
+# touches. These are LIFTED, not stubbed, because two of them decide control flow
+# the cases below assert on.
+#
+#   prompt_into   the only place `q` can stop the run. Every value primitive is
+#                 read with $(…), so an answer has to come back on stdout and an
+#                 INTENT has to come back on the exit status; acting on `q` inside
+#                 that subshell would kill the subshell and let the wizard walk on.
+#                 Leaving it undefined is not a smaller runtime, it is a HANG:
+#                 setup_file_lane's folder loop assigns nothing, re-asks, and
+#                 spins forever inside a command substitution that swallows the
+#                 output — the shape that ended Wave 2's run in xrealloc.
+#   control_suffix / prompt_echo   what fs_ask_shared_folder renders its question
+#                 with, and how that question reaches a driver that is not a
+#                 terminal. Stubbed, the prompt silently loses its "Enter = …;
+#                 i = explain; q = stop" suffix and nothing here would notice.
+eval "$(sed -n '/^prompt_into()/,/^}/p;/^control_keys()/,/^}/p;/^control_suffix()/,/^}/p;/^prompt_echo()/,/^}/p' "$ROOT/src/10-utilities.inc.sh")"
+for lifted in prompt_into control_keys control_suffix prompt_echo; do
+  declare -F "$lifted" >/dev/null \
+    || { echo "could not lift $lifted out of src/10-utilities.inc.sh" >&2; exit 2; }
+done
+# prompt_into's EOF arm is `die "$NO_ANSWER"`, and this suite runs under `set -u`:
+# without the string, the one path meant to end in a readable refusal ends in an
+# unbound-variable abort instead. The shipped wording, so a case can grep it.
+NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask you questions."
+
 # shellcheck source=src/40-file-lane.inc.sh
 source "$ROOT/src/40-file-lane.inc.sh"
 # shellcheck source=src/41-agent-file-readiness.inc.sh
@@ -137,10 +163,17 @@ FS_UNIT_ACTIVE_IMPL=$(declare -f fs_unit_active)
 # would re-initialise the GW_* globals this suite sets above (GW_ID in
 # particular), which is why only these are taken. Each declare guard turns a
 # rename into a loud build failure instead of a silently skipped test.
-# hermes_api_server_port comes along because configure_hermes calls it.
-eval "$(sed -n '/^hermes_api_server_port()/,/^}/p;/^configure_hermes()/,/^}/p;/^hermes_settings_match_url()/,/^}/p;/^hermes_recall_checked_handoff_step()/,/^}/p;/^hermes_recall_post_file_lane_step()/,/^}/p' "$ROOT/src/20-gateway.inc.sh")"
+# hermes_api_server_port comes along because configure_hermes calls it, and
+# gw_guard_single_saved_setup because Step 2 opens with it: "hermes" is a fixed id,
+# so a second run replaces the saved setup of the first, and the gate says so before
+# anything is read or changed. It is lifted rather than stubbed because it is a gate
+# — it can end the run — and because it costs nothing here: no case in this file
+# writes a profile-hermes.json, so the real body returns 0 on its first line, and a
+# case that DOES write one gets the question the wizard would really ask.
+eval "$(sed -n '/^hermes_api_server_port()/,/^}/p;/^configure_hermes()/,/^}/p;/^hermes_settings_match_url()/,/^}/p;/^hermes_recall_checked_handoff_step()/,/^}/p;/^hermes_recall_post_file_lane_step()/,/^}/p;/^gw_guard_single_saved_setup()/,/^}/p' "$ROOT/src/20-gateway.inc.sh")"
 for lifted in configure_hermes hermes_api_server_port hermes_settings_match_url \
-              hermes_recall_checked_handoff_step hermes_recall_post_file_lane_step; do
+              hermes_recall_checked_handoff_step hermes_recall_post_file_lane_step \
+              gw_guard_single_saved_setup; do
   declare -F "$lifted" >/dev/null \
     || { echo "could not lift $lifted out of src/20-gateway.inc.sh" >&2; exit 2; }
 done
@@ -4202,13 +4235,89 @@ test_shared_folder_prompt() {
     *) fail "folder prompt reaches the shared-folder explanation" "$out" ;; esac
   unset -f explain_prompt
 
-  # Handed BACK, never acted on: quit_run inside the caller's $( ) would stop the
-  # subshell and let the run continue past a stop the operator asked for.
-  out=$(printf 'q\n' | fs_ask_shared_folder 2>/dev/null)
-  expect_eq "folder prompt hands 'q' back to the caller" "$out" "q"
+  # The prompt contract, at the one prompt whose answer is free text. `q` is
+  # handed BACK on the exit status and NOTHING is written to stdout — a literal
+  # "q" on stdout cannot carry the intent, because "q" is also an answer somebody
+  # could legitimately type, and the caller reads stdout as the value. Acting on
+  # it here instead would be worse still: this function always runs inside the
+  # caller's $( ), where a quit_run stops the subshell and lets the run walk on.
+  rc=0
+  out=$(printf 'q\n' | fs_ask_shared_folder 2>/dev/null) || rc=$?
+  expect_eq "folder prompt answers 'q' with the contract's stop status" "$rc" "11"
+  expect_eq "folder prompt writes no value when the answer was a control key" "$out" ""
 
+  rc=0
   fs_ask_shared_folder </dev/null >/dev/null 2>&1 || rc=$?
   expect_eq "folder prompt reports a closed stdin instead of spinning" "$rc" "1"
+
+  # The prompt states its own controls, like every other prompt in the tool. This
+  # is the assertion that would have caught an unlifted control_suffix: without it
+  # the question renders with an empty parenthesis and nothing else here notices.
+  out=$(printf '/srv/agent-files\n' | fs_ask_shared_folder 2>&1 >/dev/null)
+  case "$out" in *"Enter = ask again; i = explain; q = stop"*)
+      pass "folder prompt advertises the controls it honours" ;;
+    *) fail "folder prompt advertises the controls it honours" "$out" ;; esac
+  # Back is deliberately NOT advertised here — the gate that would receive it is
+  # asked only where a default exists, and having no default is the whole reason
+  # this prompt is reached. A prompt that took a key it never offered is the same
+  # defect the contract exists to prevent, pointing the other way.
+  case "$out" in *"b = back"*)
+      fail "folder prompt does not offer a Back it cannot honour" "$out" ;;
+    *) pass "folder prompt does not offer a Back it cannot honour" ;; esac
+}
+
+# Why prompt_into exists, proved in the shell where it matters.
+#
+# The primitives are all read with $(…). A `quit_run` fired from inside that
+# command substitution stops the SUBSHELL and returns to a caller that carries on
+# with an empty answer — a stop the operator asked for, silently ignored. So the
+# stop is carried out by prompt_into, which runs in the CALLER's shell. Three
+# shells are in play and the claim is about the middle one:
+#
+#   this suite
+#   └─ out=$( … )                    the transcript being graded
+#      └─ pipeline right-hand side   ← prompt_into's caller. The stop lands HERE.
+#         └─ $("$@") inside prompt_into   ← where the primitive actually reads
+#
+# Asserting only "the marker is somewhere in the transcript" would be weaker than
+# it looks: the marker does not say which shell printed it. So the case pins the
+# STATUS that escapes the caller as well. quit_run is overridden here to exit 3 —
+# the shipped status, so the number is not invented — and 3 can only reach the
+# outer capture by leaving the caller. A quit_run fired one level deeper would be
+# swallowed by the inner substitution, prompt_into would read 3 instead of 11,
+# take its EOF path, and the caller would print WALKED ON and leave 0.
+#
+# It also guards the lift. With prompt_into missing this case fails loudly instead
+# of taking the whole suite down in an unbounded loop three cases later.
+test_folder_prompt_quit_reaches_its_caller() {
+  local out rc=0
+  out=$(printf 'q\n' | {
+          quit_run() { printf '[quit]\n'; exit 3; }
+          FOLDER_ANSWER="untouched"
+          prompt_into FOLDER_ANSWER fs_ask_shared_folder
+          printf 'WALKED ON folder=%s\n' "$FOLDER_ANSWER"
+        } 2>/dev/null) || rc=$?
+  expect_eq "q at the folder prompt leaves prompt_into's caller with the stop status" "$rc" "3"
+  case "$out" in *"[quit]"*)
+      pass "q at the folder prompt reaches quit_run" ;;
+    *) fail "q at the folder prompt reaches quit_run" "$out" ;; esac
+  case "$out" in *"WALKED ON"*)
+      fail "q at the folder prompt stops the run instead of returning an empty answer" "$out" ;;
+    *) pass "q at the folder prompt stops the run instead of returning an empty answer" ;; esac
+
+  # The same helper's other job, and the reason it takes a variable NAME rather
+  # than handing the value back on stdout: an ordinary answer has to be assigned
+  # in the caller's shell, where the rest of the step can see it.
+  rc=0
+  out=$(printf '/srv/agent-files\n' | {
+          FOLDER_ANSWER=""
+          prompt_into FOLDER_ANSWER fs_ask_shared_folder
+          printf 'folder=%s\n' "$FOLDER_ANSWER"
+        } 2>/dev/null) || rc=$?
+  expect_eq "an ordinary answer leaves the caller running" "$rc" "0"
+  case "$out" in *"folder=/srv/agent-files"*)
+      pass "an ordinary answer is assigned in the caller's shell" ;;
+    *) fail "an ordinary answer is assigned in the caller's shell" "$out" ;; esac
 }
 
 test_shared_folder_gate() {
@@ -4373,7 +4482,7 @@ test_new_lane_folder_recording() {
 #
 # The measured bug: an operator answered y to "Set it up?", the wizard found and
 # byte-verified their existing file server, and then a paste that did not land
-# left the address prompt blank. That shipped a pairing code with no file lane —
+# left the address prompt blank. That shipped a setup code with no file lane —
 # discovered on the phone, and recoverable only by a FULL re-run, because
 # --show-code can re-emit a saved lane but cannot invent one. A fumbled paste, a
 # stray Enter and a deliberate skip all arrived as the same empty string.
@@ -5968,6 +6077,46 @@ test_hermes_lane_pdf_notes() {
   HOME="$saved_home"
 }
 
+# ============================================== the undefined-lift tripwire ==
+#
+# This harness builds a minimal runtime: it `source`s four modules and LIFTS a
+# named handful of functions out of three others. When shipped code grows a call
+# to a helper nobody added to a lift list, that call is not an error anybody sees.
+# It is rc 127 with no output — and because almost every harness here runs its
+# subject inside `$( … 2>&1 )`, the shell's "command not found" lands in a
+# captured variable rather than on the screen. The assertion after it then passes
+# or fails for no reason at all: a green that proves nothing. In the worst case it
+# is not even that — an unassigned loop variable spins forever and the run ends in
+# xrealloc, which is exactly how `prompt_into` took this suite down in Wave 2.
+#
+# So the omission is written down. Every function defined in src/ that this shell
+# does NOT define gets a stub that records its own name and returns 127 — byte for
+# byte what the missing function already did, so nothing about the run changes
+# except that the gap becomes visible. A case that stubs a function itself shadows
+# this one, which is the right reading: there, it IS defined.
+UNDEFINED_LIFTS="$TMP/undefined-lifts"
+: > "$UNDEFINED_LIFTS"
+install_lift_tripwire() {
+  local fn
+  for fn in $(sed -n 's/^\([a-z_][A-Za-z0-9_]*\)().*/\1/p' "$ROOT"/src/*.inc.sh | sort -u); do
+    declare -F "$fn" >/dev/null && continue
+    eval "$fn() { printf '%s\n' '$fn' >> '$UNDEFINED_LIFTS'; return 127; }"
+  done
+}
+install_lift_tripwire
+
+report_undefined_lifts() {
+  local names
+  names=$(sort -u "$UNDEFINED_LIFTS" | tr '\n' ' ')
+  names="${names% }"
+  if [ -n "$names" ]; then
+    fail "harness: the lifted code calls nothing this runtime lacks" \
+      "called but never lifted (add to a lift list, or stub deliberately): $names"
+  else
+    pass "harness: the lifted code calls nothing this runtime lacks"
+  fi
+}
+
 printf 'file-lane readiness regressions — source modules + loopback fixtures\n'
 test_gateway_restart_wait
 test_restart_timing_note
@@ -6011,6 +6160,7 @@ test_request_credential_controls
 test_show_code_live_folder
 test_pairing_capability_summary
 test_shared_folder_prompt
+test_folder_prompt_quit_reaches_its_caller
 test_shared_folder_gate
 test_new_lane_folder_recording
 test_file_lane_blank_address_confirm
@@ -6019,6 +6169,7 @@ test_lane_residue_report
 test_inactive_unit_report
 test_probe_write_failure_wording
 test_403_loopback_probe
+report_undefined_lifts   # last: it grades everything the cases above ran
 
 printf '\nFILE READY RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ] || exit 1

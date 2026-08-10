@@ -16,7 +16,7 @@
 # never lets an absent one read as coverage.
 #
 # Two cases, same served dir shape as the app, OS-assigned ports, a per-run
-# random credential, HOME isolated so no real pairing profile is consulted:
+# random credential, HOME isolated so no saved setup on this machine is consulted:
 #   default    rclone's default dir-cache-time (5m) → a file written straight
 #              to disk stays invisible over WebDAV → FILES_READ_FRESH FAILs
 #              (and the immediate agent-output probe → FILE_E2E FAILs): the
@@ -64,7 +64,7 @@ SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=[0-9]+\.[0-9]+ 
 
 PASS=0; FAIL=0
 # The dumped file is an argument, not always doctor.out: a case that dies before
-# the connector ever runs has no doctor.out, and `sed` on a missing path printed
+# conduck-connect ever runs has no doctor.out, and `sed` on a missing path printed
 # its own error instead of the log that would explain the failure.
 fail_case() { # fail_case <label> <why> [log-file…]
   FAIL=$((FAIL+1)); printf 'INTEG ✗ %s — %s\n' "$1" "$2"; shift 2

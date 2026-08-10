@@ -48,6 +48,14 @@ Modes ("good" behavior unless listed):
     chat-redirect-308    chat redirects to a valid final chat route
     require-accept       authenticated routes require Accept: application/json
     require-model        400 when the request has no "model" field
+    model-less-500       500 when the request has no "model" field, 200 with one.
+                         A model-less turn CAN fail for a reason that has nothing
+                         to do with the model, and --check-server's chat verdict
+                         forks on exactly that: only 400/404/413/422 may be read
+                         as "this server requires a model" (PASS). Everything else
+                         is a real fault the app would hit too (FAIL). No other
+                         mode produces that middle branch, so it was the one arm
+                         of a two-way split that had never been driven end to end.
     require-long-model   same, but its only advertised model id is over 100
                          characters (opaque ids must survive pairing exactly)
     require-model-reject-history  requires a model AND 400s an EARLIER-message
@@ -569,6 +577,29 @@ def make_handler(mode, token, models):
             model = req.get("model")
             if mode in REQUIRE_MODEL_MODES and model is None:
                 return self.err(400, "model is required.")
+            # The middle branch of --check-server's three-way chat verdict, and
+            # the only one no other mode can produce.
+            #
+            # The checker sends one turn WITHOUT a "model" field (the app's
+            # default shape) and, if that fails, one WITH a named model. When the
+            # named turn succeeds, the model-less status decides between two very
+            # different verdicts:
+            #
+            #   400 / 404 / 413 / 422  -> PASS, "this server REQUIRES the model
+            #                             field" — a configuration fact, not a
+            #                             fault.
+            #   anything else          -> FAIL, "the model-named turn worked, but
+            #                             this failure isn't the missing-model
+            #                             kind" — a transient 5xx or a 429 that
+            #                             happened to clear by the second turn
+            #                             must never be read as "needs a model".
+            #
+            # Reading a flaky server as a model-requiring one is the expensive
+            # mistake here: the operator is told to configure a model in the app,
+            # does it, and the intermittent fault is still there with its only
+            # diagnosis now spent. So: 500 without a model, 200 with one.
+            if mode == "model-less-500" and model is None:
+                return self.err(500, "Upstream engine is unavailable.")
             if model is not None and model not in models:
                 ignore = (mode == "bogus-model-200"
                           or (mode == "single-model" and len(models) == 1))

@@ -20,7 +20,7 @@ FS_ROLLBACK_INCOMPLETE=false  # a file-lane exposure we applied could not be pro
 # PUBLIC Funnel in front of a tool-capable agent — while the only record of who
 # opened it dies with the shell, so no later run can find it. $STATE_DIR is the
 # sanctioned home for this class of data and is created only by ensure_state_dir.
-EXPOSURE_RECORD_VERSION=1
+EXPOSURE_RECORD_VERSION=2
 EXPOSURE_RUN_TAG=""            # per-run, so a whole-run purge only drops THIS run's files
 EXPOSURE_RECORD_SEQ=0          # zero-padded into the name, so restore order is recoverable
 EXPOSURE_RECORD_WARNED=false   # an unusable record is named once, and kept
@@ -249,8 +249,15 @@ snapshot_port() { # snapshot_port <port> <verb> [role] — record prior state + 
 # ------------------------------------------------- the on-disk undo record -----
 # One line per record, tab-separated, `prior` LAST because it is the one field
 # that legitimately contains a tab ("verb<TAB>proxy"):
-#   <format-version>  <role>  <port>  <applied-verb>  <applied-proxy>  <prior>
+#   <format-version>  <role>  <port>  <applied-verb>  <applied-proxy>  <gateway-id>  <prior>
 # Nothing else in this script reads these files.
+#
+# `gateway-id` is what makes a per-gateway teardown possible at all. Without it a
+# record says WHAT KIND of thing was exposed (a gateway, or a file lane) and on
+# which HTTPS port, but never WHICH gateway — so two gateways on one host leave
+# records nobody can tell apart, and the by-hand teardown in WHAT-IT-TOUCHES.md
+# has to ask the operator for a port number that nothing on their machine tells
+# them. It is written for identification only and never reaches a command line.
 
 # Every value read back out is interpolated into a `tailscale` command, so each is
 # checked against the ONLY shape this script ever writes rather than trusted: a
@@ -267,22 +274,28 @@ exposure_proxy_ok() { # exposure_proxy_ok <proxy>
 # Returns 1 for anything this version cannot use, WITHOUT deleting the file: an
 # unreadable record may still name a live public exposure, so it is kept for a
 # version that understands it, and never fed to a command.
-REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
+REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_GWID=""; REC_PRIOR=""
 read_exposure_record() { # read_exposure_record <file> -> 0 and sets REC_*, else 1
-  REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_PRIOR=""
-  local ver role port averb aproxy prior
-  IFS=$'\t' read -r ver role port averb aproxy prior < "$1" 2>/dev/null || return 1
+  REC_ROLE=""; REC_PORT=""; REC_AVERB=""; REC_APROXY=""; REC_GWID=""; REC_PRIOR=""
+  local ver role port averb aproxy gwid prior
+  IFS=$'\t' read -r ver role port averb aproxy gwid prior < "$1" 2>/dev/null || return 1
   [ "${ver:-}" = "$EXPOSURE_RECORD_VERSION" ] || return 1
   case "${role:-}" in gateway|file) ;; *) return 1 ;; esac
   case "${port:-}" in ''|*[!0-9]*) return 1 ;; esac
   case "${averb:-}" in serve|funnel) ;; *) return 1 ;; esac
   exposure_proxy_ok "${aproxy:-}" || return 1
+  # Every id this script writes is `openclaw`, `hermes`, a `custom-<slug>` from
+  # slug(), or the literal `unknown` — all of them this charset. A record whose id
+  # is any other shape was not written by a version of this script, and the whole
+  # file is refused rather than half-trusted.
+  case "${gwid:-}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   case "${prior:-}" in
     EMPTY) ;;
     serve$'\t'*|funnel$'\t'*) exposure_proxy_ok "${prior#*$'\t'}" || return 1 ;;
     *) return 1 ;;
   esac
-  REC_ROLE="$role"; REC_PORT="$port"; REC_AVERB="$averb"; REC_APROXY="$aproxy"; REC_PRIOR="$prior"
+  REC_ROLE="$role"; REC_PORT="$port"; REC_AVERB="$averb"; REC_APROXY="$aproxy"
+  REC_GWID="$gwid"; REC_PRIOR="$prior"
 }
 
 # Is the exposure a record describes STILL the one live on that port? The whole
@@ -310,10 +323,17 @@ persist_exposure_record() { # persist_exposure_record <port> <applied-verb> <app
   # exposure itself as its own prior state and make the undo a no-op.
   [ -n "$prior" ] || prior=$(ts_target_for_port "$port")
   local f; f=$(printf '%s/exposure-%s-%03d.pending' "$STATE_DIR" "$EXPOSURE_RUN_TAG" "$EXPOSURE_RECORD_SEQ")
+  # The owning gateway is read from the global rather than passed: every caller is
+  # downstream of the gateway phase, so GW_ID is already the id this exposure is
+  # being opened for — including on the adopt path, where taking an earlier run's
+  # mapping over makes it this gateway's. `unknown` keeps the field's shape when a
+  # caller somehow has no id; a record that identifies nothing is still readable,
+  # and refusing to write one would trade a naming gap for a lost undo.
+  local gwid="${GW_ID:-}"; [ -n "$gwid" ] || gwid="unknown"
   # 0600 like everything else in here: the line names a gateway's port and backend.
   ( umask 077
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$EXPOSURE_RECORD_VERSION" "$role" "$port" "$averb" "$aproxy" "${prior:-EMPTY}" >"$f"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$EXPOSURE_RECORD_VERSION" "$role" "$port" "$averb" "$aproxy" "$gwid" "${prior:-EMPTY}" >"$f"
   ) 2>/dev/null || return 0
 }
 
@@ -711,7 +731,7 @@ reconcile_orphaned_exposures() {
   # Two passes so the operator sees the full scope before answering: collect the
   # still-live records as undo entries (the shape print_undo_hints and
   # undo_exposure_entry both take), retiring the rest as we go.
-  local live=() files=() backends=() roles=() entry public=false host=""
+  local live=() files=() backends=() roles=() entry public=false host="" owner=""
   for f in "$STATE_DIR"/exposure-*.pending; do
     [ -f "$f" ] || continue
     if ! read_exposure_record "$f"; then
@@ -728,7 +748,11 @@ reconcile_orphaned_exposures() {
     backends+=("${REC_APROXY#http://127.0.0.1:}")   # the local port it fronts, for the report
     # What sits behind it decides how alarming this is: an agent gateway answers
     # prompts and runs tools, a file lane hands out files.
-    if [ "$REC_ROLE" = "file" ]; then roles+=("your shared folder"); else roles+=("your gateway"); fi
+    # Which gateway it belonged to, when the record knows: on a machine with two of
+    # them "your gateway" alone does not say which, and this listing is where the
+    # operator decides whether a leftover exposure is one they still want.
+    owner=""; [ "$REC_GWID" = "unknown" ] || owner=" — $REC_GWID"
+    if [ "$REC_ROLE" = "file" ]; then roles+=("your shared folder$owner"); else roles+=("your gateway$owner"); fi
     [ "$REC_AVERB" = "funnel" ] && public=true
   done
   [ ${#live[@]} -gt 0 ] || return 0
@@ -833,8 +857,8 @@ explain_exposure_paths() {
   say "  3) Cloudflare Tunnel — PUBLIC"
   say "     Who can reach it:  anyone on the internet — same lock: the gateway's token."
   say "     What to install:   nothing on your devices; needs a domain you manage in"
-  say "                        Cloudflare (~\$8/yr for the domain) and Cloudflare's"
-  say "                        connector program (cloudflared) on this machine."
+  say "                        Cloudflare (~\$8/yr for the domain) and Cloudflare's own"
+  say "                        tunnel program (cloudflared) on this machine."
   say "     Who sees traffic:  Cloudflare can read it — your HTTPS ends at their servers;"
   say "                        the onward leg to this machine rides their encrypted tunnel."
   say "     Apple Watch:       works on its own, anywhere."
@@ -850,7 +874,88 @@ explain_exposure_paths() {
   say "     devices already trust, and it needs no domain of your own."
   say "     Apple Watch:       works on its own IF that address works without a VPN."
   say ""
-  say "  You can re-run this script any time and pick a different path."
+  # Naming `b` here rather than only "re-run the script": the menu this panel
+  # explains is a loop that re-asks after every path it cannot take, so stepping
+  # back is a keystroke, and a comparison that ends by pointing at a re-run
+  # teaches the opposite.
+  say "  None of the four is applied until you pick it. b at the menu backs out of this"
+  say "  step, and you can re-run this script later and choose differently — every step"
+  say "  detects what is already in place and reuses it."
+  say ""
+}
+
+# Is a Tailscale path (menu options 1 and 2) usable on this machine right now?
+# Prints the reason and returns 1 when it is not. Neither blocker is something
+# this script fixes — installing a background program and signing a machine in to
+# a tailnet are both the operator's to do — but a path this machine cannot take
+# today is a reason to ask the question again, not to end the run: three other
+# ways to reach the gateway are still on the menu, and the user has just been
+# shown the one that is closed. The instructions therefore point back at the menu
+# rather than at a re-run, and the caller re-reads `have tailscale` on the next
+# pass, so a user who installs it in another window can pick 1 without restarting.
+exposure_tailscale_ready() {
+  if ! have tailscale; then
+    say ""
+    # "background program" rather than "daemon": the sentence exists to reassure a
+    # novice, and it cannot do that around a word they have to look up. The claim is
+    # narrowed to match what the script actually promises in README §What it never
+    # does — it creates service units for programs you already have (the file lane's
+    # rclone is one), so the honest line is that it installs nothing NEW.
+    warn "Tailscale isn't installed, and installing it is yours to do — this script never"
+    warn "installs a background program you don't already have. It's one command from"
+    warn "https://tailscale.com/download — install it, then choose 1 or 2 again and I'll"
+    warn "look for it fresh. Or pick another path from the menu below."
+    return 1
+  fi
+  if [ -z "$(tailscale_dns_name)" ]; then
+    say ""
+    warn "Tailscale is installed but not logged in on this machine."
+    # Unlike the three failure handlers, `tailscale up` has NOT been tried yet,
+    # so a bare command is the right print when this shell is already root.
+    local up_priv; up_priv=$(priv_prefix)
+    warn "Run '${up_priv:+$up_priv }tailscale up' to connect it to your tailnet (your private Tailscale"
+    warn "network) — it opens a browser link to sign in the first time. Then choose 1 or 2"
+    warn "again, or pick another path from the menu below."
+    [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$up_priv" ] \
+      || note "This shell is not root and has neither sudo nor doas — run that from a root shell."
+    return 1
+  fi
+  return 0
+}
+
+# The same courtesy for menu option 3. Setting a Cloudflare tunnel up is a longer
+# errand than installing Tailscale, so the user is even more likely to want one of
+# the other three paths once they read this.
+exposure_cloudflared_ready() {
+  have cloudflared && return 0
+  say ""
+  warn "cloudflared isn't installed. Set it up per Cloudflare's quickstart"
+  warn "(https://developers.cloudflare.com/cloudflare-one/), then choose 3 again — or"
+  warn "pick another path from the menu below."
+  return 1
+}
+
+# The two facts a reverse-proxy operator needs BEFORE typing an address, in the
+# short form. Both already exist in the project and neither was anywhere near this
+# prompt: the base-URL contract only surfaces in a note that fires AFTER a URL has
+# been rewritten, and the Host-header rule sits 250 lines into the README. The
+# Host one earns the space because the failure it prevents is a 403 — the one
+# status a user reads as "my token is wrong", which sends them to look in the one
+# place the problem is not.
+# Deliberately the short form: the `i` of the prompt below (exposure.own_https)
+# carries the full version, so this stays scannable enough to be read at all.
+explain_own_https_target() {
+  say ""
+  say "  Two things worth knowing before you type it:"
+  say "    • Give the ${BOLD}base${RESET} address — no /v1 and no other endpoint on the end."
+  say "      ${BOLD}<that address>/v1/models${RESET} has to reach your gateway. A path prefix of"
+  say "      your own is fine: https://example.com/ai works."
+  say "    • If the gateway itself listens only on 127.0.0.1, whatever sits in front of it"
+  say "      (Caddy, nginx, a tunnel) usually has to rewrite the Host header: a server like"
+  say "      that often refuses a request arriving under any other name, and it refuses it"
+  say "      with 403 — which reads like a token problem and is not one. In nginx:"
+  say "      ${BOLD}proxy_set_header Host 127.0.0.1:<the gateway's port>;${RESET}"
+  say "  Press i at the prompt below for the longer version."
   say ""
 }
 
@@ -867,147 +972,196 @@ choose_exposure() {
   fi
 
   head_ "Step 3 — how should your phone reach this gateway?"
-  ts_targets
-  local ts_state="not installed" cf_state="not installed"
-  if have tailscale; then
-    if [ -n "$(tailscale_dns_name)" ]; then ts_state="✓ detected and running"
-    else ts_state="installed, but not running/logged in"; fi
-  fi
-  have cloudflared && cf_state="✓ cloudflared found"
 
-  say ""
-  say "  1) ${BOLD}Tailscale${RESET} — private, free  ($ts_state)"
-  say "     Only devices on your own Tailscale network reach it; each device needs the Tailscale app."
-  say ""
-  say "  2) ${BOLD}Tailscale Funnel${RESET} — public, free  ($ts_state)"
-  say "     Reachable from anywhere; nothing to install on your devices."
-  say ""
-  say "  3) ${BOLD}Cloudflare Tunnel${RESET} — public  ($cf_state)"
-  say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
-  say ""
-  # The parenthetical names the commonest casual exposure of all, `cloudflared tunnel
-  # --url`. Its address belongs to option 4; unnamed here, a quick-tunnel user reads
-  # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
-  # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
-  # would hide it whenever the tunnel runs from another terminal, host, or PATH.
-  say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
-  say "     You give the https:// address; its certificate has to be one your devices already trust."
-  say ""
-  if $SETUP_FROM_CHECK; then
-    say "  ${DIM}b) stop this setup (the completed check remains unchanged)${RESET}"
-  else
-    say "  ${DIM}b) go back to the gateway choice (earlier approved changes stay in place)${RESET}"
-  fi
-  say ""
-  say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
-  say "  only if that address is reachable from anywhere."
-  say ""
-  local back_word="goes back"
-  $SETUP_FROM_CHECK && back_word="stops setup"
-  local choice; choice=$(require_choice "Choose 1-4 ('i' compares them, 'b' $back_word)" '^([1-4]|[bB])$' explain_exposure_paths) || die "$NO_ANSWER"
-  [ "$choice" = "q" ] && quit_run
-  [[ "$choice" =~ ^[bB]$ ]] && return 10   # back/stop — no exposure change has happened yet
-  $DRY_RUN || note "From here I may apply changes to this machine. q/Ctrl-C stops; neither undoes an earlier approved change."
+  # The menu is a loop, not a one-shot. Every way out of it that is not a chosen
+  # transport — a path this machine cannot take, an address the user decides not to
+  # give — comes back here instead of ending the run, because the decision is
+  # unchanged: this gateway still needs an HTTPS address, and three other ways to
+  # get one are still on offer. What still leaves without a transport: `b` (rc 10),
+  # `q`, and the refusals that are meant to be final — a keyless gateway on a public
+  # address, a certificate the machine will not trust. Every `continue` in here is
+  # placed before that pass has planned, printed or run anything, so an abandoned
+  # pass leaves nothing for the next one to inherit.
+  local ts_state cf_state mutation_notice=false
+  local choice funnel host gw_https existing everb h tunnel tname
+  while true; do
+    # Every pass starts from "no transport chosen". Each branch does set both
+    # before anything reads them, so this changes no outcome today — but in a loop
+    # "some later branch overwrites it" is a property nobody can check by reading
+    # one case arm, and an abandoned pass leaving a half-answer behind is the class
+    # of bug this whole function was rewritten into.
+    TRANSPORT=""; SCOPE=""
+    # Detection runs on EVERY pass, which is most of what makes the re-ask worth
+    # having: a user who reads "not installed", installs Tailscale in a second
+    # terminal and picks 1 again gets the fresh answer without restarting. It is
+    # also why a refused row needs no separate "you already tried this" marker —
+    # the state column IS that marker, and one derived from a live re-read cannot
+    # go stale the way a remembered flag does.
+    ts_targets
+    ts_state="not installed"; cf_state="not installed"
+    if have tailscale; then
+      if [ -n "$(tailscale_dns_name)" ]; then ts_state="✓ detected and running"
+      else ts_state="installed, but not running/logged in"; fi
+    fi
+    have cloudflared && cf_state="✓ cloudflared found"
 
-  case "$choice" in
-    1|2)
-      local funnel=false; [ "$choice" = "2" ] && funnel=true
-      TRANSPORT=$($funnel && echo funnel || echo tailscale)
-      SCOPE=$($funnel && echo public || echo private)
-      if ! have tailscale; then
-        say ""
-        warn "Tailscale isn't installed, and installing it is yours to do (we never"
-        warn "install daemons). It's one command from https://tailscale.com/download —"
-        warn "then re-run this script; it picks up where you left off."
-        exit 0
-      fi
-      if [ -z "$(tailscale_dns_name)" ]; then
-        say ""
-        warn "Tailscale is installed but not logged in on this machine."
-        # Unlike the three failure handlers, `tailscale up` has NOT been tried yet,
-        # so a bare command is the right print when this shell is already root.
-        local up_priv; up_priv=$(priv_prefix)
-        warn "Run '${up_priv:+$up_priv }tailscale up' to connect it to your tailnet (your private Tailscale"
-        warn "network) — it opens a browser link to sign in the first time. Then re-run this"
-        warn "script; it picks up where you left off."
-        [ "$(id -u 2>/dev/null)" = 0 ] || [ -n "$up_priv" ] \
-          || note "This shell is not root and has neither sudo nor doas — run that from a root shell."
-        exit 0
-      fi
-      keyless_public_guard
-      local host; host=$(tailscale_dns_name)
-      pick_public_port "$TRANSPORT" "$GW_LOCAL_PORT" "gateway"; local gw_https="$PICKED_PORT"
-      ok "Chosen public port for the gateway: $gw_https"
-      # A verb flip changes who can reach the gateway — say so, in BOTH directions.
-      local existing; existing=$(ts_target_for_port "$gw_https")
-      if [ -n "$existing" ]; then
-        local everb="${existing%%$'\t'*}"
-        if $funnel && [ "$everb" = "serve" ]; then
-          warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
-          warn "https://$host:$gw_https reachable from the public internet."
-          confirm "  Make it public?" "exposure.tailscale.make_public" \
-            || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
-        elif ! $funnel && [ "$everb" = "funnel" ]; then
-          warn "Port $gw_https is currently PUBLIC (Tailscale Funnel). Going private turns the"
-          warn "public URL off — afterwards only devices on your tailnet reach this gateway."
-          confirm "  Make it private (turn the public URL off)?" "exposure.tailscale.make_private" \
-            || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
+    say ""
+    say "  1) ${BOLD}Tailscale${RESET} — private, free  ($ts_state)"
+    say "     Only devices on your own Tailscale network reach it; each device needs the Tailscale app."
+    say ""
+    say "  2) ${BOLD}Tailscale Funnel${RESET} — public, free  ($ts_state)"
+    say "     Reachable from anywhere; nothing to install on your devices."
+    say ""
+    say "  3) ${BOLD}Cloudflare Tunnel${RESET} — public  ($cf_state)"
+    say "     Rides a domain you manage in Cloudflare (~\$8/yr); Cloudflare can see the traffic."
+    say ""
+    # The parenthetical names the commonest casual exposure of all, `cloudflared tunnel
+    # --url`. Its address belongs to option 4; unnamed here, a quick-tunnel user reads
+    # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
+    # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
+    # would hide it whenever the tunnel runs from another terminal, host, or PATH.
+    say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
+    say "     You give the https:// address; its certificate has to be one your devices already trust."
+    say ""
+    if $SETUP_FROM_CHECK; then
+      # "back out of", not "stop": on this route `b` returns to the offer that
+      # started the setup, so the check's result — which cost real chat turns on
+      # somebody's provider account — survives the keystroke and can still be
+      # accepted. Promising a stop here would make the one recoverable exit read
+      # like the irreversible one.
+      say "  ${DIM}b) back out of this setup (the completed check remains unchanged)${RESET}"
+    else
+      say "  ${DIM}b) go back to the gateway choice (earlier approved changes stay in place)${RESET}"
+    fi
+    say ""
+    say "  An Apple Watch used away from your iPhone needs a PUBLIC path: 2, 3 — or 4"
+    say "  only if that address is reachable from anywhere."
+    say ""
+    # No hand-written control prose. The primitive renders `b = back` from the same
+    # argument that makes `b` work, so the one prompt in this tool where Back is
+    # genuinely available cannot be the one whose control list denies it. What `b`
+    # MEANS here still differs by how the run started, and the two b) lines above
+    # own that difference — the suffix only advertises the key.
+    prompt_into choice require_choice "Choose 1-4" '^[1-4]$' explain_exposure_paths true \
+      || return 10   # back/stop — no exposure change has happened yet
+
+    # Availability is graded BEFORE anything else, so a refused path leaves no
+    # trace: no mutation warning for changes that cannot happen, and no half-set
+    # TRANSPORT/SCOPE carried into whatever the user picks next.
+    case "$choice" in
+      1|2) exposure_tailscale_ready   || continue ;;
+      3)   exposure_cloudflared_ready || continue ;;
+    esac
+
+    if ! $DRY_RUN && ! $mutation_notice; then
+      note "From here I may apply changes to this machine. q/Ctrl-C stops; neither undoes an earlier approved change."
+      mutation_notice=true
+    fi
+
+    case "$choice" in
+      1|2)
+        funnel=false; [ "$choice" = "2" ] && funnel=true
+        TRANSPORT=$($funnel && echo funnel || echo tailscale)
+        SCOPE=$($funnel && echo public || echo private)
+        keyless_public_guard
+        host=$(tailscale_dns_name)
+        pick_public_port "$TRANSPORT" "$GW_LOCAL_PORT" "gateway"; gw_https="$PICKED_PORT"
+        ok "Chosen public port for the gateway: $gw_https"
+        # A verb flip changes who can reach the gateway — say so, in BOTH directions.
+        existing=$(ts_target_for_port "$gw_https")
+        if [ -n "$existing" ]; then
+          everb="${existing%%$'\t'*}"
+          if $funnel && [ "$everb" = "serve" ]; then
+            warn "Port $gw_https is currently PRIVATE (Serve). Switching it to Funnel makes"
+            warn "https://$host:$gw_https reachable from the public internet."
+            confirm "  Make it public?" "exposure.tailscale.make_public" \
+              || die "Left private. Re-run and pick option 1 (Tailscale, private) to stay private."
+          elif ! $funnel && [ "$everb" = "funnel" ]; then
+            warn "Port $gw_https is currently PUBLIC (Tailscale Funnel). Going private turns the"
+            warn "public URL off — afterwards only devices on your tailnet reach this gateway."
+            confirm "  Make it private (turn the public URL off)?" "exposure.tailscale.make_private" \
+              || die "Left public. Re-run and pick option 2 (Tailscale Funnel) if public is what you want."
+          fi
         fi
-      fi
-      tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
-        || { cleanup_exposures; die "Gateway exposure not confirmed — cannot continue without an HTTPS URL."; }
-      GW_URL="https://$host"; [ "$gw_https" != "443" ] && GW_URL="https://$host:$gw_https"
-      if [ "$SCOPE" = "private" ]; then
-        sweep_stale_public_funnels "$GW_LOCAL_PORT" "$gw_https" "$host"
-      fi
-      ;;
-    3)
-      TRANSPORT="cloudflare"; SCOPE="public"
-      keyless_public_guard
-      if ! have cloudflared; then
+        tailscale_expose "$gw_https" "$GW_LOCAL_PORT" "$funnel" "gateway" \
+          || { cleanup_exposures; die "Gateway exposure not confirmed — cannot continue without an HTTPS URL."; }
+        GW_URL="https://$host"; [ "$gw_https" != "443" ] && GW_URL="https://$host:$gw_https"
+        if [ "$SCOPE" = "private" ]; then
+          sweep_stale_public_funnels "$GW_LOCAL_PORT" "$gw_https" "$host"
+        fi
+        ;;
+      3)
+        TRANSPORT="cloudflare"; SCOPE="public"
+        keyless_public_guard
         say ""
-        warn "cloudflared isn't installed. Set up a tunnel per Cloudflare's quickstart"
-        warn "(https://developers.cloudflare.com/cloudflare-one/), then re-run me."
-        exit 0
-      fi
-      local tunnel; tunnel=$(cloudflared tunnel list 2>/dev/null | awk 'NR>1{print $2}' | head -2)
-      local tname="<your-tunnel>"
-      [ "$(printf '%s\n' "$tunnel" | grep -c .)" = "1" ] && tname="$tunnel"
-      say ""
-      say "  Your tunnel config (usually ~/.cloudflared/config.yml) needs one 'ingress rule'"
-      say "  per service — a line that tells Cloudflare to send requests for a hostname to a"
-      say "  local port. For the gateway:"
-      say ""
-      say "      - hostname: ${BOLD}gateway.YOURDOMAIN${RESET}"
-      say "        service: http://127.0.0.1:$GW_LOCAL_PORT"
-      note "(127.0.0.1 means \"this same machine\" — keep it as-is if the gateway runs on this host.)"
-      say ""
-      if $REUSE_ONLY; then
-        note "(reuse-only: assuming your gateway ingress rule already exists — I won't guide changes)"
-      else
-        print_and_wait "exposure.cloudflare.gateway" \
-          "Add the ingress rule, route DNS for the new hostname, and restart cloudflared. Replace YOURDOMAIN with a host on your Cloudflare domain." \
-          "cloudflared tunnel route dns $tname gateway.YOURDOMAIN" || true
-      fi
-      local h; h=$(ask "  The gateway hostname you configured (e.g. gateway.example.com)" "" "stop this option without a hostname")
-      case "$h" in http://*|https://*) h="${h#*://}" ;; esac   # tolerate a pasted URL — keep the host part
-      while [ "${h%/}" != "$h" ]; do h="${h%/}"; done
-      [ -n "$h" ] || die "No hostname given. This option needs a domain already added to your Cloudflare account; if you don't have one yet, re-run and pick Tailscale instead, or add a domain in Cloudflare first."
-      GW_URL="https://$h"
-      apply_gateway_url_normalization
-      ;;
-    4)
-      # One option for "I run my own HTTPS." It is a GATE, not a fork: the
-      # certificate is either one this machine trusts (which is the bar the app
-      # applies too) or the run stops.
-      GW_URL=$(ask_url "The https:// web address that reaches your gateway" "https://ai.example.com") || die "$NO_ANSWER"
-      apply_gateway_url_normalization
-      scope_choice
-      keyless_public_guard
-      classify_own_https   # sets TRANSPORT=public, or STOPs and names the free routes
-      ;;
-    *) die "Invalid choice." ;;
-  esac
+        say "  This path answers on a hostname of your own, in a domain you manage in"
+        say "  Cloudflare — something shaped like ${BOLD}gateway.YOURDOMAIN${RESET}. Name the one you want"
+        say "  first; it does not have to exist yet, and the step after this is the command"
+        say "  that points it at this gateway."
+        say ""
+        # The hostname is asked for BEFORE anything is printed to run or recorded in
+        # the dry-run plan, because leaving this option has to stay free right up to
+        # the last moment it costs nothing. Asked afterwards — as it reads naturally,
+        # "the hostname you configured" — an abandoned pass leaves a public Cloudflare
+        # route the operator has already created, and a run that then finishes on
+        # private Tailscale reports "private" over a live public address it never
+        # mentions again; --dry-run keeps the abandoned command in its plan on the
+        # same path. Asking first also makes the command below exact rather than a
+        # YOURDOMAIN template the operator has to edit by hand.
+        prompt_into h ask "  The hostname you want this gateway to answer on (e.g. gateway.example.com)" \
+          "" "go back to the four ways above" "exposure.cloudflare.hostname"
+        case "$h" in http://*|https://*) h="${h#*://}" ;; esac   # tolerate a pasted URL — keep the host part
+        while [ "${h%/}" != "$h" ]; do h="${h%/}"; done
+        # Blank returns to the menu rather than ending the run: a user who gets
+        # here without a Cloudflare domain has picked the wrong path, and the two
+        # paths that need no domain of their own are one keystroke away.
+        if [ -z "$h" ]; then
+          note "No hostname given. This option needs a domain already added to your Cloudflare"
+          note "account; without one, Tailscale (1 or 2) gives you an address for free."
+          continue
+        fi
+        tunnel=$(cloudflared tunnel list 2>/dev/null | awk 'NR>1{print $2}' | head -2)
+        tname="<your-tunnel>"
+        [ "$(printf '%s\n' "$tunnel" | grep -c .)" = "1" ] && tname="$tunnel"
+        say ""
+        say "  Your tunnel config (usually ~/.cloudflared/config.yml) needs one 'ingress rule'"
+        say "  per service — a line that tells Cloudflare to send requests for a hostname to a"
+        say "  local port. For the gateway:"
+        say ""
+        say "      - hostname: ${BOLD}$h${RESET}"
+        say "        service: http://127.0.0.1:$GW_LOCAL_PORT"
+        note "(127.0.0.1 means \"this same machine\" — keep it as-is if the gateway runs on this host.)"
+        say ""
+        if $REUSE_ONLY; then
+          note "(reuse-only: assuming your gateway ingress rule already exists — I won't guide changes)"
+        else
+          print_and_wait "exposure.cloudflare.gateway" \
+            "Adds the ingress rule's DNS side: it points $h at your tunnel. Add the ingress rule itself to the config file and restart cloudflared." \
+            "cloudflared tunnel route dns $tname $h" || true
+        fi
+        GW_URL="https://$h"
+        apply_gateway_url_normalization
+        ;;
+      4)
+        # One option for "I run my own HTTPS." It is a GATE, not a fork: the
+        # certificate is either one this machine trusts (which is the bar the app
+        # applies too) or the run stops.
+        explain_own_https_target
+        # Back returns to the menu. Without it this prompt is a loop whose only
+        # exit is a valid https:// URL or Ctrl-C — and it sits directly under a
+        # commitment ("I already run my own HTTPS") the user may have made wrongly,
+        # which is exactly when un-committing has to be possible.
+        prompt_into GW_URL ask_url "The https:// web address that reaches your gateway" \
+          "https://ai.example.com" 0 "" "exposure.own_https" true || continue
+        apply_gateway_url_normalization
+        scope_choice
+        keyless_public_guard
+        classify_own_https   # sets TRANSPORT=public, or STOPs and names the free routes
+        ;;
+      *) die "Invalid choice." ;;
+    esac
+    break   # a transport is chosen and applied; the menu's work is done
+  done
 }
 
 # The plain-words help behind the reach question's `?`. The safety stakes are
@@ -1050,8 +1204,10 @@ scope_choice() {
   note "it's public; if it only works on your home/office network or a VPN like Tailscale, it's private."
   say "    1) Public — reachable from the open internet"
   say "    2) Private — only my own network / VPN (Tailscale, home or office LAN)"
-  local c; c=$(require_choice "Is this address public or private? Choose 1-2 ('i' explains)" '^[12]$' explain_scope_choice) || die "$NO_ANSWER"
-  [ "$c" = "q" ] && quit_run
+  # No back here: the address this question is about has already been given, and
+  # the two callers reach it from opposite directions (the menu's option 4 and the
+  # ready-URL shortcut), so there is no one step to return to.
+  local c; prompt_into c require_choice "Is this address public or private? Choose 1-2" '^[12]$' explain_scope_choice
   if [ "$c" = "1" ]; then SCOPE="public"; else SCOPE="private"; fi
 }
 

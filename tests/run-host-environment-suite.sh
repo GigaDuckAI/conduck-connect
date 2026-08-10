@@ -68,14 +68,15 @@ lift "$UT" priv_prefix linux_install_cmd preflight run_step mutate_guard \
            setup_lock_proc_sig setup_lock_holder_state setup_lock_acquire setup_lock_release \
            saved_profile_exists choose_main_action json_query
 lift "$EX" ts_priv_retry tailscale_expose ts_unmap sweep_stale_public_funnels \
-           ts_target_for_port snapshot_port
+           ts_target_for_port snapshot_port is_quick_tunnel_url
 lift "$FL" setup_file_lane fs_linger_enabled_linux fs_report_linger_linux
 # The one-liner setters/accessors sit BETWEEN column-0 `}` lines, so the sed lift
 # takes the whole run in one bite. Named here for what they bring, not for elegance:
 # `show_qr_profile_invalid` carries show_qr_validate_profile with it, and json_get
 # carries json_type + env_get. The bodies are the shipped ones either way.
-lift "$SQ" show_qr_profile_invalid show_qr_is_https_host show_qr_is_port show_qr_pick_profile
-lift "$UT" json_get
+lift "$SQ" show_qr_profile_invalid show_qr_is_https_host show_qr_is_port show_qr_pick_profile \
+           show_qr_describe_saved_setup show_qr_warn_quick_tunnel
+lift "$UT" json_get prompt_into
 # Gateway identity: which saved gateway a re-run is changing, and which ids are
 # already spoken for. These read the same $STATE_DIR the picker above does.
 lift "$GW" gateway_id_is_taken report_gateway_id_collision pick_existing_custom_gateway
@@ -83,6 +84,23 @@ declare -F show_qr_validate_profile >/dev/null \
   || { printf 'show_qr_validate_profile did not come along with show_qr_profile_invalid\n' >&2; exit 2; }
 declare -F json_type >/dev/null \
   || { printf 'json_type did not come along with json_get\n' >&2; exit 2; }
+
+# prompt_into's EOF arm is `die "$NO_ANSWER"`, and this suite runs under `set -u`:
+# without the string, the one path that is supposed to end in a readable refusal
+# ends in an unbound-variable abort instead.
+NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask you questions."
+
+# Exposure BOOKKEEPING, stubbed on purpose. `tailscale_expose` and
+# `sweep_stale_public_funnels` write and prune the `.pending` record files that let
+# the NEXT run offer to close an exposure this one opened. That machinery is graded
+# by run-checks-suite.sh against the assembled script; here it is pure side effect,
+# and lifting it would drag in read_exposure_record, exposure_record_is_live,
+# exposure_proxy_ok and three EXPOSURE_* globals for no assertion. Both shipped
+# bodies are best-effort and return 0 on every path, so `return 0` is a faithful
+# stand-in. Written down rather than left undefined: the tripwire below exists so
+# that a missing dependency is a decision somebody made, not a silence.
+persist_exposure_record() { return 0; }
+prune_exposure_records() { return 0; }
 
 VERSION="0.13.0-test"      # the validator names it in its schema-mismatch reason
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/conduck-hostenv.XXXXXX") || exit 2
@@ -1023,7 +1041,11 @@ test_menu_saved_profile_usable() {
   write_profile_fixture "$sd" "custom-ok" 1
   out=$(menu_out "$sd")
   expect_has "menu: a usable profile offers option 4" "$out" "4) Show a saved setup code"
-  expect_has "menu: a usable profile widens the accept regex" "$out" 'regex=^([1-4]|[qQ])$'
+  # Six entries, not four: a file on disk also earns the two manage entries, and
+  # they are offered for a saved file whether or not this version can parse it.
+  expect_has "menu: a usable profile widens the accept regex" "$out" 'regex=^([1-6]|[qQ])$'
+  expect_has "menu: a saved file offers the two manage entries" \
+    "$out" "5) See what this machine already has set up"
   expect_lacks "menu: a usable profile raises no rejection warning" "$out" "warn:"
 }
 
@@ -1052,6 +1074,15 @@ test_menu_unreadable_profile() {
     "$out" "Update this script, then try again"
   expect_has "menu: the operator is warned that setup replaces the file" \
     "$out" "Setting up again REPLACES the saved file"
+  # The third numbering state, and the one that makes the warning above actionable:
+  # option 4 is genuinely gone, but the two manage entries take its place, so the
+  # list runs 1-5. An unreadable profile is exactly the file somebody wants to look
+  # at and remove, so gating those entries on a successful parse would hide them in
+  # the one state that needs them — and "set up again" would be the only way out.
+  expect_has "menu: an unreadable profile still earns the manage entries" \
+    "$out" 'regex=^([1-5]|[qQ])$'
+  expect_has "menu: the warning points at the entries that do not overwrite" \
+    "$out" "the last two options below work on"
 
   # A usable profile answers the question; rejections behind it are the picker's business.
   write_profile_fixture "$sd" "custom-ok" 1
@@ -1091,11 +1122,11 @@ test_show_code_picker_reason() {
   write_profile_fixture "$sd" "custom-future" 2
   out=$(pick_out "$sd")
   expect_has "--show-code: an unreadable profile is reported as unusable, not absent" \
-    "$out" "There IS a saved pairing profile on this machine, and this version ($VERSION) can't use it"
+    "$out" "There IS a saved setup code on this machine, and this version ($VERSION) can't use it"
   expect_has "--show-code: the validator's real reason is carried through" \
     "$out" "uses schema version '2'"
   expect_lacks "--show-code: an existing profile is never called missing" \
-    "$out" "No usable saved pairing profile on this machine yet"
+    "$out" "No usable saved setup code on this machine yet"
 
   # Several unusable profiles name the count and quote the first reason, so the
   # operator knows how much recoverable state is on the machine.
@@ -1104,20 +1135,25 @@ test_show_code_picker_reason() {
   write_profile_fixture "$sd" "custom-b" 3
   out=$(pick_out "$sd")
   expect_has "--show-code: several unusable profiles are counted" \
-    "$out" "There are 2 saved pairing profiles on this machine"
+    "$out" "There are 2 saved setup codes on this machine"
   expect_has "--show-code: the first reason is quoted as such" "$out" "The first one says:"
 
   # Genuinely nothing saved keeps the original onboarding message.
   sd="$TMPD/pick-empty/conduck"; rm -rf "$TMPD/pick-empty"; mkdir -p "$sd"
   out=$(pick_out "$sd")
   expect_has "--show-code: an empty state dir still says to run setup once" \
-    "$out" "No usable saved pairing profile on this machine yet"
+    "$out" "No usable saved setup code on this machine yet"
 
   sd="$TMPD/pick-ok/conduck"; rm -rf "$TMPD/pick-ok"
   write_profile_fixture "$sd" "custom-ok" 1
   out=$(pick_out "$sd")
   expect_has "--show-code: a single usable profile is selected without a question" \
     "$out" "picked=$sd/profile-custom-ok.json"
+  # Auto-selected is not the same as unannounced. There is nothing to decide with
+  # one saved setup, but there IS something to recognise before the questions that
+  # follow, so the lone profile is still described.
+  expect_has "--show-code: the lone saved setup is described before it is used" \
+    "$out" "The one saved setup on this machine:"
 }
 
 # ============================ custom-gateway identity (20-gateway, 91) ==
@@ -1465,6 +1501,44 @@ test_show_code_state_dir_wiring() {
   fi
 }
 
+# ============================================== the undefined-lift tripwire ==
+#
+# This harness builds a minimal runtime by LIFTING named functions out of src/.
+# When shipped code grows a call to a helper nobody added to a lift list, that
+# call is not an error anybody sees: it is rc 127 with no output, and because
+# almost every harness here runs its subject inside `$( … 2>&1 )`, the shell's
+# "command not found" lands in a captured variable rather than on the screen. The
+# assertion after it then passes or fails for no reason at all — a green that
+# proves nothing, which is worse than a red.
+#
+# So the omission is written down. Every function defined in src/ that this shell
+# does NOT define gets a stub that records its own name and returns 127 — exactly
+# what the missing function already did, so nothing about the run changes except
+# that the gap becomes visible. A case that stubs a function itself shadows this
+# one, which is the right reading: there, it IS defined.
+UNDEFINED_LIFTS="$TMPD/undefined-lifts"
+: > "$UNDEFINED_LIFTS"
+install_lift_tripwire() {
+  local fn
+  for fn in $(sed -n 's/^\([a-z_][A-Za-z0-9_]*\)().*/\1/p' "$ROOT"/src/*.inc.sh | sort -u); do
+    declare -F "$fn" >/dev/null && continue
+    eval "$fn() { printf '%s\n' '$fn' >> '$UNDEFINED_LIFTS'; return 127; }"
+  done
+}
+install_lift_tripwire
+
+report_undefined_lifts() {
+  local names
+  names=$(sort -u "$UNDEFINED_LIFTS" | tr '\n' ' ')
+  names="${names% }"
+  if [ -n "$names" ]; then
+    fail "harness: the lifted code calls nothing this runtime lacks" \
+      "called but never lifted (add to a lift list, or stub deliberately): $names"
+  else
+    pass "harness: the lifted code calls nothing this runtime lacks"
+  fi
+}
+
 printf 'host-environment regressions — lifted source functions, simulated hosts\n'
 test_priv_prefix
 test_install_cmd_per_manager
@@ -1495,6 +1569,7 @@ test_custom_gateway_picker
 test_gateway_id_collision_message
 test_state_dir_exposure_wording
 test_show_code_state_dir_wiring
+report_undefined_lifts   # last: it grades everything the cases above ran
 
 printf '\nHOST ENV RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ] || exit 1
