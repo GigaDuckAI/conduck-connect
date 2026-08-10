@@ -662,6 +662,248 @@ agent_file_lane_gate() {
   return 1
 }
 
+# ---- the image gate -----------------------------------------------------------
+#
+# The last gateway chat turn every pairing verification makes, on every kind and by
+# every route in (--setup, both check handoffs, --show-code): one more REAL chat
+# turn carrying a picture, so a gateway that answers photos without ever looking
+# at them cannot reach the app silently.
+#
+# Why it exists at all: a photo that vanishes is the one failure the app cannot
+# show. A dropped image comes back as an ordinary, confident reply, the pairing
+# payload has no field to carry a warning, and nothing on the phone can tell that
+# reply from a real sighting. So the only place the operator can ever learn it is
+# this screen, before the code exists.
+#
+# It addresses $GW_URL — the FINAL app-facing address, whatever HTTPS front,
+# tunnel or reverse proxy is in it — and carries $GW_MODEL, the model the code is
+# about to name. A loopback probe would skip the exact hop most likely to strip a
+# multipart content array, and a different model would grade a route the app
+# never takes.
+#
+# Severity keys on the probe's OUTCOME, never on the target's pedigree. A
+# purpose-built adapter and a plain Ollama behind a text-only model produce the
+# identical silent 200 — behaviour is the evidence, so a 200 that answers as if
+# no picture was attached is what gets asked about, and an honest refusal passes
+# on every kind. Provenance moves nothing. It is tempting on the --check-adapter
+# → setup handoff, where the operator has declared this software was built for
+# Conduck and its contract does forbid answering a picture the engine never saw
+# — but this probe cannot observe forwarding, only whether the digits came back,
+# and the sentences it prints say so. Convicting on that reading because of the
+# door the run came through turns an inconclusive measurement into an assertion,
+# and it can stop an adapter that forwarded the picture correctly to an engine
+# that misread four small digits. The strict grade still lands where a grade
+# belongs: --check-adapter --deep reports IMAGE_INPUT red and exits nonzero.
+#
+# It never fails on the absence of evidence. A transfer that does not complete, a
+# body cap, an error nobody can classify — each is reported for what it is and
+# none of them withholds a code: the text turn above already passed, and a run
+# that cannot measure something must not convict on it.
+IMG_PROOF=""     # transcript state for THIS run: "" | verified | declined | too-large
+                 # | unmeasured | opaque | ignored | ignored-acked. Not in
+                 # the payload and not in the profile — there is nowhere honest to
+                 # put it, which is the whole reason this gate is on screen.
+IMG_OUTCOME=""   # the last graded turn, set by verify_image_probe_once
+
+# One graded image turn. Prints nothing and decides nothing — it leaves the
+# outcome word in IMG_OUTCOME and the app-evaluator state in CCE_*/DCC_* for the
+# caller to word. Split out because the ignored case is retried, and a second
+# attempt that fails a DIFFERENT way (the tunnel drops, the engine refuses the
+# second picture) must be graded on what IT did: a retry folded into the first
+# attempt's verdict is exactly how a network fault gets reported to an operator
+# as "your gateway drops photos".
+verify_image_probe_once() { # verify_image_probe_once [digits-the-retry-must-not-reuse]
+  local avoid="${1:-}" redraws=0
+  IMG_OUTCOME=""
+  # Set explicitly, never inherited: image_probe_gen's python reads the
+  # ENVIRONMENT, so a CONDUCK_PROBE_MODEL the operator happens to have exported
+  # would quietly grade a different model than the one being paired.
+  CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
+  # A retry that happens to redraw the FIRST attempt's digits is not a second
+  # look — a cached reply, or the one-in-nine-thousand coincidence the first turn
+  # was retried for, would pass on exactly the run where it must not. The digits
+  # are drawn locally with no request behind them, so redrawing costs nothing;
+  # the bound is there because an unbounded loop on a broken generator is worse
+  # than a repeated code.
+  while [ -n "$avoid" ] && [ "$IPG_CODE" = "$avoid" ] && [ "$redraws" -lt 8 ]; do
+    redraws=$((redraws+1))
+    CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
+  done
+  # The SAME evaluator the round-trip above used, and the same one the app is
+  # mirrored on — a stricter grader here would redden replies the app accepts.
+  # That mirroring decides two edges deliberately: EVERY 2xx counts as a reply
+  # (a 201 without the digits is the same confident answer on the phone as a 200
+  # without them), and a decline the app recognizes counts as recognized at
+  # whatever status it arrives on (the app keys on the error code, so a 500
+  # carrying "image_unsupported" still shows the user "pictures aren't supported
+  # here" rather than a lie about their photo). This gate grades what the person
+  # holding the phone will experience, not what the wire ought to look like —
+  # --check-adapter --deep is where the wire is held to the stricter bar.
+  if app_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
+    if [ "$CCE_TOKEN" = "yes" ]; then IMG_OUTCOME="verified"; else IMG_OUTCOME="ignored"; fi
+    return 0
+  fi
+  # A transfer that never completed carries no status to read, so nothing about
+  # images was measured. Asked FIRST, before any classification: DCC_CODE is
+  # empty in exactly this case, and an empty status falls through every arm below
+  # into "opaque" — which would report a dropped connection as a gateway defect.
+  if [ "$DCC_CURL_RC" != "0" ]; then IMG_OUTCOME="unmeasured"; return 0; fi
+  # The app's own decline classifier, split the way the app splits it: a refusal
+  # it can name ("pictures aren't supported here") is a different user experience
+  # from a size cap, and both differ from an error it can only show as generic.
+  case "$(compat_image_failure_kind)" in
+    image_unsupported) IMG_OUTCOME="declined" ;;
+    too_large)         IMG_OUTCOME="too_large" ;;
+    *)                 IMG_OUTCOME="opaque" ;;
+  esac
+  return 0
+}
+
+# The two ways out of a gateway whose reply does not reflect the picture it was
+# sent, said in one place because the refusal arm and the no-terminal arm owe the
+# identical advice and a second copy is how they drift.
+verify_image_two_fixes() {
+  say "    Two ways to fix it, and either one is fine:"
+  say "      • send pictures to an engine that can actually see them, or"
+  say "      • refuse them: answer HTTP 400 with an error body carrying"
+  say "        code \"image_unsupported\". The app then shows its own \"pictures aren't"
+  say "        supported here\" message, and text and voice keep working."
+}
+
+# A 200 that does not read the picture back, twice. Everything above has passed,
+# so this is the only branch that can withhold a code.
+verify_image_ignored_gate() {
+  bad "photo turn: answered 200 — twice — without reading either test picture's digits back"
+  say "    This run could not verify the engine used the picture. It may never have reached the"
+  say "    engine, or it may have reached one that could not read it; from out here those are the"
+  say "    same answer, so both are worth checking. What is certain is what happens in the app:"
+  say "    a photo comes back as a confident reply that does not reflect what you sent, and the"
+  say "    app cannot tell that reply from a real one — the setup code has no field to warn it,"
+  say "    and there is no error for it to show."
+
+  # Wording only — it changes no severity and no arm below. An operator who came
+  # from --check-adapter is the one person on this screen who can fix the software
+  # instead of working around it, so they get the loop that grades it and the rule
+  # it grades against. Everyone else is pointed at the two fixes and left alone.
+  # ${…:-} because the suites lift this module into runtimes under `set -u` that
+  # declare only what they drive; 10-utilities owns the initialisation, and a
+  # module may not depend on an earlier one's globals existing in a harness.
+  if [ "${SETUP_FROM_CHECK_KIND:-}" = "adapter" ]; then
+    say ""
+    say "    You reached setup from ${BOLD}--check-adapter${RESET}, so this is software built for Conduck. Its"
+    say "    contract allows two answers to a picture in the newest message — forward it to the engine,"
+    say "    or refuse the whole request — and a 200 the engine never saw the picture for is neither."
+    say "    From out here this run cannot tell that apart from an engine that misread the digits, so"
+    say "    it does not stop you on it. The grade that judges the wire is:"
+    say "      ${BOLD}bash conduck-connect.sh --check-adapter --deep${RESET}"
+    say "      ${BOLD}conduck.com/setup/adapter/v1/${RESET} → Images   (the rule, and the text-only recipe)"
+  fi
+
+  # One outcome, one severity, whichever door the run came through. This script
+  # cannot know what it is talking to — the custom bucket deliberately holds
+  # hand-written adapters and plain model servers alike — and a text-only Ollama
+  # behaving exactly like this is not a defect in Ollama. So: report, and offer.
+  # Default No, because the answer that may cost someone their photos should not
+  # be the one Enter gives.
+  warn "Photos are UNVERIFIED here — one may be silently ignored, and the app cannot tell you."
+
+  # --setup only reaches a person (a redirected check exits before it offers the
+  # handoff), but --show-code has no such guard and is the path a script uses to
+  # re-pair a second device. Asked there, `confirm` reads EOF and answers No —
+  # the right ANSWER, printed as a question into a log nobody is reading, which
+  # leaves the operator with a missing code and a prompt as the only explanation.
+  # Same outcome, said as a statement: this run stops, and here is why and where
+  # to decide it. No flag opens it: the code this run would print is a QR for a
+  # person holding a phone, so "re-run it where you can answer" is the whole
+  # recovery, and a bypass would be permanent public surface bought for a case
+  # that starts by not having anyone to show the code to.
+  if ! interactive_terminal; then
+    IMG_PROOF="ignored"
+    VERIFY_FAILED=true
+    say "    There is no terminal to ask on in this run, and pairing a gateway whose photos are"
+    say "    unverified is not a decision to make on your behalf — so it stops here, with no code."
+    say "    Re-run me from a terminal to decide it yourself, or fix it:"
+    verify_image_two_fixes
+    return 0
+  fi
+
+  if confirm "Continue and get the code anyway, knowing a photo here may be silently ignored?" \
+             "verification.image_ignored"; then
+    IMG_PROOF="ignored-acked"
+    note "Continuing. This screen is the only record of it — nothing in the code, the app, or your"
+    note "saved profile carries this, so a photo will still look answered either way."
+    return 0
+  fi
+  IMG_PROOF="ignored"
+  VERIFY_FAILED=true
+  say "    Stopped before emitting a code."
+  verify_image_two_fixes
+  return 0
+}
+
+verify_image_intake() {
+  IMG_PROOF=""
+  IMG_OUTCOME=""
+  # Nothing left to protect on a run that will emit no code: emit_payload already
+  # withholds it. Same arithmetic as skip_agent_file_probe_after_failed_gateway —
+  # this turn's answer would be discarded, and the re-run they now have to do
+  # anyway buys it again for free. Silent: a line about a probe that was skipped
+  # is noise under a failure epilogue that already names what to fix.
+  $VERIFY_FAILED && return 0
+
+  say "  Then one real photo turn — the same address and model the app will use…"
+  verify_image_probe_once
+  if [ "$IMG_OUTCOME" = "ignored" ]; then
+    # Retry ONCE, and only this outcome, because only this one is about to cost
+    # someone their setup code. A FRESHLY drawn picture on purpose: re-sending
+    # the same one lets a cached answer, or the ~1-in-9000 lucky guess, pass on
+    # the second look — the retry is there to forgive a flaky turn, not to give
+    # a wrong answer two chances to be right.
+    # This is the only path that spends a second turn, so a gateway that bills
+    # per request is charged twice only when it has already answered once in the
+    # single way that would otherwise block it.
+    note "That reply didn't contain the picture's digits. Trying once with a new picture before judging…"
+    verify_image_probe_once "$IPG_CODE"
+  fi
+
+  case "$IMG_OUTCOME" in
+    verified)
+      IMG_PROOF="verified"
+      ok "photo turn: the reply reads the test picture's digits back — pictures reach the engine"
+      ;;
+    declined)
+      IMG_PROOF="declined"
+      ok "photo turn: pictures are refused honestly, in a way the app recognizes"
+      note "The app shows its own \"pictures aren't supported here\" message; text and voice are"
+      note "unaffected. Nothing is lost quietly — a photo fails visibly, with a reason."
+      ;;
+    too_large)
+      IMG_PROOF="too-large"
+      warn "The test picture was refused as TOO LARGE (HTTP 413) — and it is a few kilobytes."
+      note "Something on this route caps request bodies far below what a photo needs, so in the app"
+      note "every picture will fail this way. Raise the limit wherever it lives — a reverse proxy, a"
+      note "tunnel, or the gateway itself; the adapter contract's floor is 50 MiB. Not silent: the"
+      note "app shows a clear picture-too-large message, so this doesn't hold up your code."
+      ;;
+    unmeasured)
+      IMG_PROOF="unmeasured"
+      warn "Image support was NOT measured — the photo turn didn't complete ($CCE_REASON)."
+      note "That is a transport fault, not a finding about how this gateway handles pictures. The"
+      note "text turn above passed, so your code stands; re-run me if you want the photo answer."
+      ;;
+    opaque)
+      IMG_PROOF="opaque"
+      warn "Photo turns fail with an error the app can't classify ($CCE_REASON)."
+      note "Sending a picture shows a generic failure instead of \"pictures aren't supported here\"."
+      note "Annoying, never deceptive — nothing goes missing quietly, so your code stands."
+      ;;
+    ignored)
+      verify_image_ignored_gate
+      ;;
+  esac
+  return 0
+}
+
 verify_all() {
   head_ "Step 5 — verify (real requests, before you touch your phone)"
   # The only place in the whole tool that says verification is not free: it spends
@@ -675,6 +917,7 @@ verify_all() {
   # declaration so a second verify_all in one process — a re-check, a test, a
   # future menu loop — can never inherit a green claim from an earlier lane.
   FS_AGENT_PROOF=""
+  IMG_PROOF=""
 
   # Local health first (when the gateway has a health endpoint).
   # "Is it up locally?" — any HTTP answer below 500 counts (this request carries
@@ -786,6 +1029,12 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
     bad "live round-trip failed ($CCE_REASON)"
     VERIFY_FAILED=true
   fi
+
+  # …and the same round trip with a picture on it. Runs AFTER the text turn on
+  # purpose: a gateway that cannot answer text at all is not a gateway with an
+  # image problem, and the gate returns without spending a turn once anything
+  # above has failed.
+  verify_image_intake
 
   # File transport first. For known agent gateways, a second real agent turn
   # below is the launch gate: WebDAV plus static config inspection must never

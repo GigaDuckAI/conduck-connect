@@ -1179,6 +1179,11 @@ manage_show_code() { # manage_show_code <id>
   local FS_URL="" FS_CRED="" FS_LOCAL_PORT="" FS_REACH="" FS_UNIT="" FS_FOLDER=""
   local FS_CRED_LEGACY_ARGV=false FS_EXISTING_UNSAFE=false
   local VERIFY_FAILED=false FS_LANE_DROPPED_BY_CHECK=false FS_AGENT_PROOF=""
+  # The image verdict is this run's measurement, exactly like FS_AGENT_PROOF above.
+  # verify_all clears both at entry, so the leak this closes is the narrower one:
+  # a menu action that dies BEFORE verification would otherwise hand the epilogue
+  # in 80-pairing the previous action's verdict to print.
+  local IMG_PROOF="" IMG_OUTCOME=""
   PROFILE_FILE=$(manage_profile_path "$1")
   preflight
   say ""

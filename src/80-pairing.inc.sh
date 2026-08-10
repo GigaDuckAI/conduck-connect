@@ -152,6 +152,30 @@ pairing_capability_summary() {
     warn "File transfer is NOT included — attachments stay inline-only."
     note "To add it later, re-run setup and give the file lane an address."
   fi
+  # Photos are the third thing the app can send, and the only one whose failure it
+  # cannot show: a picture that never reached the engine comes back as an ordinary
+  # reply. Step 5 measured that against this exact address and model; this states
+  # what the measurement means for the code about to be scanned, for the same
+  # reason the lane above earns its lines — the payload has no field for it, and a
+  # warning given three prompts ago has scrolled away by the time the code appears.
+  # Silent when nothing was measured (a skipped, unmeasured, or not-yet-run gate):
+  # a line about an unmeasured capability is the ✓-on-an-unmeasured-half bug again.
+  # ${IMG_PROOF:-} because this function is deliberately lifted out of its module
+  # by the suite, into a runtime that declares only what it drives.
+  case "${IMG_PROOF:-}" in
+    verified)
+      ok "Photos — pictures you send reach the engine" ;;
+    declined)
+      note "Photos are refused with a clear \"pictures aren't supported here\" message." ;;
+    too-large)
+      warn "Photos will FAIL — a size cap on this route refused a few-kilobyte test picture." ;;
+    opaque)
+      warn "Photos will fail with an error the app can only show as a generic failure." ;;
+    ignored-acked)
+      warn "Photos are UNVERIFIED — the test picture came back unread, twice, and you paired anyway."
+      note "A photo may be silently ignored: the reply looks confident either way, and the app cannot"
+      note "tell you which it was." ;;
+  esac
 }
 
 emit_payload() {

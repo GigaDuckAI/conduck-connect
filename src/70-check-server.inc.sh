@@ -714,8 +714,17 @@ print(json.dumps(req))') \
       say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
     else
       COMPAT_IMAGE_INPUT="IGNORED"
-      warn "image input: IGNORED — answered 200 while ignoring the image. In the app, photos"
-      say "    are silently unseen: users get confident answers about images the engine never saw."
+      # The meter name is frozen in the schema=2 grammar, but the sentence under it
+      # must not claim more than the probe saw. A missing set of digits proves the
+      # absence of evidence, never where the image went — and a server that
+      # forwarded it faithfully to a text-weak model gets this identical result, so
+      # naming a drop sends that operator hunting through a delivery path that is
+      # working. Say what is unproven, name both causes, leave the verdict alone.
+      warn "image input: IGNORED — answered 200 without reading the probe image's digits back, so this"
+      say "    run could not verify the engine used the image. It may never have reached the engine, or"
+      say "    it may have reached one that misread it — from out here those look the same. Either way,"
+      say "    in the app a photo can come back as a confident answer about a picture the engine did"
+      say "    not read."
     fi
   elif compat_image_declined_detectable; then
     COMPAT_IMAGE_INPUT="DECLINED"

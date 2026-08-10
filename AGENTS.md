@@ -85,8 +85,18 @@ own reason, rather than hanging. `--show-code` is the exception in form only. It
 stores a gateway token, so for a custom gateway it asks for it again at a hidden
 prompt, and with nobody to answer it fails there with **1** instead of refusing
 up front. It is also not a shortcut around setup: it re-emits exactly what the
-saved profile holds, and it runs live verification, which spends a real chat turn
-whenever a file lane is configured.
+saved profile holds, and it runs live verification, which spends at least two real
+chat turns — a text round-trip and a photo turn — plus one more whenever a file
+lane is configured.
+
+That photo turn is the second way `--show-code` stops with nobody at the keyboard,
+and unlike the token prompt it can happen on a gateway whose credentials are all
+on disk. If the gateway answers a picture without reading it back, twice, the run
+has found the one failure the app cannot report later — and that is a decision, so
+it asks. With no terminal to ask on it stops with **1** and no code rather than
+printing a question into a log. There is no flag that answers it: what the run
+would go on to print is a QR code a person scans with a phone, so re-running it
+where somebody can answer is the whole recovery. Hand the command to your operator.
 
 ## Credentials
 

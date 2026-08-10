@@ -31,7 +31,7 @@ prepare_setup_from_check() {
     # repository names can legitimately be long, and a sanitised variant would
     # pair something no request ever tested.
     GW_MODEL="${COMPAT_MODEL_ID:-}"
-    # This line is the operator's last look at what their pairing code will
+    # This line is the operator's last look at what their setup code will
     # carry, so it prints the WHOLE id — a truncated one cannot be checked
     # against the server, and "exact" would be a lie. safe_display is still
     # applied for its control-stripping: an explicitly named id is unvalidated
