@@ -5459,6 +5459,62 @@ test_tool_policy_verdict() {
       "$(policy_ops_summary "$refuse_cfg")" ""
   done
 
+  # ---- a policy key written as the wrong TYPE -------------------------------
+  # PINNED. Every accessor in the analysis reads a wrong-typed key as ABSENT, and
+  # absent is indistinguishable from healthy: `"deny": "group:fs"` — the bare
+  # string where a list belongs — vanished from the read entirely, so an operator
+  # who had just switched their agent's file tools off was told *read/write
+  # allowed, profile: coding*. The same hole one level up swallows a `tools` block
+  # that is not an object. Nothing here may be auto-corrected either: this read
+  # cannot say what OpenClaw makes of such a key — it may reject the config, it
+  # may ignore the key — so it reaches `manual`, says what it saw, and proposes
+  # no operation, exactly as the lossy-list and empty-allowlist refusals do.
+  for mistyped_case in \
+    'a deny written as a bare string|{"tools": {"profile": "coding", "deny": "group:fs"}}' \
+    'an allow written as a bare string|{"tools": {"allow": "read"}}' \
+    'an alsoAllow written as an object|{"tools": {"profile": "minimal", "alsoAllow": {"0": "read"}}}' \
+    'a profile written as a list|{"tools": {"profile": ["minimal"]}}' \
+    'a tools block that is not an object|{"tools": ["read", "write"]}'; do
+    mistyped_label=${mistyped_case%%|*}
+    mistyped_cfg=${mistyped_case#*|}
+    expect_eq "tool policy: $mistyped_label is reported, not read as absent" \
+      "$(policy_field status 2 "$mistyped_cfg")" "manual"
+    expect_eq "tool policy: $mistyped_label proposes no operation" \
+      "$(policy_ops_summary "$mistyped_cfg")" ""
+    # Reported is not the same as repaired: nothing may be written or restarted.
+    facts=$(CONFIRM_ANSWER="y"; policy_step_facts "$mistyped_cfg")
+    case "$facts" in *" steps=0 waits=0 epoch=none")
+        pass "tool policy: $mistyped_label changes nothing on the host" ;;
+      *) fail "tool policy: $mistyped_label changes nothing on the host" "$facts" ;; esac
+    out=$(cat "$POLICY_STEP_OUT")
+    case "$out" in *"look ready"*|*"read/write allowed"*)
+        fail "tool policy: $mistyped_label is never graded green" "$out" ;;
+      *) pass "tool policy: $mistyped_label is never graded green" ;; esac
+    case "$out" in *"by hand"*)
+        pass "tool policy: $mistyped_label is handed back to the operator" ;;
+      *) fail "tool policy: $mistyped_label is handed back to the operator" "$out" ;; esac
+  done
+  # The key is named, or the operator has a whole file to search.
+  expect_eq "tool policy: the wrong-type verdict names the key it could not read" \
+    "$(policy_field status 3 '{"tools": {"profile": "coding", "deny": "group:fs"}}')" \
+    "tools.deny (expects a list) is written as the wrong type, so this read cannot tell what it grants or blocks — and a key it cannot read looks exactly like one that isn't there; correct the type by hand first"
+  # Anti-vacuity, and the whole point of the case: spelled as a list, that same
+  # deny is a policy this step repairs. Read as a bare string it disappeared and
+  # the run went green, so the two spellings must not reach the same verdict.
+  expect_eq "tool policy: the list spelling of that same deny really needs a fix" \
+    "$(policy_field status 2 '{"tools": {"profile": "coding", "deny": ["group:fs"]}}')" "fix"
+  # …and a JSON null stays ABSENT. It is a legitimate spelling of "unset", and
+  # dragging it into the wrong-type verdict would turn a harmless config into a
+  # question the operator has to answer to keep their file lane.
+  expect_eq "tool policy: a null deny is read as unset, not as the wrong type" \
+    "$(policy_field status 2 '{"tools": {"profile": "coding", "deny": null}}')" "ok"
+  expect_eq "tool policy: a null profile is read as unset" \
+    "$(policy_field status 2 '{"tools": {"profile": null, "allow": ["read", "write"]}}')" "ok"
+  expect_eq "tool policy: a null tools block is still the default-policy verdict" \
+    "$(policy_field status 2 '{"tools": null}')" "none"
+  expect_eq "tool policy: an absent tools block is still the default-policy verdict" \
+    "$(policy_field status 2 '{}')" "none"
+
   # ---- nothing emitted anywhere names the pdf tool --------------------------
   # Machine records and operator screen together, over every branch that emits
   # either. Each arm carries the status it is supposed to reach, so an arm that
@@ -5693,6 +5749,29 @@ test_tool_policy_verdict() {
   case "$out" in *"The live file test later will confirm file access"*)
       pass "a real run still points at the live test that proves it" ;;
     *) fail "a real run still points at the live test that proves it" "$out" ;; esac
+
+  # ---- the verdict and its closing line have to agree ----------------------
+  # PINNED. "will confirm file access" is the GREEN branch's sentence: it reads as
+  # a pass already granted. The unknown verdict has just spent two lines saying it
+  # could not tell which file tools the profile grants and that nothing was
+  # changed — closing on that sentence contradicts both, and the screen reads as a
+  # check that passed. Its own line says what is true: the live test is what
+  # settles a question this read could not.
+  policy_step_facts '{"tools": {"profile": "toolsmith"}}' > /dev/null
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"The live file test later will confirm file access"*)
+      fail "an undocumented profile does not close on the green verdict's line" "$out" ;;
+    *) pass "an undocumented profile does not close on the green verdict's line" ;; esac
+  case "$out" in *"is what settles it"*)
+      pass "an undocumented profile closes on a line that matches its own verdict" ;;
+    *) fail "an undocumented profile closes on a line that matches its own verdict" "$out" ;; esac
+  # …and the green verdict keeps its own sentence, so the two cannot collapse into
+  # one wording that is wrong for whichever verdict did not choose it.
+  policy_step_facts '{"tools": {"profile": "coding"}}' > /dev/null
+  out=$(cat "$POLICY_STEP_OUT")
+  case "$out" in *"is what settles it"*)
+      fail "the green verdict does not borrow the unknown verdict's line" "$out" ;;
+    *) pass "the green verdict does not borrow the unknown verdict's line" ;; esac
 
   # ---- the write can never contradict itself -------------------------------
   # OpenClaw resolves deny-versus-allow by denying, so a config naming one tool

@@ -1562,9 +1562,17 @@ except Exception:
     sys.exit(0)
 
 tools = cfg.get("tools")
-if not isinstance(tools, dict):
+if tools is None:
     emit("status", "none",
          "no tools block in openclaw.json — the default policy leaves the agent's file tools on")
+    sys.exit(0)
+if not isinstance(tools, dict):
+    # Present, but not an object. Read as absent it would print the sentence above,
+    # which is an affirmative claim that the default policy is in force — made
+    # about a block this read could not interpret at all.
+    emit("status", "manual",
+         "tools in openclaw.json is not an object, so nothing inside it could be read and "
+         "this check cannot say what the policy grants or blocks; fix the block by hand first")
     sys.exit(0)
 
 # Keys whose list held something other than a string. Every rewrite below writes
@@ -1631,6 +1639,29 @@ def granted(entries, tool):
                 or (tool in FS_GROUP and fnmatch.fnmatchcase("group:fs", low))):
             return True
     return False
+
+# A key that is PRESENT but written as the wrong TYPE. Every accessor above reads
+# one as ABSENT, and absent is indistinguishable from healthy: tools.deny written
+# as the bare string "group:fs" instead of ["group:fs"] vanished from this read
+# entirely, and the operator who had just switched their agent's file tools off was
+# told read/write allowed. Same shape one level up for a profile that is not a
+# string. This read cannot say what OpenClaw makes of such a key either — it may
+# reject the config, it may ignore the key — so it grades nothing and rewrites
+# nothing, the same posture as the lossy list below. A JSON null is NOT this case:
+# that is a legitimate spelling of "unset" and stays absent.
+mistyped = []
+for key, want, kind in (("allow", "a list", list), ("alsoAllow", "a list", list),
+                        ("deny", "a list", list), ("profile", "a name", str)):
+    value = tools.get(key)
+    if value is None or isinstance(value, kind):
+        continue
+    mistyped.append("tools.%s (expects %s)" % (key, want))
+if mistyped:
+    emit("status", "manual",
+         "%s is written as the wrong type, so this read cannot tell what it grants or blocks — "
+         "and a key it cannot read looks exactly like one that isn't there; correct the type by "
+         "hand first" % " and ".join(mistyped))
+    sys.exit(0)
 
 # An invalid config (both allow + alsoAllow) must never be auto-edited into a
 # different invalid config — surface it instead.
@@ -1901,16 +1932,21 @@ gw_note_restart_and_wait() { # gw_note_restart_and_wait [<what> [<http-safe>]]
   return 0
 }
 
-# The one sentence a config read is allowed to end on, and the reason it changes
-# under --dry-run: the live file test in Step 5 is what actually proves the agent
-# can use this lane, and a dry run exits at print_plan before verify_all is ever
-# reached (README documents the mode as one that stops and sends nothing). A test
-# this mode never runs must not be promised — that is the same overstatement the
-# rest of this step exists to avoid, in the one place a user is most likely to
-# believe it. Kept in one function because two verdicts end on it.
-openclaw_policy_live_test_note() {
+# The one sentence a config read is allowed to end on, and the two things that
+# change it. Under --dry-run the live file test in Step 5 never runs at all — the
+# mode exits at print_plan before verify_all is ever reached (README documents it
+# as the mode that stops and sends nothing) — so that test must not be promised
+# there. And the sentence turns on what the read ESTABLISHED, because a verdict
+# and its closing line have to agree: a GREEN read is confirmed by the live test,
+# while an UNKNOWN read is only settled by it. "will confirm file access" reads as
+# a pass already granted, which is the exact claim the unknown verdict has just
+# finished saying it cannot make — two lines reporting that nothing was graded,
+# closing on a sentence that sounds like something was.
+openclaw_policy_live_test_note() { # openclaw_policy_live_test_note [settles]
   if $DRY_RUN; then
     note "(dry-run: this pass stops before the live file test, so nothing here is checked against a running agent)"
+  elif [ "${1:-}" = "settles" ]; then
+    note "The live file test later is what settles it — if the agent can't use this lane, that test is where it shows."
   else
     note "The live file test later will confirm file access."
   fi
@@ -1962,7 +1998,7 @@ openclaw_tool_policy_step() {
       # a false alarm whose declined fix would cost the operator the whole lane.
       note "$reason."
       note "Nothing is changed here, and the file lane is kept either way."
-      openclaw_policy_live_test_note
+      openclaw_policy_live_test_note settles
       return 0 ;;
     unreadable|"")
       warn "Could not read the tool policy ($reason) — continuing, but if attachments later"
@@ -2036,7 +2072,7 @@ openclaw_tool_policy_step() {
           note "Restart it when you can; until then the agent still can't open the files Conduck uploads."
         fi
         if [ "$recheck" = "unknown" ]; then
-          openclaw_policy_live_test_note
+          openclaw_policy_live_test_note settles
         fi
         return 0
       fi

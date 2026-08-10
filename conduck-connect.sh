@@ -1658,6 +1658,15 @@ explain_action() { # explain_action <action-id>
         "The saved profile keeps its file lane, so a later show-code run checks it again."
       ;;
 
+    verification.image_ignored|image-ignored)
+      explain_panel \
+        "Pair a gateway whose reply did not reflect the test picture" \
+        "This is the one failure the app cannot show you later: a photo comes back as an ordinary, confident reply that does not reflect it, and the pairing code carries no field that could warn the app about it — so this screen is the only place it can be said." \
+        "Yes prints the code and pairs the gateway exactly as it is; nothing about this finding is recorded in the code, in the app, or in the saved profile. No ends this run without a code — which is a failed verification like any other, so a file lane is left out of this run and any network exposure this run applied for it is rolled back, and you are offered the commands to undo the rest." \
+        "Enter means No. Your gateway is not reconfigured either way: this question is about whether a code is printed, not about changing the server." \
+        "Re-running verifies again from scratch, so fixing the gateway — sending pictures to an engine that can see them, or refusing them with HTTP 400 and code \"image_unsupported\" — clears this without any further undo."
+      ;;
+
     pairing.code|pairing-code)
       explain_panel \
         "Bring the verified gateway into the Conduck app" \
@@ -5311,9 +5320,17 @@ except Exception:
     sys.exit(0)
 
 tools = cfg.get("tools")
-if not isinstance(tools, dict):
+if tools is None:
     emit("status", "none",
          "no tools block in openclaw.json — the default policy leaves the agent's file tools on")
+    sys.exit(0)
+if not isinstance(tools, dict):
+    # Present, but not an object. Read as absent it would print the sentence above,
+    # which is an affirmative claim that the default policy is in force — made
+    # about a block this read could not interpret at all.
+    emit("status", "manual",
+         "tools in openclaw.json is not an object, so nothing inside it could be read and "
+         "this check cannot say what the policy grants or blocks; fix the block by hand first")
     sys.exit(0)
 
 # Keys whose list held something other than a string. Every rewrite below writes
@@ -5380,6 +5397,29 @@ def granted(entries, tool):
                 or (tool in FS_GROUP and fnmatch.fnmatchcase("group:fs", low))):
             return True
     return False
+
+# A key that is PRESENT but written as the wrong TYPE. Every accessor above reads
+# one as ABSENT, and absent is indistinguishable from healthy: tools.deny written
+# as the bare string "group:fs" instead of ["group:fs"] vanished from this read
+# entirely, and the operator who had just switched their agent's file tools off was
+# told read/write allowed. Same shape one level up for a profile that is not a
+# string. This read cannot say what OpenClaw makes of such a key either — it may
+# reject the config, it may ignore the key — so it grades nothing and rewrites
+# nothing, the same posture as the lossy list below. A JSON null is NOT this case:
+# that is a legitimate spelling of "unset" and stays absent.
+mistyped = []
+for key, want, kind in (("allow", "a list", list), ("alsoAllow", "a list", list),
+                        ("deny", "a list", list), ("profile", "a name", str)):
+    value = tools.get(key)
+    if value is None or isinstance(value, kind):
+        continue
+    mistyped.append("tools.%s (expects %s)" % (key, want))
+if mistyped:
+    emit("status", "manual",
+         "%s is written as the wrong type, so this read cannot tell what it grants or blocks — "
+         "and a key it cannot read looks exactly like one that isn't there; correct the type by "
+         "hand first" % " and ".join(mistyped))
+    sys.exit(0)
 
 # An invalid config (both allow + alsoAllow) must never be auto-edited into a
 # different invalid config — surface it instead.
@@ -5650,16 +5690,21 @@ gw_note_restart_and_wait() { # gw_note_restart_and_wait [<what> [<http-safe>]]
   return 0
 }
 
-# The one sentence a config read is allowed to end on, and the reason it changes
-# under --dry-run: the live file test in Step 5 is what actually proves the agent
-# can use this lane, and a dry run exits at print_plan before verify_all is ever
-# reached (README documents the mode as one that stops and sends nothing). A test
-# this mode never runs must not be promised — that is the same overstatement the
-# rest of this step exists to avoid, in the one place a user is most likely to
-# believe it. Kept in one function because two verdicts end on it.
-openclaw_policy_live_test_note() {
+# The one sentence a config read is allowed to end on, and the two things that
+# change it. Under --dry-run the live file test in Step 5 never runs at all — the
+# mode exits at print_plan before verify_all is ever reached (README documents it
+# as the mode that stops and sends nothing) — so that test must not be promised
+# there. And the sentence turns on what the read ESTABLISHED, because a verdict
+# and its closing line have to agree: a GREEN read is confirmed by the live test,
+# while an UNKNOWN read is only settled by it. "will confirm file access" reads as
+# a pass already granted, which is the exact claim the unknown verdict has just
+# finished saying it cannot make — two lines reporting that nothing was graded,
+# closing on a sentence that sounds like something was.
+openclaw_policy_live_test_note() { # openclaw_policy_live_test_note [settles]
   if $DRY_RUN; then
     note "(dry-run: this pass stops before the live file test, so nothing here is checked against a running agent)"
+  elif [ "${1:-}" = "settles" ]; then
+    note "The live file test later is what settles it — if the agent can't use this lane, that test is where it shows."
   else
     note "The live file test later will confirm file access."
   fi
@@ -5711,7 +5756,7 @@ openclaw_tool_policy_step() {
       # a false alarm whose declined fix would cost the operator the whole lane.
       note "$reason."
       note "Nothing is changed here, and the file lane is kept either way."
-      openclaw_policy_live_test_note
+      openclaw_policy_live_test_note settles
       return 0 ;;
     unreadable|"")
       warn "Could not read the tool policy ($reason) — continuing, but if attachments later"
@@ -5785,7 +5830,7 @@ openclaw_tool_policy_step() {
           note "Restart it when you can; until then the agent still can't open the files Conduck uploads."
         fi
         if [ "$recheck" = "unknown" ]; then
-          openclaw_policy_live_test_note
+          openclaw_policy_live_test_note settles
         fi
         return 0
       fi
@@ -9210,12 +9255,253 @@ agent_file_lane_gate() {
   return 1
 }
 
+# ---- the image gate -----------------------------------------------------------
+#
+# The last gateway chat turn every pairing verification makes, on every kind and by
+# every route in (--setup, both check handoffs, --show-code): one more REAL chat
+# turn carrying a picture, so a gateway that answers photos without ever looking
+# at them cannot reach the app silently.
+#
+# Why it exists at all: a photo that vanishes is the one failure the app cannot
+# show. A dropped image comes back as an ordinary, confident reply, the pairing
+# payload has no field to carry a warning, and nothing on the phone can tell that
+# reply from a real sighting. So the only place the operator can ever learn it is
+# this screen, before the code exists.
+#
+# It addresses $GW_URL — the FINAL app-facing address, whatever HTTPS front,
+# tunnel or reverse proxy is in it — and carries $GW_MODEL, the model the code is
+# about to name. A loopback probe would skip the exact hop most likely to strip a
+# multipart content array, and a different model would grade a route the app
+# never takes.
+#
+# Severity keys on the probe's OUTCOME, never on the target's pedigree. A
+# purpose-built adapter and a plain Ollama behind a text-only model produce the
+# identical silent 200 — behaviour is the evidence, so a 200 that answers as if
+# no picture was attached is what gets stopped, and an honest refusal passes on
+# every kind. Provenance moves exactly one outcome: on the --check-adapter →
+# setup handoff the operator has themselves declared this software was built for
+# Conduck, and there the contract admits no third answer, so the warning becomes
+# a block.
+#
+# It never fails on the absence of evidence. A transfer that does not complete, a
+# body cap, an error nobody can classify — each is reported for what it is and
+# none of them withholds a code: the text turn above already passed, and a run
+# that cannot measure something must not convict on it.
+IMG_PROOF=""     # transcript state for THIS run: "" | verified | declined | too-large
+                 # | unmeasured | opaque | ignored-acked | ignored-blocked. Not in
+                 # the payload and not in the profile — there is nowhere honest to
+                 # put it, which is the whole reason this gate is on screen.
+IMG_OUTCOME=""   # the last graded turn, set by verify_image_probe_once
+
+# One graded image turn. Prints nothing and decides nothing — it leaves the
+# outcome word in IMG_OUTCOME and the app-evaluator state in CCE_*/DCC_* for the
+# caller to word. Split out because the ignored case is retried, and a second
+# attempt that fails a DIFFERENT way (the tunnel drops, the engine refuses the
+# second picture) must be graded on what IT did: a retry folded into the first
+# attempt's verdict is exactly how a network fault gets reported to an operator
+# as "your gateway drops photos".
+verify_image_probe_once() { # verify_image_probe_once [digits-the-retry-must-not-reuse]
+  local avoid="${1:-}" redraws=0
+  IMG_OUTCOME=""
+  # Set explicitly, never inherited: image_probe_gen's python reads the
+  # ENVIRONMENT, so a CONDUCK_PROBE_MODEL the operator happens to have exported
+  # would quietly grade a different model than the one being paired.
+  CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
+  # A retry that happens to redraw the FIRST attempt's digits is not a second
+  # look — a cached reply, or the one-in-nine-thousand coincidence the first turn
+  # was retried for, would pass on exactly the run where it must not. The digits
+  # are drawn locally with no request behind them, so redrawing costs nothing;
+  # the bound is there because an unbounded loop on a broken generator is worse
+  # than a repeated code.
+  while [ -n "$avoid" ] && [ "$IPG_CODE" = "$avoid" ] && [ "$redraws" -lt 8 ]; do
+    redraws=$((redraws+1))
+    CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
+  done
+  # The SAME evaluator the round-trip above used, and the same one the app is
+  # mirrored on — a stricter grader here would redden replies the app accepts.
+  # That mirroring decides two edges deliberately: EVERY 2xx counts as a reply
+  # (a 201 without the digits is the same confident answer on the phone as a 200
+  # without them), and a decline the app recognizes counts as recognized at
+  # whatever status it arrives on (the app keys on the error code, so a 500
+  # carrying "image_unsupported" still shows the user "pictures aren't supported
+  # here" rather than a lie about their photo). This gate grades what the person
+  # holding the phone will experience, not what the wire ought to look like —
+  # --check-adapter --deep is where the wire is held to the stricter bar.
+  if app_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
+    if [ "$CCE_TOKEN" = "yes" ]; then IMG_OUTCOME="verified"; else IMG_OUTCOME="ignored"; fi
+    return 0
+  fi
+  # A transfer that never completed carries no status to read, so nothing about
+  # images was measured. Asked FIRST, before any classification: DCC_CODE is
+  # empty in exactly this case, and an empty status falls through every arm below
+  # into "opaque" — which would report a dropped connection as a gateway defect.
+  if [ "$DCC_CURL_RC" != "0" ]; then IMG_OUTCOME="unmeasured"; return 0; fi
+  # The app's own decline classifier, split the way the app splits it: a refusal
+  # it can name ("pictures aren't supported here") is a different user experience
+  # from a size cap, and both differ from an error it can only show as generic.
+  case "$(compat_image_failure_kind)" in
+    image_unsupported) IMG_OUTCOME="declined" ;;
+    too_large)         IMG_OUTCOME="too_large" ;;
+    *)                 IMG_OUTCOME="opaque" ;;
+  esac
+  return 0
+}
+
+# The two ways out of a gateway whose reply does not reflect the picture it was
+# sent, said in one place because the block arm and the refusal arm owe the
+# identical advice and a second copy is how they drift.
+verify_image_two_fixes() {
+  say "    Two ways to fix it, and either one is fine:"
+  say "      • send pictures to an engine that can actually see them, or"
+  say "      • refuse them: answer HTTP 400 with an error body carrying"
+  say "        code \"image_unsupported\". The app then shows its own \"pictures aren't"
+  say "        supported here\" message, and text and voice keep working."
+}
+
+# A 200 that does not read the picture back, twice. Everything above has passed,
+# so this is the only branch that can withhold a code.
+verify_image_ignored_gate() {
+  bad "photo turn: answered 200 — twice — without reading either test picture's digits back"
+  say "    This run could not verify the engine used the picture. It may never have reached the"
+  say "    engine, or it may have reached one that could not read it; from out here those are the"
+  say "    same answer, so both are worth checking. What is certain is what happens in the app:"
+  say "    a photo comes back as a confident reply that does not reflect what you sent, and the"
+  say "    app cannot tell that reply from a real one — the pairing code has no field to warn it,"
+  say "    and there is no error for it to show."
+
+  # The ONE place provenance is known: this operator ran --check-adapter, which is
+  # their own statement that the software was built for Conduck. That contract
+  # allows exactly two answers to a picture in the newest message, so there is no
+  # honest "continue anyway" to offer here — the thing being paired is the thing
+  # whose author can fix it.
+  # ${…:-} because the suites lift this module into runtimes under `set -u` that
+  # declare only what they drive; 10-utilities owns the initialisation, and a
+  # module may not depend on an earlier one's globals existing in a harness.
+  if [ "${SETUP_FROM_CHECK_KIND:-}" = "adapter" ]; then
+    IMG_PROOF="ignored-blocked"
+    VERIFY_FAILED=true
+    say ""
+    say "    You reached setup from ${BOLD}--check-adapter${RESET}, so this is software built for Conduck, and"
+    say "    its contract allows exactly two answers to a picture in the newest message: forward it"
+    say "    to the engine, or refuse the whole request. A 200 produced without the engine seeing"
+    say "    the picture is the one forbidden move — a substituted note about it is the same move —"
+    say "    so this run stops here rather than handing you a code that pairs it."
+    verify_image_two_fixes
+    say "    Then iterate until [IMAGE_INPUT] is green:"
+    say "      ${BOLD}bash conduck-connect.sh --check-adapter --deep${RESET}"
+    say "      ${BOLD}conduck.com/setup/adapter/v1/${RESET} → Images   (the rule, and the text-only recipe)"
+    return 0
+  fi
+
+  # Everywhere else this script cannot know what it is talking to — the custom
+  # bucket deliberately holds hand-written adapters and plain model servers alike
+  # — and a text-only Ollama behaving exactly like this is not a defect in
+  # Ollama. So: report, and offer. Default No, because the answer that costs
+  # someone their photos should not be the one Enter gives.
+  warn "Photo replies won't reflect the picture you send, and there is no way to tell the app so."
+
+  # --setup only reaches a person (a redirected check exits before it offers the
+  # handoff), but --show-code has no such guard and is the path a script uses to
+  # re-pair a second device. Asked there, `confirm` reads EOF and answers No —
+  # the right ANSWER, printed as a question into a log nobody is reading, which
+  # leaves the operator with a missing code and a prompt as the only explanation.
+  # Same outcome, said as a statement: this run stops, and here is why and where
+  # to decide it. Not an escape hatch — redirecting stdin gets you fewer codes,
+  # never more, so there is nothing here to cargo-cult around the gate.
+  if ! interactive_terminal; then
+    IMG_PROOF="ignored"
+    VERIFY_FAILED=true
+    say "    There is no terminal to ask on in this run, and pairing a gateway that loses photos is"
+    say "    not a decision to make on your behalf — so it stops here, with no code."
+    say "    Re-run me from a terminal to decide it yourself, or fix it:"
+    verify_image_two_fixes
+    return 0
+  fi
+
+  if confirm "Continue and get the code anyway, knowing photo replies won't reflect the picture?" \
+             "verification.image_ignored"; then
+    IMG_PROOF="ignored-acked"
+    note "Continuing. This screen is the only record of it — nothing in the code, the app, or your"
+    note "saved profile carries this, so a photo will still look answered either way."
+    return 0
+  fi
+  IMG_PROOF="ignored"
+  VERIFY_FAILED=true
+  say "    Stopped before emitting a code."
+  verify_image_two_fixes
+  return 0
+}
+
+verify_image_intake() {
+  IMG_PROOF=""
+  IMG_OUTCOME=""
+  # Nothing left to protect on a run that will emit no code: emit_payload already
+  # withholds it. Same arithmetic as skip_agent_file_probe_after_failed_gateway —
+  # this turn's answer would be discarded, and the re-run they now have to do
+  # anyway buys it again for free. Silent: a line about a probe that was skipped
+  # is noise under a failure epilogue that already names what to fix.
+  $VERIFY_FAILED && return 0
+
+  say "  Then one real photo turn — the same address and model the app will use…"
+  verify_image_probe_once
+  if [ "$IMG_OUTCOME" = "ignored" ]; then
+    # Retry ONCE, and only this outcome, because only this one is about to cost
+    # someone their pairing code. A FRESHLY drawn picture on purpose: re-sending
+    # the same one lets a cached answer, or the ~1-in-9000 lucky guess, pass on
+    # the second look — the retry is there to forgive a flaky turn, not to give
+    # a wrong answer two chances to be right.
+    # This is the only path that spends a second turn, so a gateway that bills
+    # per request is charged twice only when it has already answered once in the
+    # single way that would otherwise block it.
+    note "That reply didn't contain the picture's digits. Trying once with a new picture before judging…"
+    verify_image_probe_once "$IPG_CODE"
+  fi
+
+  case "$IMG_OUTCOME" in
+    verified)
+      IMG_PROOF="verified"
+      ok "photo turn: the reply reads the test picture's digits back — pictures reach the engine"
+      ;;
+    declined)
+      IMG_PROOF="declined"
+      ok "photo turn: pictures are refused honestly, in a way the app recognizes"
+      note "The app shows its own \"pictures aren't supported here\" message; text and voice are"
+      note "unaffected. Nothing is lost quietly — a photo fails visibly, with a reason."
+      ;;
+    too_large)
+      IMG_PROOF="too-large"
+      warn "The test picture was refused as TOO LARGE (HTTP 413) — and it is a few kilobytes."
+      note "Something on this route caps request bodies far below what a photo needs, so in the app"
+      note "every picture will fail this way. Raise the limit wherever it lives — a reverse proxy, a"
+      note "tunnel, or the gateway itself; the adapter contract's floor is 50 MiB. Not silent: the"
+      note "app shows a clear picture-too-large message, so this doesn't hold up your code."
+      ;;
+    unmeasured)
+      IMG_PROOF="unmeasured"
+      warn "Image support was NOT measured — the photo turn didn't complete ($CCE_REASON)."
+      note "That is a transport fault, not a finding about how this gateway handles pictures. The"
+      note "text turn above passed, so your code stands; re-run me if you want the photo answer."
+      ;;
+    opaque)
+      IMG_PROOF="opaque"
+      warn "Photo turns fail with an error the app can't classify ($CCE_REASON)."
+      note "Sending a picture shows a generic failure instead of \"pictures aren't supported here\"."
+      note "Annoying, never deceptive — nothing goes missing quietly, so your code stands."
+      ;;
+    ignored)
+      verify_image_ignored_gate
+      ;;
+  esac
+  return 0
+}
+
 verify_all() {
   head_ "Step 5 — verify (real requests, before you touch your phone)"
   # Proof belongs to THIS run's measurements. Cleared here rather than only at
   # declaration so a second verify_all in one process — a re-check, a test, a
   # future menu loop — can never inherit a green claim from an earlier lane.
   FS_AGENT_PROOF=""
+  IMG_PROOF=""
 
   # Local health first (when the gateway has a health endpoint).
   # "Is it up locally?" — any HTTP answer below 500 counts (this request carries
@@ -9328,6 +9614,12 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
     VERIFY_FAILED=true
   fi
 
+  # …and the same round trip with a picture on it. Runs AFTER the text turn on
+  # purpose: a gateway that cannot answer text at all is not a gateway with an
+  # image problem, and the gate returns without spending a turn once anything
+  # above has failed.
+  verify_image_intake
+
   # File transport first. For known agent gateways, a second real agent turn
   # below is the launch gate: WebDAV plus static config inspection must never
   # produce an end-to-end green claim by themselves.
@@ -9396,7 +9688,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.4). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.5). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -9428,8 +9720,10 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
 # image (VERIFIED); an honest HTTP 400 decline with code "image_unsupported"
-# also passes (DECLINED); a 200 that ignores the image is the forbidden
-# silent drop (UNVERIFIED → exit 1).
+# also passes (DECLINED); a 200 without them leaves the sighting UNPROVEN
+# (UNVERIFIED → exit 1) — from out here that reply cannot be told apart from
+# the forbidden silent drop, which is why it fails closed rather than being
+# diagnosed as one.
 #
 # --files adds the file-lane probes (MUTATING — the one adapter-check profile that
 # is: it writes + removes small conduck-check-* files in the configured
@@ -9444,7 +9738,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.4 harness=<ver>
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.5 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
 #     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
 #     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
@@ -9475,7 +9769,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.4"
+DOCTOR_CONTRACT_REV="1.5"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
@@ -9532,6 +9826,11 @@ doctor_not_yours_hint() {
   say "  wrong. Ask the question you actually have instead:"
   say "    ${BOLD}bash conduck-connect.sh --check-server${RESET}   — can the app talk to this server?"
   say "    ${BOLD}bash conduck-connect.sh --setup${RESET}          — pair it; a failed grade here doesn't block that"
+  # That last line has to stay literally true, and setup now carries one gate of
+  # its own: it sends a real photo turn before it prints a code. Nothing on THIS
+  # grade blocks pairing — but "doesn't block that" reads as a promise that setup
+  # asks nothing, and the operator would meet the question anyway.
+  say "      (setup runs its own final photo check and asks first)"
 }
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
@@ -10489,9 +10788,14 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 #                images (OCR tooling counts — this grades capability, not eyes).
 #   DECLINED   — HTTP 400 + OpenAI error body + code "image_unsupported": a
 #                text-only adapter refusing honestly. Allowed, passes.
-#   UNVERIFIED — 200 but the digits aren't in the reply: the image was
-#                silently dropped or hallucinated over — the one forbidden
-#                move. Fails the deep profile.
+#   UNVERIFIED — 200 but the digits aren't in the reply: this run could not
+#                verify the engine used the image. Two different faults reach
+#                this same answer — the image never got to the engine, or it
+#                got to one that misread it — and a black-box probe cannot
+#                separate them, so it names both and diagnoses neither. Fails
+#                the deep profile either way: the app cannot tell this reply
+#                from a real sighting, so an unproven one is as unusable as
+#                the forbidden silent drop it may or may not be.
 # Anything else (wrong/missing decline code, other statuses, bad shape) FAILs:
 # clients key on the machine code, so "looks declined" isn't good enough.
 # ~1-in-9000 guess odds are accepted. The reply's content is never printed.
@@ -10569,9 +10873,19 @@ doctor_image_input_check() {
     fi
     DOCTOR_IMAGE_INPUT="UNVERIFIED"
     d_bad "$id" "image input — answered 200, but the reply doesn't contain the image's digits (${DCE_LEN:-?} chars)"
-    d_say "$id" "(the engine never saw the image — it was silently dropped somewhere, the one forbidden"
-    d_say "$id" " move. Forward images to the engine, or decline honestly with HTTP 400 + an error body"
-    d_say "$id" " carrying code \"image_unsupported\" — never answer as if no image was attached.)"
+    # What this probe can and cannot establish. It proves the ABSENCE of evidence
+    # that the engine used the image; it does not observe where the image went.
+    # Naming a cause anyway sends the reader to one place: an earlier wording said
+    # the image "was silently dropped somewhere", and an adapter that forwarded it
+    # faithfully to a model too weak to read the glyphs got that same sentence and
+    # audited its forwarding path for a fault that was never there. Two adapters
+    # with different internals produced identical verdicts on a live run.
+    d_say "$id" "(this run could not verify that the engine used the image — that is all a 200 without the"
+    d_say "$id" " digits proves. It may never have reached the engine, or it may have reached one that"
+    d_say "$id" " misread it; from out here those are the same answer, so check the forwarding path AND the"
+    d_say "$id" " engine's own vision. Unproven still fails: the app cannot tell this reply from a real"
+    d_say "$id" " sighting either. Forward images to the engine, or decline honestly with HTTP 400 + an"
+    d_say "$id" " error body carrying code \"image_unsupported\" — never answer as if no image was attached.)"
     doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
     return 1
   fi
@@ -12236,8 +12550,17 @@ print(json.dumps(req))') \
       say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
     else
       COMPAT_IMAGE_INPUT="IGNORED"
-      warn "image input: IGNORED — answered 200 while ignoring the image. In the app, photos"
-      say "    are silently unseen: users get confident answers about images the engine never saw."
+      # The meter name is frozen in the schema=2 grammar, but the sentence under it
+      # must not claim more than the probe saw. A missing set of digits proves the
+      # absence of evidence, never where the image went — and a server that
+      # forwarded it faithfully to a text-weak model gets this identical result, so
+      # naming a drop sends that operator hunting through a delivery path that is
+      # working. Say what is unproven, name both causes, leave the verdict alone.
+      warn "image input: IGNORED — answered 200 without reading the probe image's digits back, so this"
+      say "    run could not verify the engine used the image. It may never have reached the engine, or"
+      say "    it may have reached one that misread it — from out here those look the same. Either way,"
+      say "    in the app a photo can come back as a confident answer about a picture the engine did"
+      say "    not read."
     fi
   elif compat_image_declined_detectable; then
     COMPAT_IMAGE_INPUT="DECLINED"
@@ -12462,6 +12785,29 @@ pairing_capability_summary() {
     warn "File transfer is NOT included — attachments stay inline-only."
     note "To add it later, re-run setup and give the file lane an address."
   fi
+  # Photos are the third thing the app can send, and the only one whose failure it
+  # cannot show: a picture that never reached the engine comes back as an ordinary
+  # reply. Step 5 measured that against this exact address and model; this states
+  # what the measurement means for the code about to be scanned, for the same
+  # reason the lane above earns its lines — the payload has no field for it, and a
+  # warning given three prompts ago has scrolled away by the time the code appears.
+  # Silent when nothing was measured (a skipped, unmeasured, or not-yet-run gate):
+  # a line about an unmeasured capability is the ✓-on-an-unmeasured-half bug again.
+  # ${IMG_PROOF:-} because this function is deliberately lifted out of its module
+  # by the suite, into a runtime that declares only what it drives.
+  case "${IMG_PROOF:-}" in
+    verified)
+      ok "Photos — pictures you send reach the engine" ;;
+    declined)
+      note "Photos are refused with a clear \"pictures aren't supported here\" message." ;;
+    too-large)
+      warn "Photos will FAIL — a size cap on this route refused a few-kilobyte test picture." ;;
+    opaque)
+      warn "Photos will fail with an error the app can only show as a generic failure." ;;
+    ignored-acked)
+      warn "Photo replies DON'T REFLECT THE PICTURE — you chose to pair anyway. A photo comes"
+      note "back as a confident answer that doesn't match what you sent, and the app cannot tell you." ;;
+  esac
 }
 
 emit_payload() {

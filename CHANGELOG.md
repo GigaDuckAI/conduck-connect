@@ -4,6 +4,81 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [Unreleased]
 
+- **Setup will no longer hand you a pairing code for a gateway that swallows
+  photos.** Nothing stopped one before: `--check-server` printed *image input:
+  IGNORED* and still returned PASS, `--check-adapter --deep` failed the same
+  gateway and then offered *pair it; a failed grade here doesn't block that*, and
+  setup itself never asked. So a gateway that dropped every picture paired
+  cleanly and the owner found out the first time a photo vanished mid-conversation
+  — the one failure the app cannot show, because a dropped picture comes back as
+  an ordinary confident reply and the pairing code has no field to warn anything.
+  Every verification now makes one more real chat turn carrying a small picture
+  the script draws itself — four random digits, a couple of kilobytes — and asks
+  for the digits back. It runs on every gateway kind and by every route to a code:
+  `--setup`, both check-to-setup handoffs, and `--show-code`. It addresses the
+  final app-facing URL with the model the code is about to name, so whatever HTTPS
+  front, tunnel or proxy sits in the way is part of what gets tested.
+  **What each answer costs you:** the digits read back, or a refusal the app
+  recognizes (`400` + code `image_unsupported`), and the run passes with a line
+  saying which — a text-only server that declines honestly is not a problem and is
+  never treated as one. A body-size cap (`413`), an error nobody can classify, or
+  a turn that never completed are reported and pass: a run that measured nothing
+  may not convict, so a dropped tunnel is never reported as a gateway that loses
+  photos. Only one answer withholds a code — a confident reply that quotes neither
+  picture, asked twice with freshly drawn digits. Reached setup from
+  `--check-adapter`? That is your own statement that this software was built for
+  Conduck, whose contract admits exactly two answers here, so the run stops and
+  points at `--check-adapter --deep` to iterate. Everywhere else the wizard cannot
+  know what it is talking to — a plain Ollama behind a text-only model behaves
+  identically, and its owner did nothing wrong — so it reports and asks whether to
+  pair anyway. **Enter means no.** Answering yes prints the code and says plainly
+  that this screen is the only record; the pairing screen repeats it beside the
+  code. A run with no terminal to ask on stops instead of printing a question into
+  a log, and says why.
+
+- Tracks adapter contract **revision 1.5**. The revision resolves a contradiction
+  between the contract's prose and its own conformance checker over one image
+  rule: a CURRENT-turn image has exactly two conforming outcomes, forward it to
+  the engine or reject the request with `400` + code `image_unsupported`, and a
+  `200` the engine produced without seeing the image fails whether it is silent
+  or carries a substituted note. `--check-adapter --deep` has graded it that way
+  since revision 1.3, so **no check changes behaviour here** — an adapter that
+  passed before passes now, and the number this check reports is simply the
+  revision whose text it has been enforcing.
+
+- **A failed image probe stops naming a cause it cannot see.** `--check-adapter
+  --deep` reported a reply without the probe's digits as *the engine never saw the
+  image — it was silently dropped somewhere*, and `--check-server` said photos are
+  *silently unseen*. From outside, that reply has two causes that look identical:
+  the image never reached the engine, or it reached one that could not read the
+  glyphs. Two adapters with different internals produced that same verdict on a
+  live run, and the one that was forwarding correctly went auditing a delivery
+  path that worked. Both messages now say what the probe actually establishes —
+  this run could not verify the engine used the image — and name both causes so
+  you check both. The verdicts are unchanged: `--check-adapter --deep` still fails
+  closed on an unproven sighting, with the same two ways out (forward the image,
+  or decline with `400` + code `image_unsupported`), and `--check-server`'s image
+  result stays informational.
+
+- **A tool-policy key written as the wrong type is reported instead of vanishing.**
+  `{"tools": {"deny": "group:fs"}}` — the bare string where OpenClaw expects a
+  list — was read as *no deny list at all*, and a config whose author had just
+  switched their agent's file tools off came back as *OpenClaw's file-tool settings
+  look ready (read/write allowed, profile: coding)*. `allow`, `alsoAllow`, `deny`,
+  a `profile` that is not a name, and a whole `tools` block that is not an object
+  all take the same route now: the wizard names the key, changes nothing, and
+  leaves it with you — the same posture it already takes toward a list holding
+  entries it cannot faithfully rewrite. A JSON `null` still means *unset* and is
+  read exactly as before.
+
+- **The unrecognised-profile verdict stops ending on the green verdict's line.**
+  It says it cannot tell which file tools that profile grants and that nothing was
+  changed, then closed on *The live file test later will confirm file access.* —
+  the sentence the ready verdict ends on, which reads as a pass already granted.
+  It now closes on one that matches what it just said: the live file test later is
+  what settles it. The ready verdict keeps its own sentence, and `--dry-run` still
+  promises neither.
+
 - **Two policies this check used to rewrite are now left to you, because the only
   safe edit to either was none.** An empty `tools.allow` was read as an allowlist
   two entries short, and the offered repair wrote `["read", "write"]` into it —

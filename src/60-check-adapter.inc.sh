@@ -1,7 +1,7 @@
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.4). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.5). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -33,8 +33,10 @@
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
 # image (VERIFIED); an honest HTTP 400 decline with code "image_unsupported"
-# also passes (DECLINED); a 200 that ignores the image is the forbidden
-# silent drop (UNVERIFIED → exit 1).
+# also passes (DECLINED); a 200 without them leaves the sighting UNPROVEN
+# (UNVERIFIED → exit 1) — from out here that reply cannot be told apart from
+# the forbidden silent drop, which is why it fails closed rather than being
+# diagnosed as one.
 #
 # --files adds the file-lane probes (MUTATING — the one adapter-check profile that
 # is: it writes + removes small conduck-check-* files in the configured
@@ -49,7 +51,7 @@
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.4 harness=<ver>
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.5 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
 #     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
 #     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
@@ -80,7 +82,7 @@
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.4"
+DOCTOR_CONTRACT_REV="1.5"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
@@ -137,6 +139,11 @@ doctor_not_yours_hint() {
   say "  wrong. Ask the question you actually have instead:"
   say "    ${BOLD}bash conduck-connect.sh --check-server${RESET}   — can the app talk to this server?"
   say "    ${BOLD}bash conduck-connect.sh --setup${RESET}          — pair it; a failed grade here doesn't block that"
+  # That last line has to stay literally true, and setup now carries one gate of
+  # its own: it sends a real photo turn before it prints a code. Nothing on THIS
+  # grade blocks pairing — but "doesn't block that" reads as a promise that setup
+  # asks nothing, and the operator would meet the question anyway.
+  say "      (setup runs its own final photo check and asks first)"
 }
 
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
@@ -1094,9 +1101,14 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 #                images (OCR tooling counts — this grades capability, not eyes).
 #   DECLINED   — HTTP 400 + OpenAI error body + code "image_unsupported": a
 #                text-only adapter refusing honestly. Allowed, passes.
-#   UNVERIFIED — 200 but the digits aren't in the reply: the image was
-#                silently dropped or hallucinated over — the one forbidden
-#                move. Fails the deep profile.
+#   UNVERIFIED — 200 but the digits aren't in the reply: this run could not
+#                verify the engine used the image. Two different faults reach
+#                this same answer — the image never got to the engine, or it
+#                got to one that misread it — and a black-box probe cannot
+#                separate them, so it names both and diagnoses neither. Fails
+#                the deep profile either way: the app cannot tell this reply
+#                from a real sighting, so an unproven one is as unusable as
+#                the forbidden silent drop it may or may not be.
 # Anything else (wrong/missing decline code, other statuses, bad shape) FAILs:
 # clients key on the machine code, so "looks declined" isn't good enough.
 # ~1-in-9000 guess odds are accepted. The reply's content is never printed.
@@ -1174,9 +1186,19 @@ doctor_image_input_check() {
     fi
     DOCTOR_IMAGE_INPUT="UNVERIFIED"
     d_bad "$id" "image input — answered 200, but the reply doesn't contain the image's digits (${DCE_LEN:-?} chars)"
-    d_say "$id" "(the engine never saw the image — it was silently dropped somewhere, the one forbidden"
-    d_say "$id" " move. Forward images to the engine, or decline honestly with HTTP 400 + an error body"
-    d_say "$id" " carrying code \"image_unsupported\" — never answer as if no image was attached.)"
+    # What this probe can and cannot establish. It proves the ABSENCE of evidence
+    # that the engine used the image; it does not observe where the image went.
+    # Naming a cause anyway sends the reader to one place: an earlier wording said
+    # the image "was silently dropped somewhere", and an adapter that forwarded it
+    # faithfully to a model too weak to read the glyphs got that same sentence and
+    # audited its forwarding path for a fault that was never there. Two adapters
+    # with different internals produced identical verdicts on a live run.
+    d_say "$id" "(this run could not verify that the engine used the image — that is all a 200 without the"
+    d_say "$id" " digits proves. It may never have reached the engine, or it may have reached one that"
+    d_say "$id" " misread it; from out here those are the same answer, so check the forwarding path AND the"
+    d_say "$id" " engine's own vision. Unproven still fails: the app cannot tell this reply from a real"
+    d_say "$id" " sighting either. Forward images to the engine, or decline honestly with HTTP 400 + an"
+    d_say "$id" " error body carrying code \"image_unsupported\" — never answer as if no image was attached.)"
     doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
     return 1
   fi

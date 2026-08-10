@@ -422,9 +422,33 @@ run_case() { # run_case <table-row>
         fail_case "$name" "a real history-image rejection lost its explanation"; return
       fi
       ;;
-    require-model-drop-image)
-      if ! grep -qF 'the engine never saw the image' "$TMP/doctor.out"; then
-        fail_case "$name" "a real silent image drop lost its explanation"; return
+    silent-drop-image|require-model-drop-image)
+      # The verdict may say what the probe MEASURED and nothing past it. From out
+      # here a missing set of digits has two causes that answer identically — the
+      # image never reached the engine, or it reached one that misread the glyphs —
+      # and both were seen producing this same verdict on a live run. Asserting the
+      # drop sends the second builder auditing a forwarding path that works, so the
+      # explanation must name both and diagnose neither.
+      if ! grep -qF 'could not verify that the engine used the image' "$TMP/doctor.out"; then
+        fail_case "$name" "an unproven image sighting lost its explanation"; return
+      fi
+      if ! grep -qF 'may never have reached the engine' "$TMP/doctor.out"; then
+        fail_case "$name" "the dropped-before-the-engine cause was not named"; return
+      fi
+      if ! grep -qF 'misread it' "$TMP/doctor.out"; then
+        fail_case "$name" "the engine-saw-it-and-misread-it cause was not named"; return
+      fi
+      if grep -qF 'the engine never saw the image' "$TMP/doctor.out"; then
+        fail_case "$name" "the verdict asserted a cause a black-box probe cannot observe"; return
+      fi
+      # Failing closed on missing proof is still correct, and the way out is still
+      # the contract's two conforming outcomes — softening the cause must not have
+      # cost the remedy.
+      if ! grep -qF 'Forward images to the engine' "$TMP/doctor.out"; then
+        fail_case "$name" "the unproven-image verdict lost the forward-it remedy"; return
+      fi
+      if ! grep -qF 'image_unsupported' "$TMP/doctor.out"; then
+        fail_case "$name" "the unproven-image verdict lost the honest-decline remedy"; return
       fi
       ;;
     strict-fields-image-413)
@@ -865,6 +889,31 @@ run_server_case() { # run_server_case <table-row>
       # line is the only place the two halves appear together.
       if ! grep -qE '✗ .*HTTP 3[0-9][0-9] redirect — use the final server URL directly' "$TMP/doctor.out"; then
         fail_case "$name" "redirect failure omitted the direct-final-URL hint on its ✗ line"; return
+      fi
+      ;;
+    server-silent-drop-image)
+      # IGNORED is a meter name, frozen in the grammar; the sentence under it is
+      # not, and it may only claim what the probe saw. Absent digits have two
+      # causes that answer identically out here — the image never reached the
+      # engine, or it reached one that misread the glyphs — and a generic server
+      # fronting a text-weak model is the commonest way to hit the second. An
+      # operator told the image "was never seen" goes looking in a delivery path
+      # that is working.
+      if ! grep -qF 'could not verify the engine used the image' "$TMP/doctor.out"; then
+        fail_case "$name" "the IGNORED note doesn't say what went unproven"; return
+      fi
+      if ! grep -qF 'may never have reached the engine' "$TMP/doctor.out"; then
+        fail_case "$name" "the dropped-before-the-engine cause was not named"; return
+      fi
+      if ! grep -qF 'misread it' "$TMP/doctor.out"; then
+        fail_case "$name" "the engine-saw-it-and-misread-it cause was not named"; return
+      fi
+      if grep -qF 'the engine never saw' "$TMP/doctor.out"; then
+        fail_case "$name" "the note asserted a cause a black-box probe cannot observe"; return
+      fi
+      # …and it stays informational: this result never moves the wire verdict.
+      if ! grep -qF 'never changes the verdict' "$TMP/doctor.out"; then
+        fail_case "$name" "the image probe stopped saying it is informational"; return
       fi
       ;;
   esac
@@ -2592,10 +2641,17 @@ ARMS
 #     Stubbed, and it prints its target: a case that grades a diagnosis drawn from a
 #     live comparison has to be able to assert the comparison was actually made, and
 #     the suite must never reach a real port to find that out.
+#   image-gate: pass|block — what the image gate decides. STUBBED here, and it must
+#     be: this harness lifts verify_all alone, and the real gate needs the whole
+#     probe/evaluator chain plus a server willing to answer a picture. Its own
+#     outcome table is proved against live fixtures in run_image_gate_case; what
+#     the stub buys is (a) silence — an unstubbed call would be "command not
+#     found" on every arm, and a case can go green through that — and (b) the one
+#     thing only this harness can show: what verify_all does AFTER the gate blocks.
 run_verify_all_isolated() {
   FUNCS="$1" TRANSPORT_IN="$2" MRC="$3" MCODE="$4" MCURL="$5" LOOP="$6" \
   LPORT="$7" CHAT="$8" FSU="$9" FSC="${10}" SQ="${11}" \
-  GWAUTH="${12:-bearer}" LB2XX="${13:-no}" bash -c '
+  GWAUTH="${12:-bearer}" LB2XX="${13:-no}" IMGGATE="${14:-pass}" bash -c '
 eval "$FUNCS"
 say()   { printf "%s\n" "$*"; }
 ok()    { printf "OK %s\n" "$*"; }
@@ -2613,6 +2669,14 @@ models_is_json() {
 local_health_ok() { [ "$LOOP" = "up" ]; }
 gw_answers_on_loopback() { printf "LOOPBACK-PROBE %s\n" "$1"; [ "$LB2XX" = "yes" ]; }
 app_chat_eval()   { CCE_LEN=4; CCE_REASON="stubbed failure"; [ "$CHAT" = "ok" ]; }
+verify_image_intake() {
+  # Mirrors the real gate on the one property this harness grades: it is silent
+  # and spends nothing once verification has already failed.
+  $VERIFY_FAILED && return 0
+  printf "IMAGE-GATE %s\n" "$IMGGATE"
+  [ "$IMGGATE" = "block" ] && VERIFY_FAILED=true
+  return 0
+}
 curl_fs()         { return 22; }                       # the file-lane probe never succeeds
 drop_file_lane()  { FS_URL=""; FS_CRED=""; printf "DROPPED-LANE\n"; }
 agent_file_lane_gate() { :; }
@@ -4270,7 +4334,7 @@ run_reject_body_gate_case() { # run_reject_body_gate_case <wrong-token-ok|keyles
 run_reject_body_matrix_isolated() { # <function-source> <pair-output>
   FUNCS="$1" PAIR="$2" bash -c '
 eval "$FUNCS"
-DOCTOR_CONTRACT_REV="1.4"
+DOCTOR_CONTRACT_REV="1.5"
 tag() { case "$*" in
   *"ONE reused connection"*)   printf "reused" ;;
   *"down one connection"*)     printf "unstable" ;;
@@ -4584,6 +4648,345 @@ apply_checked_path_prefix
   if [ "$rc" != "0" ]; then
     fail_case "$name" "checked path prefix was lost or appended twice"; return
   fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# ===================== the image gate, against real adapters =================
+#
+# The measured bug: `--check-server` printed "image input: IGNORED" and returned
+# PASS with exit 0, and `--check-adapter --deep` failed the same adapter and then
+# offered "pair it; a failed grade here doesn't block that". So an adapter that
+# silently ate every photo paired successfully, and the operator found out the
+# first time a picture vanished mid-conversation — the one failure the app cannot
+# show, because a dropped image comes back as an ordinary confident reply and the
+# pairing payload has no field to carry a warning.
+#
+# Every arm drives the SHIPPED verify_image_intake against a real fixture on
+# loopback. The outcome table is about what a server actually answers, so a
+# stubbed evaluator would only grade the stub. What is pinned is the severity
+# rule: exactly which outcomes may withhold a pairing code, and which may not.
+# The pass arms are the load-bearing half — a gate that blocked everything would
+# satisfy "the bad adapter is stopped" while breaking every honest text-only
+# setup, which is the commonest custom gateway there is.
+#
+# extract_funcs cannot serve this family: image_probe_gen embeds a python literal
+# whose FONT dict closes with a column-0 `}`, and the sed lift every other case
+# relies on stops there, half a function short. So the artifact is sourced as a
+# LIBRARY — everything above the command dispatch, which is the whole function
+# catalogue with its real globals and nothing that runs.
+image_gate_library() { # image_gate_library <out-file>
+  sed -n '1,/^if \[ "\$COMMAND" = "menu" \]; then$/p' "$SCRIPT" | sed '$d' > "$1"
+  grep -q '^verify_image_intake()' "$1" && grep -q '^image_probe_gen()' "$1"
+}
+
+# One gate run against one address. Sourcing installs the release EXIT/signal
+# traps, so they are cleared first: an inherited on_exit would print a run
+# epilogue into the middle of the assertions.
+run_image_gate_probe() { # <lib> <url> <auth> <token> <from-check-kind> <tty> <answer>
+  LIB="$1" IGURL="$2" IGAUTH="$3" IGTOK="$4" IGKIND="$5" IGTTY="$6" IGANS="$7" bash -c '
+. "$LIB"
+trap - EXIT HUP INT TERM
+GREEN=""; RED=""; YELLOW=""; DIM=""; BOLD=""; RESET=""
+say()  { printf "%s\n" "$*"; }
+ok()   { printf "OK %s\n" "$*"; }
+bad()  { printf "BAD %s\n" "$*"; }
+warn() { printf "WARN %s\n" "$*"; }
+note() { printf "NOTE %s\n" "$*"; }
+die()  { printf "DIE %s\n" "$*"; exit 9; }
+confirm() { printf "CONFIRM %s\n" "$1"; [ "$IGANS" = "y" ]; }
+interactive_terminal() { [ "$IGTTY" = "yes" ]; }
+DOCTOR=false; COMPAT=false
+GW_URL="$IGURL"; GW_AUTH="$IGAUTH"; GW_TOKEN="$IGTOK"; GW_MODEL=""
+VERIFY_FAILED=false; SETUP_FROM_CHECK_KIND="$IGKIND"
+verify_image_intake
+printf "GATE proof=%s failed=%s\n" "$IMG_PROOF" "$VERIFY_FAILED"
+'
+}
+
+run_image_gate_case() {
+  local name="image-gate-blocks-only-the-silent-drop" lib="$TMP/gate-lib.sh"
+  local arm mode kind tty ans want_proof want_failed out flat got_retry
+  if ! image_gate_library "$lib"; then
+    fail_case "$name" "could not lift the release artifact into a library"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # arm|fixture-mode|from-check-kind|tty|answer|expect-proof|expect-VERIFY_FAILED
+  local arms='sees-it|good||yes|n|verified|false
+declines-honestly|text-only||yes|n|declined|false
+refused-too-large|strict-fields-image-413||yes|n|too-large|false
+ignored-declined|silent-drop-image||yes|n|ignored|true
+ignored-acknowledged|silent-drop-image||yes|y|ignored-acked|false
+ignored-from-check-adapter|silent-drop-image|adapter|yes|y|ignored-blocked|true
+ignored-no-terminal|silent-drop-image||no|y|ignored|true'
+  while IFS='|' read -r arm mode kind tty ans want_proof want_failed; do
+    [ -n "$arm" ] || continue
+    start_fixture "$mode" || { fail_case "$name" "[$arm] fixture $mode failed to start"; stop_fixture; return; }
+    out=$(run_image_gate_probe "$lib" "http://127.0.0.1:$PORT" bearer "$TOKEN" "$kind" "$tty" "$ans")
+    stop_fixture
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+
+    case "$flat" in *"GATE proof=$want_proof failed=$want_failed"*) ;;
+      *) fail_case "$name" "[$arm] expected proof=$want_proof failed=$want_failed"; return ;;
+    esac
+
+    # A pairing code is withheld by exactly one finding, and only after the gate
+    # has SEEN the same answer twice. Everything else — a size cap, an honest
+    # refusal, a picture the engine read — leaves the code alone. The pass arms
+    # are what stops this gate from turning into "no photos, no pairing".
+    case "$want_failed" in
+      true)  case "$flat" in *"answered 200 — twice"*) ;;
+               *) fail_case "$name" "[$arm] a code was withheld without naming the repeated silent answer"; return ;;
+             esac ;;
+    esac
+
+    # Only the blocking outcome is retried. A second live turn is a second real
+    # (and on a paid gateway, billable) request, so it is spent only where the
+    # first answer would otherwise cost the operator their setup — never after a
+    # transport fault, an honest decline, or a size cap.
+    case "$flat" in *"Trying once with a new picture"*) got_retry=yes ;; *) got_retry=no ;; esac
+    case "$want_proof" in
+      ignored|ignored-acked|ignored-blocked)
+        [ "$got_retry" = "yes" ] || { fail_case "$name" "[$arm] judged a silent answer on one turn"; return ;} ;;
+      *)
+        [ "$got_retry" = "no" ] || { fail_case "$name" "[$arm] spent a second live turn on an outcome that cannot block"; return ;} ;;
+    esac
+  done <<ARMS
+$arms
+ARMS
+
+  # Per-arm wording, where the exit state alone cannot tell a true explanation
+  # from a false one.
+  #
+  # The honest text-only server is the case most likely to be broken by a careless
+  # implementation, so it is asserted in both directions: it passes, and it is
+  # never told its photos vanish.
+  start_fixture text-only || { fail_case "$name" "text-only fixture failed to start"; stop_fixture; return; }
+  out=$(run_image_gate_probe "$lib" "http://127.0.0.1:$PORT" bearer "$TOKEN" "" yes n)
+  stop_fixture
+  printf -- '--- text-only wording ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  if warning_states "$flat" 'CONFIRM|silently|BAD '; then
+    fail_case "$name" "a conformant 400 + image_unsupported decline was treated as a problem"; return
+  fi
+  if ! warning_states "$flat" "pictures aren.t supported here"; then
+    fail_case "$name" "an honest decline did not say what the app shows instead"; return
+  fi
+
+  # The provenance arm blocks WITHOUT asking. Offering "continue anyway" to
+  # someone who just declared this software purpose-built would be offering to
+  # pair a contract violation, and the answer that costs them their photos must
+  # never be reachable by pressing y at a question the wizard should not ask.
+  start_fixture silent-drop-image || { fail_case "$name" "silent-drop fixture failed to start"; stop_fixture; return; }
+  out=$(run_image_gate_probe "$lib" "http://127.0.0.1:$PORT" bearer "$TOKEN" adapter yes y)
+  stop_fixture
+  printf -- '--- adapter provenance ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  if warning_states "$flat" 'CONFIRM'; then
+    fail_case "$name" "the adapter block asked a question a yes could have walked through"; return
+  fi
+  if ! warning_states "$flat" 'check-adapter --deep' || ! warning_states "$flat" 'image_unsupported'; then
+    fail_case "$name" "the adapter block named neither the way to iterate nor the conforming refusal"; return
+  fi
+
+  # A run with no terminal reaches the same fail-closed end WITHOUT printing a
+  # question into a log nobody reads — --show-code has no interactivity guard of
+  # its own, and a missing code whose only explanation is an unanswered prompt is
+  # the worst of both.
+  start_fixture silent-drop-image || { fail_case "$name" "silent-drop fixture failed to start"; stop_fixture; return; }
+  out=$(run_image_gate_probe "$lib" "http://127.0.0.1:$PORT" bearer "$TOKEN" "" no y)
+  stop_fixture
+  printf -- '--- no terminal ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  if warning_states "$flat" 'CONFIRM'; then
+    fail_case "$name" "a question was asked on a run that cannot answer one"; return
+  fi
+  if ! warning_states "$flat" 'no terminal'; then
+    fail_case "$name" "the fail-closed run did not say why it could not ask"; return
+  fi
+
+  # A transport failure is NOT a verdict about images. Nothing is listening on
+  # port 1; the gate must report that it measured nothing, keep the code, and
+  # never name a drop it did not see.
+  out=$(run_image_gate_probe "$lib" "http://127.0.0.1:1" bearer "$TOKEN" "" yes n)
+  printf -- '--- transport failure ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  case "$flat" in *"GATE proof=unmeasured failed=false"*) ;;
+    *) fail_case "$name" "a dead address was not reported as unmeasured, or it withheld a code"; return ;;
+  esac
+  if ! warning_states "$flat" 'NOT measured'; then
+    fail_case "$name" "a transport fault did not say the question went unanswered"; return
+  fi
+  if warning_states "$flat" 'silently|drops|ignored'; then
+    fail_case "$name" "a transport fault was reported as a gateway that loses photos"; return
+  fi
+
+  # How many live turns each outcome actually costs. The arms above can only see
+  # the sentence announcing a retry, and a sentence is not a request — an earlier
+  # revision of this case stayed green with the second probe call deleted. Turns
+  # are counted at the evaluator, so this is the act rather than the narration:
+  # a second real (and on a metered gateway, billable) request is spent on the
+  # ONE answer that would otherwise cost the operator their setup, and on nothing
+  # else — least of all on a transport fault, where the tunnel dropping twice is
+  # the likeliest way to double a charge for no information at all.
+  local turns
+  # scripted-reply|expected-turns
+  local turn_rows='notoken|2
+token|1
+transport|1
+decline|1
+toobig|1'
+  local scripted want_turns
+  while IFS='|' read -r scripted want_turns; do
+    [ -n "$scripted" ] || continue
+    turns=$(LIB="$lib" SCRIPTED="$scripted" bash -c '
+. "$LIB"
+trap - EXIT HUP INT TERM
+say(){ :; }; ok(){ :; }; bad(){ :; }; warn(){ :; }; note(){ :; }
+confirm(){ return 0; }; interactive_terminal(){ return 0; }
+GW_MODEL=""; DOCTOR=false; COMPAT=false
+VERIFY_FAILED=false; SETUP_FROM_CHECK_KIND=""
+TURNS=0
+app_chat_eval() {
+  TURNS=$((TURNS+1))
+  DCC_CURL_RC=0; DCC_CODE=""; CCE_WIRE_CODE=""; CCE_TOKEN=""; CCE_LEN=3; CCE_REASON="scripted"
+  case "$SCRIPTED" in
+    token)     CCE_TOKEN="yes"; return 0 ;;
+    notoken)   CCE_TOKEN="no";  return 0 ;;
+    transport) DCC_CURL_RC=7; return 1 ;;
+    decline)   DCC_CODE=400; CCE_WIRE_CODE="image_unsupported"; return 1 ;;
+    toobig)    DCC_CODE=413; return 1 ;;
+  esac
+}
+verify_image_intake
+printf "%s\n" "$TURNS"
+')
+    printf -- '--- turns: %s -> %s (want %s) ---\n' "$scripted" "$turns" "$want_turns" >> "$TMP/doctor.out"
+    if [ "$turns" != "$want_turns" ]; then
+      fail_case "$name" "a '$scripted' answer cost $turns live turns, expected $want_turns"; return
+    fi
+  done <<TURNROWS
+$turn_rows
+TURNROWS
+
+  # The retry has to carry DIFFERENT digits or it is not a second look: a cached
+  # reply, or the one-in-nine-thousand coincidence the first turn was retried
+  # for, would pass on exactly the run where it must not. Driven with no server
+  # at all — the redraw happens before any request, and this asserts the property
+  # the live arms above can only assume.
+  local redraw
+  redraw=$(LIB="$lib" bash -c '
+. "$LIB"
+trap - EXIT HUP INT TERM
+GW_MODEL=""; DOCTOR=false; COMPAT=false
+app_chat_eval() { DCC_CURL_RC=7; return 1; }   # never reaches the wire
+first=""; repeats=0; i=0
+while [ $i -lt 40 ]; do
+  i=$((i+1))
+  verify_image_probe_once "4242"
+  [ "$IPG_CODE" = "4242" ] && repeats=$((repeats+1))
+  first="$first $IPG_CODE"
+done
+printf "repeats=%s distinct=%s\n" "$repeats" "$(printf "%s\n" $first | sort -u | wc -l | tr -d " ")"
+')
+  printf -- '--- retry redraw ---\n%s\n' "$redraw" >> "$TMP/doctor.out"
+  case "$redraw" in *"repeats=0"*) ;;
+    *) fail_case "$name" "a retry was allowed to reuse the first attempt's digits"; return ;;
+  esac
+  # Non-vacuity: the generator is genuinely random, so "never 4242" is a real
+  # constraint rather than a property of a generator that returns one value.
+  case "$redraw" in *"distinct=1 "*|*"distinct=1")
+      fail_case "$name" "the probe generator returned one fixed code, so the redraw guard proves nothing"; return ;;
+  esac
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Wiring the live arms cannot see: WHERE the gate sits, and what a blocked gate
+# does to the rest of verify_all. It must run after the text round-trip (a
+# gateway that cannot answer text at all is not a gateway with an image problem),
+# before the file lane (whose own entry guard then reads the failure and declines
+# to spend a five-minute agent turn on a run that will emit no code), and it must
+# spend nothing at all when verification has already failed above it.
+run_image_gate_placement_case() {
+  local name="image-gate-runs-between-the-chat-turn-and-the-file-lane" verify funcs out flat
+  local n_chat n_img n_lane
+  verify=$(sed -n '/^verify_all()/,/^}/p' "$SCRIPT")
+  n_chat=$(printf '%s\n' "$verify" | grep -n 'app_chat_eval "\$body"' | head -1 | cut -d: -f1)
+  n_img=$(printf '%s\n'  "$verify" | grep -n 'verify_image_intake'    | head -1 | cut -d: -f1)
+  n_lane=$(printf '%s\n' "$verify" | grep -n 'FS_URL" \] && \[ -n "\$FS_CRED' | head -1 | cut -d: -f1)
+  : > "$TMP/doctor.out"
+  printf 'chat=%s image=%s lane=%s\n' "$n_chat" "$n_img" "$n_lane" > "$TMP/doctor.out"
+  if [ -z "$n_chat" ] || [ -z "$n_img" ] || [ -z "$n_lane" ] \
+     || [ "$n_img" -le "$n_chat" ] || [ "$n_img" -ge "$n_lane" ]; then
+    fail_case "$name" "the image gate is not between the chat round-trip and the file lane"; return
+  fi
+
+  funcs=$(extract_funcs verify_all gw_url_drift_note)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'verify_all()'; then
+    fail_case "$name" "could not extract verify_all from the release artifact"; return
+  fi
+
+  # A gateway that already failed: the gate is silent and spends nothing.
+  out=$(run_verify_all_isolated "$funcs" public 0 200 0 up 8080 fail "" "" false bearer no pass)
+  printf -- '--- failed gateway ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if warning_states "$(printf '%s\n' "$out" | tr '\n' ' ')" 'IMAGE-GATE'; then
+    fail_case "$name" "a doomed run still spent a live photo turn"; return
+  fi
+
+  # A green gateway: the gate runs, and its block is what withholds the code —
+  # through the same VERIFY_FAILED emit_payload already honours, not a second
+  # mechanism beside it.
+  out=$(run_verify_all_isolated "$funcs" public 0 200 0 up 8080 ok "" "" false bearer no block)
+  printf -- '--- gate blocks ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  flat=$(printf '%s\n' "$out" | tr '\n' ' ')
+  if ! warning_states "$flat" 'IMAGE-GATE block'; then
+    fail_case "$name" "the gate never ran on a passing gateway"; return
+  fi
+  if ! warning_states "$flat" 'VERIFY_FAILED=true'; then
+    fail_case "$name" "a blocking gate did not fail verification, so a code would still be printed"; return
+  fi
+
+  # Control: the same run with a passing gate leaves verification green. Without
+  # it the assertion above could be satisfied by a verify_all that always fails.
+  out=$(run_verify_all_isolated "$funcs" public 0 200 0 up 8080 ok "" "" false bearer no pass)
+  printf -- '--- gate passes ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  if ! warning_states "$(printf '%s\n' "$out" | tr '\n' ' ')" 'VERIFY_FAILED=false'; then
+    fail_case "$name" "a passing gate still failed verification"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The new consent gate owes an `i` panel, like every other confirm in setup. A
+# missing entry is silent — explain_prompt falls through to the generic panel —
+# so the question that costs someone their photos would be the one step in setup
+# that cannot explain itself.
+run_image_gate_explanation_case() {
+  local name="image-gate-question-explains-itself" out lib="$TMP/gate-lib.sh"
+  if [ ! -f "$lib" ] && ! image_gate_library "$lib"; then
+    fail_case "$name" "could not lift the release artifact into a library"; return
+  fi
+  out=$(LIB="$lib" bash -c '. "$LIB"; trap - EXIT HUP INT TERM
+BOLD=""; RESET=""; explain_action verification.image_ignored')
+  printf -- '--- explain verification.image_ignored ---\n%s\n' "$out" > "$TMP/doctor.out"
+  # The generic fallback is what a missing id produces, so its opening line is
+  # the exact thing this must NOT be.
+  case "$out" in *"Review the current setup action"*)
+      fail_case "$name" "the image question fell through to the generic panel"; return ;;
+  esac
+  case "$out" in *"did not reflect the test picture"*) ;;
+    *) fail_case "$name" "the panel does not describe the finding being consented to"; return ;;
+  esac
+  # It has to be honest about what No costs, because No is the default: a run
+  # that ends here rolls the file lane's exposure back like any other failure.
+  case "$out" in *"rolled back"*) ;;
+    *) fail_case "$name" "the panel does not say what ending the run undoes"; return ;;
+  esac
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
 }
@@ -4904,6 +5307,18 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" shared-app-evaluator "*) true ;; *) false ;; esac; then
   run_shared_app_evaluator_wiring_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" image-gate-blocks-only-the-silent-drop "*) true ;; *) false ;; esac; then
+  run_image_gate_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" image-gate-runs-between-the-chat-turn-and-the-file-lane "*) true ;; *) false ;; esac; then
+  run_image_gate_placement_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" image-gate-question-explains-itself "*) true ;; *) false ;; esac; then
+  run_image_gate_explanation_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" file-lane-readiness "*) true ;; *) false ;; esac; then
