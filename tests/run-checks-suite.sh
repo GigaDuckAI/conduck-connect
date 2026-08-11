@@ -133,6 +133,12 @@ error-missing-type|error-missing-type|--deep|no|1|MODEL_SELECTION|core=FAIL exit
 sse-despite-false|sse-despite-false|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE,IMAGE_INPUT,MODEL_SELECTION|history_image=FAIL stream=PASS image_input=FAIL exit=1
 reject-stream-true|reject-stream-true|--deep|no|1|STREAM_SYNC|core=FAIL stream=FAIL exit=1
 sse-on-stream-true|sse-on-stream-true|--deep|no|1|STREAM_SYNC|core=FAIL stream=FAIL exit=1
+# Streams only when the ACCEPT HEADER asks, never on the body flag. This row is the
+# whole reason STREAM_SYNC now sends an Accept naming text/event-stream: under a
+# json-only probe header this fixture answers every request correctly and goes green,
+# which is exactly how a content-negotiating adapter would have shipped unnoticed.
+# (No apostrophes in this block — CASES is single-quoted and one would end it.)
+sse-on-accept-header|sse-on-accept-header|--deep|no|1|STREAM_SYNC|core=FAIL stream=FAIL exit=1
 reject-history-image|reject-history-image|--deep|no|1|HISTORY_IMAGE|core=FAIL history_image=FAIL image_input=VERIFIED exit=1
 silent-drop-image|silent-drop-image|--deep|no|1|IMAGE_INPUT|core=PASS image_input=UNVERIFIED exit=1
 decline-wrong-code|decline-wrong-code|--deep|no|1|IMAGE_INPUT|core=PASS image_input=FAIL exit=1
@@ -5177,15 +5183,26 @@ run_manage_edit_tailscale_case() {
 # Both sides, because a guard is only right if the guarded branch still runs: the
 # un-pinned setup gets the plain question and saves, and the pinned one still
 # reaches choose_saved_model and can still clear the pin.
+#
+# Every lane here also crosses the model roster check, which is what the third and
+# fourth lanes exist for. This suite is hermetic and a saved profile may only hold
+# an https:// address, so no lane can reach a real model list — what is graded here
+# is the WIRING: which setups are asked for a token before the check, which are
+# not, and that a check that could not be made says so and still saves. The roster
+# verdicts themselves are graded against a live fixture in the case below.
 run_manage_edit_model_case() {
   local name="manage-edit-model-question-fits-the-setup" disk
   : > "$TMP/doctor.out"
   local nomodel='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Unpinned gateway","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.test"},"fileServer":null}'
   local pinned='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Pinned gateway","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.test","model":"qwen3-coder:480b"},"fileServer":null}'
+  local keyless='{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Keyless gateway","auth":"none","transport":"public","reach":"public","url":"https://gw.example.test"},"fileServer":null}'
 
   manage_edit_fixture m-none "$nomodel"
   printf -- '--- model, nothing pinned ---\n' >> "$TMP/doctor.out"
-  manage_edit_run '2\nm9\nq\n' --edit custom-a
+  # n declines the roster check. Answering it is not optional in a driven lane: a
+  # bearer setup is asked before anything is sent, and a drive that ignored the
+  # question would spend its next keystroke on it.
+  manage_edit_run '2\nm9\nn\nq\n' --edit custom-a
   assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
   if [ "$EDIT_RC" = "124" ]; then
     fail_case "$name" "the un-pinned model lane hung"; return
@@ -5199,6 +5216,14 @@ run_manage_edit_model_case() {
   fi
   if ! grep -qF 'Model name' "$TMP/editdrive.out"; then
     fail_case "$name" "the un-pinned setup was not simply asked for a model name"; return
+  fi
+  # The check is OFFERED, not taken: a screen that sent the request without asking
+  # would be reaching for a credential on a screen that stores none.
+  if ! grep -qF 'Check the model against the server' "$TMP/editdrive.out"; then
+    fail_case "$name" "a named model was saved without the roster check ever being offered"; return
+  fi
+  if ! grep -qF 'Not checked' "$TMP/editdrive.out"; then
+    fail_case "$name" "the declined check was not reported as unchecked"; return
   fi
   disk=$(manage_edit_disk) || { fail_case "$name" "the un-pinned profile no longer parses"; return; }
   if [ "$disk" != "https://gw.example.test m9 fs=False" ]; then
@@ -5215,11 +5240,246 @@ run_manage_edit_model_case() {
   if ! grep -qF 'last used the model: qwen3-coder:480b' "$TMP/editdrive.out"; then
     fail_case "$name" "a setup that pins a model no longer reaches the question written for one"; return
   fi
+  # Clearing the pin is an explicit "let the server pick" — there is no id to look
+  # up, and a model list cannot answer whether a model-less request routes the way
+  # the operator wants. The q above lands on the menu only because no question was
+  # asked here; a lane that grew one would hang.
+  if grep -qF 'Check the model against the server' "$TMP/editdrive.out"; then
+    fail_case "$name" "clearing the model asked the server about an id that no longer exists"; return
+  fi
   disk=$(manage_edit_disk) || { fail_case "$name" "the pinned profile no longer parses"; return; }
   # None, not the empty string: a pin on a model with no name is worse than no pin.
   if [ "$disk" != "https://gw.example.test None fs=False" ]; then
     fail_case "$name" "clearing a pinned model did not reach the disk (disk: $disk)"; return
   fi
+
+  # A keyless setup is never asked for a token: its roster needs none, and a
+  # credential question on a saved setup that records auth=none would be asking for
+  # a secret that does not exist.
+  manage_edit_fixture m-keyless "$keyless"
+  printf -- '--- model, keyless setup ---\n' >> "$TMP/doctor.out"
+  manage_edit_run '2\nm7\nq\n' --edit custom-a
+  assert_runtime_defined "$name" "$(cat "$TMP/editdrive.out")" || return
+  if [ "$EDIT_RC" = "124" ]; then
+    fail_case "$name" "the keyless model lane hung"; return
+  fi
+  if grep -qF 'Check the model against the server' "$TMP/editdrive.out"; then
+    fail_case "$name" "a keyless setup was asked for a token it records not having"; return
+  fi
+  if ! grep -qF 'Asking the server for its model list' "$TMP/editdrive.out"; then
+    fail_case "$name" "a keyless setup skipped the roster check it needs no credential for"; return
+  fi
+  # gw.example.test answers nothing, and that is not evidence about the model id —
+  # so it is reported and saved, with no gate in between.
+  if ! grep -qF 'Not checked — nothing answered at that address' "$TMP/editdrive.out"; then
+    fail_case "$name" "an unreachable gateway did not say why the model went unchecked"; return
+  fi
+  if grep -qF 'Save it anyway?' "$TMP/editdrive.out"; then
+    fail_case "$name" "a route failure that says nothing about the model still gated the save"; return
+  fi
+  disk=$(manage_edit_disk) || { fail_case "$name" "the keyless profile no longer parses"; return; }
+  if [ "$disk" != "https://gw.example.test m7 fs=False" ]; then
+    fail_case "$name" "an unchecked model did not save (disk: $disk)"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The defect this closes: --edit saved `totally-not-a-real-model` against a live
+# LiteLLM with a green "Saved.", and LiteLLM answers 400 to every id outside its
+# model_list — so the wizard's own screen certified a setup that fails every
+# message. The three promise strings say --edit "re-verifies only what that
+# changed"; the model path verified nothing.
+#
+# Driven against the chat-adapter fixture over loopback, so the shapes a real
+# server can answer with are answered by a real server. The functions are lifted
+# out of the release artifact rather than re-implemented, because the whole claim
+# under test is that the SHIPPED classifier reads these six shapes correctly.
+#
+# The auth column is the fixture's, and it is also the second thing under test:
+# `open` needs no credential and stands for a saved auth=none setup, which must
+# never be asked for one; every other mode 401s an unauthenticated request exactly
+# like the live gateways this was measured against, and stands for the bearer
+# setup that is asked, once, before anything is sent.
+run_manage_edit_model_roster_case() {
+  local name="manage-edit-model-roster-check" funcs out rc arm mode auth wanted url
+  funcs=$(extract_funcs manage_probe_model manage_report_model_probe models_is_json curl_gw \
+                        credential_value_safe safe_display)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'manage_probe_model()'; then
+    fail_case "$name" "could not extract manage_probe_model from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # arm|fixture-mode|auth|wanted-id|expected-rc
+  local arms='advertised|open|none|fixture-echo|0
+absent|open|none|totally-not-a-real-model|1
+empty-roster|models-empty-data|bearer|fixture-echo|1
+no-usable-id|models-no-id|bearer|fixture-echo|1
+not-a-model-list|models-html|bearer|fixture-echo|3
+declined|good|declined|fixture-echo|2
+nothing-listening|CLOSED|none|fixture-echo|3'
+  local want_rc
+  while IFS='|' read -r arm mode auth wanted want_rc; do
+    [ -n "$arm" ] || continue
+    if [ "$mode" = "CLOSED" ]; then
+      # Port 1 on loopback: reserved, never bound, refused immediately — the
+      # unreachable arm without a fixture to start and stop.
+      url="http://127.0.0.1:1"
+    else
+      start_fixture "$mode" || { fail_case "$name" "[$arm] fixture $mode failed to start"; stop_fixture; return; }
+      url="http://127.0.0.1:$PORT"
+    fi
+    # No command substitution around the probe: it sets the MODELS_* diagnostics the
+    # reporter reads, and a subshell would drop every one of them.
+    out=$(FUNCS="$funcs" URL="$url" WANTED="$wanted" AUTH="$auth" FIXTOKEN="$TOKEN" bash -c '
+eval "$FUNCS"
+say() { printf "%s\n" "$*"; }
+ok() { printf "OK %s\n" "$*"; }
+warn() { printf "WARN %s\n" "$*"; }
+note() { printf "NOTE %s\n" "$*"; }
+explain_manage_model() { :; }
+confirm() { printf "CONFIRM-ASKED\n"; [ "$AUTH" != "declined" ]; }
+# The real prompt_into writes the named variable; this one writes the same one,
+# which under bash 3.2 dynamic scoping is manage_probe_model own local.
+prompt_into() { printf "PROMPTED\n"; GW_TOKEN="$FIXTOKEN"; return 0; }
+DOCTOR=false; COMPAT=false
+GW_TOKEN=""
+case "$AUTH" in none) GW_AUTH="none" ;; *) GW_AUTH="bearer" ;; esac
+rc=0; manage_probe_model "$URL" "$WANTED" || rc=$?
+manage_report_model_probe "$rc" "$WANTED"
+printf "RC %s\n" "$rc"
+' 2>&1)
+    [ "$mode" = "CLOSED" ] || stop_fixture
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$out" || return
+    rc=$(printf '%s\n' "$out" | sed -n 's/^RC //p')
+    if [ "$rc" != "$want_rc" ]; then
+      fail_case "$name" "[$arm] the roster probe returned $rc, expected $want_rc"; return
+    fi
+    if [ "$auth" = "none" ]; then
+      # A saved setup that records auth=none has no token to be asked for, and a
+      # hidden prompt on this screen is precisely what it promises not to do.
+      if printf '%s\n' "$out" | grep -qE 'CONFIRM-ASKED|PROMPTED'; then
+        fail_case "$name" "[$arm] a keyless setup was asked for a credential"; return
+      fi
+    else
+      if ! printf '%s\n' "$out" | grep -qF 'CONFIRM-ASKED'; then
+        fail_case "$name" "[$arm] a bearer setup reached the hidden prompt with no question first"; return
+      fi
+      # Declining has to stop before the secret prompt, not after it.
+      if [ "$auth" = "declined" ] && printf '%s\n' "$out" | grep -qF 'PROMPTED'; then
+        fail_case "$name" "[$arm] a declined check still asked for the token"; return
+      fi
+    fi
+    case "$want_rc" in
+      0) if ! printf '%s\n' "$out" | grep -qF "OK That server's model list carries $wanted"; then
+           fail_case "$name" "[$arm] an advertised id was not confirmed"; return
+         fi ;;
+      1) if ! printf '%s\n' "$out" | grep -qE "does NOT carry $wanted|names no model id at all"; then
+           fail_case "$name" "[$arm] an id the server does not advertise was not called out"; return
+         fi
+         # The count and the first id are what turn "not in the list" into something
+         # the operator can act on — and the disclaimer is what stops the first id
+         # reading as a recommendation.
+         if [ "$arm" = "absent" ] && ! printf '%s\n' "$out" | grep -qF 'It advertises 2 model id(s); the first is fixture-echo'; then
+           fail_case "$name" "[$arm] the warning named neither how many ids the server has nor one of them"; return
+         fi ;;
+      2|3) if ! printf '%s\n' "$out" | grep -qF 'Not checked'; then
+             fail_case "$name" "[$arm] a check that was not made did not say so"; return
+           fi
+           if printf '%s\n' "$out" | grep -qF 'does NOT carry'; then
+             fail_case "$name" "[$arm] a server that produced no model list was read as denying the id"; return
+           fi ;;
+    esac
+  done <<EOF
+$arms
+EOF
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# ONE of the four probe outcomes may stop a save, and the other three may not.
+# That split is the whole design: "this server's list does not carry that id" is
+# evidence about the value going to disk, while "the tunnel is down", "the token
+# was refused" and "you skipped the check" are facts about the route or about this
+# screen. A confirmation that cannot tell a good save from a bad one is a keystroke
+# that teaches the operator to answer y — and it would fire constantly, because
+# whoever's tunnel is down is exactly whoever opens this screen.
+#
+# Driven with a stubbed probe, deliberately: every rc is reachable in one place,
+# and no lane depends on a network. The second assertion in each arm is the one
+# that would have caught the older shape — choose_saved_model writes GW_MODEL the
+# moment it is answered, so a declined save that did not put it back would leave
+# the rejected candidate on the screen and ride the next save of any other field.
+run_manage_edit_model_gate_case() {
+  local name="manage-edit-model-gates-only-an-answered-roster" funcs out arm rc answer
+  funcs=$(extract_funcs manage_edit_model)
+  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'manage_edit_model()'; then
+    fail_case "$name" "could not extract manage_edit_model from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # arm|probe-rc|gate-answer|expect-gate|expect-saved
+  local arms='advertised|0|y|no|yes
+absent-saved-anyway|1|y|yes|yes
+absent-declined|1|n|yes|no
+not-checked-skipped|2|y|no|yes
+not-checked-failed|3|y|no|yes'
+  local want_gate want_saved
+  while IFS='|' read -r arm rc answer want_gate want_saved; do
+    [ -n "$arm" ] || continue
+    out=$(FUNCS="$funcs" PRC="$rc" ANS="$answer" bash -c '
+eval "$FUNCS"
+say() { printf "%s\n" "$*"; }
+ok() { printf "OK %s\n" "$*"; }
+warn() { printf "WARN %s\n" "$*"; }
+note() { printf "NOTE %s\n" "$*"; }
+safe_display() { printf "%s" "$1"; }
+mutate_guard() { :; }
+BOLD=""; RESET=""
+GW_URL="https://gw.example.test"; GW_AUTH="bearer"; GW_MODEL="old-model"
+# The operator picks "use a different model name" and types one.
+choose_saved_model() { GW_MODEL="candidate-model"; }
+manage_probe_model() { return "$PRC"; }
+manage_report_model_probe() { printf "REPORTED %s\n" "$1"; }
+confirm() { printf "GATE-ASKED\n"; [ "$ANS" = "y" ]; }
+manage_save_and_prove() { printf "SAVED %s\n" "$3"; return 0; }
+manage_edit_model custom-a true
+printf "LEFT-IN-STATE %s\n" "$GW_MODEL"
+' 2>&1)
+    printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$out" || return
+
+    case "$want_gate" in
+      yes) if ! printf '%s\n' "$out" | grep -qF 'GATE-ASKED'; then
+             fail_case "$name" "[$arm] a roster that does not carry the id saved with no confirmation"; return
+           fi ;;
+      no)  if printf '%s\n' "$out" | grep -qF 'GATE-ASKED'; then
+             fail_case "$name" "[$arm] the save was gated on something that says nothing about the model id"; return
+           fi ;;
+    esac
+    case "$want_saved" in
+      yes) if ! printf '%s\n' "$out" | grep -qF 'SAVED candidate-model'; then
+             fail_case "$name" "[$arm] the new model never reached the disk"; return
+           fi
+           if ! printf '%s\n' "$out" | grep -qF 'LEFT-IN-STATE candidate-model'; then
+             fail_case "$name" "[$arm] a saved model is not what the screen behind this will reprint"; return
+           fi ;;
+      no)  if printf '%s\n' "$out" | grep -qF 'SAVED'; then
+             fail_case "$name" "[$arm] a refused model was written anyway"; return
+           fi
+           if ! printf '%s\n' "$out" | grep -qF 'LEFT-IN-STATE old-model'; then
+             fail_case "$name" "[$arm] a refused candidate stayed in the screen's state and would ride the next save"; return
+           fi ;;
+    esac
+    # The report is always printed, whatever the outcome — a silent probe would
+    # leave the operator with a green "Saved." and no idea what was checked.
+    if ! printf '%s\n' "$out" | grep -qF "REPORTED $rc"; then
+      fail_case "$name" "[$arm] the probe's finding was never put on screen"; return
+    fi
+  done <<EOF
+$arms
+EOF
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
 }
@@ -5630,12 +5890,15 @@ run_manage_save_must_land_case() {
 
   # label|dir mode|keys|does this lane's write land?
   # The address lanes carry an extra answer: a save that lands offers a setup code,
-  # and the offer has to be declined or the run blocks on it.
+  # and the offer has to be declined or the run blocks on it. The two lanes that
+  # NAME a model carry one too — this is a bearer setup, so the roster check is
+  # offered before the save, and the n declines it. Clearing the model asks
+  # nothing, because there is no id to look up.
   for lane in \
     "addr-ro|500|1\nhttps://moved.example.test\ny\nq\n|no" \
     "addr-rw|700|1\nhttps://moved.example.test\ny\nn\nq\n|yes" \
-    "model-ro|500|2\n2\nm2\nq\n|no" \
-    "model-rw|700|2\n2\nm2\nq\n|yes" \
+    "model-ro|500|2\n2\nm2\nn\nq\n|no" \
+    "model-rw|700|2\n2\nm2\nn\nq\n|yes" \
     "clear-ro|500|2\n3\nq\n|no" \
     "clear-rw|700|2\n3\nq\n|yes" \
   ; do
@@ -8844,6 +9107,14 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-model-question-fits-the-setup "*) true ;; *) false ;; esac; then
   run_manage_edit_model_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-model-roster-check "*) true ;; *) false ;; esac; then
+  run_manage_edit_model_roster_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-model-gates-only-an-answered-roster "*) true ;; *) false ;; esac; then
+  run_manage_edit_model_gate_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-loads-a-unit-only-credential "*) true ;; *) false ;; esac; then

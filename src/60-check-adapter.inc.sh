@@ -1,7 +1,7 @@
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.5). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.6). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -22,7 +22,9 @@
 # (or answers 400 + code "model_not_found"), that an image in an EARLIER
 # message can never poison the chat (forward it or replace it with the
 # contract's disclosure — never reject; one bad photo must not kill every
-# later turn), and that "stream": true still gets ONE synchronous JSON answer.
+# later turn), and that "stream": true still gets ONE synchronous JSON answer —
+# asked for in the body AND in the Accept header, since an adapter that decides by
+# content negotiation is invisible to a probe that only ever asks for JSON.
 # CHAT_BASIC owns the absent-model rule, and it owns it alone: the history,
 # stream and image probes also omit the field, so on an adapter that REQUIRES a
 # model they would every one of them fail for CHAT_BASIC's reason. Once CHAT_BASIC
@@ -51,7 +53,7 @@
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.5 harness=<ver>
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.6 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
 #     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
 #     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
@@ -82,7 +84,7 @@
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.5"
+DOCTOR_CONTRACT_REV="1.6"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
@@ -125,7 +127,7 @@ DOCTOR_MODEL_LANE_ID=""
 
 # The way out of a FAIL that isn't the reader's to fix. This grade holds software
 # written FOR Conduck to Conduck-specific rules, and third-party OpenAI-compatible
-# software is EXPECTED to fail it — answering "stream": true with SSE is correct
+# software is EXPECTED to fail it — answering a request that asks for SSE with SSE is correct
 # OpenAI behaviour, keyless is a legitimate deployment choice, and neither is a
 # defect in LiteLLM, Open WebUI or Ollama. Without this, the closing line points
 # only at the contract docs, so a user grading someone else's server reads a wall
@@ -744,13 +746,21 @@ doctor_auth_checks() {
 # credential guard before curl ever runs (preflight makes that unreachable
 # here, but the code is not curl's to interpret if it ever fires).
 DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
+# The Accept header the NEXT chat probe sends. An input, not a result — which is why
+# doctor_chat_request never clears it with the DCC_* results below. Every check but one
+# sends what Conduck sends. STREAM_SYNC alone asks for a stream, because the contract's
+# "respond with plain JSON regardless of content negotiation" cannot be measured by a
+# probe that only ever asks for JSON: an adapter that streams when the HEADER asks is
+# invisible to it, and would pass a check it should fail. Whoever changes it restores
+# it in the next line — a leaked value silently re-grades every later check.
+DCC_ACCEPT="application/json"
 doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 iff transfer completed
   local out tail_ max_time="${2:-300}"
   DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
   # `out=$(…) || { rc=$?; }` on purpose: inside `if ! out=$(…); then` the `$?`
   # is the NEGATED status (0), and the real code would be lost.
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
-        --max-time "$max_time" -H "Accept: application/json" \
+        --max-time "$max_time" -H "Accept: $DCC_ACCEPT" \
         -H "Content-Type: application/json" -d "$1" 2>/dev/null) || { DCC_CURL_RC=$?; return 1; }
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
@@ -1057,9 +1067,12 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
   case "$DCE_HINT" in
     sse)
       case "$kind" in
-        stream) d_say "$id" "(even when the request says \"stream\": true, answer ONE complete JSON object."
-                d_say "$id" " Conduck always sends \"stream\": false and never accepts SSE, so answer one JSON"
-                d_say "$id" " object even if some other client sets the flag)" ;;
+        stream) d_say "$id" "(this request asked for a stream TWICE — \"stream\": true in the body, and an"
+                d_say "$id" " Accept header naming text/event-stream — and both must be ignored. Conduck"
+                d_say "$id" " always sends \"stream\": false with Accept: application/json and never decodes"
+                d_say "$id" " SSE, so answer ONE complete JSON object however a client asks. Look for a"
+                d_say "$id" " branch on either the flag or the Accept header and delete it; if your engine"
+                d_say "$id" " streams, consume its stream yourself and send the finished text in one body)" ;;
         *)      d_say "$id" "(when stream is false, answer with ONE complete JSON object — Conduck never accepts SSE)" ;;
       esac ;;
     transfer)
@@ -1127,8 +1140,10 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
           d_say "$id" " A text-only newest message must always get an answer: one rejected photo must never"
           d_say "$id" " poison every later turn of the conversation.)" ;;
         stream)
-          d_say "$id" "(\"stream\": true must not be rejected — ignore the flag and answer one synchronous"
-          d_say "$id" " JSON object, exactly as for stream:false)" ;;
+          d_say "$id" "(neither \"stream\": true nor an Accept header naming text/event-stream may be"
+          d_say "$id" " rejected — ignore both and answer one synchronous JSON object, exactly as for"
+          d_say "$id" " stream:false. A 406 here is the same defect as an SSE body: the contract says"
+          d_say "$id" " answer with plain JSON regardless of content negotiation)" ;;
         *)
           case "$DCC_CODE" in
             4??) d_say "$id" "(a 4xx here usually means the request body was rejected — the contract requires"

@@ -1065,7 +1065,15 @@ print(json.dumps({"messages": [
 print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                   "stream": True}))') \
     || die "Could not build the stream test request (python3 failed)."
-  doctor_chat_check STREAM_SYNC "chat: \"stream\": true still answers one JSON object" "$payload" stream
+  # The one probe that does not send Conduck's own Accept header. It asks for a stream
+  # FIRST and JSON second, which is what an OpenAI client in streaming mode sends. Both
+  # halves are deliberate: asking for a stream catches an adapter that decides by content
+  # negotiation rather than by the flag, and still listing JSON means a correct
+  # negotiator has an acceptable answer to give, so this can only fail an adapter that
+  # PREFERS to stream — never one that merely honours the header properly.
+  DCC_ACCEPT='text/event-stream, application/json'
+  doctor_chat_check STREAM_SYNC "chat: \"stream\": true and an Accept asking for SSE still answer one JSON object" "$payload" stream
+  DCC_ACCEPT="application/json"
   DOCTOR_STREAM=$(doctor_capability_meter)
 
   if $DOCTOR_DEEP; then

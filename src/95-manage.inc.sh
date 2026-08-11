@@ -1057,6 +1057,90 @@ manage_follow_file_address() { # manage_follow_file_address <id> <old-gateway-ur
   note "Nothing was restarted or re-routed — this records where the address is."
 }
 
+# Does this server still advertise that model id? The ROSTER, and only the roster.
+#
+# Not a chat turn, for two independent reasons. It would spend the operator's
+# provider quota and land in their server's own history, which no other question
+# on this screen does. And it would prove less than it looks: the adapter contract
+# obliges only a MULTI-model server to answer an unknown id with 400
+# "model_not_found", so a server that advertises exactly one model may ignore the
+# field entirely and answer a nonsense id with a cheerful reply.
+#
+# The credential is the whole difference from manage_probe_address, and it is
+# forced by what the two probes ask. That one asks "does anything answer here?",
+# which a 401 answers as well as a 200 does, so it never needs a token. A roster
+# cannot be read out of a 401 at all — measured against the live gateways this is
+# tested on, an unauthenticated /v1/models comes back 401, 401 and 500 — so an
+# unauthenticated-only check would report "could not check" on exactly the
+# population it exists to protect. It asks instead, in two steps: a plain question
+# naming what the token is for and where it goes, and only after a yes, the hidden
+# prompt. The thing being avoided is a hidden secret prompt appearing UNASKED on a
+# screen whose promise is that it does not make you re-enter things; a question
+# about whether to run an optional check is not that.
+#
+# 0 = the list carries that id · 1 = the list came back without it · 2 = no check
+# was made · 3 = a request went out and no model list came back.
+manage_probe_model() { # manage_probe_model <https-url> <model-id>
+  # Local, so the token falls out of scope on return: this screen holds no
+  # credential before or after, and nothing it saves is built from one.
+  local GW_TOKEN=""
+  if [ "${GW_AUTH:-none}" = "bearer" ]; then
+    say ""
+    say "  Reading that server's model list needs the token it checks, and this tool never"
+    say "  stored one. Pasting it here sends ONE request — $(safe_display "$1" 160)/v1/models"
+    say "  — and no chat turn, so nothing is billed. It is hidden as you type, used for that"
+    say "  one request, and written nowhere."
+    confirm "  Check the model against the server's list?" explain_manage_model || return 2
+    prompt_into GW_TOKEN ask_secret "Paste the gateway bearer token (hidden)" \
+      "skip the check" "gateway.token" || return 2
+    [ -n "$GW_TOKEN" ] || return 2
+  fi
+  say ""
+  note "Asking the server for its model list (one request; nothing is changed)."
+  models_is_json "$1" "$2" || return 3
+  $MODELS_WANTED_FOUND && return 0
+  return 1
+}
+
+# Say what the roster lookup found, in one place, so the model prompt and any later
+# caller cannot describe the same four outcomes differently.
+manage_report_model_probe() { # manage_report_model_probe <rc> <model-id>
+  local why=""
+  case "$1" in
+    0) ok "That server's model list carries $(safe_display "$2" 200)."
+       note "That list is what the app's model picker reads. It is not a promise that a chat"
+       note "turn with it succeeds — only your server can answer that." ;;
+    # Empty data and entries with no usable id land here too, and they belong here:
+    # the server answered the roster question, and its answer does not contain this
+    # id. That is the same doubt, arrived at from a shorter list.
+    1) if [ "${MODELS_ID_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+         warn "That server's model list does NOT carry $(safe_display "$2" 200)."
+         warn "It advertises ${MODELS_ID_COUNT} model id(s); the first is $(safe_display "${MODELS_FIRST_ID:-?}" 160) —"
+         warn "list order is not a recommendation."
+       else
+         warn "That server's model list names no model id at all, so nothing in it carries"
+         warn "$(safe_display "$2" 200)."
+       fi
+       note "That can be a typo, an alias the server accepts without advertising, or a model you"
+       note "are about to add — only you can tell which. But a server that refuses unknown ids"
+       note "refuses EVERY message, and the app can only show you the refusal." ;;
+    2) note "Not checked — the model is saved exactly as you typed it." ;;
+    *) if [ "${MODELS_CURL_RC:-0}" != "0" ] || [ -z "${MODELS_HTTP_CODE:-}" ]; then
+         why="nothing answered at that address"
+       else
+         case "$MODELS_HTTP_CODE" in
+           401|403) if [ "${GW_AUTH:-none}" = "bearer" ]; then
+                      why="the server refused that token (HTTP $MODELS_HTTP_CODE)"
+                    else
+                      why="that address answered HTTP $MODELS_HTTP_CODE — it wants a credential, and this saved setup records none"
+                    fi ;;
+           *)       why="that address answered HTTP $MODELS_HTTP_CODE instead of a model list" ;;
+         esac
+       fi
+       note "Not checked — $why. The model is saved exactly as you typed it." ;;
+  esac
+}
+
 # The model. choose_saved_model is exactly this edit already — a bounded three-way
 # choice over one field — so it is called rather than re-written; the only thing
 # added here is the save, which the wizard does at the end of its own run.
@@ -1071,12 +1155,18 @@ manage_follow_file_address() { # manage_follow_file_address <id> <old-gateway-ur
 # saved setup is by definition one being edited — so the guard is the model.
 #
 # The un-pinned branch asks the plain question instead. It does NOT copy the
-# wizard's probe_single_model shortcut: that probe reads http://127.0.0.1:<port>
-# and it needs a token this screen deliberately never loads, so against the bearer
-# gateway that is the common case it would send a request nobody was told about
-# and come back with nothing to show for it.
+# wizard's probe_single_model shortcut: that probe reads http://127.0.0.1:<port>,
+# and a saved setup is reached by its https:// address — the loopback port is not
+# even recorded for most of them.
 manage_edit_model() { # manage_edit_model <id> <lane-preserved>
-  local id="$1" lane_ok="$2" old="$GW_MODEL"
+  local id="$1" lane_ok="$2" old="$GW_MODEL" candidate rc
+  # models_is_json reports through nine globals, and this screen's caller keeps
+  # running afterwards. Shadowed here so the roster below cannot be read as a fact
+  # about anything else on the screen — bash's dynamic scoping hands these same
+  # locals to models_is_json and to the reporter, and drops them on return.
+  local MODELS_CURL_RC=0 MODELS_HTTP_CODE="" MODELS_DATA_EMPTY=false MODELS_NO_VALID_ID=false
+  local MODELS_TIME="" MODELS_CONTENT_TYPE="" MODELS_ID_COUNT=0 MODELS_FIRST_ID=""
+  local MODELS_WANTED_FOUND=false
   if [ -n "$GW_MODEL" ]; then
     choose_saved_model
   else
@@ -1088,12 +1178,45 @@ manage_edit_model() { # manage_edit_model <id> <lane-preserved>
     prompt_into GW_MODEL ask "  Model name" "" "keep letting the server pick" \
       "gateway.custom.model" true || return 0
   fi
-  if [ "$GW_MODEL" = "$old" ]; then
+  # choose_saved_model writes GW_MODEL the moment it is answered, and everything
+  # below can still decline. The answer is carried as a CANDIDATE from here, with
+  # GW_MODEL put back at once: the screen behind this reprints the setup from these
+  # locals, and an unsaved candidate left in one of them is shown as this setup's
+  # model for the rest of the session — and would ride the next save of any field.
+  candidate="$GW_MODEL"
+  GW_MODEL="$old"
+  if [ "$candidate" = "$old" ]; then
     note "Model unchanged — nothing to save."
     return 0
   fi
-  $lane_ok || { say ""; warn "Not saved — see the file-lane warning above."; GW_MODEL="$old"; return 0; }
+  $lane_ok || { say ""; warn "Not saved — see the file-lane warning above."; return 0; }
+
+  # The check, before the write. Only a named model can be looked up: clearing the
+  # pin is an explicit "let the server pick", there is no id to ask about, and no
+  # model list can say whether a server routes a model-less request the way the
+  # operator wants — only a real chat turn could, and this screen spends none.
+  if [ -n "$candidate" ]; then
+    manage_probe_model "$GW_URL" "$candidate"; rc=$?
+    manage_report_model_probe "$rc" "$candidate"
+    # ONE doubt earns the gate, and it is the narrow one: the server answered with
+    # its model list and that list does not carry this id. Every other unhappy
+    # outcome — the address unreachable, the token refused, an HTML page, a check
+    # declined — is a fact about the ROUTE or about this screen, and says nothing
+    # at all about whether the id is right. A confirmation that cannot tell a good
+    # save from a bad one is a keystroke that teaches the operator to answer y, and
+    # it would fire constantly: whoever's tunnel is down is exactly whoever opens
+    # this screen. Those outcomes are reported and then saved, unblocked.
+    if [ "$rc" = "1" ]; then
+      say ""
+      if ! confirm "  Save it anyway?" explain_manage_model; then
+        note "Left the saved model as it was."
+        return 0
+      fi
+    fi
+  fi
+
   mutate_guard "record a new model for the saved setup $id"
+  GW_MODEL="$candidate"
   # Same proof as the address edit, and the same restore on failure: the screen
   # behind this reprints the setup from these locals, so a model the disk never
   # accepted would be shown as this setup's model for the rest of the session.
@@ -1837,6 +1960,26 @@ explain_manage_address() {
   say "  ${BOLD}Honestly unsure?${RESET}"
   say "  Press b. Nothing is saved until you answer this, and the old address keeps"
   say "  working exactly as well or as badly as it did a minute ago."
+  say ""
+}
+
+explain_manage_model() {
+  say ""
+  say "  ${BOLD}What the check is${RESET}"
+  say "  One request for the server's own list of models, and a look for the name you"
+  say "  typed in it. No message is sent to a model, so nothing is billed and nothing"
+  say "  lands in your server's history."
+  say ""
+  say "  ${BOLD}Why it asks for the token${RESET}"
+  say "  Most servers will not show their model list to a request with no credential,"
+  say "  and this tool stores none — the token lives in your gateway and in the setup"
+  say "  code your device scanned, never in the record here. Skipping is a real"
+  say "  option: the name is saved either way, unchecked."
+  say ""
+  say "  ${BOLD}What a missing name means${RESET}"
+  say "  Not always a mistake. Some servers accept names they do not advertise. But a"
+  say "  typo looks exactly like this, and a server that refuses unknown names refuses"
+  say "  every message you send — with the app showing only the refusal."
   say ""
 }
 

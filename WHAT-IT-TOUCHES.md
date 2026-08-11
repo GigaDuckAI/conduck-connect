@@ -228,6 +228,16 @@ one, so a password can never end up inside a routing field or the setup code.
   background work could still write later, it prints the exact output path for
   a later recheck instead of promising future absence.
   `--show-code` never changes configuration or rewrites its saved profile.
+- `--edit` sends at most one `GET /v1/models`, and only to the saved gateway
+  address, when you change one of two fields. Changing the **address** probes the
+  new one without any credential — the question is only whether something
+  answers, and a refusal from the right host answers it. Changing the **model**
+  reads the server's list of models to see whether your name is in it; that list
+  is usually not readable without the gateway's token, which this tool never
+  stores, so the screen asks first, uses what you paste for that one request,
+  writes it nowhere, and treats skipping as a normal answer. Neither probe sends
+  a chat turn, so neither costs model compute. `--edit` changes no host
+  configuration; the only thing it writes is the saved profile.
 - `--check-server` sends `GET /v1/models` plus several real chat
   turns: model-less and advertised-model probes, a historical-image turn, and
   an informational current-image probe. It changes no host configuration, but

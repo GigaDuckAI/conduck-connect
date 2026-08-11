@@ -18,6 +18,25 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
   having seen it. Guessing is no longer a way to pass: a blind guess now gets
   through about 1 in 16,700 times, better than the 1 in 9,000 the older, stricter
   rule allowed.
+- **A model name you mistype is caught before it is saved.** Changing the model
+  of a saved setup wrote down whatever you typed and called it saved — including
+  a name your server has never heard of. A server that insists on a name it knows
+  then refuses every message you send, and the app can only show you the refusal.
+  The model change now asks your server for its own list of models and tells you
+  whether your name is in it; if it is not, you are told what the server does
+  advertise and asked whether to save anyway. Reading that list needs the
+  gateway's token on most servers and this tool stores none, so it asks first —
+  and skipping is a normal answer, because a name can be an alias your server
+  accepts without advertising it. Nothing is sent to a model, so nothing is
+  billed.
+- **The adapter check now grades against contract revision 1.6, and one check got
+  harder.** An adapter must answer with one complete JSON body and never a stream.
+  The check only ever asked for JSON, so it could see an adapter that streams when
+  the request *says* `stream: true` — but not one that streams when the request
+  *headers* ask for a stream instead. That second kind passed with a clean bill of
+  health. It now gets asked both ways. Nothing that passed for the right reason
+  changes verdict; if this newly fails your adapter, it was answering some clients
+  with a stream that Conduck could never have read.
 - **A file server that is running is no longer reported as dead.** Asking systemd
   whether a service is up can fail for two very different reasons: the service is
   stopped, or this particular shell cannot ask at all — which is what happens

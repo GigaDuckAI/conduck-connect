@@ -46,7 +46,9 @@ Modes ("good" behavior unless listed):
                          doctor's exact-200 response requirement on chat
     models-redirect-307  /v1/models redirects to a valid final models route
     chat-redirect-308    chat redirects to a valid final chat route
-    require-accept       authenticated routes require Accept: application/json
+    require-accept       authenticated routes 406 unless Accept names
+                         application/json or */* (a preference LIST counts —
+                         see accepts_json)
     require-model        400 when the request has no "model" field
     model-less-500       500 when the request has no "model" field, 200 with one.
                          A model-less turn CAN fail for a reason that has nothing
@@ -79,6 +81,10 @@ Modes ("good" behavior unless listed):
     sse-despite-false    streams SSE when "stream" is false (correct on true)
     reject-stream-true   400 when "stream" is true
     sse-on-stream-true   streams SSE when "stream" is true (correct on false)
+    sse-on-accept-header streams SSE when the Accept header names text/event-stream,
+                         whatever the "stream" flag says — the content-negotiating
+                         shape of the defect, which a probe that only ever asks for
+                         JSON cannot see. Correct for every other request it gets.
     reject-history-image 400 when an EARLIER message contains an image (the
                          clean-room poisoning bug this revision exists to kill)
     silent-drop-image    ignores a current-turn image and answers from text only
@@ -364,6 +370,26 @@ def data_url_bytes(url):
         return None
 
 
+def accepts_json(headers):
+    """Would a correctly picky server answer this request with JSON?
+
+    require-accept exists to prove the checker always tells a server it wants
+    JSON. It used to demand the literal string "application/json", which is a
+    stricter thing and the wrong one: an Accept header is a comma-separated
+    preference LIST, and `text/event-stream, application/json` asks for JSON
+    perfectly well. STREAM_SYNC sends exactly that — deliberately, to catch an
+    adapter that streams on content negotiation — so an exact-match fixture
+    would have turned a correct probe into a 406 and called the checker broken.
+    A wildcard counts too. What still 406s, which is the whole point, is a
+    request that names neither: no Accept at all, or one asking only for HTML.
+    """
+    raw = headers.get("Accept")
+    if raw is None:
+        return False
+    offered = [part.split(";", 1)[0].strip() for part in raw.split(",")]
+    return "application/json" in offered or "*/*" in offered
+
+
 def make_handler(mode, token, models):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -528,8 +554,7 @@ def make_handler(mode, token, models):
                 return
             if mode == "models-redirect-307" and not final:
                 return self.send_redirect(307, "/final/v1/models")
-            if mode == "require-accept" and \
-                    self.headers.get("Accept") != "application/json":
+            if mode == "require-accept" and not accepts_json(self.headers):
                 return self.err(406, "Accept: application/json is required.")
             if mode == "models-slow":
                 time.sleep(16)
@@ -556,8 +581,7 @@ def make_handler(mode, token, models):
                 return
             if mode == "chat-redirect-308" and not final:
                 return self.send_redirect(308, "/final/v1/chat/completions")
-            if mode == "require-accept" and \
-                    self.headers.get("Accept") != "application/json":
+            if mode == "require-accept" and not accepts_json(self.headers):
                 return self.err(406, "Accept: application/json is required.")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -678,7 +702,9 @@ def make_handler(mode, token, models):
                 reply = Engine.reply(texts, digit_code)
 
             sse = (mode == "sse-despite-false" and not stream) or \
-                  (mode == "sse-on-stream-true" and stream)
+                  (mode == "sse-on-stream-true" and stream) or \
+                  (mode == "sse-on-accept-header"
+                   and "text/event-stream" in self.headers.get("Accept", ""))
             if mode == "reject-stream-true" and stream:
                 return self.err(400, "stream is not supported.")
             if sse:
