@@ -4698,7 +4698,10 @@ STATE_DIR_EXPOSURE_REPORTED=true
 DRY_RUN=false; REUSE_ONLY=false; SHOW_QR=false
 VERIFY_FAILED=false; FS_LANE_DROPPED_BY_CHECK=false
 
-# manage_edit’s frame: the values the screen is holding when 4 is pressed. The id
+# The manage_edit frame: the values the screen is holding when 4 is pressed. An
+# apostrophe cannot appear anywhere in this comment — it sits inside a single
+# quoted block and would close it. A curly one closes nothing but fails the
+# shellcheck gate (SC1112), so the wording simply avoids needing one. The id
 # is the one the operator PICKED, which is the file name, not the id in the file.
 GW_ID="custom-a"; GW_KIND="custom"; GW_NAME="Two id gateway"; GW_AUTH="none"
 TRANSPORT="public"; SCOPE="public"; GW_URL="https://gw.example.test"
@@ -6341,7 +6344,7 @@ run_help_surface_case() {
   # Written out, not read from the artifact: the point is that a release BUMPED
   # it, and a test that derives the number from the same file it grades can never
   # notice a release that forgot to.
-  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.14.0" ]; then
+  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.14.1" ]; then
     fail_case "$name" "--version did not print the expected public version"; return
   fi
   # The manage surface is public CLI, so --help owes it the same contract as the
@@ -8198,20 +8201,69 @@ TURNROWS
 trap - EXIT HUP INT TERM
 GW_MODEL=""; DOCTOR=false; COMPAT=false
 app_chat_eval() { DCC_CURL_RC=7; return 1; }   # never reaches the wire
+REAL_GEN=$(declare -f image_probe_gen)
+
+# The predicate, which nothing else in the tree exercises. "Too close" is one
+# differing position or fewer, because the grader forgives exactly one; a length
+# mismatch cannot be confused at all and so is never too close.
+tc=""
+for row in 728431:728431:close 728431:728432:close 728431:725432:far \
+           728431:72843:far 728431::far 111111:222222:far; do
+  a=${row%%:*}; rest=${row#*:}; b=${rest%%:*}; want=${rest#*:}
+  if probe_codes_too_close "$a" "$b"; then got=close; else got=far; fi
+  [ "$got" = "$want" ] || tc="$tc $a/$b=$got(want $want)"
+done
+printf "predicate=%s\n" "${tc:-ok}"
+
+# The loop must REDRAW on a close code and stop once it is clear. Driven with a
+# scripted generator on purpose: a live one lands within one position of a fixed
+# code about once in seventeen thousand draws, so no number of random iterations
+# reaches this path — the assertion below it was unreachable by construction
+# while the avoid value was a different length from the code.
+# The real generator runs once first, so IPG_PATH and the rest of its output are
+# genuine; only the digits are then scripted.
+CONDUCK_PROBE_MODEL="" image_probe_gen
+draws=0
+image_probe_gen() {
+  draws=$((draws+1))
+  case $draws in
+    1) IPG_CODE="728432" ;;   # one position off the avoided code: unusable
+    *) IPG_CODE="519073" ;;   # far enough: usable
+  esac
+}
+verify_image_probe_once "728431"
+printf "scripted draws=%s final=%s\n" "$draws" "$IPG_CODE"
+
+# A generator that never clears the guard must not spin forever.
+draws=0
+image_probe_gen() { draws=$((draws+1)); IPG_CODE="728431"; }
+verify_image_probe_once "728431"
+printf "bounded draws=%s\n" "$draws"
+
+eval "$REAL_GEN"
 first=""; repeats=0; i=0
 while [ $i -lt 40 ]; do
   i=$((i+1))
-  verify_image_probe_once "4242"
-  [ "$IPG_CODE" = "4242" ] && repeats=$((repeats+1))
+  verify_image_probe_once "424242"
+  [ "$IPG_CODE" = "424242" ] && repeats=$((repeats+1))
   first="$first $IPG_CODE"
 done
 printf "repeats=%s distinct=%s\n" "$repeats" "$(printf "%s\n" $first | sort -u | wc -l | tr -d " ")"
 ')
   printf -- '--- retry redraw ---\n%s\n' "$redraw" >> "$TMP/doctor.out"
+  case "$redraw" in *"predicate=ok"*) ;;
+    *) fail_case "$name" "the too-close predicate misgraded a pair: $redraw"; return ;;
+  esac
+  case "$redraw" in *"scripted draws=2 final=519073"*) ;;
+    *) fail_case "$name" "a code one glyph off the previous attempt was not redrawn: $redraw"; return ;;
+  esac
+  case "$redraw" in *"bounded draws=9"*) ;;
+    *) fail_case "$name" "the redraw loop is not bounded at 8 retries: $redraw"; return ;;
+  esac
   case "$redraw" in *"repeats=0"*) ;;
     *) fail_case "$name" "a retry was allowed to reuse the first attempt's digits"; return ;;
   esac
-  # Non-vacuity: the generator is genuinely random, so "never 4242" is a real
+  # Non-vacuity: the generator is genuinely random, so "never 424242" is a real
   # constraint rather than a property of a generator that returns one value.
   case "$redraw" in *"distinct=1 "*|*"distinct=1")
       fail_case "$name" "the probe generator returned one fixed code, so the redraw guard proves nothing"; return ;;
@@ -8318,6 +8370,229 @@ run_shared_app_evaluator_wiring_case() {
   fi
   if grep -q 'compat_chat_eval' "$SCRIPT"; then
     fail_case "$name" "obsolete server-only evaluator still exists"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The fixture reads the probe PNG by matching each glyph cell against its OWN
+# copy of the generator's font, because it must not import the release artifact.
+# Two copies means drift, and drift here is quiet in the worst way: an unknown
+# glyph decodes to None, the fixture answers with no digits, and every honest arm
+# of the deep image family goes red under [IMAGE_INPUT] — which reads as "the
+# adapter drops pictures", the exact fault those arms exist to detect. A real
+# edit to the shipped glyphs (they were changed once, to stop vision models
+# misreading a slashed 0 and a flat-topped 3) would look identical to a
+# regression. This case makes the tables answer for themselves.
+# The grader decides whether a reply proves the engine saw the picture. It is
+# duplicated — doctor_chat_eval and app_chat_body_eval each carry their own copy,
+# because each lives in its own python -c block — and the two grading the same
+# gateway differently is the one outcome an operator cannot act on. Nothing but
+# this case holds them together.
+#
+# It also pins the ACCEPTANCE RULE itself, which shipped once with no coverage at
+# all: the threshold could be widened from "one wrong position" to "three" and
+# every image test in this suite still passed, because the fixture only ever
+# answers with the exactly-decoded code. The rows below are the cases the fixture
+# structurally cannot produce.
+run_probe_grader_case() {
+  local name="probe-grader" out
+  out=$(SCRIPT="$SCRIPT" python3 - <<'PY'
+import os, re, subprocess, sys
+
+src = open(os.environ["SCRIPT"], encoding="utf-8").read()
+
+# Lift every copy of the grader out of the artifact. Both must exist, and both
+# must be character-identical: a divergence here is the defect this case exists
+# for, so it is checked before either is exercised.
+blocks = re.findall(r"^if exp != \"-\":\n(.*?)^print\(\"ok %d\" % len\(c\)\)",
+                    src, re.M | re.S)
+if len(blocks) != 2:
+    print("expected 2 grader copies in the artifact, found %d" % len(blocks)); sys.exit(0)
+
+# Compare the CODE, not the prose. The two copies carry deliberately different
+# comments — one holds the reasoning, the other points at it — so a raw diff
+# would fail permanently and this case would be deleted rather than fixed.
+def code_only(b):
+    return [ln.rstrip() for ln in b.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+if code_only(blocks[0]) != code_only(blocks[1]):
+    print("the two grader copies have diverged"); sys.exit(0)
+
+# Rebuilt with the block's own `if` header so its indentation stays valid, and
+# with the same trailing print the artifact has, so the "no expected code" path
+# is exercised by the identical source too.
+body = ('import re, sys\n'
+        'c = sys.stdin.read()\n'
+        'exp = sys.argv[1]\n'
+        'if exp != "-":\n' + blocks[0].rstrip() + '\n'
+        'print("ok %d" % len(c))\n')
+
+def grade(reply, exp):
+    r = subprocess.run([sys.executable, "-c", body, exp], input=reply,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return "<crash:%s>" % (r.stderr.strip().splitlines() or ["?"])[-1][:60]
+    return (r.stdout.split() or ["<empty>"])[0]
+
+CODE = "728431"
+CASES = [
+    # reply                                              exp     want
+    (CODE,                                               CODE,   "token"),
+    ("The digits are 728431.",                           CODE,   "token"),
+    ("7 2 8 4 3 1",                                      CODE,   "token"),
+    ("7 2 8 4 3 1. I read 6 digits.",                    CODE,   "token"),
+    ("728432",                                           CODE,   "near"),    # one wrong
+    ("I read 728432 in the image.",                      CODE,   "near"),
+    ("728433 is my reading",                             "728431", "near"),
+    ("725432",                                           CODE,   "notoken"), # two wrong
+    ("I cannot see any image.",                          CODE,   "notoken"),
+    ("",                                                 CODE,   "notoken"),
+    # the refusal that must never assemble a code out of unrelated numbers
+    ("I cannot see an image. Retry in 7 to 2 minutes, "
+     "code 8, dept 4, room 3, ext 1.",                   CODE,   "notoken"),
+    # Many same-length numbers must not buy one draw at the tolerance each.
+    # EVERY id here is within one digit of the code on purpose: if the rule ever
+    # scores the best of several candidates, this must go green and fail the case
+    # no matter which candidate it happens to look at first.
+    ("No image. ids: 728430 728432 728433 728434 728435", CODE,  "notoken"),
+    # A degenerate expected length must not make every reply a sighting. The
+    # reply carries exactly one digit so the comparison is actually reached —
+    # with no digits at all the candidate list is empty and the guard is moot,
+    # which is what made an earlier version of this row prove nothing.
+    ("I see 5 things.",                                  "7",    "notoken"),
+    # A digit run of the WRONG length must never reach the near-miss comparison:
+    # zip() truncates to the shorter string, so an unfiltered 5-digit run would
+    # score 5 of 5 against a 6-digit code and grade as a sighting.
+    ("I read 72843 in the image.",                       CODE,   "notoken"),
+    ("I read 7284310 in the image.",                     CODE,   "notoken"),
+    # Spaced groups: EVERY one counts, and each must be maximal. A first-match
+    # search let the first of several guesses stand alone and collect the
+    # tolerance; an unanchored group let a long spray be windowed to its first n.
+    ("Either 7 2 8 4 3 0 or 7 2 8 4 3 5 or 1 1 1 1 1 1 "
+     "-- I cannot see the image.",                       CODE,   "notoken"),
+    ("Cannot read it. Maybe 7 2 8 4 3 0 9 9 9 9.",       CODE,   "notoken"),
+    ("digits 1 2 3 4 5 6 7 8 9 0 shown",                 "123456", "notoken"),
+    # ...and the honest shapes those two anchors must not cost us.
+    ("The code is 7 2 8 4 3 1",                          CODE,   "token"),
+    ("7-2-8-4-3-1",                                      CODE,   "token"),
+    ("I see 7 2 8 4 3 2 in the picture.",                CODE,   "near"),
+]
+bad = []
+for reply, exp, want in CASES:
+    got = grade(reply, exp)
+    if got != want:
+        bad.append("%r exp=%s -> %s (want %s)" % (reply[:42], exp, got, want))
+print("OK" if not bad else " | ".join(bad))
+PY
+)
+  if [ "$out" != "OK" ]; then
+    fail_case "$name" "probe grader: ${out:-the comparison produced nothing}"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The `near` verdict crosses TWO layers and only the python half had coverage.
+# The grader prints "near"; a shell case arm in each checker has to turn that
+# into "sighted, one glyph misread". Deleting either arm left all four suites
+# green — and at runtime a one-glyph misread then fell into the catch-all and was
+# reported as "could not grade the reply", so the honest gateway this whole
+# tolerance exists to stop accusing was accused a different way. The fixture
+# cannot reach this: it answers with the exactly-decoded code and has no mode
+# that perturbs a digit. So the artifact's own functions are driven directly,
+# with only the transport answered from here.
+run_probe_near_verdict_case() {
+  local name="probe-near-verdict" doctor server out
+  doctor=$(sed -n '/^doctor_chat_eval()/,/^}/p' "$SCRIPT")
+  server=$(sed -n '/^app_chat_body_eval()/,/^}/p' "$SCRIPT")
+  if [ -z "$doctor" ] || [ -z "$server" ]; then
+    fail_case "$name" "could not lift both graders out of the release artifact"; return
+  fi
+  out=$(DOCTOR_FN="$doctor" SERVER_FN="$server" bash -c '
+set -u
+eval "$DOCTOR_FN"
+eval "$SERVER_FN"
+ct_is_json() { return 0; }
+DCC_CURL_RC=0
+grade() { # grade <content> -> "<doctor rc/token/near> <server rc/token/near>"
+  local body d_rc=0 s_rc=0
+  body="{\"choices\":[{\"message\":{\"content\":\"$1\"}}]}"
+  doctor_chat_request() { DCC_BODY="$body"; DCC_CODE="200"; DCC_CT="application/json"; return 0; }
+  doctor_chat_eval "{}" "728431" || d_rc=$?
+  app_chat_body_eval "$body" "728431" || s_rc=$?
+  printf "%s/%s/%s %s/%s/%s" "$d_rc" "${DCE_TOKEN:--}" "${DCE_NEAR:--}" \
+                             "$s_rc" "${CCE_TOKEN:--}" "${CCE_NEAR:--}"
+}
+printf "exact   %s\n" "$(grade "The digits are 728431.")"
+printf "oneoff  %s\n" "$(grade "I read 728432 in the image.")"
+printf "twooff  %s\n" "$(grade "I read 725432 in the image.")"
+' 2>&1)
+  # An exact read is a sighting with nothing to disclose; one wrong glyph is a
+  # sighting that MUST carry the near flag onward, or the operator is told the
+  # picture arrived clean when it did not; two wrong is not a sighting at all.
+  if [ "$out" != "exact   0/yes/- 0/yes/-
+oneoff  0/yes/yes 0/yes/yes
+twooff  0/no/- 0/no/-" ]; then
+    fail_case "$name" "the near verdict is not carried by both checkers: ${out:-no output}"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+run_probe_font_mirror_case() {
+  local name="probe-font-mirror" out
+  out=$(SCRIPT="$SCRIPT" FIXTURE="$FIXTURE" python3 - <<'PY'
+import ast, os, re
+
+def font(path):
+    # literal_eval, not eval: this parses two files the suite does not own, and a
+    # font table is a pure literal (digit -> 7 ints). It also spans both spellings
+    # in use — the artifact writes decimal, the fixture writes 0b binary.
+    src = open(path, encoding="utf-8").read()
+    m = re.search(r"^FONT = \{$(.*?)^\}$", src, re.M | re.S)
+    if not m:
+        return None
+    try:
+        return ast.literal_eval("{" + m.group(1) + "}")
+    except Exception:
+        return None
+
+a, b = font(os.environ["SCRIPT"]), font(os.environ["FIXTURE"])
+if a is None:
+    print("no FONT literal found in the release artifact")
+elif b is None:
+    print("no FONT literal found in the fixture")
+elif len(a) != 10:
+    print("the artifact font has %d glyphs, expected 10" % len(a))
+elif a != b:
+    print("glyphs disagree: " + ",".join(sorted(k for k in set(a) | set(b)
+                                                if a.get(k) != b.get(k))))
+else:
+    # The SEPARATION, not just the table. The font comment argues the closest
+    # pair at length, and until this ran the comment was the only thing guarding
+    # it — a restyle silently dropped the minimum from 6 to 5 and nothing said
+    # so. Exact, not ">=": the comment states a number, and a glyph edit that
+    # moves it in EITHER direction has to move the prose with it.
+    MIN_SEP, MIN_PAIR = 5, "0/8"
+    worst, pair = 99, ""
+    keys = sorted(a)
+    for i, x in enumerate(keys):
+        for y in keys[i + 1:]:
+            d = sum(bin(p ^ q).count("1") for p, q in zip(a[x], a[y]))
+            if d < worst:
+                worst, pair = d, "%s/%s" % (x, y)
+    if (worst, pair) != (MIN_SEP, MIN_PAIR):
+        print("closest glyph pair is %s at %d cells; the font comment in "
+              "src/60-check-adapter.inc.sh says %s at %d — update both"
+              % (pair, worst, MIN_PAIR, MIN_SEP))
+    else:
+        print("OK")
+PY
+)
+  if [ "$out" != "OK" ]; then
+    fail_case "$name" "probe font mirror: ${out:-the comparison produced nothing}"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -8713,6 +8988,18 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" shared-app-evaluator "*) true ;; *) false ;; esac; then
   run_shared_app_evaluator_wiring_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" probe-grader "*) true ;; *) false ;; esac; then
+  run_probe_grader_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" probe-near-verdict "*) true ;; *) false ;; esac; then
+  run_probe_near_verdict_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" probe-font-mirror "*) true ;; *) false ;; esac; then
+  run_probe_font_mirror_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" image-gate-blocks-only-the-silent-drop "*) true ;; *) false ;; esac; then

@@ -295,8 +295,16 @@ test_duplicate_per_gateway_port() {
   if (
     eval "$FS_UNIT_ACTIVE_IMPL"
     have() { [ "$1" = "systemctl" ]; }
+    # Faithful to the real tool: `is-active` PRINTS the state word and exits 3
+    # when the unit is not running. A stub that only sets an exit code cannot
+    # tell a stopped unit apart from a shell that could not reach the bus, and
+    # that is precisely the distinction the function under test has to make.
     systemctl() {
-      [ "$*" = "--user is-active --quiet conduck-files-openclaw.service" ]
+      case "$*" in
+        "--user is-active conduck-files-openclaw.service") printf 'active\n' ;;
+        *"is-active"*) printf 'inactive\n'; return 3 ;;
+        *) return 1 ;;
+      esac
     }
     OS="Linux"
     FS_UNIT="$hermes_unit"
@@ -4786,9 +4794,11 @@ inactive_run() { # inactive_run <confirm> <reuse-only> [pre-bind-new-ports]
     # is the opposite, so the real pair is restored and driven by this systemctl.
     eval "$FS_UNIT_ACTIVE_IMPL"
     have() { case "$1" in systemctl|loginctl|rclone) return 0 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    # `is-active` prints the state word; see the note at the duplicate-port case.
     systemctl() {
       case "$*" in
-        *"is-active"*)    [ -f "$HOME/started" ] ;;
+        *"is-active"*)    if [ -f "$HOME/started" ]; then printf 'active\n'
+                          else printf 'inactive\n'; return 3; fi ;;
         *"enable --now"*) : > "$HOME/started"; return 0 ;;
         *)                return 0 ;;
       esac
@@ -4844,12 +4854,54 @@ test_inactive_unit_report() {
     have() { return 1; }
     fs_inactive_unit_report 2>&1 || true
   )
-  case "$out" in *"can't ask this machine whether the file server is running"*)
+  # The WHOLE sentence, not its opening clause. The first version of this
+  # assertion stopped one character before a trailing "(no systemctl/launchctl
+  # here)" and stayed green while the script told an operator with systemd
+  # installed that their machine has no service manager.
+  case "$out" in *"I can't get a usable answer from this machine's service manager about whether"*"the file server is running"*)
       pass "dead unit: an unaskable supervisor is not reported as dead" ;;
     *) fail "dead unit: an unaskable supervisor is not reported as dead" "$out" ;; esac
   case "$out" in *"exists but is not active"*)
       fail "dead unit: no death claim without evidence" "$out" ;;
     *) pass "dead unit: no death claim without evidence" ;; esac
+
+  # A supervisor that is INSTALLED but unreachable is the same answer as no
+  # supervisor at all. `systemctl --user` off a session bus — su, sudo -u, cron,
+  # a remote command against a lingering account — exits non-zero and prints
+  # nothing, which is byte-for-byte what a stopped unit's exit code looks like.
+  # Reading only the exit code turns a healthy file server into a corpse in the
+  # report, so the state word is the evidence and its absence is `unknown`.
+  out=$(
+    OS="Linux"; FS_UNIT="$TMP/absent.service"; DRY_RUN=false
+    have() { [ "$1" = "systemctl" ]; }
+    systemctl() { printf 'Failed to connect to bus.\n' >&2; return 1; }
+    fs_inactive_unit_report 2>&1 || true
+  )
+  # The WHOLE sentence, not its opening clause. The first version of this
+  # assertion stopped one character before a trailing "(no systemctl/launchctl
+  # here)" and stayed green while the script told an operator with systemd
+  # installed that their machine has no service manager.
+  case "$out" in *"I can't get a usable answer from this machine's service manager about whether"*"the file server is running"*)
+      pass "dead unit: an unreachable bus is not evidence of death" ;;
+    *) fail "dead unit: an unreachable bus is not evidence of death" "$out" ;; esac
+
+  # The three answers, pinned one at a time, so a regression names its branch.
+  out=$(
+    OS="Linux"; FS_UNIT="$TMP/tri.service"
+    have() { [ "$1" = "systemctl" ]; }
+    systemctl() {
+      [ -n "$SAYS" ] && printf '%s\n' "$SAYS"
+      [ "$SAYS" = active ]
+    }
+    for SAYS in active inactive failed activating ""; do
+      printf '%s=%s ' "${SAYS:-empty}" "$(fs_unit_state)"
+    done
+  )
+  case "$out" in
+    "active=active inactive=inactive failed=inactive activating=inactive empty=unknown ")
+      pass "unit state: running, stopped and unaskable are three answers" ;;
+    *) fail "unit state: running, stopped and unaskable are three answers" "$out" ;;
+  esac
 }
 
 # =========================== what a failed probe write may claim about disk ====

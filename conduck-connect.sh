@@ -158,7 +158,7 @@
 
 set -u -o pipefail
 
-VERSION="0.14.0"
+VERSION="0.14.1"
 PAYLOAD_VERSION=1
 # ---------------------------------------------------------------- utilities --
 
@@ -6480,11 +6480,23 @@ fs_unit_state() { # fs_unit_state -> active | inactive | unknown
   [ -n "$FS_UNIT" ] || { printf 'unknown'; return 0; }
   if [ "$OS" = "Linux" ]; then
     have systemctl || { printf 'unknown'; return 0; }
-    if systemctl --user is-active --quiet "$(basename "$FS_UNIT")"; then
-      printf 'active'
-    else
-      printf 'inactive'
-    fi
+    # Read what systemctl SAYS, not merely whether it succeeded. A non-zero exit
+    # covers two different facts: the unit is stopped, and this shell could not
+    # ask at all. `systemctl --user` with no session bus — su, sudo -u, cron, a
+    # remote command against a lingering account — fails with "Failed to connect
+    # to bus" and prints nothing. Folding that into "inactive" tells an operator
+    # their running file server is stopped, which is exactly the invention this
+    # surface exists to avoid; `unknown` already has honest wording waiting for
+    # it at every call site. Measured on a lingering account: running prints
+    # "active", stopped prints "inactive", an unreachable bus prints nothing.
+    # Callers still fail closed, because `unknown` is not `active` either.
+    local out
+    out=$(systemctl --user is-active "$(basename "$FS_UNIT")" 2>/dev/null)
+    case "$out" in
+      active) printf 'active' ;;
+      "")     printf 'unknown' ;;
+      *)      printf 'inactive' ;;
+    esac
   else
     have launchctl || { printf 'unknown'; return 0; }
     local label
@@ -6649,7 +6661,8 @@ fs_inactive_unit_report() {
   state=$(fs_unit_state)
   unit_name=$(basename "${FS_UNIT:-unknown}")
   if [ "$state" = "unknown" ]; then
-    warn "I can't ask this machine whether the file server is running (no systemctl/launchctl here),"
+    warn "I can't get a usable answer from this machine's service manager about whether"
+    warn "the file server is running,"
     warn "so I won't expose it."
     [ -n "$FS_UNIT" ] && note "service: $FS_UNIT"
     return 1
@@ -10122,7 +10135,7 @@ agent_file_chat_eval() { # dedicated five-minute sentinel turn
   case "$max_time" in 0|[1-9][0-9]*) ;; *) max_time=300 ;; esac
   [ "$max_time" -ge 31 ] 2>/dev/null && [ "$max_time" -le 1800 ] 2>/dev/null \
     || max_time=300
-  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
   if ! doctor_chat_request "$1" "$max_time"; then
     CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
   fi
@@ -11280,6 +11293,7 @@ IMG_PROOF=""     # transcript state for THIS run: "" | verified | declined | too
                  # the payload and not in the profile — there is nowhere honest to
                  # put it, which is the whole reason this gate is on screen.
 IMG_OUTCOME=""   # the last graded turn, set by verify_image_probe_once
+IMG_NEAR=""      # non-empty when that turn was read back with one glyph misread
 
 # One graded image turn. Prints nothing and decides nothing — it leaves the
 # outcome word in IMG_OUTCOME and the app-evaluator state in CCE_*/DCC_* for the
@@ -11288,20 +11302,41 @@ IMG_OUTCOME=""   # the last graded turn, set by verify_image_probe_once
 # second picture) must be graded on what IT did: a retry folded into the first
 # attempt's verdict is exactly how a network fault gets reported to an operator
 # as "your gateway drops photos".
+# True when a freshly drawn code sits close enough to the previous one that a
+# reply carrying the OLD digits would still be graded a sighting of the new ones.
+# The grader forgives one wrong position, so two codes differing in a single
+# digit are interchangeable to it, and a cached or echoed answer would sail
+# through the retry that exists to catch exactly that. Two or more differing
+# positions is the whole requirement; lengths that differ cannot be confused at
+# all. Returns 0 (shell true) when the pair is UNUSABLE and must be redrawn.
+probe_codes_too_close() { # probe_codes_too_close <code-a> <code-b>
+  local a="$1" b="$2" i=0 diff=0
+  [ "${#a}" = "${#b}" ] || return 1
+  while [ "$i" -lt "${#a}" ]; do
+    [ "${a:$i:1}" = "${b:$i:1}" ] || diff=$((diff+1))
+    [ "$diff" -ge 2 ] && return 1
+    i=$((i+1))
+  done
+  return 0
+}
+
 verify_image_probe_once() { # verify_image_probe_once [digits-the-retry-must-not-reuse]
   local avoid="${1:-}" redraws=0
-  IMG_OUTCOME=""
+  IMG_OUTCOME=""; IMG_NEAR=""
   # Set explicitly, never inherited: image_probe_gen's python reads the
   # ENVIRONMENT, so a CONDUCK_PROBE_MODEL the operator happens to have exported
   # would quietly grade a different model than the one being paired.
   CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
-  # A retry that happens to redraw the FIRST attempt's digits is not a second
-  # look — a cached reply, or the one-in-nine-thousand coincidence the first turn
-  # was retried for, would pass on exactly the run where it must not. The digits
-  # are drawn locally with no request behind them, so redrawing costs nothing;
-  # the bound is there because an unbounded loop on a broken generator is worse
-  # than a repeated code.
-  while [ -n "$avoid" ] && [ "$IPG_CODE" = "$avoid" ] && [ "$redraws" -lt 8 ]; do
+  # A retry that redraws digits TOO CLOSE to the first attempt's is not a second
+  # look — a cached reply, or the lucky guess the first turn was retried for,
+  # would pass on exactly the run where it must not. "Too close" is not "equal":
+  # the grader forgives one wrong position, so a code differing from the first in
+  # a single digit is one the stale answer still passes. Inequality was the right
+  # test only while the match was exact. The digits are drawn locally with no
+  # request behind them, so redrawing costs nothing; the bound is there because
+  # an unbounded loop on a broken generator is worse than a close code.
+  while [ -n "$avoid" ] && [ "$redraws" -lt 8 ] \
+        && probe_codes_too_close "$IPG_CODE" "$avoid"; do
     redraws=$((redraws+1))
     CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
   done
@@ -11316,7 +11351,15 @@ verify_image_probe_once() { # verify_image_probe_once [digits-the-retry-must-not
   # holding the phone will experience, not what the wire ought to look like —
   # --check-adapter --deep is where the wire is held to the stricter bar.
   if app_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
-    if [ "$CCE_TOKEN" = "yes" ]; then IMG_OUTCOME="verified"; else IMG_OUTCOME="ignored"; fi
+    if [ "$CCE_TOKEN" = "yes" ]; then
+      # "verified" either way — one misread glyph is still a sighting — but the
+      # two are not the same evidence, and this is the route that hands out a
+      # pairing code. IMG_NEAR carries it to the verdict line so the operator is
+      # told what was actually read back rather than a tidied-up version.
+      IMG_OUTCOME="verified"; IMG_NEAR="${CCE_NEAR:-}"
+    else
+      IMG_OUTCOME="ignored"; IMG_NEAR=""
+    fi
     return 0
   fi
   # A transfer that never completed carries no status to read, so nothing about
@@ -11419,7 +11462,7 @@ verify_image_ignored_gate() {
 
 verify_image_intake() {
   IMG_PROOF=""
-  IMG_OUTCOME=""
+  IMG_OUTCOME=""; IMG_NEAR=""
   # Nothing left to protect on a run that will emit no code: emit_payload already
   # withholds it. Same arithmetic as skip_agent_file_probe_after_failed_gateway —
   # this turn's answer would be discarded, and the re-run they now have to do
@@ -11431,10 +11474,12 @@ verify_image_intake() {
   verify_image_probe_once
   if [ "$IMG_OUTCOME" = "ignored" ]; then
     # Retry ONCE, and only this outcome, because only this one is about to cost
-    # someone their setup code. A FRESHLY drawn picture on purpose: re-sending
-    # the same one lets a cached answer, or the ~1-in-9000 lucky guess, pass on
-    # the second look — the retry is there to forgive a flaky turn, not to give
-    # a wrong answer two chances to be right.
+    # someone their setup code. A FRESHLY drawn picture on purpose, and one that
+    # differs from the first in more than a single digit: re-sending the same
+    # one — or a near-twin the grader cannot tell from it — lets a cached answer,
+    # or the roughly 1-in-16,700 lucky guess, pass on the second look. The retry
+    # is there to forgive a flaky turn, not to give a wrong answer two chances to
+    # be right. probe_codes_too_close is what enforces the distance.
     # This is the only path that spends a second turn, so a gateway that bills
     # per request is charged twice only when it has already answered once in the
     # single way that would otherwise block it.
@@ -11445,7 +11490,13 @@ verify_image_intake() {
   case "$IMG_OUTCOME" in
     verified)
       IMG_PROOF="verified"
-      ok "photo turn: the reply reads the test picture's digits back — pictures reach the engine"
+      if [ -n "${IMG_NEAR:-}" ]; then
+        ok "photo turn: the reply reads the test picture's digits back, one glyph misread — pictures"
+        say "    reach the engine. The miss is the engine reading small block digits, not your gateway;"
+        say "    it could not have come within a digit without being shown the picture."
+      else
+        ok "photo turn: the reply reads the test picture's digits back — pictures reach the engine"
+      fi
       ;;
     declined)
       IMG_PROOF="declined"
@@ -11708,7 +11759,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # has confirmed that requirement — by re-sending its identical request with the
 # first advertised id — the later probes carry that id and grade their OWN rule,
 # and the missing-model failure is reported once, where it belongs.
-# --deep adds the semantic image probe: a locally generated PNG showing 4
+# --deep adds the semantic image probe: a locally generated PNG showing 6
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
 # image (VERIFIED); an honest HTTP 400 decline with code "image_unsupported"
@@ -12471,10 +12522,10 @@ doctor_transfer_reason() { # doctor_transfer_reason <curl exit code>
 # DCE_TOKEN when an expected digit code was given (the --deep image probe's
 # semantic grading: the code must appear as a standalone digit-run in the
 # reply, so "The digits are 4827." passes while "48275" does not).
-DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
+DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""; DCE_NEAR=""
 doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}" res verdict detail
-  DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
+  DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""; DCE_NEAR=""
   if ! doctor_chat_request "$1"; then
     # DCE_HINT stays exactly "transfer" — the file lane keys on that literal to
     # decide it may not grade the lane. The sub-case lives in DCC_CURL_RC.
@@ -12521,12 +12572,57 @@ if not isinstance(c, str):
 if not c:
     print("empty -"); sys.exit(0)
 if exp != "-":
-    print(("token %d" if exp in re.findall(r"\d+", c) else "notoken %d") % len(c)); sys.exit(0)
+    # Grade SIGHTING, not OCR -- the question is whether the picture reached the
+    # engine, not whether the engine reads a 5x7 bitmap perfectly. An engine shown
+    # no image says so; it does not land one glyph away from a six-digit code. So
+    # one wrong position is forgiven. Exact-match alone called the picture unseen
+    # on 31% of honest turns, measured against a proxy that cannot drop one.
+    #
+    # The CANDIDATE SET is where a tolerance turns dangerous, so it is narrow on
+    # purpose. Exactly two things count as a read-back: a standalone run of the
+    # right length, or single digits split by spaces or punctuation (7 2 8 4 3 1),
+    # which is how some models answer. Digits scattered through a sentence are
+    # NEVER stitched together -- otherwise "I cannot see an image, try again in
+    # 8 to 2 minutes, ext 7" assembles a code out of unrelated numbers and a
+    # refusal grades as a sighting. And a near miss is allowed only when the
+    # reply offers exactly ONE distinct candidate: taking the best of many
+    # numbers would hand the gateway one draw at the tolerance per number it
+    # prints, so the odds below would stop describing anything. An exact hit
+    # stands alone -- at six digits it is one in a million.
+    #
+    # EVERY spaced group is collected, and each one must be MAXIMAL -- no digit
+    # and no separator+digit may sit on either side of it. Both halves are load
+    # bearing, and neither is a style choice:
+    #   * a first-match-only search let "maybe 7 2 8 4 3 0 or 7 2 8 4 3 5 or
+    #     1 1 1 1 1 1, I cannot see the image" present ONE candidate, so the
+    #     one-distinct-candidate rule passed and a refusal graded as a sighting;
+    #   * an unanchored group let a ten-digit spray be windowed down to its
+    #     first six, so "digits 1 2 3 4 5 6 7 8 9 0 shown" scored an exact hit.
+    # The same rule lives in app_chat_body_eval; change both or neither.
+    n = len(exp)
+    runs = re.findall(r"\d+", c)
+    cands = [r for r in runs if len(r) == n]
+    for m in re.finditer(
+            r"(?<!\d)(?<![\d][ .,\-])\d(?:[ .,\-]\d){%d}(?![ .,\-]?\d)" % (n - 1), c):
+        cands.append(re.sub(r"\D", "", m.group(0)))
+    if exp in cands:
+        print("token %d" % len(c)); sys.exit(0)
+    uniq = set(cands)
+    # n >= 4 is not decoration: at n == 1 the threshold degenerates to "zero
+    # positions must match", which every reply satisfies, including one with no
+    # digits at all. The generator only ever draws NDIGITS, but this grader takes
+    # whatever it is handed.
+    if n >= 4 and len(uniq) == 1:
+        only = uniq.pop()
+        if sum(1 for a, b in zip(only, exp) if a == b) >= n - 1:
+            print("near %d" % len(c)); sys.exit(0)
+    print("notoken %d" % len(c)); sys.exit(0)
 print("ok %d" % len(c))' "$exp" 2>/dev/null)
   verdict="${res%% *}"; detail="${res#* }"
   case "$verdict" in
     ok)      DCE_LEN="$detail"; return 0 ;;
     token)   DCE_LEN="$detail"; DCE_TOKEN="yes"; return 0 ;;
+    near)    DCE_LEN="$detail"; DCE_TOKEN="yes"; DCE_NEAR="yes"; return 0 ;;  # saw it, misread one glyph
     notoken) DCE_LEN="$detail"; DCE_TOKEN="no";  return 0 ;;   # shape is fine; the digits aren't there
     badjson)     DCE_REASON="HTTP 200, but the body isn't strict JSON"; DCE_HINT="badjson" ;;
     nochoices)   DCE_REASON="no usable \"choices\" array"; DCE_HINT="nochoices" ;;
@@ -12592,11 +12688,11 @@ print(json.dumps(req))' 2>/dev/null
 doctor_model_required_probe() { # <payload-json>
   local payload="$1" retried rc=1
   local s_code="$DCC_CODE" s_ct="$DCC_CT" s_time="$DCC_TIME" s_body="$DCC_BODY" s_crc="$DCC_CURL_RC"
-  local s_reason="$DCE_REASON" s_hint="$DCE_HINT" s_len="$DCE_LEN" s_token="$DCE_TOKEN"
+  local s_reason="$DCE_REASON" s_hint="$DCE_HINT" s_len="$DCE_LEN" s_token="$DCE_TOKEN" s_near="$DCE_NEAR"
   retried=$(doctor_payload_with_model "$payload" "$MODELS_FIRST_ID")
   if [ -n "$retried" ] && doctor_chat_eval "$retried"; then rc=0; fi
   DCC_CODE="$s_code"; DCC_CT="$s_ct"; DCC_TIME="$s_time"; DCC_BODY="$s_body"; DCC_CURL_RC="$s_crc"
-  DCE_REASON="$s_reason"; DCE_HINT="$s_hint"; DCE_LEN="$s_len"; DCE_TOKEN="$s_token"
+  DCE_REASON="$s_reason"; DCE_HINT="$s_hint"; DCE_LEN="$s_len"; DCE_TOKEN="$s_token"; DCE_NEAR="$s_near"
   return $rc
 }
 
@@ -12834,12 +12930,18 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   return 1
 }
 
-# --deep's semantic image probe. A PNG rendered HERE (stdlib zlib/struct — 4
-# random digits as big block glyphs, black on white, ~632×232) rides the
+# --deep's semantic image probe. A PNG rendered HERE (stdlib zlib/struct — 6
+# random digits as big block glyphs, black on white, ~920×232) rides the
 # newest message; the digits are never in the prompt, filename, or metadata,
 # so the ONLY way to answer them is to actually see the image. Outcomes:
-#   VERIFIED   — 200 and the reply contains the digits: the engine truly sees
-#                images (OCR tooling counts — this grades capability, not eyes).
+#   VERIFIED   — 200 and the reply reads the digits back, allowing ONE wrong
+#                position: the engine truly sees images (OCR tooling counts —
+#                this grades capability, not eyes). The tolerance is not
+#                leniency; it is what separates the two questions. An engine
+#                shown no picture answers that it cannot see one, it does not
+#                land within one glyph of six, so a near miss still proves
+#                sighting while exact-match alone failed conforming gateways on
+#                31% of honest turns. See the threshold note in doctor_chat_eval.
 #   DECLINED   — HTTP 400 + OpenAI error body + code "image_unsupported": a
 #                text-only adapter refusing honestly. Allowed, passes.
 #   UNVERIFIED — 200 but the digits aren't in the reply: this run could not
@@ -12852,9 +12954,13 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 #                the forbidden silent drop it may or may not be.
 # Anything else (wrong/missing decline code, other statuses, bad shape) FAILs:
 # clients key on the machine code, so "looks declined" isn't good enough.
-# ~1-in-9000 guess odds are accepted. The reply's content is never printed.
+# One wrong position is forgiven, so a blind guess passes about 1 in 16,700 —
+# stronger than the ~1-in-9,000 the older exact four-digit rule allowed, because
+# the code grew to six digits when the tolerance appeared. The reply's content is
+# never printed.
 # Build the semantic image probe (shared by --deep and --check-server): sets
-# IPG_CODE (the 4 digits) and IPG_PAYLOAD (the chat request carrying the PNG).
+# IPG_CODE (the digits, NDIGITS of them) and IPG_PAYLOAD (the chat request
+# carrying the PNG).
 # $CONDUCK_PROBE_MODEL adds a "model" field when it is non-empty. EVERY caller
 # sets it explicitly, because the python reads the ENVIRONMENT: a caller that
 # merely omits it inherits whatever the operator happened to export, which
@@ -12865,19 +12971,58 @@ image_probe_gen() {
   local gen
   gen=$(python3 -c '
 import json, os, zlib, struct, base64, random
+# Two glyphs are drawn against convention, and both choices are measured against
+# a thin proxy that CANNOT drop an image, so every miss there is the drawing and
+# not the gateway. The ZERO carries no slash: the diagonal is a programmer-font
+# habit for telling 0 from O, there is no O in a numeric code, and at 5x7 it
+# fills the counter so the digit reads as 8, 9, 6, 5 or 2. The THREE has open
+# arcs and a full centre bar; the original flat-top 3 was a 7 with a hook and was
+# read as 7, 2 and 5. Those two accounted for 10 of 12 misreads over 40 samples.
+#
+# The 3 is drawn the way it is for a SECOND reason, and this is the trap: the
+# obvious replacement — a round-topped 3 — is an 8 with its left side missing.
+# It measured well and is still wrong, because it puts 3 and 8 three cells apart
+# in a 35-cell grid, with all three differing cells isolated singletons. That is
+# the feature scale an image encoder loses first.
+#
+# The closest pair this table actually keeps is 0/8 at FIVE cells, and the count
+# alone is not what makes it safe: those five cells are one contiguous horizontal
+# bar — the waist stroke of 8, which 0 omits — not the singletons the 3/8 case
+# warns about. A whole stroke is the feature an encoder loses LAST. Contiguity,
+# not distance, is the property to preserve; a single 0<->8 misread is also
+# exactly what the one-wrong-position tolerance absorbs. probe_font_mirror pins
+# both the table and that 5-cell minimum, so a restyle fails loudly rather than
+# silently narrowing the gap — but re-measure the recognition rate too, which no
+# test can do for you.
 FONT = {
-    "0": [14, 17, 19, 21, 25, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
-    "2": [14, 17, 1, 2, 4, 8, 31],     "3": [31, 2, 4, 2, 1, 17, 14],
+    "0": [14, 17, 17, 17, 17, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
+    "2": [14, 17, 1, 2, 4, 8, 31],     "3": [30, 1, 1, 14, 1, 1, 30],
     "4": [2, 6, 10, 18, 31, 2, 2],     "5": [31, 16, 30, 1, 1, 17, 14],
     "6": [6, 8, 16, 30, 17, 17, 14],   "7": [31, 1, 2, 4, 8, 8, 8],
     "8": [14, 17, 17, 14, 17, 17, 14], "9": [14, 17, 17, 15, 1, 2, 12],
 }
 SCALE, MARGIN, GAP = 16, 60, 64  # wide GAP is load-bearing: at GAP=24 real
-# vision models systematically misread adjacent glyphs (measured 1/6 correct
-# vs 8/8 at GAP=64 on gpt-5.6 — tight spacing reads as merged segments)
+# vision models systematically misread adjacent glyphs (measured 1/6 correct at
+# GAP=24 — tight spacing reads as merged segments). Widening it did NOT make the
+# probe reliable on its own: at GAP=64 the same font still scored 27/40 exact on
+# gpt-5.6-luna, because the remaining errors were single-glyph, not spacing. That
+# is what the 0 and 3 above fix; spacing and glyph shape are separate faults and
+# each was measured on its own.
 GW, GH = 5 * SCALE, 7 * SCALE
-W, H = MARGIN * 2 + 4 * GW + 3 * GAP, MARGIN * 2 + GH
-code = str(random.randint(1, 9)) + "".join(str(random.randint(0, 9)) for _ in range(3))
+# SIX digits, not four, and the count is what pays for the one-glyph tolerance
+# below. Four digits with one position forgiven accepts a blind guess at about
+# 1 in 250 — weaker than the 1 in 9,000 an exact four-digit match gave, which is
+# a real cost for a check that certifies a capability. Six digits with the same
+# tolerance is about 1 in 16,700: STRONGER than the exact rule it replaces, while
+# the tolerance still absorbs the single-glyph misreads that were failing honest
+# gateways. Longer is not free — every extra glyph is another chance to misread,
+# and measured over 60 live turns on two models six digits with one forgiven was
+# 60/60 while six exact was 51/60. Changing NDIGITS changes the guarantee; the
+# odds quoted in the header and to the operator are computed for this value.
+NDIGITS = 6
+W, H = MARGIN * 2 + NDIGITS * GW + (NDIGITS - 1) * GAP, MARGIN * 2 + GH
+code = str(random.randint(1, 9)) + "".join(str(random.randint(0, 9))
+                                           for _ in range(NDIGITS - 1))
 rows = [bytearray(b"\xff" * W) for _ in range(H)]
 for i, ch in enumerate(code):
     x0 = MARGIN + i * (GW + GAP)
@@ -12921,7 +13066,16 @@ doctor_image_input_check() {
   if doctor_chat_eval "$payload" "$code"; then
     if [ "$DCE_TOKEN" = "yes" ]; then
       DOCTOR_IMAGE_INPUT="VERIFIED"
-      d_ok "$id" "image input — the reply reads the digits back (VERIFIED, ${DCC_TIME:-?}s)"
+      if [ "${DCE_NEAR:-}" = "yes" ]; then
+        # Say that one glyph was misread rather than quietly rounding it up. The
+        # capability is proven either way — an engine shown nothing cannot come
+        # within one digit of six — but an adapter author comparing two runs
+        # deserves to know which was exact. Every route that grades this probe
+        # says so: --check-server and the setup gate print their own version.
+        d_ok "$id" "image input — the reply reads the digits back, one glyph misread (VERIFIED, ${DCC_TIME:-?}s)"
+      else
+        d_ok "$id" "image input — the reply reads the digits back (VERIFIED, ${DCC_TIME:-?}s)"
+      fi
       doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
       return 0
     fi
@@ -14048,10 +14202,10 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 
   if $DOCTOR_DEEP; then
     say ""
-    say "  --deep: the semantic image probe — a locally generated PNG showing 4 digits rides the"
-    say "  newest message. A reply carrying those digits proves the engine truly SAW it; an honest"
-    say "  HTTP 400 decline with code \"image_unsupported\" also passes. Answering while silently"
-    say "  ignoring the image is the one forbidden move."
+    say "  --deep: the semantic image probe — a locally generated PNG showing six digits rides the"
+    say "  newest message. A reply carrying those digits, allowing one misread glyph, proves the"
+    say "  engine truly SAW it; an honest HTTP 400 decline with code \"image_unsupported\" also"
+    say "  passes. Answering while silently ignoring the image is the one forbidden move."
     doctor_image_input_check || true
   fi
 
@@ -14140,10 +14294,10 @@ c_say() { local id="$1"; shift; say "    [$id] $*"; }
 # Content-Type is deliberately NOT checked (the app never reads it) and
 # tool_calls/extra fields are tolerated (unknown JSON is ignored). On non-2xx
 # the app keys on the error body's "code" field — captured in CCE_WIRE_CODE.
-CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
 app_chat_body_eval() { # app_chat_body_eval <response-body> [expected-digit-code]
   local body="$1" exp="${2:--}" res verdict detail
-  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
   case "$body" in data:*)
     CCE_REASON="SSE framing — the app never reads streams, so its JSON decoder fails on this"; return 1 ;;
   esac
@@ -14164,12 +14318,31 @@ for c in ch:
         print("badchoice -"); sys.exit(0)
 c = ch[0]["message"]["content"]
 if exp != "-":
-    print(("token %d" if exp in re.findall(r"\d+", c) else "notoken %d") % len(c)); sys.exit(0)
+    # Grade SIGHTING, not OCR. The reasoning, the measurement and the reason the
+    # candidate set is this narrow all live on the copy in doctor_chat_eval. The
+    # two must stay byte-identical: a setup run and a --check-adapter run grading
+    # the same gateway differently is the one outcome no operator can act on, and
+    # grader-parity is the case that holds them together.
+    n = len(exp)
+    runs = re.findall(r"\d+", c)
+    cands = [r for r in runs if len(r) == n]
+    for m in re.finditer(
+            r"(?<!\d)(?<![\d][ .,\-])\d(?:[ .,\-]\d){%d}(?![ .,\-]?\d)" % (n - 1), c):
+        cands.append(re.sub(r"\D", "", m.group(0)))
+    if exp in cands:
+        print("token %d" % len(c)); sys.exit(0)
+    uniq = set(cands)
+    if n >= 4 and len(uniq) == 1:
+        only = uniq.pop()
+        if sum(1 for a, b in zip(only, exp) if a == b) >= n - 1:
+            print("near %d" % len(c)); sys.exit(0)
+    print("notoken %d" % len(c)); sys.exit(0)
 print("ok %d" % len(c))' "$exp" 2>/dev/null)
   verdict="${res%% *}"; detail="${res#* }"
   case "$verdict" in
     ok)      CCE_LEN="$detail"; return 0 ;;
     token)   CCE_LEN="$detail"; CCE_TOKEN="yes"; return 0 ;;
+    near)    CCE_LEN="$detail"; CCE_TOKEN="yes"; CCE_NEAR="yes"; return 0 ;;  # saw it, misread one glyph
     notoken) CCE_LEN="$detail"; CCE_TOKEN="no";  return 0 ;;
     badjson)   CCE_REASON="the 2xx body isn't the strict JSON the app's decoder accepts" ;;
     nochoices) CCE_REASON="no usable \"choices\" array (the app reads choices[0].message.content)" ;;
@@ -14213,7 +14386,7 @@ if isinstance(c, str) and c:
 
 app_chat_eval() { # app_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}"
-  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
   if ! doctor_chat_request "$1"; then
     # "timed out or the connection dropped" makes the operator guess between a
     # dead host, a refused port, a TLS failure and a slow agent. curl already
@@ -14781,7 +14954,13 @@ print(json.dumps(req))') \
   if app_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
     if [ "$CCE_TOKEN" = "yes" ]; then
       COMPAT_IMAGE_INPUT="VERIFIED"
-      say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
+      if [ "${CCE_NEAR:-}" = "yes" ]; then
+        say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back, one glyph"
+        say "    misread (${DCC_TIME:-?}s). The engine saw the picture; it is simply not a perfect reader of"
+        say "    small block digits, which this probe does not grade."
+      else
+        say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
+      fi
     else
       COMPAT_IMAGE_INPUT="IGNORED"
       # The meter name is frozen in the schema=2 grammar, but the sentence under it
@@ -18108,6 +18287,7 @@ manage_edit_folder() { # manage_edit_folder <id>
   case "$state" in
     active)   note "The file server for this setup is running now; setup will reuse it." ;;
     inactive) note "The file server for this setup is installed but not running." ;;
+    unknown)  note "The file server for this setup is installed; this shell cannot ask whether it is running." ;;
     absent)   [ -n "$folder" ] && note "No service file for this setup's file server is present on this machine." ;;
   esac
   return 0

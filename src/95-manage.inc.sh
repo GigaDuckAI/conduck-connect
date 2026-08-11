@@ -1137,6 +1137,7 @@ manage_edit_folder() { # manage_edit_folder <id>
   case "$state" in
     active)   note "The file server for this setup is running now; setup will reuse it." ;;
     inactive) note "The file server for this setup is installed but not running." ;;
+    unknown)  note "The file server for this setup is installed; this shell cannot ask whether it is running." ;;
     absent)   [ -n "$folder" ] && note "No service file for this setup's file server is present on this machine." ;;
   esac
   return 0

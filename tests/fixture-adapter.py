@@ -233,15 +233,24 @@ def handle_file_turn(mode, files_dir, text):
     return named
 
 # --- digit-PNG decode (mirror of the doctor's generator geometry) ------------
-# The doctor renders 4 digits as 5x7 glyph bitmaps at scale 16, margin 40,
-# gap 24, 8-bit grayscale, black on white. Geometry is FIXED so this fixture
+# The doctor renders its digits as 5x7 glyph bitmaps at scale 16, margin 60,
+# gap 64, 8-bit grayscale, black on white. Geometry is FIXED so this fixture
 # can read the digits without OCR: sample each glyph cell's center pixel and
 # match the 35-bit pattern against the same font table.
+#
+# This table is a MIRROR of image_probe_gen's FONT in src/60-check-adapter.inc.sh
+# and decoding is exact — an unrecognised glyph yields None, which the fixture
+# answers as a reply carrying no digits: indistinguishable from a silently
+# dropped image. Drift is caught, but it is caught WEARING THE WRONG NAME. Every
+# honest arm reports [IMAGE_INPUT] instead of "the tables disagree", which reads
+# as the probe finding a real fault. The probe-font-mirror case pins the two
+# tables against each other so the drift says so in its own words; if you are
+# here because IMAGE_INPUT went red across many arms at once, check that first.
 FONT = {
-    "0": [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+    "0": [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
     "1": [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
     "2": [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-    "3": [0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110],
+    "3": [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
     "4": [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
     "5": [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
     "6": [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
@@ -257,7 +266,12 @@ DISCLOSURE = ("An image was attached in this earlier message, but this adapter "
 
 
 def decode_digit_png(png):
-    """Return the 4-digit string, or None if this isn't the doctor's probe PNG."""
+    """Return the digit string, or None if this isn't the doctor's probe PNG.
+
+    The digit COUNT is derived from the image width rather than hardcoded, so the
+    generator can change how many it draws without this decoder going stale. Only
+    the glyph table has to be mirrored by hand, and probe-font-mirror pins that.
+    """
     try:
         if png[:8] != b"\x89PNG\r\n\x1a\n":
             return None
@@ -294,8 +308,12 @@ def decode_digit_png(png):
             rows.append(line)
             prev = line
         inv = {tuple(v): k for k, v in FONT.items()}
+        # w = 2*MARGIN + n*GLYPH_W + (n-1)*GAP  ->  solve for n
+        ndig, rem = divmod(w - 2 * MARGIN + GAP, GLYPH_W + GAP)
+        if rem or ndig < 1:
+            return None
         out = []
-        for i in range(4):
+        for i in range(ndig):
             x0 = MARGIN + i * (GLYPH_W + GAP)
             pat = []
             for r in range(7):

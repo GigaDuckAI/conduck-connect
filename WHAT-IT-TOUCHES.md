@@ -201,7 +201,7 @@ one, so a password can never end up inside a routing field or the setup code.
 - Normal setup and `--show-code` verification may send a local health check,
   `GET /v1/models`, and a real `POST /v1/chat/completions` pong. Once that pong
   passes, one more `POST /v1/chat/completions` carries a small picture the
-  script draws locally — four random digits, a couple of kilobytes, no camera,
+  script draws locally — six random digits, a couple of kilobytes, no camera,
   no file of yours, nothing read from disk — and asks the gateway to read the
   digits back. It is the only way to find out whether photos sent from the app
   reach your engine, because a dropped one comes back as an ordinary reply. A

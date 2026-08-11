@@ -70,10 +70,10 @@ c_say() { local id="$1"; shift; say "    [$id] $*"; }
 # Content-Type is deliberately NOT checked (the app never reads it) and
 # tool_calls/extra fields are tolerated (unknown JSON is ignored). On non-2xx
 # the app keys on the error body's "code" field — captured in CCE_WIRE_CODE.
-CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
 app_chat_body_eval() { # app_chat_body_eval <response-body> [expected-digit-code]
   local body="$1" exp="${2:--}" res verdict detail
-  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
   case "$body" in data:*)
     CCE_REASON="SSE framing — the app never reads streams, so its JSON decoder fails on this"; return 1 ;;
   esac
@@ -94,12 +94,31 @@ for c in ch:
         print("badchoice -"); sys.exit(0)
 c = ch[0]["message"]["content"]
 if exp != "-":
-    print(("token %d" if exp in re.findall(r"\d+", c) else "notoken %d") % len(c)); sys.exit(0)
+    # Grade SIGHTING, not OCR. The reasoning, the measurement and the reason the
+    # candidate set is this narrow all live on the copy in doctor_chat_eval. The
+    # two must stay byte-identical: a setup run and a --check-adapter run grading
+    # the same gateway differently is the one outcome no operator can act on, and
+    # grader-parity is the case that holds them together.
+    n = len(exp)
+    runs = re.findall(r"\d+", c)
+    cands = [r for r in runs if len(r) == n]
+    for m in re.finditer(
+            r"(?<!\d)(?<![\d][ .,\-])\d(?:[ .,\-]\d){%d}(?![ .,\-]?\d)" % (n - 1), c):
+        cands.append(re.sub(r"\D", "", m.group(0)))
+    if exp in cands:
+        print("token %d" % len(c)); sys.exit(0)
+    uniq = set(cands)
+    if n >= 4 and len(uniq) == 1:
+        only = uniq.pop()
+        if sum(1 for a, b in zip(only, exp) if a == b) >= n - 1:
+            print("near %d" % len(c)); sys.exit(0)
+    print("notoken %d" % len(c)); sys.exit(0)
 print("ok %d" % len(c))' "$exp" 2>/dev/null)
   verdict="${res%% *}"; detail="${res#* }"
   case "$verdict" in
     ok)      CCE_LEN="$detail"; return 0 ;;
     token)   CCE_LEN="$detail"; CCE_TOKEN="yes"; return 0 ;;
+    near)    CCE_LEN="$detail"; CCE_TOKEN="yes"; CCE_NEAR="yes"; return 0 ;;  # saw it, misread one glyph
     notoken) CCE_LEN="$detail"; CCE_TOKEN="no";  return 0 ;;
     badjson)   CCE_REASON="the 2xx body isn't the strict JSON the app's decoder accepts" ;;
     nochoices) CCE_REASON="no usable \"choices\" array (the app reads choices[0].message.content)" ;;
@@ -143,7 +162,7 @@ if isinstance(c, str) and c:
 
 app_chat_eval() { # app_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}"
-  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
   if ! doctor_chat_request "$1"; then
     # "timed out or the connection dropped" makes the operator guess between a
     # dead host, a refused port, a TLS failure and a slow agent. curl already
@@ -711,7 +730,13 @@ print(json.dumps(req))') \
   if app_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
     if [ "$CCE_TOKEN" = "yes" ]; then
       COMPAT_IMAGE_INPUT="VERIFIED"
-      say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
+      if [ "${CCE_NEAR:-}" = "yes" ]; then
+        say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back, one glyph"
+        say "    misread (${DCC_TIME:-?}s). The engine saw the picture; it is simply not a perfect reader of"
+        say "    small block digits, which this probe does not grade."
+      else
+        say "  ${GREEN}•${RESET} image input: VERIFIED — the reply reads the probe image's digits back (${DCC_TIME:-?}s)"
+      fi
     else
       COMPAT_IMAGE_INPUT="IGNORED"
       # The meter name is frozen in the schema=2 grammar, but the sentence under it

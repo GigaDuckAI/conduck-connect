@@ -1707,7 +1707,7 @@ agent_file_chat_eval() { # dedicated five-minute sentinel turn
   case "$max_time" in 0|[1-9][0-9]*) ;; *) max_time=300 ;; esac
   [ "$max_time" -ge 31 ] 2>/dev/null && [ "$max_time" -le 1800 ] 2>/dev/null \
     || max_time=300
-  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""
+  CCE_REASON=""; CCE_LEN=""; CCE_TOKEN=""; CCE_WIRE_CODE=""; CCE_NEAR=""
   if ! doctor_chat_request "$1" "$max_time"; then
     CCE_REASON="transfer failed (timed out or the connection dropped)"; return 1
   fi

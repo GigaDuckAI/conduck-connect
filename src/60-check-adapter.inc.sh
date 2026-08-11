@@ -29,7 +29,7 @@
 # has confirmed that requirement — by re-sending its identical request with the
 # first advertised id — the later probes carry that id and grade their OWN rule,
 # and the missing-model failure is reported once, where it belongs.
-# --deep adds the semantic image probe: a locally generated PNG showing 4
+# --deep adds the semantic image probe: a locally generated PNG showing 6
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
 # image (VERIFIED); an honest HTTP 400 decline with code "image_unsupported"
@@ -792,10 +792,10 @@ doctor_transfer_reason() { # doctor_transfer_reason <curl exit code>
 # DCE_TOKEN when an expected digit code was given (the --deep image probe's
 # semantic grading: the code must appear as a standalone digit-run in the
 # reply, so "The digits are 4827." passes while "48275" does not).
-DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
+DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""; DCE_NEAR=""
 doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
   local exp="${2:--}" res verdict detail
-  DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""
+  DCE_REASON=""; DCE_HINT=""; DCE_LEN=""; DCE_TOKEN=""; DCE_NEAR=""
   if ! doctor_chat_request "$1"; then
     # DCE_HINT stays exactly "transfer" — the file lane keys on that literal to
     # decide it may not grade the lane. The sub-case lives in DCC_CURL_RC.
@@ -842,12 +842,57 @@ if not isinstance(c, str):
 if not c:
     print("empty -"); sys.exit(0)
 if exp != "-":
-    print(("token %d" if exp in re.findall(r"\d+", c) else "notoken %d") % len(c)); sys.exit(0)
+    # Grade SIGHTING, not OCR -- the question is whether the picture reached the
+    # engine, not whether the engine reads a 5x7 bitmap perfectly. An engine shown
+    # no image says so; it does not land one glyph away from a six-digit code. So
+    # one wrong position is forgiven. Exact-match alone called the picture unseen
+    # on 31% of honest turns, measured against a proxy that cannot drop one.
+    #
+    # The CANDIDATE SET is where a tolerance turns dangerous, so it is narrow on
+    # purpose. Exactly two things count as a read-back: a standalone run of the
+    # right length, or single digits split by spaces or punctuation (7 2 8 4 3 1),
+    # which is how some models answer. Digits scattered through a sentence are
+    # NEVER stitched together -- otherwise "I cannot see an image, try again in
+    # 8 to 2 minutes, ext 7" assembles a code out of unrelated numbers and a
+    # refusal grades as a sighting. And a near miss is allowed only when the
+    # reply offers exactly ONE distinct candidate: taking the best of many
+    # numbers would hand the gateway one draw at the tolerance per number it
+    # prints, so the odds below would stop describing anything. An exact hit
+    # stands alone -- at six digits it is one in a million.
+    #
+    # EVERY spaced group is collected, and each one must be MAXIMAL -- no digit
+    # and no separator+digit may sit on either side of it. Both halves are load
+    # bearing, and neither is a style choice:
+    #   * a first-match-only search let "maybe 7 2 8 4 3 0 or 7 2 8 4 3 5 or
+    #     1 1 1 1 1 1, I cannot see the image" present ONE candidate, so the
+    #     one-distinct-candidate rule passed and a refusal graded as a sighting;
+    #   * an unanchored group let a ten-digit spray be windowed down to its
+    #     first six, so "digits 1 2 3 4 5 6 7 8 9 0 shown" scored an exact hit.
+    # The same rule lives in app_chat_body_eval; change both or neither.
+    n = len(exp)
+    runs = re.findall(r"\d+", c)
+    cands = [r for r in runs if len(r) == n]
+    for m in re.finditer(
+            r"(?<!\d)(?<![\d][ .,\-])\d(?:[ .,\-]\d){%d}(?![ .,\-]?\d)" % (n - 1), c):
+        cands.append(re.sub(r"\D", "", m.group(0)))
+    if exp in cands:
+        print("token %d" % len(c)); sys.exit(0)
+    uniq = set(cands)
+    # n >= 4 is not decoration: at n == 1 the threshold degenerates to "zero
+    # positions must match", which every reply satisfies, including one with no
+    # digits at all. The generator only ever draws NDIGITS, but this grader takes
+    # whatever it is handed.
+    if n >= 4 and len(uniq) == 1:
+        only = uniq.pop()
+        if sum(1 for a, b in zip(only, exp) if a == b) >= n - 1:
+            print("near %d" % len(c)); sys.exit(0)
+    print("notoken %d" % len(c)); sys.exit(0)
 print("ok %d" % len(c))' "$exp" 2>/dev/null)
   verdict="${res%% *}"; detail="${res#* }"
   case "$verdict" in
     ok)      DCE_LEN="$detail"; return 0 ;;
     token)   DCE_LEN="$detail"; DCE_TOKEN="yes"; return 0 ;;
+    near)    DCE_LEN="$detail"; DCE_TOKEN="yes"; DCE_NEAR="yes"; return 0 ;;  # saw it, misread one glyph
     notoken) DCE_LEN="$detail"; DCE_TOKEN="no";  return 0 ;;   # shape is fine; the digits aren't there
     badjson)     DCE_REASON="HTTP 200, but the body isn't strict JSON"; DCE_HINT="badjson" ;;
     nochoices)   DCE_REASON="no usable \"choices\" array"; DCE_HINT="nochoices" ;;
@@ -913,11 +958,11 @@ print(json.dumps(req))' 2>/dev/null
 doctor_model_required_probe() { # <payload-json>
   local payload="$1" retried rc=1
   local s_code="$DCC_CODE" s_ct="$DCC_CT" s_time="$DCC_TIME" s_body="$DCC_BODY" s_crc="$DCC_CURL_RC"
-  local s_reason="$DCE_REASON" s_hint="$DCE_HINT" s_len="$DCE_LEN" s_token="$DCE_TOKEN"
+  local s_reason="$DCE_REASON" s_hint="$DCE_HINT" s_len="$DCE_LEN" s_token="$DCE_TOKEN" s_near="$DCE_NEAR"
   retried=$(doctor_payload_with_model "$payload" "$MODELS_FIRST_ID")
   if [ -n "$retried" ] && doctor_chat_eval "$retried"; then rc=0; fi
   DCC_CODE="$s_code"; DCC_CT="$s_ct"; DCC_TIME="$s_time"; DCC_BODY="$s_body"; DCC_CURL_RC="$s_crc"
-  DCE_REASON="$s_reason"; DCE_HINT="$s_hint"; DCE_LEN="$s_len"; DCE_TOKEN="$s_token"
+  DCE_REASON="$s_reason"; DCE_HINT="$s_hint"; DCE_LEN="$s_len"; DCE_TOKEN="$s_token"; DCE_NEAR="$s_near"
   return $rc
 }
 
@@ -1155,12 +1200,18 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
   return 1
 }
 
-# --deep's semantic image probe. A PNG rendered HERE (stdlib zlib/struct — 4
-# random digits as big block glyphs, black on white, ~632×232) rides the
+# --deep's semantic image probe. A PNG rendered HERE (stdlib zlib/struct — 6
+# random digits as big block glyphs, black on white, ~920×232) rides the
 # newest message; the digits are never in the prompt, filename, or metadata,
 # so the ONLY way to answer them is to actually see the image. Outcomes:
-#   VERIFIED   — 200 and the reply contains the digits: the engine truly sees
-#                images (OCR tooling counts — this grades capability, not eyes).
+#   VERIFIED   — 200 and the reply reads the digits back, allowing ONE wrong
+#                position: the engine truly sees images (OCR tooling counts —
+#                this grades capability, not eyes). The tolerance is not
+#                leniency; it is what separates the two questions. An engine
+#                shown no picture answers that it cannot see one, it does not
+#                land within one glyph of six, so a near miss still proves
+#                sighting while exact-match alone failed conforming gateways on
+#                31% of honest turns. See the threshold note in doctor_chat_eval.
 #   DECLINED   — HTTP 400 + OpenAI error body + code "image_unsupported": a
 #                text-only adapter refusing honestly. Allowed, passes.
 #   UNVERIFIED — 200 but the digits aren't in the reply: this run could not
@@ -1173,9 +1224,13 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 #                the forbidden silent drop it may or may not be.
 # Anything else (wrong/missing decline code, other statuses, bad shape) FAILs:
 # clients key on the machine code, so "looks declined" isn't good enough.
-# ~1-in-9000 guess odds are accepted. The reply's content is never printed.
+# One wrong position is forgiven, so a blind guess passes about 1 in 16,700 —
+# stronger than the ~1-in-9,000 the older exact four-digit rule allowed, because
+# the code grew to six digits when the tolerance appeared. The reply's content is
+# never printed.
 # Build the semantic image probe (shared by --deep and --check-server): sets
-# IPG_CODE (the 4 digits) and IPG_PAYLOAD (the chat request carrying the PNG).
+# IPG_CODE (the digits, NDIGITS of them) and IPG_PAYLOAD (the chat request
+# carrying the PNG).
 # $CONDUCK_PROBE_MODEL adds a "model" field when it is non-empty. EVERY caller
 # sets it explicitly, because the python reads the ENVIRONMENT: a caller that
 # merely omits it inherits whatever the operator happened to export, which
@@ -1186,19 +1241,58 @@ image_probe_gen() {
   local gen
   gen=$(python3 -c '
 import json, os, zlib, struct, base64, random
+# Two glyphs are drawn against convention, and both choices are measured against
+# a thin proxy that CANNOT drop an image, so every miss there is the drawing and
+# not the gateway. The ZERO carries no slash: the diagonal is a programmer-font
+# habit for telling 0 from O, there is no O in a numeric code, and at 5x7 it
+# fills the counter so the digit reads as 8, 9, 6, 5 or 2. The THREE has open
+# arcs and a full centre bar; the original flat-top 3 was a 7 with a hook and was
+# read as 7, 2 and 5. Those two accounted for 10 of 12 misreads over 40 samples.
+#
+# The 3 is drawn the way it is for a SECOND reason, and this is the trap: the
+# obvious replacement — a round-topped 3 — is an 8 with its left side missing.
+# It measured well and is still wrong, because it puts 3 and 8 three cells apart
+# in a 35-cell grid, with all three differing cells isolated singletons. That is
+# the feature scale an image encoder loses first.
+#
+# The closest pair this table actually keeps is 0/8 at FIVE cells, and the count
+# alone is not what makes it safe: those five cells are one contiguous horizontal
+# bar — the waist stroke of 8, which 0 omits — not the singletons the 3/8 case
+# warns about. A whole stroke is the feature an encoder loses LAST. Contiguity,
+# not distance, is the property to preserve; a single 0<->8 misread is also
+# exactly what the one-wrong-position tolerance absorbs. probe_font_mirror pins
+# both the table and that 5-cell minimum, so a restyle fails loudly rather than
+# silently narrowing the gap — but re-measure the recognition rate too, which no
+# test can do for you.
 FONT = {
-    "0": [14, 17, 19, 21, 25, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
-    "2": [14, 17, 1, 2, 4, 8, 31],     "3": [31, 2, 4, 2, 1, 17, 14],
+    "0": [14, 17, 17, 17, 17, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
+    "2": [14, 17, 1, 2, 4, 8, 31],     "3": [30, 1, 1, 14, 1, 1, 30],
     "4": [2, 6, 10, 18, 31, 2, 2],     "5": [31, 16, 30, 1, 1, 17, 14],
     "6": [6, 8, 16, 30, 17, 17, 14],   "7": [31, 1, 2, 4, 8, 8, 8],
     "8": [14, 17, 17, 14, 17, 17, 14], "9": [14, 17, 17, 15, 1, 2, 12],
 }
 SCALE, MARGIN, GAP = 16, 60, 64  # wide GAP is load-bearing: at GAP=24 real
-# vision models systematically misread adjacent glyphs (measured 1/6 correct
-# vs 8/8 at GAP=64 on gpt-5.6 — tight spacing reads as merged segments)
+# vision models systematically misread adjacent glyphs (measured 1/6 correct at
+# GAP=24 — tight spacing reads as merged segments). Widening it did NOT make the
+# probe reliable on its own: at GAP=64 the same font still scored 27/40 exact on
+# gpt-5.6-luna, because the remaining errors were single-glyph, not spacing. That
+# is what the 0 and 3 above fix; spacing and glyph shape are separate faults and
+# each was measured on its own.
 GW, GH = 5 * SCALE, 7 * SCALE
-W, H = MARGIN * 2 + 4 * GW + 3 * GAP, MARGIN * 2 + GH
-code = str(random.randint(1, 9)) + "".join(str(random.randint(0, 9)) for _ in range(3))
+# SIX digits, not four, and the count is what pays for the one-glyph tolerance
+# below. Four digits with one position forgiven accepts a blind guess at about
+# 1 in 250 — weaker than the 1 in 9,000 an exact four-digit match gave, which is
+# a real cost for a check that certifies a capability. Six digits with the same
+# tolerance is about 1 in 16,700: STRONGER than the exact rule it replaces, while
+# the tolerance still absorbs the single-glyph misreads that were failing honest
+# gateways. Longer is not free — every extra glyph is another chance to misread,
+# and measured over 60 live turns on two models six digits with one forgiven was
+# 60/60 while six exact was 51/60. Changing NDIGITS changes the guarantee; the
+# odds quoted in the header and to the operator are computed for this value.
+NDIGITS = 6
+W, H = MARGIN * 2 + NDIGITS * GW + (NDIGITS - 1) * GAP, MARGIN * 2 + GH
+code = str(random.randint(1, 9)) + "".join(str(random.randint(0, 9))
+                                           for _ in range(NDIGITS - 1))
 rows = [bytearray(b"\xff" * W) for _ in range(H)]
 for i, ch in enumerate(code):
     x0 = MARGIN + i * (GW + GAP)
@@ -1242,7 +1336,16 @@ doctor_image_input_check() {
   if doctor_chat_eval "$payload" "$code"; then
     if [ "$DCE_TOKEN" = "yes" ]; then
       DOCTOR_IMAGE_INPUT="VERIFIED"
-      d_ok "$id" "image input — the reply reads the digits back (VERIFIED, ${DCC_TIME:-?}s)"
+      if [ "${DCE_NEAR:-}" = "yes" ]; then
+        # Say that one glyph was misread rather than quietly rounding it up. The
+        # capability is proven either way — an engine shown nothing cannot come
+        # within one digit of six — but an adapter author comparing two runs
+        # deserves to know which was exact. Every route that grades this probe
+        # says so: --check-server and the setup gate print their own version.
+        d_ok "$id" "image input — the reply reads the digits back, one glyph misread (VERIFIED, ${DCC_TIME:-?}s)"
+      else
+        d_ok "$id" "image input — the reply reads the digits back (VERIFIED, ${DCC_TIME:-?}s)"
+      fi
       doctor_carried_model_note "$id" "$DOCTOR_MODEL_LANE_ID"
       return 0
     fi

@@ -704,6 +704,7 @@ IMG_PROOF=""     # transcript state for THIS run: "" | verified | declined | too
                  # the payload and not in the profile — there is nowhere honest to
                  # put it, which is the whole reason this gate is on screen.
 IMG_OUTCOME=""   # the last graded turn, set by verify_image_probe_once
+IMG_NEAR=""      # non-empty when that turn was read back with one glyph misread
 
 # One graded image turn. Prints nothing and decides nothing — it leaves the
 # outcome word in IMG_OUTCOME and the app-evaluator state in CCE_*/DCC_* for the
@@ -712,20 +713,41 @@ IMG_OUTCOME=""   # the last graded turn, set by verify_image_probe_once
 # second picture) must be graded on what IT did: a retry folded into the first
 # attempt's verdict is exactly how a network fault gets reported to an operator
 # as "your gateway drops photos".
+# True when a freshly drawn code sits close enough to the previous one that a
+# reply carrying the OLD digits would still be graded a sighting of the new ones.
+# The grader forgives one wrong position, so two codes differing in a single
+# digit are interchangeable to it, and a cached or echoed answer would sail
+# through the retry that exists to catch exactly that. Two or more differing
+# positions is the whole requirement; lengths that differ cannot be confused at
+# all. Returns 0 (shell true) when the pair is UNUSABLE and must be redrawn.
+probe_codes_too_close() { # probe_codes_too_close <code-a> <code-b>
+  local a="$1" b="$2" i=0 diff=0
+  [ "${#a}" = "${#b}" ] || return 1
+  while [ "$i" -lt "${#a}" ]; do
+    [ "${a:$i:1}" = "${b:$i:1}" ] || diff=$((diff+1))
+    [ "$diff" -ge 2 ] && return 1
+    i=$((i+1))
+  done
+  return 0
+}
+
 verify_image_probe_once() { # verify_image_probe_once [digits-the-retry-must-not-reuse]
   local avoid="${1:-}" redraws=0
-  IMG_OUTCOME=""
+  IMG_OUTCOME=""; IMG_NEAR=""
   # Set explicitly, never inherited: image_probe_gen's python reads the
   # ENVIRONMENT, so a CONDUCK_PROBE_MODEL the operator happens to have exported
   # would quietly grade a different model than the one being paired.
   CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
-  # A retry that happens to redraw the FIRST attempt's digits is not a second
-  # look — a cached reply, or the one-in-nine-thousand coincidence the first turn
-  # was retried for, would pass on exactly the run where it must not. The digits
-  # are drawn locally with no request behind them, so redrawing costs nothing;
-  # the bound is there because an unbounded loop on a broken generator is worse
-  # than a repeated code.
-  while [ -n "$avoid" ] && [ "$IPG_CODE" = "$avoid" ] && [ "$redraws" -lt 8 ]; do
+  # A retry that redraws digits TOO CLOSE to the first attempt's is not a second
+  # look — a cached reply, or the lucky guess the first turn was retried for,
+  # would pass on exactly the run where it must not. "Too close" is not "equal":
+  # the grader forgives one wrong position, so a code differing from the first in
+  # a single digit is one the stale answer still passes. Inequality was the right
+  # test only while the match was exact. The digits are drawn locally with no
+  # request behind them, so redrawing costs nothing; the bound is there because
+  # an unbounded loop on a broken generator is worse than a close code.
+  while [ -n "$avoid" ] && [ "$redraws" -lt 8 ] \
+        && probe_codes_too_close "$IPG_CODE" "$avoid"; do
     redraws=$((redraws+1))
     CONDUCK_PROBE_MODEL="$GW_MODEL" image_probe_gen
   done
@@ -740,7 +762,15 @@ verify_image_probe_once() { # verify_image_probe_once [digits-the-retry-must-not
   # holding the phone will experience, not what the wire ought to look like —
   # --check-adapter --deep is where the wire is held to the stricter bar.
   if app_chat_eval "$IPG_PAYLOAD" "$IPG_CODE"; then
-    if [ "$CCE_TOKEN" = "yes" ]; then IMG_OUTCOME="verified"; else IMG_OUTCOME="ignored"; fi
+    if [ "$CCE_TOKEN" = "yes" ]; then
+      # "verified" either way — one misread glyph is still a sighting — but the
+      # two are not the same evidence, and this is the route that hands out a
+      # pairing code. IMG_NEAR carries it to the verdict line so the operator is
+      # told what was actually read back rather than a tidied-up version.
+      IMG_OUTCOME="verified"; IMG_NEAR="${CCE_NEAR:-}"
+    else
+      IMG_OUTCOME="ignored"; IMG_NEAR=""
+    fi
     return 0
   fi
   # A transfer that never completed carries no status to read, so nothing about
@@ -843,7 +873,7 @@ verify_image_ignored_gate() {
 
 verify_image_intake() {
   IMG_PROOF=""
-  IMG_OUTCOME=""
+  IMG_OUTCOME=""; IMG_NEAR=""
   # Nothing left to protect on a run that will emit no code: emit_payload already
   # withholds it. Same arithmetic as skip_agent_file_probe_after_failed_gateway —
   # this turn's answer would be discarded, and the re-run they now have to do
@@ -855,10 +885,12 @@ verify_image_intake() {
   verify_image_probe_once
   if [ "$IMG_OUTCOME" = "ignored" ]; then
     # Retry ONCE, and only this outcome, because only this one is about to cost
-    # someone their setup code. A FRESHLY drawn picture on purpose: re-sending
-    # the same one lets a cached answer, or the ~1-in-9000 lucky guess, pass on
-    # the second look — the retry is there to forgive a flaky turn, not to give
-    # a wrong answer two chances to be right.
+    # someone their setup code. A FRESHLY drawn picture on purpose, and one that
+    # differs from the first in more than a single digit: re-sending the same
+    # one — or a near-twin the grader cannot tell from it — lets a cached answer,
+    # or the roughly 1-in-16,700 lucky guess, pass on the second look. The retry
+    # is there to forgive a flaky turn, not to give a wrong answer two chances to
+    # be right. probe_codes_too_close is what enforces the distance.
     # This is the only path that spends a second turn, so a gateway that bills
     # per request is charged twice only when it has already answered once in the
     # single way that would otherwise block it.
@@ -869,7 +901,13 @@ verify_image_intake() {
   case "$IMG_OUTCOME" in
     verified)
       IMG_PROOF="verified"
-      ok "photo turn: the reply reads the test picture's digits back — pictures reach the engine"
+      if [ -n "${IMG_NEAR:-}" ]; then
+        ok "photo turn: the reply reads the test picture's digits back, one glyph misread — pictures"
+        say "    reach the engine. The miss is the engine reading small block digits, not your gateway;"
+        say "    it could not have come within a digit without being shown the picture."
+      else
+        ok "photo turn: the reply reads the test picture's digits back — pictures reach the engine"
+      fi
       ;;
     declined)
       IMG_PROOF="declined"

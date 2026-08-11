@@ -2,6 +2,31 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [0.14.1] — the photo check stops accusing gateways that did nothing wrong
+
+- **Verification was wrong about one honest gateway in three.** The photo turn
+  draws digits and asks your engine to read them back. Measured against a server
+  that forwards to the model and therefore *cannot* drop a picture, the check
+  still reported the picture unseen on 31% of runs — a false accusation, and one
+  that leads straight to the loud question about pairing anyway. The digits are
+  now drawn legibly, there are six of them, and a reply that gets all but one
+  right counts as having seen the image. None of the eleven gateways this was
+  re-graded against changed verdict except the ones that were being accused
+  wrongly.
+- **And it stopped believing a gateway that told it the truth.** A reply along
+  the lines of "maybe 728430, or 728435 — I cannot see the image" was scored as
+  having seen it. Guessing is no longer a way to pass: a blind guess now gets
+  through about 1 in 16,700 times, better than the 1 in 9,000 the older, stricter
+  rule allowed.
+- **A file server that is running is no longer reported as dead.** Asking systemd
+  whether a service is up can fail for two very different reasons: the service is
+  stopped, or this particular shell cannot ask at all — which is what happens
+  under `su`, `sudo -u`, `cron`, or a remote command against an account with
+  lingering enabled. Both looked identical, so a healthy file server was
+  announced as not running, followed by an offer to move its lane to another
+  port. When the answer cannot be obtained the script now says so and changes
+  nothing.
+
 ## [0.14.0] — the setups you already have, and controls that mean what they say
 
 Everything this release adds is something you can see on screen. The tool could

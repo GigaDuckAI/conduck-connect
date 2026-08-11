@@ -1070,10 +1070,10 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
 
   if $DOCTOR_DEEP; then
     say ""
-    say "  --deep: the semantic image probe — a locally generated PNG showing 4 digits rides the"
-    say "  newest message. A reply carrying those digits proves the engine truly SAW it; an honest"
-    say "  HTTP 400 decline with code \"image_unsupported\" also passes. Answering while silently"
-    say "  ignoring the image is the one forbidden move."
+    say "  --deep: the semantic image probe — a locally generated PNG showing six digits rides the"
+    say "  newest message. A reply carrying those digits, allowing one misread glyph, proves the"
+    say "  engine truly SAW it; an honest HTTP 400 decline with code \"image_unsupported\" also"
+    say "  passes. Answering while silently ignoring the image is the one forbidden move."
     doctor_image_input_check || true
   fi
 

@@ -166,6 +166,12 @@ a `CHANGELOG.md` release heading in a feature PR unless a maintainer asks — th
 release is cut separately, with the checksum and license files it ships beside
 the script.
 
+A version lives in **three** places and the release workflow refuses the tag
+unless all three agree: `VERSION` in `src/00-cli.inc.sh` (rebuild the artifact
+after changing it), the `## [x.y.z]` heading in `CHANGELOG.md`, and the
+`source is at` line in the **Release boundary** paragraph of `README.md`. The
+README one is the easiest to forget and the tag fails on it, not on the push.
+
 ## Bugs, questions, and security
 
 - **Bugs:** open a [GitHub issue](../../issues) using the bug form. Include the

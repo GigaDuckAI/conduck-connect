@@ -873,11 +873,23 @@ fs_unit_state() { # fs_unit_state -> active | inactive | unknown
   [ -n "$FS_UNIT" ] || { printf 'unknown'; return 0; }
   if [ "$OS" = "Linux" ]; then
     have systemctl || { printf 'unknown'; return 0; }
-    if systemctl --user is-active --quiet "$(basename "$FS_UNIT")"; then
-      printf 'active'
-    else
-      printf 'inactive'
-    fi
+    # Read what systemctl SAYS, not merely whether it succeeded. A non-zero exit
+    # covers two different facts: the unit is stopped, and this shell could not
+    # ask at all. `systemctl --user` with no session bus — su, sudo -u, cron, a
+    # remote command against a lingering account — fails with "Failed to connect
+    # to bus" and prints nothing. Folding that into "inactive" tells an operator
+    # their running file server is stopped, which is exactly the invention this
+    # surface exists to avoid; `unknown` already has honest wording waiting for
+    # it at every call site. Measured on a lingering account: running prints
+    # "active", stopped prints "inactive", an unreachable bus prints nothing.
+    # Callers still fail closed, because `unknown` is not `active` either.
+    local out
+    out=$(systemctl --user is-active "$(basename "$FS_UNIT")" 2>/dev/null)
+    case "$out" in
+      active) printf 'active' ;;
+      "")     printf 'unknown' ;;
+      *)      printf 'inactive' ;;
+    esac
   else
     have launchctl || { printf 'unknown'; return 0; }
     local label
@@ -1042,7 +1054,8 @@ fs_inactive_unit_report() {
   state=$(fs_unit_state)
   unit_name=$(basename "${FS_UNIT:-unknown}")
   if [ "$state" = "unknown" ]; then
-    warn "I can't ask this machine whether the file server is running (no systemctl/launchctl here),"
+    warn "I can't get a usable answer from this machine's service manager about whether"
+    warn "the file server is running,"
     warn "so I won't expose it."
     [ -n "$FS_UNIT" ] && note "service: $FS_UNIT"
     return 1
