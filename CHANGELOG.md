@@ -4,6 +4,43 @@ Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](
 
 ## [0.14.1] — the photo check stops accusing gateways that did nothing wrong
 
+- **`--forget` now really closes the address in front of the gateway.** Removing a
+  saved setup promised to close the HTTPS route this script had opened for it, and
+  on an ordinary machine it did not. A run that finishes cleanly retires its own
+  exposure records on the way out — a reported exposure is not an unreported one —
+  so by the time you came back to remove the setup, nothing on disk named the route
+  any more. The saved setup went, the file server went, both copies of its password
+  went, and a PUBLIC Tailscale Funnel in front of your agent stayed open without
+  ever being mentioned. `--forget` now also reads the address the setup was paired
+  on, asks Tailscale what this machine is serving right now, and closes that mapping
+  when — and only when — the two agree on the tailnet name, the HTTPS port, the
+  local port behind it, and whether it is public. Anything it cannot prove is this
+  setup's is named, left exactly as it is, and printed with the command to close it
+  by hand. The list you approve marks which addresses were found this way, because a
+  route you opened yourself to that same address is indistinguishable from one this
+  script opened and would be closed too — and a public route it closes is followed
+  by the one command that puts it back. Cloudflare tunnels and reverse proxies of
+  your own are untouched, as before: this script only ever printed the commands for
+  those, so it has nothing to undo.
+- **A saved address it cannot read is now said out loud, not skipped.** One address
+  in a saved setup can be one this version refuses to parse — a mistyped tailnet
+  name is enough, and changing the address never warned you about one, because the
+  check there only asks whether the name ends in `.ts.net`. `--forget` used to drop
+  such an address without a word: the setup went, the file server went, both copies
+  of its password went, and a PUBLIC Funnel in front of your agent could still be up
+  with nothing said about it. That address is now named on the same screen as every
+  other route this command cannot decide about, together with the plain statement
+  that a route in front of it may still be open and the two commands that show you
+  what this machine is serving and close a port by hand. It is still never closed
+  for you — an address that cannot be read cannot be matched against anything live,
+  and closing a port on that basis would be a guess.
+- **An address that would not close now makes the command exit `1`.** `--forget`
+  exits `0` when everything is gone and `1` when some of it is still there. A file
+  it could not delete has always answered `1`; a Tailscale route it tried to close
+  and could not prove closed answered `0`, even while the screen said in as many
+  words that it could not confirm the address was closed. A script that reads only
+  the status was told the removal was complete while a public route into the agent
+  was still up. Both now answer `1`, and the screen is unchanged.
 - **Verification was wrong about one honest gateway in three.** The photo turn
   draws digits and asks your engine to read them back. Measured against a server
   that forwards to the model and therefore *cannot* drop a picture, the check

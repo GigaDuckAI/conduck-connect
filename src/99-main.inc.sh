@@ -475,10 +475,12 @@ dispatch_menu_command() {
       # mints no credential, and refusing to clean up a machine because it lacks the
       # tools for setting one up is exactly the dead end this command exists to end.
       need python3 || die "--forget reads the saved setup with python3 to know what to stop, and this host doesn't have it."
-      # The status comes straight back out: 0 removed, 1 refused or no such setup,
-      # 3 the operator backed out. Those are already this tool's contract for
-      # success / runtime failure / stopped by the operator, which is why the manage
-      # ABI was written to those three numbers rather than to its own.
+      # The status comes straight back out: 0 removed and nothing of it left, 1
+      # refused / no such setup / some of it still here — a file that would not
+      # delete, or an address that would not close — 3 the operator backed out. Those
+      # are already this tool's contract for success / runtime failure / stopped by
+      # the operator, which is why the manage ABI was written to those three numbers
+      # rather than to its own.
       manage_forget "$MANAGE_ID" || rc=$?
       offer_menu_return
       exit "$rc"

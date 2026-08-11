@@ -6,6 +6,11 @@ TS_STATE_KNOWN=true
 declare -a TS_PORTS=()        # "port<TAB>verb<TAB>proxy" lines from ts_targets
 declare -a TS_HOSTS=()        # unique lowercased tailnet hostnames serving on THIS machine (from ts_targets)
 declare -a TS_MAPS=()         # "host<TAB>port<TAB>verb<TAB>proxy" per mapping (host lowercased) — show-qr's host-qualified assert
+declare -a TS_HANDLERS=()     # "host<TAB>port<TAB>handler-count" per mapping. A close names a PORT and
+                              # nothing finer, so a port carrying more than one path handler cannot be
+                              # closed on one handler's behalf: `funnel --https=443 off` takes /admin
+                              # with it. TS_MAPS keeps only the LAST handler's proxy, so the count is
+                              # the only place that difference survives.
 declare -a APPLIED=()         # "port<TAB>applied-verb<TAB>prior-state" snapshots for cleanup (gateway)
 declare -a FS_APPLIED=()      # same, but for the OPTIONAL file lane — rolled back on its own when the
                               # lane is dropped post-mutation, so a public Funnel is never orphaned
@@ -128,7 +133,7 @@ except Exception: pass'
 # TS_PORTS' line format is UNCHANGED — several consumers split it on tabs.
 # FAIL CLOSED: on any parse/exec error TS_STATE_KNOWN=false (caller refuses to mutate).
 ts_targets() {
-  TS_PORTS=(); TS_HOSTS=(); TS_MAPS=(); TS_STATE_KNOWN=true
+  TS_PORTS=(); TS_HOSTS=(); TS_MAPS=(); TS_HANDLERS=(); TS_STATE_KNOWN=true
   local raw; raw=$(tailscale serve status --json 2>/dev/null) || { TS_STATE_KNOWN=false; return 0; }
   [ -n "$raw" ] || return 0   # genuinely no targets is fine (empty, but known)
   local parsed
@@ -153,10 +158,15 @@ for hostport,conf in web.items():
     host=hostport.rsplit(":",1)[0].lower()
     port=hostport.rsplit(":",1)[-1]
     proxy=""
-    for _,h in ((conf or {}).get("Handlers") or {}).items():
+    handlers=(conf or {}).get("Handlers") or {}
+    for _,h in handlers.items():
         proxy=(h or {}).get("Proxy","") or proxy
     verb="funnel" if af.get(hostport) else "serve"
     print(f"MAP\t{host}\t{port}\t{verb}\t{proxy}")
+    # Bound to a local first: a backslash inside an f-string expression is a
+    # SyntaxError before Python 3.12, and this script supports older ones.
+    hcount=len(handlers)
+    print(f"HANDLERS\t{host}\t{port}\t{hcount}")
     print(f"{port}\t{verb}\t{proxy}")
 ') || { TS_STATE_KNOWN=false; return 0; }
   # First line must be the OK sentinel, else treat as unknown.
@@ -166,6 +176,7 @@ for hostport,conf in web.items():
     if $first; then first=false; continue; fi   # skip OK
     [ -n "$line" ] || continue
     case "$line" in
+      HANDLERS$'\t'*) TS_HANDLERS+=("${line#HANDLERS$'\t'}") ;;   # handler count → TS_HANDLERS (additive)
       HOST$'\t'*) TS_HOSTS+=("${line#HOST$'\t'}") ;;   # host line → TS_HOSTS (additive; port consumers unaffected)
       MAP$'\t'*)  TS_MAPS+=("${line#MAP$'\t'}") ;;     # mapping tuple → TS_MAPS (additive, show-qr only)
       *)          TS_PORTS+=("$line") ;;               # unchanged "port<TAB>verb<TAB>proxy"
@@ -177,6 +188,20 @@ ts_target_for_port() { # echoes "verb<TAB>proxy" for <port>, empty if free
   local p="$1" line
   for line in "${TS_PORTS[@]-}"; do
     [ "${line%%$'\t'*}" = "$p" ] && { printf '%s' "${line#*$'\t'}"; return 0; }
+  done
+}
+
+# How many path handlers one host:port carries, "" when this mapping is unknown to
+# the current read. Only a count of 1 is safe to close on behalf of one setup: a
+# `tailscale funnel --https=<port> off` names the port and takes every handler on
+# it, so a port serving /→ours and /admin→theirs would lose both.
+ts_handler_count() { # ts_handler_count <host> <port> -> handler count, "" when unknown
+  local h="$1" p="$2" line rest
+  for line in ${TS_HANDLERS[@]+"${TS_HANDLERS[@]}"}; do
+    [ "${line%%$'\t'*}" = "$h" ] || continue
+    rest="${line#*$'\t'}"
+    [ "${rest%%$'\t'*}" = "$p" ] || continue
+    printf '%s' "${rest#*$'\t'}"; return 0
   done
 }
 

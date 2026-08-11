@@ -6002,7 +6002,7 @@ PY
 # resolves, so without it both lanes go quiet and both assertions become vacuous.
 run_manage_forget_exposure_case() {
   local name="manage-forget-discloses-unreadable-exposures" lane rc out
-  local label ver gwid home state sd unit credf envf rec
+  local label ver gwid home state sd unit credf envf rec want_rc
   : > "$TMP/doctor.out"
 
   # The shim answers exactly the one question ts_targets asks, and refuses
@@ -6061,8 +6061,17 @@ SHIM
     if [ "$rc" = "124" ]; then
       fail_case "$name" "lane $label hung instead of completing the removal"; return
     fi
-    if [ "$rc" != "0" ]; then
-      fail_case "$name" "lane $label exited $rc, expected 0 — the removal was confirmed"; return
+    # The two lanes exit differently, and the shim above is the reason. The v1
+    # record belongs to nobody, so no close is ever attempted and the removal is
+    # complete: rc 0. The v2 record IS this setup's, so the close is attempted — and
+    # this fixture's `tailscale` answers everything but the status read with exit 1,
+    # deliberately, so the route is still live on the re-read. An address this
+    # command tried to close and could not prove closed is "some of it is still
+    # there", which the command reports on screen and answers with rc 1.
+    want_rc=0
+    [ "$label" = "v2" ] && want_rc=1
+    if [ "$rc" != "$want_rc" ]; then
+      fail_case "$name" "lane $label exited $rc, expected $want_rc"; return
     fi
 
     # Whichever lane this is, the removal it DID prove has to have happened. This
@@ -6109,6 +6118,292 @@ SHIM
         fi
         if grep -qF 'in a format this version cannot read' "$TMP/forgetexp.out"; then
           fail_case "$name" "a record this version CAN read was reported as unreadable — the v1 lane proves nothing"; return
+        fi ;;
+    esac
+  done
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The sibling above covers the case where an exposure RECORD is still on disk. This
+# one covers the case that is far more common and was, until this case existed,
+# entirely unguarded: no record at all.
+#
+# That is not an exotic state. `on_exit` calls `prune_exposure_records all` on every
+# clean run that emitted a setup code — deliberately, because a reported exposure is
+# not an unreported one — so the ordinary machine, the one where setup SUCCEEDED, has
+# a live Funnel and nothing on disk naming it. A --forget sourced only from records
+# removed the profile, the password and the unit, exited 0, and left a PUBLIC address
+# in front of a tool-capable agent, never mentioning it. Simulating "already pruned"
+# is simply "the file was never written".
+#
+# The `tailscale` shim is STATEFUL, which is what makes this case about closure
+# rather than about wording: `undo_exposure_entry` runs `funnel … off` under
+# `2>/dev/null || true`, so an exit code proves nothing in either direction. The shim
+# touches a marker file when the real `off` arrives and answers the next
+# `serve status --json` with an empty tailnet, so the script's own post-teardown
+# re-read is the evidence — and anything unexpected still fails with exit 1.
+#
+# Four lanes, and the last three are the assertion. `pruned` proves the route is
+# found and closed; `foreign`, `contested` and `silent` prove the new source did not
+# buy that by guessing — a wrongly closed stranger's port is worse than the bug.
+#
+# Two later lanes guard the two ways this command can go back to reporting a removal
+# as complete when it is not. `unreadable` is the silence again, in the one case the
+# grader cannot look anything up: a saved address it cannot parse. `closefail` is the
+# exit status: a close that is attempted and fails must not come back 0.
+run_manage_forget_pruned_exposure_case() {
+  local name="manage-forget-closes-a-pruned-exposure" lane rc
+  local home state sd closed bin hostkey reads gwurl attempts refuse want_rc
+  : > "$TMP/doctor.out"
+
+  for lane in pruned foreign contested silent recorded raced unreadable closefail; do
+    home="$TMP/forgetpruned-$lane-home"; state="$TMP/forgetpruned-$lane-state"
+    sd="$state/conduck"; bin="$TMP/forgetpruned-$lane-bin"
+    closed="$TMP/forgetpruned-$lane-closed"; reads="$TMP/forgetpruned-$lane-reads"
+    attempts="$TMP/forgetpruned-$lane-attempts"; refuse="$TMP/forgetpruned-$lane-refuse"
+    rm -rf "$home" "$state" "$bin"; rm -f "$closed" "$reads" "$attempts" "$refuse"
+    mkdir -p "$home/Library/LaunchAgents" "$home/.config/systemd/user" "$sd" "$bin"
+    # A `tailscale` that answers `funnel … off` with exit 1 and goes on serving the
+    # mapping. It is the only lane where the close is ATTEMPTED and fails, which is
+    # the only way to reach the leftover branch whose exit status is in question.
+    [ "$lane" = "closefail" ] && : > "$refuse"
+
+    # The `foreign` lane serves the same PORT under a different tailnet name — the
+    # one shape of near-miss a port-only close cannot tell from a hit.
+    hostkey="box.tail1234.ts.net:8443"
+    [ "$lane" = "foreign" ] && hostkey="other.tail1234.ts.net:8443"
+
+    if [ "$lane" = "raced" ]; then
+      # The typed confirmation can sit on screen for minutes. This shim answers the
+      # DISCLOSURE's read with this setup's own address and every later read with a
+      # different tailnet name, so the route stops being provable during the pause —
+      # which is the only way to show that the far side of the prompt re-reads and
+      # re-grades rather than acting on the list the operator just approved.
+      cat > "$bin/tailscale" <<SHIM
+#!/usr/bin/env bash
+if [ "\$1" = "serve" ] && [ "\$2" = "status" ] && [ "\$3" = "--json" ]; then
+  printf 'r\n' >> "$reads"
+  host=box.tail1234.ts.net
+  [ "\$(wc -l < "$reads" | tr -d ' ')" -ge 2 ] && host=other.tail1234.ts.net
+  printf '{"Web":{"%s:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}},"AllowFunnel":{"%s:8443":true}}\n' "\$host" "\$host"
+  exit 0
+fi
+if [ "\$1" = "funnel" ] && [ "\$2" = "--https=8443" ] && [ "\$3" = "off" ]; then
+  : > "$closed"
+  exit 0
+fi
+exit 1
+SHIM
+    else
+      cat > "$bin/tailscale" <<SHIM
+#!/usr/bin/env bash
+if [ "\$1" = "serve" ] && [ "\$2" = "status" ] && [ "\$3" = "--json" ]; then
+  if [ -f "$closed" ]; then
+    printf '%s\n' '{"Web":{},"AllowFunnel":{}}'
+  else
+    printf '%s\n' '{"Web":{"$hostkey":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}},"AllowFunnel":{"$hostkey":true}}'
+  fi
+  exit 0
+fi
+if [ "\$1" = "funnel" ] && [ "\$2" = "--https=8443" ] && [ "\$3" = "off" ]; then
+  printf 'off\n' >> "$attempts"
+  # The attempt is logged before the refusal, because "it tried and failed" and "it
+  # never tried" are the two readings of an unclosed route and only the log tells
+  # them apart.
+  [ -f "$refuse" ] && exit 1
+  : > "$closed"
+  exit 0
+fi
+exit 1
+SHIM
+    fi
+    chmod +x "$bin/tailscale"
+
+    # NO exposure-*.pending file in any lane but `recorded`. That single omission IS
+    # the fixture: it is what a clean successful run leaves behind.
+    if [ "$lane" = "recorded" ]; then
+      # The mirror image, and the only lane where the OLD source is the one that
+      # finds the route: a Cloudflare pairing whose profile names no Tailscale
+      # address, plus a record an interrupted earlier Tailscale run left behind.
+      # It exists to pin the boundary — a record-derived line must NOT be labelled
+      # as having been matched from a saved address, because that label is what
+      # tells an operator to look for a route of their own.
+      printf '%s\n' '{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Tunnelled gateway","auth":"bearer","transport":"cloudflare","reach":"public","url":"https://gw.example.com"},"fileServer":null}' \
+        > "$sd/profile-custom-a.json"
+      printf '2\tgateway\t8443\tfunnel\thttp://127.0.0.1:8080\tcustom-a\tEMPTY\n' \
+        > "$sd/exposure-oldrun-001.pending"
+    elif [ "$lane" = "silent" ]; then
+      # A reverse proxy of the operator's own: this script never opened a route for
+      # it and has nothing to close, so it must not send them to read a program that
+      # has nothing to do with their setup.
+      printf '%s\n' '{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Reverse proxy","auth":"bearer","transport":"public","reach":"public","url":"https://gw.example.com"},"fileServer":null}' \
+        > "$sd/profile-custom-a.json"
+    else
+      # The `unreadable` lane's saved address carries an underscore in the tailnet
+      # name. No hand-edit is needed to get one: `ask_url` takes anything shaped like
+      # https://?*, and --edit's transport check only asks whether the host ends in
+      # .ts.net, so a typo sails through and is saved. Every parser downstream refuses
+      # it, and refusing it silently is the original defect's exact shape.
+      gwurl="https://box.tail1234.ts.net:8443"
+      [ "$lane" = "unreadable" ] && gwurl="https://box_1.tail1234.ts.net:8443"
+      printf '{"schemaVersion":1,"gateway":{"id":"custom-a","kind":"custom","name":"Tailnet gateway","auth":"bearer","transport":"funnel","reach":"public","url":"%s","localPort":"8080"},"fileServer":null}\n' \
+        "$gwurl" > "$sd/profile-custom-a.json"
+    fi
+    # A second saved setup naming the SAME address. Whichever is removed first would
+    # close a route the other still needs, so neither may be closed on a guess.
+    [ "$lane" = "contested" ] && printf '%s\n' '{"schemaVersion":1,"gateway":{"id":"custom-b","kind":"custom","name":"Twin","auth":"bearer","transport":"funnel","reach":"public","url":"https://box.tail1234.ts.net:8443","localPort":"8080"},"fileServer":null}' \
+      > "$sd/profile-custom-b.json"
+
+    PTY_ENV=(HOME="$home" XDG_CONFIG_HOME="$state" PATH="$bin:$PATH")
+    rc=0
+    pty_run 30 $'custom-a\n' --forget custom-a > "$TMP/forgetpruned.out" 2>&1 || rc=$?
+    printf -- '--- lane %s rc=%s ---\n' "$lane" "$rc" >> "$TMP/doctor.out"
+    cat "$TMP/forgetpruned.out" >> "$TMP/doctor.out"
+    assert_runtime_defined "$name" "$(cat "$TMP/forgetpruned.out")" || return
+    if [ "$rc" = "124" ]; then
+      fail_case "$name" "lane $lane hung instead of completing the removal"; return
+    fi
+    # Every lane confirms the removal, so every lane but one exits 0. `closefail` is
+    # the exception and is the whole point of that lane: an address this command tried
+    # to close and could not prove closed is "some of it is still there", which README
+    # pins to 1 — and a caller keying on the status cannot read the screen that says so.
+    want_rc=0
+    [ "$lane" = "closefail" ] && want_rc=1
+    if [ "$rc" != "$want_rc" ]; then
+      fail_case "$name" "lane $lane exited $rc, expected $want_rc"; return
+    fi
+    # Asserted in every lane, first: a "safe" fix that refuses to remove anything
+    # whenever it cannot prove a route would satisfy every refusal assertion below
+    # and break the command.
+    if ! grep -qF 'Removed the saved setup' "$TMP/forgetpruned.out"; then
+      fail_case "$name" "lane $lane never reported the removal"; return
+    fi
+    if [ -f "$sd/profile-custom-a.json" ]; then
+      fail_case "$name" "lane $lane left the saved setup on disk"; return
+    fi
+    # "No record at all" and "a record this version cannot parse" are different
+    # facts with different advice; the second must never be printed for the first.
+    if grep -qF 'in a format this version cannot read' "$TMP/forgetpruned.out"; then
+      fail_case "$name" "lane $lane reported an unreadable record where no record exists at all"; return
+    fi
+
+    case "$lane" in
+      pruned)
+        # The disclosure line is rendered by the same loop a record-derived route
+        # goes through, so the literal column alignment is the proof that the two
+        # sources really do share it.
+        if ! grep -qF 'a PUBLIC address      port 8443 → 127.0.0.1:8080' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a live route named only by the saved profile was never disclosed"; return
+        fi
+        # The marker and its note are the only defence against closing a route the
+        # operator opened by hand to this same address — a case no signal available
+        # here can decide.
+        if ! grep -qF "matched from this setup's saved address" "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a profile-derived route was listed with no sign of where the match came from"; return
+        fi
+        if ! grep -qF 'A route you opened by hand to that same address is indistinguishable' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the marker was printed without the note that says what it means"; return
+        fi
+        if [ ! -f "$closed" ]; then
+          fail_case "$name" "the PUBLIC Funnel was disclosed and then never closed — 'tailscale funnel --https=8443 off' never ran"; return
+        fi
+        if ! grep -qF 'Port 8443 is no longer exposed.' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the close was never proven from a fresh read of Tailscale's own state"; return
+        fi
+        if ! grep -qF 'tailscale funnel --bg --https=8443 http://127.0.0.1:8080' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a closed PUBLIC route left no way to put it back"; return
+        fi ;;
+      foreign)
+        if [ -f "$closed" ]; then
+          fail_case "$name" "a route on a tailnet name this setup does not use was CLOSED — that is somebody else's port"; return
+        fi
+        if grep -qF 'Port 8443 is no longer exposed.' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a route that was left open was reported closed"; return
+        fi
+        if ! grep -qF 'this machine serves port 8443 under the name other.tail1234.ts.net' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the route was refused without saying why, so nothing can be checked by hand"; return
+        fi
+        if ! grep -qF 'tailscale funnel --https=<port> off' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a route left open was named without the command that closes it"; return
+        fi
+        if ! grep -qF 'I did not run those' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the by-hand commands were printed without saying they had not been run"; return
+        fi ;;
+      contested)
+        if [ -f "$closed" ]; then
+          fail_case "$name" "a route two saved setups both name was closed on behalf of one of them"; return
+        fi
+        if ! grep -qF 'another saved setup on this machine names that same address' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the contested route was refused without naming the conflict"; return
+        fi ;;
+      silent)
+        # The widened gate must stay shut for a setup this script never opened a
+        # route for. Case-insensitive, because the word is capitalised in prose.
+        if grep -qi 'tailscale' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a Cloudflare/reverse-proxy setup was sent to check Tailscale, which has nothing to do with it"; return
+        fi ;;
+      recorded)
+        if ! grep -qF 'a PUBLIC address      port 8443 → 127.0.0.1:8080' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the record-derived route stopped being disclosed"; return
+        fi
+        if [ ! -f "$closed" ]; then
+          fail_case "$name" "the record-derived route stopped being closed"; return
+        fi
+        if grep -qF "matched from this setup's saved address" "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a route found in a RECORD was labelled as matched from the saved address"; return
+        fi
+        if grep -qF 'A route you opened by hand to that same address is indistinguishable' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the profile-source caveat was printed for a route no profile named"; return
+        fi
+        if grep -qF 'tailscale funnel --bg --https=8443' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the profile-source restore hint was printed for a record-derived route"; return
+        fi ;;
+      raced)
+        # It has to have FOUND the route first, or "did not close it" would be true
+        # for the wrong reason and this lane would prove nothing.
+        if ! grep -qF 'a PUBLIC address      port 8443 → 127.0.0.1:8080' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the route was never disclosed, so the re-read had nothing to change its mind about"; return
+        fi
+        if [ -f "$closed" ]; then
+          fail_case "$name" "a route that stopped matching during the confirmation was closed anyway — the disclosure was trusted"; return
+        fi
+        if ! grep -qF 'Port 8443 no longer matches this setup' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a disclosed route was dropped in silence instead of saying it had stopped matching"; return
+        fi
+        if grep -qF 'Port 8443 is no longer exposed.' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a route that was left open was reported closed"; return
+        fi ;;
+      unreadable)
+        # The silence, back in the one case the grader cannot look anything up: with
+        # no port to match on, it cannot even ask whether something is live, so
+        # "nothing is open" is not a thing this branch may imply. It must say it could
+        # not read the address, name it, and hand over the by-hand commands.
+        if [ -f "$closed" ]; then
+          fail_case "$name" "a route named only by an address this version cannot read was CLOSED"; return
+        fi
+        if ! grep -qF 'this version cannot read that saved address at all' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "an unreadable saved address was dropped in SILENCE — the live PUBLIC route was never mentioned"; return
+        fi
+        if ! grep -qF 'https://box_1.tail1234.ts.net:8443' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "the address it could not read was never named, so there is nothing to go and check"; return
+        fi
+        if ! grep -qF 'tailscale funnel --https=<port> off' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "an unreadable saved address was reported with no command to close a route by hand"; return
+        fi ;;
+      closefail)
+        # The exit status is asserted above, with every other lane's. These three
+        # keep that assertion from passing for the wrong reason: the close has to
+        # have been ATTEMPTED, the failure has to be on screen, and a route still
+        # live must not be reported closed.
+        if [ ! -f "$attempts" ]; then
+          fail_case "$name" "the close was never attempted, so an exit status proves nothing about one that failed"; return
+        fi
+        if ! grep -qF 'Could not confirm every address in front of this gateway was closed' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a close that failed was never reported on screen"; return
+        fi
+        if grep -qF 'Port 8443 is no longer exposed.' "$TMP/forgetpruned.out"; then
+          fail_case "$name" "a route that is still live was reported closed"; return
         fi ;;
     esac
   done
@@ -9075,6 +9370,10 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" manage-forget-discloses-unreadable-exposures "*) true ;; *) false ;; esac; then
   run_manage_forget_exposure_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" manage-forget-closes-a-pruned-exposure "*) true ;; *) false ;; esac; then
+  run_manage_forget_pruned_exposure_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" manage-edit-survives-showing-a-setup-code "*) true ;; *) false ;; esac; then

@@ -81,7 +81,7 @@ bash conduck-connect.sh --list            # the ids, and what each one still has
 bash conduck-connect.sh --forget <id>     # remove one, after you type the id back
 ```
 
-It stops and deletes that gateway's file server, closes the HTTPS routes this script opened for it, deletes **both** copies of the file-lane password, and deletes the saved profile. It lists all of that before it asks, and asks you to type the id rather than press Enter. It never touches your shared folder, your agent's context file, any gateway configuration it edited, the gateway itself, or the pairing already on a device.
+It stops and deletes that gateway's file server, closes the Tailscale Serve and Funnel routes this machine is still serving for it, deletes **both** copies of the file-lane password, and deletes the saved profile. Cloudflare tunnels and reverse proxies of your own are never closed for you — this script only ever printed the commands for those, so it has nothing to undo. It lists all of that before it asks, and asks you to type the id rather than press Enter. It never touches your shared folder, your agent's context file, any gateway configuration it edited, the gateway itself, or the pairing already on a device.
 
 `--list` also reports file servers with **no saved setup behind them** — the residue of a gateway removed by hand — with the `--forget` line for each. Two legacy names carry no gateway id (`conduck-files.service`, `ai.gigaduck.conduck-fileserver.plist`); those cannot be attributed to a setup, so they are reported and never removed for you. Use the recipe below on those.
 
@@ -128,7 +128,7 @@ tailscale serve status
 tailscale funnel status
 ```
 
-A run that finished normally has already retired its own records, so an empty result usually means there is nothing left open from this script. It is not proof: check `tailscale serve status` and `tailscale funnel status` yourself, which show every mapping regardless of who made it.
+A run that finished normally has already retired its own records, so an empty result here is the ordinary case and is **not** proof that nothing is open. The saved setup names the same ports: `gateway.url` — and `fileServer.url`, if there is one — in `profile-<id>.json` end in `:<port>`, and no `:<port>` means 443. Either way `tailscale serve status` and `tailscale funnel status` are the authority: they show every mapping regardless of who made it.
 
 **4. Delete the saved setup.**
 

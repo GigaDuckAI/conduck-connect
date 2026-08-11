@@ -4224,6 +4224,11 @@ TS_STATE_KNOWN=true
 declare -a TS_PORTS=()        # "port<TAB>verb<TAB>proxy" lines from ts_targets
 declare -a TS_HOSTS=()        # unique lowercased tailnet hostnames serving on THIS machine (from ts_targets)
 declare -a TS_MAPS=()         # "host<TAB>port<TAB>verb<TAB>proxy" per mapping (host lowercased) — show-qr's host-qualified assert
+declare -a TS_HANDLERS=()     # "host<TAB>port<TAB>handler-count" per mapping. A close names a PORT and
+                              # nothing finer, so a port carrying more than one path handler cannot be
+                              # closed on one handler's behalf: `funnel --https=443 off` takes /admin
+                              # with it. TS_MAPS keeps only the LAST handler's proxy, so the count is
+                              # the only place that difference survives.
 declare -a APPLIED=()         # "port<TAB>applied-verb<TAB>prior-state" snapshots for cleanup (gateway)
 declare -a FS_APPLIED=()      # same, but for the OPTIONAL file lane — rolled back on its own when the
                               # lane is dropped post-mutation, so a public Funnel is never orphaned
@@ -4346,7 +4351,7 @@ except Exception: pass'
 # TS_PORTS' line format is UNCHANGED — several consumers split it on tabs.
 # FAIL CLOSED: on any parse/exec error TS_STATE_KNOWN=false (caller refuses to mutate).
 ts_targets() {
-  TS_PORTS=(); TS_HOSTS=(); TS_MAPS=(); TS_STATE_KNOWN=true
+  TS_PORTS=(); TS_HOSTS=(); TS_MAPS=(); TS_HANDLERS=(); TS_STATE_KNOWN=true
   local raw; raw=$(tailscale serve status --json 2>/dev/null) || { TS_STATE_KNOWN=false; return 0; }
   [ -n "$raw" ] || return 0   # genuinely no targets is fine (empty, but known)
   local parsed
@@ -4371,10 +4376,15 @@ for hostport,conf in web.items():
     host=hostport.rsplit(":",1)[0].lower()
     port=hostport.rsplit(":",1)[-1]
     proxy=""
-    for _,h in ((conf or {}).get("Handlers") or {}).items():
+    handlers=(conf or {}).get("Handlers") or {}
+    for _,h in handlers.items():
         proxy=(h or {}).get("Proxy","") or proxy
     verb="funnel" if af.get(hostport) else "serve"
     print(f"MAP\t{host}\t{port}\t{verb}\t{proxy}")
+    # Bound to a local first: a backslash inside an f-string expression is a
+    # SyntaxError before Python 3.12, and this script supports older ones.
+    hcount=len(handlers)
+    print(f"HANDLERS\t{host}\t{port}\t{hcount}")
     print(f"{port}\t{verb}\t{proxy}")
 ') || { TS_STATE_KNOWN=false; return 0; }
   # First line must be the OK sentinel, else treat as unknown.
@@ -4384,6 +4394,7 @@ for hostport,conf in web.items():
     if $first; then first=false; continue; fi   # skip OK
     [ -n "$line" ] || continue
     case "$line" in
+      HANDLERS$'\t'*) TS_HANDLERS+=("${line#HANDLERS$'\t'}") ;;   # handler count → TS_HANDLERS (additive)
       HOST$'\t'*) TS_HOSTS+=("${line#HOST$'\t'}") ;;   # host line → TS_HOSTS (additive; port consumers unaffected)
       MAP$'\t'*)  TS_MAPS+=("${line#MAP$'\t'}") ;;     # mapping tuple → TS_MAPS (additive, show-qr only)
       *)          TS_PORTS+=("$line") ;;               # unchanged "port<TAB>verb<TAB>proxy"
@@ -4395,6 +4406,20 @@ ts_target_for_port() { # echoes "verb<TAB>proxy" for <port>, empty if free
   local p="$1" line
   for line in "${TS_PORTS[@]-}"; do
     [ "${line%%$'\t'*}" = "$p" ] && { printf '%s' "${line#*$'\t'}"; return 0; }
+  done
+}
+
+# How many path handlers one host:port carries, "" when this mapping is unknown to
+# the current read. Only a count of 1 is safe to close on behalf of one setup: a
+# `tailscale funnel --https=<port> off` names the port and takes every handler on
+# it, so a port serving /→ours and /admin→theirs would lose both.
+ts_handler_count() { # ts_handler_count <host> <port> -> handler count, "" when unknown
+  local h="$1" p="$2" line rest
+  for line in ${TS_HANDLERS[@]+"${TS_HANDLERS[@]}"}; do
+    [ "${line%%$'\t'*}" = "$h" ] || continue
+    rest="${line#*$'\t'}"
+    [ "${rest%%$'\t'*}" = "$p" ] || continue
+    printf '%s' "${rest#*$'\t'}"; return 0
   done
 }
 
@@ -18060,7 +18085,13 @@ manage_edit() { # manage_edit [<id>]
       2) manage_edit_model "$id" "$lane_preserved" ;;
       3) manage_edit_folder "$id" ;;
       4) manage_show_code "$id" ;;
-      5) if manage_forget "$id"; then return 0; fi ;;
+      # Non-zero from a removal is "the operator backed out" OR "it happened, but
+      # some of it is still here" — and a route that would not close leaves no file
+      # behind, so the status alone cannot separate them. The disk can: a removal
+      # that got as far as deleting the profile has nothing left for this screen to
+      # describe, and redrawing it would show a setup that is gone.
+      5) if manage_forget "$id"; then return 0; fi
+         [ -f "$(manage_profile_path "$id")" ] || return 0 ;;
     esac
   done
 }
@@ -18500,9 +18531,274 @@ manage_show_code() { # manage_show_code <id>
 
 # ----------------------------------------------------------------- forget --
 
+# ------------------------------------- the SECOND source of --forget's routes --
+#
+# A record under $STATE_DIR is not the only thing that names a route this script
+# opened, and on a machine where setup SUCCEEDED it is not even the usual one: a
+# clean run that emitted a code calls `prune_exposure_records all` on the way out
+# (30-exposure's on_exit), because a reported exposure is not an unreported one and
+# stale warnings train operators to click past them. So the ordinary state of an
+# ordinary machine is "the Funnel is live and no record names it" — and a --forget
+# sourced only from records would remove the profile, the unit and both copies of
+# the password while leaving a PUBLIC address in front of a tool-capable agent,
+# with nothing left on disk that names it.
+#
+# The profile itself is the other source: it records the public address the pairing
+# was minted on and the transport behind it. That is a CLAIM, not evidence, so it is
+# never acted on by itself — it only nominates a candidate, which is then graded
+# against what Tailscale says this machine is serving RIGHT NOW.
+#
+# TAILSCALE ONLY, deliberately. A Cloudflare tunnel or a reverse proxy of the
+# operator's own is opened by the OPERATOR — this script only ever printed the
+# commands — so it was never a route this script opened and is never one it closes.
+#
+# The one thing this source can do that the record source cannot: tailscale_expose
+# REUSES a mapping that already matches ("Already exposed: … Reusing.") and writes
+# no record for it, so a route the operator made by hand before pairing is
+# indistinguishable here from one this script created. That case is closed anyway,
+# because refusing it would kill the fix for every profile that exists today — but
+# it is disclosed in the operator's own words before consent (the "matched from this
+# setup's saved address" marker) and a proven close prints the exact command that
+# puts the route back.
+#
+# Two globals rather than namerefs: bash 3.2, matching the REC_*/TS_* convention.
+declare -a FGT_CLOSE=()    # "port<TAB>verb<TAB>backend-port<TAB>role" — provably this setup's
+declare -a FGT_REPORT=()   # "label<TAB>address<TAB>reason"           — live, but not provable
+
+# Grade ONE saved address against live Tailscale state. Appends to FGT_CLOSE when
+# every condition below holds, to FGT_REPORT when one of them fails and something
+# live still touches that port, and to NEITHER when nothing live touches it — that
+# last case is the same silence the record path keeps for a record whose exposure is
+# already gone, and it is the only path here that prints nothing.
+manage_forget_grade_route() { # <id> <url> <lport> <verb> <label> <role> <claimed-ports>
+  local id="$1" url="$2" lport="$3" cverb="$4" label="$5" role="$6" claimed="$7"
+  # Condition 0. Without a live read there is nothing to grade against, and
+  # ts_targets CLEARS TS_MAPS before setting TS_STATE_KNOWN=false — so a scan over
+  # the empty arrays would answer "nothing live touches this" and drop the route in
+  # silence. The caller reports this case; the grader must never reach the arrays.
+  $TS_STATE_KNOWN || return 0
+
+  local cand_host cand_port cand_proxy
+  cand_host=$(url_host_lc "$url")
+  cand_port=$(url_https_port "$url")
+  # Condition 1a. A profile is exactly as untrusted as a record — a file under
+  # $STATE_DIR is editable by its owner — and every value below is either compared
+  # against Tailscale's own output or interpolated into a `tailscale` command. An
+  # address this validator rejects yields no port to match on and no port to close,
+  # so it is never acted on — but it is REPORTED, never dropped. Dropping it is the
+  # original defect's exact shape in miniature: the setup, the unit and both password
+  # copies go, success is reported, and a PUBLIC Funnel in front of the gateway is
+  # never mentioned. It is also the ONE candidate whose liveness cannot be looked up
+  # at all — with no port to look it up by, the silence rule below cannot speak for
+  # it, so "nothing is open" is not a thing this branch is entitled to imply.
+  #
+  # Not a hand-edit-only case: ask_url accepts anything shaped like https://?*, and
+  # --edit's transport check only asks whether the host ends in .ts.net, so a typo'd
+  # tailnet name (box_1.tail1234.ts.net) is saved with no warning and lands here.
+  if ! show_qr_is_https_host "$url" || ! show_qr_is_port "$cand_port" || [ -z "$cand_host" ]; then
+    # An address that is not there at all is not an address that cannot be read. An
+    # empty string names no route, so there is nothing to warn about and nothing an
+    # operator could go and check.
+    if [ -n "$url" ]; then
+      FGT_REPORT+=("$label"$'\t'"$(manage_safe_url "$url" 200)"$'\t'"this version cannot read that saved address at all, so a route in front of it may still be open")
+    fi
+    return 0
+  fi
+  # Sanitised once, here: FGT_REPORT is tab-separated and a control character in a
+  # hand-edited address would otherwise forge a field boundary. manage_safe_url, not
+  # safe_display, because it is this module's rule for every URL that leaves here —
+  # show_qr_is_https_host already refuses userinfo, so this is belt and braces.
+  local safe_url; safe_url=$(manage_safe_url "$url" 200)
+
+  # Condition 8, checked FIRST rather than last: when a record-derived entry already
+  # claims this port, that entry is closing it with proof, and a second opinion about
+  # a port already on the list is noise at best and a contradiction at worst ("left
+  # exactly as it is" next to a line that closes it).
+  case " $claimed " in *" $cand_port "*) return 0 ;; esac
+
+  # What is live on this port, and whether this setup's backend appears anywhere at
+  # all. Both are read in one pass because the silence rule needs both.
+  local line h p v x rest nrows=0 mhost="" mverb="" mproxy="" proxy_seen=false
+  cand_proxy="http://127.0.0.1:$lport"
+  for line in ${TS_MAPS[@]+"${TS_MAPS[@]}"}; do
+    h="${line%%$'\t'*}"; rest="${line#*$'\t'}"
+    p="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+    v="${rest%%$'\t'*}"; x="${rest#*$'\t'}"
+    [ -n "$lport" ] && [ "$x" = "$cand_proxy" ] && proxy_seen=true
+    [ "$p" = "$cand_port" ] || continue
+    nrows=$((nrows+1)); mhost="$h"; mverb="$v"; mproxy="$x"
+  done
+  # THE silence rule. Nothing live sits on this setup's saved port and nothing live
+  # forwards to its backend, so there is nothing open and nothing to warn about.
+  if [ "$nrows" -eq 0 ] && ! $proxy_seen; then return 0; fi
+
+  # Condition 1b. The local port is what makes a match a match; without it the most
+  # this could say is "some route exists on that port", which is exactly the guess
+  # this command refuses to make.
+  if ! show_qr_is_port "${lport:-}"; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"this saved setup does not record a usable local port for it, so I cannot match it against what is live")
+    return 0
+  fi
+  # Condition 2. A close names a PORT and nothing else, so two tailnet names serving
+  # one port cannot be told apart by the only command available to act.
+  if [ "$nrows" -eq 0 ]; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"nothing is serving that address now, though 127.0.0.1:$lport is reachable on another HTTPS port")
+    return 0
+  fi
+  if [ "$nrows" -gt 1 ]; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"two tailnet names on this machine serve port $cand_port, and a close can only name the port, not which of them")
+    return 0
+  fi
+  # Condition 3. The saved address names a machine; this one serves that port under
+  # a different name, so the route in front of it is somebody else's.
+  if [ "$mhost" != "$cand_host" ]; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"this machine serves port $cand_port under the name $(safe_display "$mhost" 120), not the one in that address")
+    return 0
+  fi
+  # Condition 4. A route this script created always carries exactly one handler, so
+  # refusing a multi-handler port never costs a true close.
+  if [ "$(ts_handler_count "$cand_host" "$cand_port")" != "1" ]; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"that address serves more than one path on this machine, and closing the port would take the others with it")
+    return 0
+  fi
+  # Condition 5. Same port, different destination — or the same destination reached
+  # a different way. Either is a route this setup does not own.
+  if [ "$mproxy" != "$cand_proxy" ]; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"port $cand_port now forwards to $(safe_display "${mproxy#http://}" 120) — not the 127.0.0.1:$lport this setup uses")
+    return 0
+  fi
+  if [ "$mverb" != "$cverb" ]; then
+    if [ "$mverb" = "funnel" ]; then
+      FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"port $cand_port is PUBLIC right now, and this setup's saved address is a private one")
+    else
+      FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"port $cand_port is private right now, and this setup's saved address is a public one")
+    fi
+    return 0
+  fi
+  # Condition 6. Another setup's record names this port and is still live, so the
+  # live route has two claimants and neither can be proven.
+  if manage_record_claims_port "$id" "$cand_port"; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"a recorded exposure from another setup names port $cand_port, so I cannot tell which of them the live route belongs to")
+    return 0
+  fi
+  # Condition 7. Two saved setups converge on one address. Whichever is removed
+  # first would close a route the other one still needs.
+  if manage_other_profile_claims "$id" "$cand_host" "$cand_port"; then
+    FGT_REPORT+=("$label"$'\t'"$safe_url"$'\t'"another saved setup on this machine names that same address — remove that one first, or close the port by hand")
+    return 0
+  fi
+  # ACCEPTED, documented residual risks, each undetectable from anything available
+  # here: an operator who repurposed 127.0.0.1:$lport for something else since
+  # pairing (the disclosure prints the mapping before consent, which is the only
+  # defence and it is theirs); a mapping this script REUSED rather than created (see
+  # the header); a v1-format record naming this port, whose port cannot be extracted
+  # without a parser for a retired format — and which would have to describe this
+  # very mapping to collide at all; and the check/use race between this read and the
+  # port-only `off`, which no Tailscale primitive can close.
+  #
+  # The port handed on is the one Tailscale itself reported, not the profile string.
+  # Equal by construction — but sourced from the machine's own reflection.
+  FGT_CLOSE+=("$cand_port"$'\t'"$cverb"$'\t'"$lport"$'\t'"$role")
+}
+
+# Does a READABLE record belonging to some OTHER setup name this port, and is it
+# still live? Clobbers REC_* — every caller runs its own record loop first.
+manage_record_claims_port() { # manage_record_claims_port <id> <port>
+  local id="$1" port="$2" f
+  [ -n "${STATE_DIR:-}" ] || return 1
+  for f in "$STATE_DIR"/exposure-*.pending; do
+    [ -f "$f" ] || continue
+    read_exposure_record "$f" || continue
+    [ "$REC_PORT" = "$port" ] || continue
+    # The literal `unknown` counts as another setup here, on purpose: a record that
+    # names no gateway is precisely one this command may not attribute to THIS one.
+    [ "$REC_GWID" = "$id" ] && continue
+    exposure_record_is_live || continue
+    return 0
+  done
+  return 1
+}
+
+# Does another saved profile name this same (host, port), on either of its lanes?
+# Read RAW and unvalidated on purpose: the answer is only ever used to BLOCK a
+# close, never to act, so a malformed neighbour can cost caution and nothing else.
+manage_other_profile_claims() { # manage_other_profile_claims <id> <host> <port>
+  local id="$1" host="$2" port="$3" p pid u
+  [ -n "${STATE_DIR:-}" ] || return 1
+  for p in "$STATE_DIR"/profile-*.json; do
+    [ -f "$p" ] || continue
+    pid="${p##*/profile-}"; pid="${pid%.json}"
+    [ "$pid" = "$id" ] && continue
+    for u in "$(json_get "$p" "gateway.url")" "$(json_get "$p" "fileServer.url")"; do
+      [ -n "$u" ] || continue
+      [ "$(url_host_lc "$u")" = "$host" ] || continue
+      [ "$(url_https_port "$u")" = "$port" ] && return 0
+    done
+  done
+  return 1
+}
+
+# Build the candidate routes a saved profile nominates, and grade each one. Sets
+# FGT_CLOSE / FGT_REPORT; both are reset here, so the disclosure and the far side of
+# the confirmation each get a list built from scratch.
+#
+# manage_load_profile and existing_fs_config are deliberately NOT used: the first
+# drags in FS_CRED recovery and a lane-preservation return code that mean nothing
+# here, the second prints notes, mutates FS_*, and falls back to legacy unnamed
+# units that belong to no id at all.
+manage_forget_profile_routes() { # manage_forget_profile_routes <id> <pf> <unit> <claimed-ports>
+  local id="$1" pf="$2" unit="$3" claimed="$4"
+  FGT_CLOSE=(); FGT_REPORT=()
+  [ -f "$pf" ] || return 0
+  case "$(json_get "$pf" "gateway.transport")" in tailscale|funnel) ;; *) return 0 ;; esac
+  $TS_STATE_KNOWN || return 0
+
+  local kind gwreach url lport verb e
+  kind=$(json_get "$pf" "gateway.kind")
+  gwreach=$(json_get "$pf" "gateway.reach")
+
+  url=$(json_get "$pf" "gateway.url")
+  lport=$(json_get "$pf" "gateway.localPort")
+  # Legacy schema-1 profiles omit localPort, and only these two kinds have a
+  # canonical config to recover it from. A custom gateway has none, so it stays
+  # empty and the route is reported rather than closed.
+  if [ -z "$lport" ]; then
+    case "$kind" in
+      openclaw) lport=$(openclaw_local_port 2>/dev/null) ;;
+      hermes)   lport=$(hermes_api_server_port 2>/dev/null) ;;
+    esac
+  fi
+  verb="serve"; [ "$gwreach" = "public" ] && verb="funnel"
+  manage_forget_grade_route "$id" "$url" "$lport" "$verb" "the gateway address" "your gateway" "$claimed"
+
+  local fsurl fslport fsreach
+  fsurl=$(json_get "$pf" "fileServer.url")
+  [ -n "$fsurl" ] || return 0
+  # The gateway lane's own accepted port joins `claimed`, so one port can never be
+  # listed — or closed — twice even if both lanes somehow name it.
+  for e in ${FGT_CLOSE[@]+"${FGT_CLOSE[@]}"}; do claimed="$claimed ${e%%$'\t'*} "; done
+  fslport=$(json_get "$pf" "fileServer.localPort")
+  # This id's OWN unit, never a legacy unnamed one: a unit that belongs to no id
+  # cannot supply a port on this id's behalf.
+  if [ -z "$fslport" ] && [ -n "$unit" ] && [ -f "$unit" ]; then
+    fslport=$(fs_unit_port "$unit" 2>/dev/null || true)
+  fi
+  fsreach=$(show_qr_resolve_file_reach "$(json_get "$pf" "fileServer.reach")" "$gwreach")
+  verb="serve"; [ "$fsreach" = "public" ] && verb="funnel"
+  manage_forget_grade_route "$id" "$fsurl" "$fslport" "$verb" "the file address" "your shared folder" "$claimed"
+}
+
 # Remove ONE saved setup and everything this script created for it.
 #
-# rc 0 = removed · 1 = refused or nothing to remove · 3 = the operator backed out.
+# rc 0 = removed, and nothing of it is left · 1 = refused, nothing to remove, or
+# some of it is STILL HERE · 3 = the operator backed out.
+#
+# "Still here" covers a file that would not delete and an address this command tried
+# to close and could not prove closed, deliberately under one number: a caller cannot
+# act differently on the two, and the one number that must never be returned for
+# either is 0. README states the same contract in the operator's words — "0 when
+# everything is gone, 1 when some of it is still there" — and it is the code that
+# answers to that sentence, not the other way round.
 #
 # The order of operations is the safety property. The full disclosure — what goes,
 # what stays, and the exact commands — is printed BEFORE the confirmation, so the
@@ -18572,11 +18868,25 @@ manage_forget() { # manage_forget <id>
       [ -f "$f" ] && { pending_seen=true; break; }
     done
   fi
+  # The SECOND source, and on a machine where setup succeeded the only one left: the
+  # saved profile's own address. See manage_forget_profile_routes' header for why the
+  # records are usually gone by now and why a claim in a profile is graded rather
+  # than believed.
+  local profile_ts=false gwurl="" fsurl=""
+  if [ -f "$pf" ]; then
+    case "$(json_get "$pf" "gateway.transport")" in
+      tailscale|funnel) profile_ts=true; gwurl=$(json_get "$pf" "gateway.url"); fsurl=$(json_get "$pf" "fileServer.url") ;;
+    esac
+  fi
   # Only asked when there is something to ask about. A gateway behind Cloudflare or
-  # a reverse proxy of the operator's own has no record here at all, and telling
-  # them Tailscale could not be read would send them to check a program that has
-  # nothing to do with their setup.
-  if $pending_seen; then
+  # a reverse proxy of the operator's own has no record here AND no Tailscale address
+  # in its profile, and telling them Tailscale could not be read would send them to
+  # check a program that has nothing to do with their setup.
+  # The count of PROFILE-derived entries, not the index they start at: live[] is
+  # only ever appended to, so a count of 0 can never be mistaken for "index 0", which
+  # is what a boundary variable left at its default silently becomes.
+  local prof_count=0 fgt_disclosed="" e bport port rest averb
+  if $pending_seen || $profile_ts; then
     if ! have tailscale; then
       ts_reason="the 'tailscale' command is not on this shell's PATH"
     else
@@ -18584,17 +18894,45 @@ manage_forget() { # manage_forget <id>
       if ! $TS_STATE_KNOWN; then
         ts_reason="'tailscale serve status --json' could not be read"
       else
-        for f in "$STATE_DIR"/exposure-*.pending; do
-          [ -f "$f" ] || continue
-          read_exposure_record "$f" || { unreadable+=("$f"); continue; }
-          if [ "$REC_GWID" = "unknown" ]; then unattributed=$((unattributed+1)); continue; fi
-          [ "$REC_GWID" = "$id" ] || continue
-          exposure_record_is_live || continue
-          live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
-          files+=("$f")
-          backends+=("${REC_APROXY#http://127.0.0.1:}")
-          [ "$REC_ROLE" = "file" ] && roles+=("your shared folder") || roles+=("your gateway")
-        done
+        if $pending_seen; then
+          for f in "$STATE_DIR"/exposure-*.pending; do
+            [ -f "$f" ] || continue
+            read_exposure_record "$f" || { unreadable+=("$f"); continue; }
+            if [ "$REC_GWID" = "unknown" ]; then unattributed=$((unattributed+1)); continue; fi
+            [ "$REC_GWID" = "$id" ] || continue
+            exposure_record_is_live || continue
+            live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
+            files+=("$f")
+            backends+=("${REC_APROXY#http://127.0.0.1:}")
+            [ "$REC_ROLE" = "file" ] && roles+=("your shared folder") || roles+=("your gateway")
+          done
+        fi
+        # Record-derived entries first, profile-derived ones APPENDED AFTER — a
+        # load-bearing invariant, not a style choice. It is what keeps
+        # manage_forget_apply's `[ "$i" -lt ${#files[@]} ]` guard correct without
+        # touching it (every index at or past ${#files[@]} is profile-derived and has
+        # no backing file to delete), it is what tells this screen which lines get the
+        # marker, and it is what tells the apply side which get the restore hint.
+        #
+        # The record loop must run BEFORE the grader: the grader reads records of its
+        # own and clobbers the REC_* globals.
+        if $profile_ts; then
+          local claimed=""
+          for e in ${live[@]+"${live[@]}"}; do claimed="$claimed ${e%%$'\t'*} "; done
+          manage_forget_profile_routes "$id" "$pf" "$unit" "$claimed"
+          for e in ${FGT_CLOSE[@]+"${FGT_CLOSE[@]}"}; do
+            port="${e%%$'\t'*}"; rest="${e#*$'\t'}"
+            averb="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+            bport="${rest%%$'\t'*}"
+            # `prior` is EMPTY, and it is the only defensible value: the snapshot that
+            # held the real prior state was the record on_exit pruned. undo_exposure_entry
+            # then CLEARS the port rather than inventing a mapping to put back.
+            live+=("$port"$'\t'"$averb"$'\tEMPTY')
+            backends+=("$bport"); roles+=("${rest#*$'\t'}")
+            fgt_disclosed="${fgt_disclosed:+$fgt_disclosed }$port"
+            prof_count=$((prof_count+1))
+          done
+        fi
       fi
     fi
   fi
@@ -18621,7 +18959,7 @@ manage_forget() { # manage_forget <id>
     warn "That service file holds a SECOND cleartext copy of the file-server password."
     warn "Removing the .cred alone would leave it on disk; both go together here."
   fi
-  local i entry port rest averb
+  local i entry
   for (( i=0; i<${#live[@]}; i++ )); do
     entry="${live[$i]}"
     port="${entry%%$'\t'*}"; rest="${entry#*$'\t'}"; averb="${rest%%$'\t'*}"
@@ -18630,7 +18968,19 @@ manage_forget() { # manage_forget <id>
     else
       say "    a private address      port $port → 127.0.0.1:${backends[$i]} (${roles[$i]}), Tailscale Serve"
     fi
+    # The one thing that separates a route this script RECORDED opening from one it
+    # merely recognises at the saved address. The operator does not know what an
+    # exposure record is — but this distinction changes a decision, because a route
+    # they made by hand to this same address is indistinguishable from ours and would
+    # be closed too. They can only recognise it if told which line came from where.
+    [ "$i" -ge $(( ${#live[@]} - prof_count )) ] && say "                           ${DIM}matched from this setup's saved address${RESET}"
   done
+  if [ "$prof_count" -gt 0 ]; then
+    note "The address(es) marked \"matched from this setup's saved address\" were found by asking"
+    note "Tailscale what this machine serves right now: this setup's own address, forwarding to"
+    note "its own local port. A route you opened by hand to that same address is indistinguishable"
+    note "from one this script opened, and would be closed too — stop now if one of them is yours."
+  fi
 
   say ""
   say "  ${BOLD}This does NOT touch:${RESET}"
@@ -18674,11 +19024,50 @@ manage_forget() { # manage_forget <id>
     printf '    %stailscale serve --https=<port> off%s\n' "$BOLD" "$RESET"
     note "I did not run those."
   fi
-  if [ -n "$ts_reason" ]; then
+  # A THIRD, distinct claim — not an unattributed record and not an unreadable one:
+  # something live sits on this setup's own saved address, and this command could not
+  # prove it is this setup's. Reported by exact reason, and left alone.
+  if [ ${#FGT_REPORT[@]} -gt 0 ]; then
     say ""
-    warn "This machine has recorded Tailscale exposures, and $ts_reason,"
-    warn "so I cannot tell whether any of them belongs to this setup. Every one of them is"
-    warn "left exactly as it is. Check 'tailscale serve status' and 'tailscale funnel status'."
+    warn "One thing I could not decide, and did not act on: the route in front of this setup's"
+    warn "saved Tailscale address. I close a route only when I can prove it is this setup's, and"
+    warn "here I cannot:"
+    local rep rlabel raddr rreason
+    for rep in "${FGT_REPORT[@]}"; do
+      rlabel="${rep%%$'\t'*}"; rest="${rep#*$'\t'}"
+      raddr="${rest%%$'\t'*}"; rreason="${rest#*$'\t'}"
+      printf '    %-23s%s\n' "$rlabel" "$raddr"
+      printf '    %-23s%s\n' "" "$rreason"
+    done
+    warn "It is left exactly as it is. What Tailscale is serving is the authority here, not a"
+    warn "saved address — read it with:"
+    printf '    %stailscale serve status%s\n' "$BOLD" "$RESET"
+    printf '    %stailscale funnel status%s\n' "$BOLD" "$RESET"
+    say "  Anything there you no longer want, closed by hand, per HTTPS port:"
+    printf '    %stailscale funnel --https=<port> off%s   # remove a PUBLIC exposure\n' "$BOLD" "$RESET"
+    printf '    %stailscale serve --https=<port> off%s\n' "$BOLD" "$RESET"
+    note "I did not run those."
+  fi
+  if [ -n "$ts_reason" ]; then
+    # Two reasons this can fire and they are not the same sentence. Records on disk
+    # and a Tailscale address in the profile are independent facts; both may be true,
+    # and claiming "this machine has recorded Tailscale exposures" when only the
+    # profile fired would be false.
+    if $pending_seen; then
+      say ""
+      warn "This machine has recorded Tailscale exposures, and $ts_reason,"
+      warn "so I cannot tell whether any of them belongs to this setup. Every one of them is"
+      warn "left exactly as it is. Check 'tailscale serve status' and 'tailscale funnel status'."
+    fi
+    if $profile_ts; then
+      say ""
+      warn "This setup's saved address is a Tailscale one, and $ts_reason,"
+      warn "so I cannot tell whether the route in front of it is still open — or still PUBLIC. It is"
+      warn "left exactly as it is:"
+      printf '    %-23s%s\n' "the gateway address" "$(manage_safe_url "$gwurl" 200)"
+      [ -n "$fsurl" ] && printf '    %-23s%s\n' "the file address" "$(manage_safe_url "$fsurl" 200)"
+      warn "Check 'tailscale serve status' and 'tailscale funnel status'."
+    fi
   fi
 
   # --reuse-only means "change nothing", and this whole command is a change.
@@ -18749,7 +19138,12 @@ manage_forget() { # manage_forget <id>
   # belonged to this gateway during the disclosure may belong to another one by the
   # time the operator answers — so the mapping to be closed is re-read and
   # re-attributed on the far side of the pause, immediately before it is touched.
-  manage_forget_apply "$id" "$pf" "$credf" "$envf" "$unit" "${files[@]+"${files[@]}"}"
+  # `fgt_disclosed` is an intersection FILTER, never a source: the far side rebuilds
+  # every profile-derived candidate from the profile and re-grades it against a fresh
+  # read, then keeps only the ports this screen actually showed. So nothing can be
+  # closed that was not disclosed, and nothing disclosed is closed on the strength of
+  # the disclosure.
+  manage_forget_apply "$id" "$pf" "$credf" "$envf" "$unit" "$fgt_disclosed" "${files[@]+"${files[@]}"}"
 }
 
 # The removal itself, after consent. Split out so the disclosure above reads as one
@@ -18767,28 +19161,64 @@ manage_forget() { # manage_forget <id>
 # so nothing is reported as removed until the state is RE-READ — the service from
 # fs_unit_state, the files from a fresh stat, the exposure from a fresh
 # `tailscale serve status`. An exit code is never the evidence.
-manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> [exposure-record-file…]
-  local id="$1" pf="$2" credf="$3" envf="$4" unit="$5"; shift 5
-  local live=() files=() f
+manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> <disclosed-profile-ports> [exposure-record-file…]
+  # `disclosed` sits BEFORE the varargs so "every trailing argument is a record file"
+  # stays true.
+  local id="$1" pf="$2" credf="$3" envf="$4" unit="$5" disclosed="$6"; shift 6
+  local live=() files=() pbacks=() f
+  # A route this command tried to close and could not prove closed answers the same
+  # as a file it could not delete: rc 1. See the return at the bottom for why the two
+  # cannot differ.
+  local route_left=false
   # Re-read every candidate record from scratch, against a FRESHLY read Tailscale
   # status. The disclosure's list is a disclosure; THIS list is what gets acted on,
   # so it re-checks the version, the owning gateway id and the liveness as they are
   # right now. `exposure_record_is_live` compares against TS_PORTS, so a stale
   # ts_targets would reproduce the very window this re-read exists to close.
-  if [ $# -gt 0 ] && have tailscale; then
-    ts_targets
-    if $TS_STATE_KNOWN; then
-      for f in "$@"; do
-        [ -f "$f" ] || continue
-        read_exposure_record "$f" || continue
-        [ "$REC_GWID" = "$id" ] || continue
-        exposure_record_is_live || continue
-        live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
-        files+=("$f")
-      done
-    else
-      warn "Tailscale's live state could not be read just now, so no address in front of"
+  if [ $# -gt 0 ] || [ -n "$disclosed" ]; then
+    if ! have tailscale; then
+      warn "The 'tailscale' command is not on this shell's PATH now, so no address in front of"
       warn "this gateway is touched. Check 'tailscale serve status' afterwards."
+    else
+      ts_targets
+      if $TS_STATE_KNOWN; then
+        for f in "$@"; do
+          [ -f "$f" ] || continue
+          read_exposure_record "$f" || continue
+          [ "$REC_GWID" = "$id" ] || continue
+          exposure_record_is_live || continue
+          live+=("$REC_PORT"$'\t'"$REC_AVERB"$'\t'"$REC_PRIOR")
+          files+=("$f")
+        done
+        # Profile-derived routes get the same treatment and the same distrust: rebuilt
+        # from the profile, re-graded against the read above (the record loop ran first
+        # — the grader clobbers REC_*), then intersected with what the disclosure
+        # showed. A candidate that stopped being provable during the pause is dropped
+        # LOUDLY. Appended AFTER every record entry, which is what keeps the
+        # `[ "$i" -lt ${#files[@]} ]` guard in the proof loop correct unchanged.
+        if [ -n "$disclosed" ]; then
+          local claimed="" e port averb bport rest proved=" "
+          for e in ${live[@]+"${live[@]}"}; do claimed="$claimed ${e%%$'\t'*} "; done
+          manage_forget_profile_routes "$id" "$pf" "$unit" "$claimed"
+          for e in ${FGT_CLOSE[@]+"${FGT_CLOSE[@]}"}; do
+            port="${e%%$'\t'*}"; rest="${e#*$'\t'}"
+            averb="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+            bport="${rest%%$'\t'*}"
+            case " $disclosed " in *" $port "*) ;; *) continue ;; esac
+            live+=("$port"$'\t'"$averb"$'\tEMPTY')
+            pbacks+=("$bport")
+            proved="$proved$port "
+          done
+          for port in $disclosed; do
+            case "$proved" in *" $port "*) continue ;; esac
+            warn "Port $port no longer matches this setup's saved address as of right now, so I did"
+            warn "not close it. Check 'tailscale serve status' and 'tailscale funnel status'."
+          done
+        fi
+      else
+        warn "Tailscale's live state could not be read just now, so no address in front of"
+        warn "this gateway is touched. Check 'tailscale serve status' afterwards."
+      fi
     fi
   fi
 
@@ -18812,7 +19242,12 @@ manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> [e
       undo_exposure_entry "${live[$i]}"
     done
     ts_targets
-    local leftover=() entry port want t
+    # Where the profile-derived entries start, derived from how many there ARE
+    # rather than remembered from where they were appended: pbacks holds exactly one
+    # element per profile-derived entry, so an empty pbacks puts the boundary past
+    # the end of the list and no record-derived line can fall on the wrong side.
+    local prof_from=$(( ${#live[@]} - ${#pbacks[@]} ))
+    local leftover=() entry port rest averb want t lport
     for (( i=0; i<${#live[@]}; i++ )); do
       entry="${live[$i]}"; port="${entry%%$'\t'*}"
       want=$(undo_target_for_entry "$entry")
@@ -18826,9 +19261,25 @@ manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> [e
         else
           ok "Port $port is no longer exposed."
         fi
+        # The recovery path for the one case this source cannot decide: a route the
+        # operator opened by hand to this same address, which looks exactly like ours.
+        # print_undo_hints' rule applies — a re-publish command never rides inline
+        # inside a block being accepted wholesale, so it gets its own labelled line
+        # that says the word PUBLIC.
+        if [ "$i" -ge "$prof_from" ]; then
+          rest="${entry#*$'\t'}"; averb="${rest%%$'\t'*}"
+          lport="${pbacks[$((i-prof_from))]}"
+          if [ "$averb" = "funnel" ]; then
+            say "    ${DIM}That address was PUBLIC. Only if you want port $port public again:${RESET}"
+            printf '    %stailscale funnel --bg --https=%s http://127.0.0.1:%s%s\n' "$BOLD" "$port" "$lport" "$RESET"
+          else
+            printf '    %sIf that route was yours: tailscale serve --bg --https=%s http://127.0.0.1:%s%s\n' "$DIM" "$port" "$lport" "$RESET"
+          fi
+        fi
       fi
     done
     if [ ${#leftover[@]} -gt 0 ]; then
+      route_left=true
       warn "Could not confirm every address in front of this gateway was closed — often"
       warn "missing operator or root rights. To close them by hand:"
       print_undo_hints "${leftover[@]}"
@@ -18988,6 +19439,14 @@ manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> [e
   say "  Conduck app. It holds the address and the token, and nothing on this machine"
   say "  can reach it."
   note "Your configuration folder is $STATE_DIR — run --list to see what is left."
+  # An address this command tried to close and could not prove closed IS "some of it
+  # is still there", and a PUBLIC Funnel is the loudest possible example of it. The
+  # files went, so the screen says so and says the route did not — but a caller that
+  # keys on the status code cannot read the screen, and answering 0 there tells a
+  # script the removal is complete while a public route into the operator's agent is
+  # still up. The one failure this whole path exists to end is a live route outliving
+  # a removal that reported success; an exit code is part of that report.
+  $route_left && return 1
   return 0
 }
 
@@ -19092,6 +19551,8 @@ explain_manage_forget() {
   say "  the saved setup, its file server, its stored password, and its environment"
   say "  file. Each one is re-read afterwards, and anything still there is reported"
   say "  as still there, with the command to finish it by hand."
+  say "  When Tailscale on this machine is serving the address this setup was paired"
+  say "  on, that mapping is closed too — cleared, not put back to anything else."
   say ""
   say "  ${BOLD}Why you type the id instead of pressing y${RESET}"
   say "  Enter means No at every other question here, so pressing it in rhythm is"
@@ -19650,10 +20111,12 @@ dispatch_menu_command() {
       # mints no credential, and refusing to clean up a machine because it lacks the
       # tools for setting one up is exactly the dead end this command exists to end.
       need python3 || die "--forget reads the saved setup with python3 to know what to stop, and this host doesn't have it."
-      # The status comes straight back out: 0 removed, 1 refused or no such setup,
-      # 3 the operator backed out. Those are already this tool's contract for
-      # success / runtime failure / stopped by the operator, which is why the manage
-      # ABI was written to those three numbers rather than to its own.
+      # The status comes straight back out: 0 removed and nothing of it left, 1
+      # refused / no such setup / some of it still here — a file that would not
+      # delete, or an address that would not close — 3 the operator backed out. Those
+      # are already this tool's contract for success / runtime failure / stopped by
+      # the operator, which is why the manage ABI was written to those three numbers
+      # rather than to its own.
       manage_forget "$MANAGE_ID" || rc=$?
       offer_menu_return
       exit "$rc"
