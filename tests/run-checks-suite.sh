@@ -53,7 +53,7 @@ ALL_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MIS
 BASIC_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC HISTORY_IMAGE MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
 # The complete green file-lane inventory on a fully-conformant --files run — the
 # ids appended to the core inventory when a pass case carries --files.
-FILE_IDS="FILES_CONFIG FILES_WRITE_THROUGH FILES_AUTH_READ_MISSING FILES_AUTH_READ_WRONG FILES_AUTH_WRITE_MISSING FILES_AUTH_WRITE_WRONG FILES_READ_FRESH FILES_PROBE_COMPAT FILES_NESTED FILE_COPY_BYTES FILE_REPLY_REFERENCE FILE_E2E FILES_DELETE"
+FILE_IDS="FILES_CONFIG FILES_WRITE_THROUGH FILES_AUTH_READ_MISSING FILES_AUTH_READ_WRONG FILES_AUTH_WRITE_MISSING FILES_AUTH_WRITE_WRONG FILES_READ_FRESH FILES_PROBE_COMPAT FILES_NESTED FILES_LISTING FILE_COPY_BYTES FILE_E2E FILES_DELETE"
 
 # The frozen schema=3 grammar — field order fixed; any change must bump schema=
 # (and this regex, and the freeze doc). The three file meters are NOT_REQUESTED
@@ -239,10 +239,13 @@ stop_webdav() {
   WEBDAV_PID=""
 }
 
-# check-artifact leftovers in a served dir (conduck-check-* / output-*), one
-# per line — the post-check for the cleanup-focused file cases.
+# check-artifact leftovers in a served dir (conduck-check-* / out-* / output-*),
+# one per line — the post-check for the cleanup-focused file cases.
+# Recursive on purpose, and matching every component form the check can mint:
+# the agent's own output now sits two segments down, inside a folder whose inner
+# segment is named "out-<nonce>" and matches neither of the other two patterns.
 check_artifacts() { # check_artifacts <served-dir>
-  find "$1" -mindepth 1 \( -name 'conduck-check-*' -o -name 'output-*' \) 2>/dev/null
+  find "$1" -mindepth 1 \( -name 'conduck-check-*' -o -name 'out-*' -o -name 'output-*' \) 2>/dev/null
 }
 
 # Lift named top-level functions out of the release artifact so a case can unit-
@@ -606,19 +609,28 @@ grade_adapter() { # grade_adapter <name> <rc> <expexit> <expfails> <args> <frags
 #             url-only    = only CONDUCK_FILES_URL set (partial → FILES_CONFIG)
 #             home-dir    = DIR=$HOME (refused) ; none = no overrides (no profile)
 #   post: - | dir-empty (served dir must hold zero check artifacts) | no-leak
+#         | stray-kept (the check's OWN artifacts are gone, and the stray file a
+#           misbehaving agent wrote outside them is still there — the "exact
+#           registered names only, never a glob" rule, stated as an assertion)
 FILE_CASES='
 files-good|files-good|good|full|--files|0|-|profile=basic core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
 files-not-requested|good|-|none|--deep|0|-|core=PASS file_transport=NOT_REQUESTED file_access=NOT_REQUESTED file_e2e=NOT_REQUESTED exit=0|-
 files-stale-cache|files-good|stale-listing|full|--files|1|FILES_READ_FRESH,FILE_E2E|core=PASS file_transport=FAIL file_access=PASS file_e2e=FAIL exit=1|-
-files-read-only|files-good|read-only|full|--files|1|FILES_WRITE_THROUGH|core=PASS file_transport=FAIL file_access=PASS file_e2e=PASS exit=1|-
+files-read-only|files-good|read-only|full|--files|1|FILES_NESTED,FILES_WRITE_THROUGH|core=PASS file_transport=FAIL file_access=PASS file_e2e=PASS exit=1|-
 files-open|files-good|open|full|--files|1|FILES_AUTH_READ_MISSING,FILES_AUTH_READ_WRONG,FILES_AUTH_WRITE_MISSING,FILES_AUTH_WRITE_WRONG|core=PASS file_transport=FAIL file_access=PASS file_e2e=PASS exit=1|-
 files-no-range|files-good|no-range|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|-
 files-no-delete|files-good|no-delete|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
-files-no-mkcol|files-good|no-mkcol|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|-
+files-no-mkcol|files-good|no-mkcol|full|--files|1|FILES_NESTED|core=PASS file_transport=FAIL file_access=PASS file_e2e=PASS exit=1|-
+files-mkcol-auto-parents|files-good|mkcol-refused-auto-parents|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
+files-no-propfind|files-good|no-propfind|full|--files|1|FILES_LISTING,FILE_COPY_BYTES|core=PASS file_transport=FAIL file_access=ERROR file_e2e=NOT_RUN exit=1|dir-empty
+files-propfind-catch-all|files-good|propfind-catch-all|full|--files|1|FILES_LISTING,FILE_COPY_BYTES|core=PASS file_transport=FAIL file_access=ERROR file_e2e=NOT_RUN exit=1|dir-empty
+files-propfind-catch-all-nested|files-good|propfind-catch-all-nested|full|--files|1|FILES_LISTING,FILE_COPY_BYTES|core=PASS file_transport=FAIL file_access=ERROR file_e2e=NOT_RUN exit=1|dir-empty
+files-propfind-hidden|files-good|propfind-hides-contents|full|--files|1|FILES_LISTING,FILE_E2E|core=PASS file_transport=FAIL file_access=PASS file_e2e=FAIL exit=1|-
+files-listing-foreign-href|files-good|listing-foreign-href|full|--files|1|FILES_LISTING,FILE_E2E|core=PASS file_transport=FAIL file_access=PASS file_e2e=FAIL exit=1|-
 files-agent-no-write|files-no-write|good|full|--files|1|FILE_COPY_BYTES|core=PASS file_transport=PASS file_access=FAIL file_e2e=NOT_RUN exit=1|-
 files-agent-late-write|files-late-write|good|full|--files|1|FILE_COPY_BYTES|core=PASS file_transport=PASS file_access=FAIL file_e2e=NOT_RUN exit=1|dir-empty
 files-agent-wrong-bytes|files-wrong-bytes|good|full|--files|1|FILE_COPY_BYTES|core=PASS file_transport=PASS file_access=FAIL file_e2e=NOT_RUN exit=1|-
-files-agent-no-reference|files-no-reference|good|full|--files|1|FILE_REPLY_REFERENCE|core=PASS file_transport=PASS file_access=FAIL file_e2e=PASS exit=1|-
+files-agent-writes-to-root|files-writes-to-root|good|full|--files|1|FILE_COPY_BYTES|core=PASS file_transport=PASS file_access=FAIL file_e2e=NOT_RUN exit=1|stray-kept
 files-env-partial|files-good|-|url-only|--files|1|FILES_CONFIG|core=PASS file_transport=ERROR file_access=NOT_RUN file_e2e=NOT_RUN exit=1|-
 files-no-config|files-good|-|none|--files|1|FILES_CONFIG|core=PASS file_transport=ERROR file_access=NOT_RUN file_e2e=NOT_RUN exit=1|-
 files-unsafe-root|files-good|-|home-dir|--files|1|FILES_CONFIG|core=PASS file_transport=ERROR file_access=NOT_RUN file_e2e=NOT_RUN exit=1|-
@@ -673,6 +685,20 @@ run_file_case() { # run_file_case <table-row>
       if [ -n "$left" ]; then
         fail_case "$name" "served dir still holds check artifacts: $(echo $left)"; return
       fi ;;
+    stray-kept)
+      # The check registers every name it may create and removes those exact
+      # names. A file a MISBEHAVING agent wrote outside that registry is not
+      # the check's to delete — the operator was told so up front — and a
+      # cleanup that swept it would be a glob wearing a registry's clothes.
+      local own stray
+      own=$(find "$SERVED" -mindepth 1 -name 'conduck-check-*' 2>/dev/null)
+      if [ -n "$own" ]; then
+        fail_case "$name" "the check's own artifacts survived: $(echo $own)"; return
+      fi
+      stray=$(find "$SERVED" -mindepth 1 -name 'output-*' 2>/dev/null)
+      if [ -z "$stray" ]; then
+        fail_case "$name" "the stray file written outside the registry was removed anyway"; return
+      fi ;;
     no-leak)
       if grep -qF "$CRED" "$TMP/doctor.out"; then
         fail_case "$name" "adapter-check output leaked the WebDAV credential"; return
@@ -684,6 +710,42 @@ run_file_case() { # run_file_case <table-row>
       fi
       if grep -qF "$nonce" "$TMP/doctor.out"; then
         fail_case "$name" "adapter-check output leaked the sentinel content nonce"; return
+      fi ;;
+  esac
+
+  # Per-name wording. The exact failed-id set says WHICH check fired; these say
+  # the check named the right cause. Three of these rows exist only because the
+  # id set alone was satisfied by the wrong reasoning, so the reason is asserted
+  # rather than assumed.
+  case "$name" in
+    files-mkcol-auto-parents)
+      # The verdict is the nested PUT + byte-echoing GET, exactly as the app
+      # decides folder capability; MKCOL is a tiebreaker for a REFUSED write. A
+      # green that stayed silent about the 405 would hide the whole finding.
+      if ! grep -qF 'MKCOL answered HTTP 405' "$TMP/doctor.out"; then
+        fail_case "$name" "the green nested verdict never says MKCOL was refused"; return
+      fi
+      if ! grep -qF 'creates the missing parent itself' "$TMP/doctor.out"; then
+        fail_case "$name" "the green nested verdict does not name auto-created parents"; return
+      fi ;;
+    files-propfind-catch-all-nested)
+      # This lane 404s a missing root-level name and 207s a missing one inside a
+      # folder. The control has to land in the folder, or it grades a route the
+      # app never takes.
+      if ! grep -qF 'for a folder that cannot exist' "$TMP/doctor.out"; then
+        fail_case "$name" "the control never caught the in-subfolder catch-all"; return
+      fi
+      if ! grep -qF 'never proved it can report a folder ABSENT' "$TMP/doctor.out"; then
+        fail_case "$name" "a disqualified control still let the agent tier run"; return
+      fi ;;
+    files-listing-foreign-href)
+      # The one that must name the app's own refusal, because the failure is
+      # nothing the operator can see in a 207 that looks perfectly ordinary.
+      if ! grep -qF 'entryOutsideCollection' "$TMP/doctor.out"; then
+        fail_case "$name" "the listing refusal does not name its reason"; return
+      fi
+      if ! grep -qF 'Conduck refuses to read' "$TMP/doctor.out"; then
+        fail_case "$name" "the red never says the app refuses this listing"; return
       fi ;;
   esac
 
@@ -9182,6 +9244,50 @@ EOF
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" signal-cleanup "*) true ;; *) false ;; esac; then
   run_signal_cleanup
+fi
+
+# The golden wire text, pinned in the SHIPPED artifact.
+#
+# What this can and cannot do, said plainly: the app lives in another repository,
+# so nothing here can compare these strings against ConverseRequest.swift — that
+# comparison is a human reading two files, and the doctor's own comment says so.
+# What a test CAN hold is the two failures that have actually happened: a retired
+# directive surviving somewhere in the artifact, and the two independent copies of
+# the frozen line drifting apart. Both are cheap to state and neither can pass by
+# accident.
+run_golden_wire_case() {
+  local name="golden-wire-text-is-frozen"
+  local frozen="[Conduck file transfer] Files you produce for this reply go in: "
+  local refhdr="The following file(s) are in your working directory — use them for this request:"
+  local n
+  # 1 — the retired reply-prose directive is gone everywhere. It told the agent
+  #     to write at the working-directory ROOT and to name the file in plain
+  #     reply text; both are rules the app no longer has, and an agent obeying
+  #     either one delivers nothing.
+  if grep -qF 'To return a file, write it to the root' "$SCRIPT"; then
+    fail_case "$name" "the retired root-and-name-it directive is still in the artifact"; return
+  fi
+  if grep -qF 'Each input lives under its conversation folder' "$SCRIPT"; then
+    fail_case "$name" "the retired per-conversation-folder claim is still in the artifact"; return
+  fi
+  # 2 — every copy of the outbox line is the SAME line. Two independent copies
+  #     ship (the doctor's sentinel and the wizard's readiness probe), and a
+  #     third would be just as welcome — what must never happen is two spellings.
+  n=$(grep -cF "$frozen" "$SCRIPT")
+  if [ "$n" -lt 2 ]; then
+    fail_case "$name" "the frozen outbox line appears $n time(s); both the doctor and the readiness probe must carry it"; return
+  fi
+  # 3 — the doctor's input-reference header is the app's, colon and all. It is
+  #     the half of the golden block that carried the falsehood.
+  if ! grep -qF "$refhdr" "$SCRIPT"; then
+    fail_case "$name" "the doctor's input-reference header is not the app's"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" golden-wire-text-is-frozen "*) true ;; *) false ;; esac; then
+  run_golden_wire_case
 fi
 
 while IFS= read -r row; do

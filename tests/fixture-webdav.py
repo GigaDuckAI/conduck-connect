@@ -2,10 +2,10 @@
 """fixture-webdav.py — a minimal WebDAV-ish file server for the doctor's
 regression suite (run-checks-suite.sh --files cases). stdlib only, loopback
 only. NOT a production server: it serves ONE directory over the exact HTTP
-verbs the doctor's file lane uses (GET incl. Range: bytes=0-0, PUT, DELETE,
-MKCOL) with HTTP Basic auth, and every `--mode` deliberately sabotages one
-behavior so the matching file check can be proven to fail (or degrade) for its
-intended reason.
+verbs the file lanes use (GET incl. Range: bytes=0-0, PUT, DELETE, MKCOL, and
+PROPFIND at Depth 0 and 1) with HTTP Basic auth, and every `--mode` deliberately
+sabotages one behavior so the matching file check can be proven to fail (or
+degrade) for its intended reason.
 
 Usage:
     WEBDAV_PASS=<pass> python3 fixture-webdav.py --dir <served> \
@@ -40,6 +40,46 @@ Modes ("good" behavior unless listed):
                     to unrelated-victim.txt, then answers 204
     delete-dir-lies DELETE removes files normally but answers 204 without
                     removing directories
+    propfind-hides-contents
+                   PROPFIND answers 207 for a directory that exists but lists
+                   only the collection itself, never its children — the shape a
+                   file server takes when the agent created that folder and the
+                   server cannot read into it (another user, `0700`) or indexes
+                   only its own writes. Every other verb, GET included, behaves
+                   normally, which is the point: the file is fetchable by exact
+                   name and still undeliverable, because the app finds returned
+                   files by listing the folder rather than by guessing names.
+    no-propfind    PROPFIND answers 405 — the shape of ngx_http_dav_module and
+                   stock Caddy file_server. Every other verb is correct, so this
+                   isolates the one verb the delivery path is built on.
+    propfind-catch-all
+                   PROPFIND answers 207 for EVERY path, including collections
+                   that do not exist. A lane that cannot say no can neither
+                   prove a reply's folder fresh beforehand nor be believed when
+                   it lists one afterwards, so its listings are disqualified
+                   rather than trusted.
+    propfind-catch-all-nested
+                   The same catch-all, but ONLY inside a subfolder: a missing
+                   collection at the served root answers a clean 404, a missing
+                   collection one or more segments down answers 207. Servers
+                   route on both the method and the path prefix, and the app
+                   mints its negative control as a sibling of the reply's box —
+                   one segment down — for exactly this reason. A control that
+                   lands at the root passes here and the real listing is
+                   disqualified on every turn.
+    mkcol-refused-auto-parents
+                   MKCOL answers 405, and PUT creates the missing parent
+                   collections itself. A real shape (several WebDAV bridges do
+                   it), and one the app serves perfectly: it treats the nested
+                   PUT plus a byte-echoing GET as the folder verdict and reads
+                   MKCOL only as a tiebreaker when that PUT is refused.
+    listing-foreign-href
+                   PROPFIND 207s carry a correct collection row, and every CHILD
+                   href is an absolute URL on ANOTHER origin. The app resolves
+                   each href against the URL it requested and refuses the whole
+                   body unless every one is a direct child on the same origin,
+                   so this lane delivers nothing — while any matcher that reads
+                   basenames out of the document sees the file it wanted.
 """
 import argparse
 import base64
@@ -51,7 +91,7 @@ import stat
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 
 class LoopbackThreadingHTTPServer(ThreadingHTTPServer):
@@ -177,9 +217,16 @@ def make_handler(cfg):
                 return self._send(200, "directory")
             if not os.path.isfile(full) or not self._visible(full, rel):
                 return self._send(404, "Not Found")
-            if mode == "hang-output-get" and rel.startswith("output-"):
+            # Matched on the LAST component, not on the whole relative path: the
+            # sentinel these two modes exist to sabotage lives inside the folder
+            # the agent creates for it, so a path-anchored test silently stops
+            # sabotaging anything and the case passes for the wrong reason. The
+            # basename form is also right for an output at the served root.
+            if mode == "hang-output-get" \
+                    and os.path.basename(rel).startswith("output-"):
                 time.sleep(hang_seconds)
-            if mode == "first-output-404" and rel.startswith("output-") \
+            if mode == "first-output-404" \
+                    and os.path.basename(rel).startswith("output-") \
                     and rel not in first_output_misses:
                 first_output_misses.add(rel)
                 return self._send(404, "Not Found")
@@ -211,15 +258,55 @@ def make_handler(cfg):
         def do_PROPFIND(self):
             if not self._require_auth():
                 return
+            if mode == "no-propfind":
+                return self._send(405, "Method Not Allowed")
             rel = self._relpath()
             if rel is None:
                 return self._send(403, "Forbidden")
             full = os.path.join(served, rel)
-            if not os.path.exists(full):
+            # The catch-all answers 207 for a path it never had, which is the
+            # one shape that makes every other listing meaningless: a server
+            # that cannot say "not there" can say nothing believable about what
+            # IS there. It still emits only the self entry, because there is
+            # nothing on disk to enumerate.
+            #
+            # The -nested variant answers that way ONLY below the served root,
+            # so a control probing a root-level name still gets its clean 404.
+            catch_all = mode == "propfind-catch-all" or (
+                mode == "propfind-catch-all-nested" and "/" in rel)
+            if not os.path.exists(full) and not catch_all:
                 return self._send(404, "Not Found")
-            body = ('<?xml version="1.0" encoding="utf-8"?>'
-                    '<d:multistatus xmlns:d="DAV:"/>')
-            return self._send(207, body, extra=[("Content-Type", "application/xml")])
+            # A real Depth: 1 emits the collection ITSELF plus its children, and
+            # the self entry is why a bare 207 proves nothing: a folder whose
+            # contents the server cannot read answers with exactly that one
+            # entry, which is what propfind-hides-contents reproduces. Anything
+            # grading this response has to look for the entry it wants by name.
+            depth = self.headers.get("Depth", "1").strip()
+            hrefs = ["/" + quote(rel) + "/" if rel else "/"]
+            # The collection's own row stays honest under listing-foreign-href;
+            # only the children move. That is the sharper sabotage: the answer
+            # looks like a listing of the folder that was asked for, right up to
+            # the point where each entry names a resource on another server.
+            elsewhere = "http://conduck-listing-elsewhere.invalid" \
+                if mode == "listing-foreign-href" else ""
+            if os.path.isdir(full) and depth != "0" \
+                    and mode != "propfind-hides-contents":
+                for child in sorted(os.listdir(full)):
+                    child_rel = (rel + "/" + child) if rel else child
+                    if not self._visible(os.path.join(full, child), child_rel):
+                        continue
+                    hrefs.append(elsewhere + "/" + quote(child_rel)
+                                 + ("/" if os.path.isdir(os.path.join(full, child))
+                                    else ""))
+            body = ['<?xml version="1.0" encoding="utf-8"?>',
+                    '<d:multistatus xmlns:d="DAV:">']
+            for href in hrefs:
+                body.append("<d:response><d:href>%s</d:href>"
+                            "<d:propstat><d:status>HTTP/1.1 200 OK</d:status>"
+                            "</d:propstat></d:response>" % href)
+            body.append("</d:multistatus>")
+            return self._send(207, "".join(body),
+                              extra=[("Content-Type", "application/xml")])
 
         def do_PUT(self):
             if not self._require_auth():
@@ -234,7 +321,13 @@ def make_handler(cfg):
             full = os.path.join(served, rel)
             parent = os.path.dirname(full)
             if parent and not os.path.isdir(parent):
-                return self._send(409, "Conflict")   # missing collection
+                if mode == "mkcol-refused-auto-parents":
+                    try:
+                        os.makedirs(parent, exist_ok=True)
+                    except Exception:
+                        return self._send(500, "Write failed")
+                else:
+                    return self._send(409, "Conflict")   # missing collection
             existed = os.path.exists(full)
             try:
                 with open(full, "wb") as fh:
@@ -288,7 +381,7 @@ def make_handler(cfg):
                 return
             if mode in ("read-only",):
                 return self._send(403, "Read-only")
-            if mode == "no-mkcol":
+            if mode in ("no-mkcol", "mkcol-refused-auto-parents"):
                 return self._send(405, "Method Not Allowed")
             rel = self._relpath()
             if rel is None:

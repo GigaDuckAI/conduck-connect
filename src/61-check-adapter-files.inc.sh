@@ -6,19 +6,26 @@
 #           routes that actually carry user bytes, write-through fidelity,
 #           direct-write freshness (the rclone --dir-cache-time trap that hid
 #           agent-written files from the app), ranged-probe compatibility,
-#           nested folders (tri-state — the app has a flat fallback), DELETE.
+#           nested folders, PROPFIND listing with its negative control, DELETE.
 #   tier 2  file_access — one real chat turn: the SELECTED model must copy a
-#           sentinel byte-for-byte to the folder root and name it detectably.
-#           Graded with the app's REAL wire text (the input-reference block +
-#           [Conduck file transfer] instruction from ConverseRequest.swift,
-#           golden-locked) and the app's REAL detector rules (allowlist,
-#           inbound exclusion, 5-candidate cap).
+#           sentinel byte-for-byte into a two-segment folder that does not
+#           exist, having created both segments itself. Graded with the app's
+#           REAL wire text (the input-reference block + the [Conduck file
+#           transfer] outbox line from ConverseRequest.swift, golden-locked).
 #   tier 3  file_e2e — the combined delivery path, probed the way the app
-#           probes it: ONE immediate ranged GET when the reply lands (no
-#           retry, no grace), then a separate full download byte-compare.
+#           probes it: ONE immediate PROPFIND Depth: 1 of that folder when the
+#           reply lands (no retry, no grace), then a full download byte-compare.
 # A PASS proves: this host's lane + the selected model, through this adapter,
-# delivered one detectable output file. It does NOT prove public exposure,
-# remote-device reachability, other models, or folder confinement.
+# delivered one output file into the folder Conduck named. It does NOT prove
+# public exposure, remote-device reachability, other models, or confinement.
+#
+# WHY THE DOCTOR CREATES NO FOLDER. Conduck names a per-reply destination
+# `<conversation>/out-<nonce>` on the wire and creates neither segment; the
+# agent makes them and therefore owns them. A folder created over WebDAV
+# belongs to whoever the file server runs as, and an agent running as another
+# user is then refused inside it — so a SUCCESSFUL creation is worse than a
+# refused one. Every probe here runs in that direction: prove both segments
+# absent, name them once, and read back only what the agent put there.
 #
 # Safety: every artifact name carries a per-run nonce and the recognizable
 # conduck-check- prefix; targets are REGISTERED before creation and removed
@@ -33,6 +40,17 @@ DF_AGENT_RAN=false
 DF_WROTE=false     # true once a mutating operation could have created something. DF_ARTS
                    # proves only INTENT (registration precedes creation, by design), so
                    # anything that sends the operator looking keys off THIS flag.
+# The agent's destination, and the ONE key the late-write backstop watches. Both
+# are module-level because cleanup runs after doctor_files_agent has returned and
+# must reach the exact nested key rather than a name rebuilt from a prefix.
+DF_BOX_OUTER=""    # first segment  — "conduck-check-<run>-out"
+DF_BOX=""          # both segments  — "<outer>/out-<32hex>"
+DF_OKEY=""         # the sentinel's full relative key inside the box
+# Tier 1's negative control, consumed by tier 2. A lane that answers 207 for a
+# collection which cannot exist cannot witness the box's absence either, and
+# tier 2 has to say THAT rather than "the folder was already there" — the two
+# send an operator to completely different places.
+DF_ABSENCE_TRUSTED=false
 df_register() { DF_ARTS+=("$1"$'\t'"$2"$'\t'"$3"); }
 
 # The file lane's own curl: same egress isolation as the chat probes (`-q`
@@ -85,14 +103,31 @@ except Exception: pass' "$DF_DIR" 2>/dev/null)
 
 # doctor_files_disk_verify <relkey> <expected-content-file>
 # -> echoes OK | MISSING | MISMATCH | NOTREGULAR | TOOBIG | UNSAFE
+#
+# Every intermediate component is resolved SEPARATELY and required to be a real
+# directory whose own parent is the component before it. Containment of the final
+# realpath is not enough now that the deepest keys sit inside a folder an AGENT
+# created: a symlinked component still inside the served root would pass a single
+# containment test while pointing the verification at somebody else's file.
 doctor_files_disk_verify() {
   doctor_files_dir_ok || { printf 'UNSAFE'; return 0; }
   python3 - "$DF_DIR" "$1" "$2" <<'PY' 2>/dev/null || printf 'UNSAFE'
 import os, stat, sys
 root, rel, expf = sys.argv[1], sys.argv[2], sys.argv[3]
-p = os.path.join(root, rel)
+root = os.path.realpath(root)
+parts = rel.split("/")
+if not parts or any(p in ("", ".", "..") for p in parts):
+    print("UNSAFE"); sys.exit(0)
+here = root
+for seg in parts[:-1]:
+    nxt = os.path.realpath(os.path.join(here, seg))
+    if os.path.dirname(nxt) != here or not os.path.isdir(nxt):
+        print("MISSING" if not os.path.lexists(os.path.join(here, seg)) else "UNSAFE")
+        sys.exit(0)
+    here = nxt
+p = os.path.join(here, parts[-1])
 rp = os.path.realpath(p)
-if not (rp == root or rp.startswith(root + os.sep)):
+if os.path.dirname(rp) != here:
     print("UNSAFE"); sys.exit(0)
 try:
     st = os.lstat(p)
@@ -110,6 +145,39 @@ got = os.read(fd, 1048577)
 os.close(fd)
 print("OK" if got == exp else "MISMATCH")
 PY
+}
+
+# doctor_fs_lists_entry <collection-key> <entry-name>
+# -> echoes OK | MISSING | REFUSED:<reason> | <3-digit HTTP status, 000 on
+#    transport failure>
+#
+# The one question the app actually asks of a returned file: Conduck never
+# guesses a filename, it PROPFINDs the folder it named and offers what the
+# listing holds. Requiring the ENTRY rather than a bare 207 is what separates
+# "the folder is there" from "the folder can be read" — a Depth: 1 of a
+# non-root collection emits the collection ITSELF, so a server that cannot
+# read into a folder an agent created still answers 207 with one entry.
+#
+# The body is graded by `strict_listing_verdict`, the ONE mirror of the app's
+# `FileServerClient.parseListing` (defined with its full rule list in
+# 41-agent-file-readiness.inc.sh, and used by the wizard's sentinel too). Asking
+# a looser question here than the client asks is the specific way a check earns
+# an operator a green setup and a lane that never delivers, so the two ask the
+# same one from the same code.
+doctor_fs_lists_entry() {
+  local raw code body url verdict
+  url="$DF_URL/$1/"
+  raw=$(doctor_curl_fs real -X PROPFIND -H 'Depth: 1' -w '\n%{http_code}' "$url" 2>/dev/null) || raw=""
+  code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  case "$code" in [0-9][0-9][0-9]) ;; *) printf '000'; return 0 ;; esac
+  [ "$code" = "207" ] || { printf '%s' "$code"; return 0; }
+  verdict=$(printf '%s' "$body" | strict_listing_verdict "$url" "$2")
+  case "$verdict" in
+    PRESENT) printf 'OK' ;;
+    ABSENT)  printf 'MISSING' ;;
+    *)       printf '%s' "$verdict" ;;
+  esac
 }
 
 # Resolve ONE immutable file-lane context (URL + credential + folder) and pin
@@ -247,8 +315,24 @@ doctor_files_transport() {
   local ukey1="conduck-check-$DF_RUN-unauth-none.txt"
   local ukey2="conduck-check-$DF_RUN-unauth-wrong.txt"
   local nkey="conduck-check-$DF_RUN-dir"
-  local wt_nonce
+  local wt_nonce akey
   wt_nonce=$(python3 -c 'import secrets; print("conduck-check write-through " + secrets.token_hex(16))' 2>/dev/null)
+  # The negative control's target: a collection that cannot exist, INSIDE the
+  # nested folder this tier creates. Both halves of its shape are load-bearing.
+  # The app mints its control as a SIBLING of the reply's box — one segment down,
+  # inside a folder that is really there — and probes it at Depth: 1 with every
+  # listing, because servers route on both the method and the path prefix, so a
+  # control that lands at the root can take a different code path and answer a
+  # question nobody asked. A server that says no at the root and 207 inside a
+  # subfolder would otherwise pass every check here and then be disqualified on
+  # every real listing the app performs.
+  #
+  # Nothing ever creates this name and PROPFIND cannot, so it is deliberately NOT
+  # registered — the cleanup registry means "this run may have made this", and
+  # this name is the one thing the run promises it did not. Its parent IS
+  # registered, and a collection DELETE is recursive, so a server that invents it
+  # anyway is still swept.
+  akey=$(python3 -c 'import secrets, sys; print("%s/conduck-check-%s-absent-%s" % (sys.argv[1], sys.argv[2], secrets.token_hex(8)))' "$nkey" "$DF_RUN" 2>/dev/null)
   # ONE 0700 directory, three files inside it — not one mktemp file plus sibling
   # names built by string concatenation. mktemp publishes its random suffix the
   # moment it creates the file, and /tmp's sticky bit stops DELETION, not the
@@ -256,7 +340,7 @@ doctor_files_transport() {
   # redirect below into a write through their symlink, at this script's
   # privileges — and `-D` lets the file server choose the bytes written.
   tmpd=$(mktemp -d "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmpd=""
-  if [ -z "$wt_nonce" ] || [ -z "$tmpd" ]; then
+  if [ -z "$wt_nonce" ] || [ -z "$akey" ] || [ -z "$tmpd" ]; then
     d_bad FILES_CONFIG "could not stage transport probes (python3/mktemp failed)"
     DOCTOR_FILE_TRANSPORT="ERROR"; return 0
   fi
@@ -410,36 +494,115 @@ PY
     note "  [FILES_PROBE_COMPAT] skipped — need the write-through file to probe against."
   fi
 
-  # nested folders: capability, not a mandate — the app falls back to flat
-  # keys on a conclusive rejection. Only an indeterminate answer is trouble.
+  # nested folders: a REQUIREMENT, not a capability. Conduck names a per-reply
+  # destination two segments deep and creates neither, so a lane that cannot
+  # hold such a path cannot deliver — there is no flat fallback to degrade into.
+  #
+  # THE NESTED PUT PLUS A BYTE-ECHOING GET IS THE VERDICT; MKCOL is best-effort
+  # and only breaks the tie when that PUT is refused. That is the app's own rule
+  # (`FileServerClient.probeFolderCapability`: PUT 2xx + echo -> capable; a
+  # 403/405/409 PUT is a folder REJECTION only where the collection provably
+  # existed, and otherwise proves nothing). A WebDAV server that creates missing
+  # parents on PUT and refuses MKCOL carries this lane perfectly, so grading it
+  # on the MKCOL answer alone fails a lane that works.
   df_register T file "$nkey/n.txt"
   df_register T dir "$nkey"
-  code=$(doctor_fs_write real -X MKCOL "$DF_URL/$nkey/")
-  case "$code" in
-    201)
-      printf 'conduck-check nested probe\n' > "$tmp"
-      code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$nkey/n.txt")
-      body=$(doctor_curl_fs real "$DF_URL/$nkey/n.txt" 2>/dev/null) || body=""
-      # Three outcomes, three different repairs: the PUT inside the new folder
-      # being refused, the file reading back empty, and it reading back wrong.
-      # A single message carrying only the PUT's status prints "(HTTP 201)" next
-      # to a failure, which reads as if the 201 is the problem — so the status
-      # stays where it IS the finding, and the read-back failures name the read
-      # instead.
-      if [ "${code#2}" = "$code" ]; then
-        d_bad FILES_NESTED "MKCOL created the folder, but a PUT inside it answered HTTP $code"; tfail=$((tfail+1))
-      elif [ "$body" = "conduck-check nested probe" ]; then
-        d_ok FILES_NESTED "nested folders SUPPORTED (MKCOL + PUT + GET round-trip)"
-      elif [ -z "$body" ]; then
-        d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but reading the file back returned no bytes"; tfail=$((tfail+1))
+  local nested_ok=false mkcol_code mkcol_made=false
+  mkcol_code=$(doctor_fs_write real -X MKCOL "$DF_URL/$nkey/")
+  # Conclusive-created is 2xx ONLY. RFC 4918 reads 405 as "the collection is
+  # already there", and the app takes it that way because its probe collection
+  # has a FIXED name an earlier run may have made; this one carries a per-run
+  # nonce that nothing can have created, so here a 405 can only mean the method
+  # itself is refused.
+  case "$mkcol_code" in 2??) mkcol_made=true ;; esac
+  printf 'conduck-check nested probe\n' > "$tmp"
+  code=$(doctor_fs_write real -T "$tmp" "$DF_URL/$nkey/n.txt")
+  body=$(doctor_curl_fs real "$DF_URL/$nkey/n.txt" 2>/dev/null) || body=""
+  # Four outcomes, four different repairs: the nested write landing and reading
+  # back correctly, reading back empty, reading back wrong, and being refused.
+  # A single message carrying only the PUT's status prints "(HTTP 201)" next to
+  # a failure, which reads as if the 201 is the problem — so the status stays
+  # where it IS the finding, and the read-back failures name the read instead.
+  if [ "${code#2}" != "$code" ]; then
+    if [ "$body" = "conduck-check nested probe" ]; then
+      if $mkcol_made; then
+        d_ok FILES_NESTED "nested folders supported (MKCOL + PUT + GET round-trip)"
       else
-        d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but the file reads back with different content"; tfail=$((tfail+1))
-      fi ;;
-    403|405|409|501)
-      d_ok FILES_NESTED "nested folders REJECTED by the server (HTTP $code) — fine: the app falls back to flat keys" ;;
-    000) d_bad FILES_NESTED "no answer to MKCOL — transport trouble, not a capability verdict"; tfail=$((tfail+1)) ;;
-    *)   d_bad FILES_NESTED "MKCOL answered HTTP $code — neither support nor a clean rejection"; tfail=$((tfail+1)) ;;
+        d_ok FILES_NESTED "nested folders supported — MKCOL answered HTTP $mkcol_code, and the nested PUT + GET round-trip works anyway (this server creates the missing parent itself)"
+      fi
+      nested_ok=true
+    elif [ -z "$body" ]; then
+      d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but reading the file back returned no bytes"; tfail=$((tfail+1))
+    else
+      d_bad FILES_NESTED "the nested PUT succeeded (HTTP $code), but the file reads back with different content"; tfail=$((tfail+1))
+    fi
+  elif $mkcol_made; then
+    d_bad FILES_NESTED "MKCOL created the folder, but a PUT inside it answered HTTP $code"; tfail=$((tfail+1))
+  elif [ "$code" = "000" ] || [ "$mkcol_code" = "000" ]; then
+    d_bad FILES_NESTED "no answer to the nested probe (MKCOL HTTP $mkcol_code, PUT HTTP $code) — transport trouble, not a capability verdict"
+    tfail=$((tfail+1))
+  else
+    d_bad FILES_NESTED "this server refuses to create folders (MKCOL answered HTTP $mkcol_code) and refused the nested PUT as well (HTTP $code)"
+    d_say FILES_NESTED "(Conduck names <conversation>/out-<nonce> for every reply that may return a file and"
+    d_say FILES_NESTED " creates neither segment — the agent does. A lane that cannot hold a two-segment path"
+    d_say FILES_NESTED " has no delivery route at all; there is no flat fallback.)"
+    tfail=$((tfail+1))
+  fi
+
+  # listing + its negative control. Conduck finds a returned file by PROPFINDing
+  # the one folder it named, so this verb IS the delivery path, and nothing else
+  # in the check exercises it. The control is what makes a 207 mean anything: a
+  # catch-all server that answers 207 for a collection which cannot exist can
+  # neither prove the box fresh beforehand nor be believed when it lists it
+  # afterwards, so its listings are disqualified rather than trusted.
+  #
+  # The control is graded even when the nested folder could not be created: a
+  # path under a missing parent is missing too, so a lane that cannot hold a
+  # folder still gets its listings judged rather than excused. What the created
+  # folder adds is the half that matters — with it, the control proves the answer
+  # holds INSIDE a subfolder rather than only at the root.
+  local control_ok=false lout
+  code=$(doctor_fs_code real -X PROPFIND -H 'Depth: 1' "$DF_URL/$akey/")
+  case "$code" in
+    404) control_ok=true; DF_ABSENCE_TRUSTED=true ;;
+    207)
+      d_bad FILES_LISTING "PROPFIND answered 207 for a folder that cannot exist — this lane cannot say no"
+      d_say FILES_LISTING "(a catch-all answer makes every listing unfalsifiable: the app could neither prove a"
+      d_say FILES_LISTING " reply's folder fresh before the turn nor trust what it reads back after one)"
+      tfail=$((tfail+1)) ;;
+    405|501)
+      d_bad FILES_LISTING "this server does not support PROPFIND (HTTP $code) — the app lists the reply's folder to find output"
+      d_say FILES_LISTING "(rclone serve webdav answers it; ngx_http_dav_module and stock Caddy file_server do not)"
+      tfail=$((tfail+1)) ;;
+    000) d_bad FILES_LISTING "no answer to PROPFIND — transport trouble, not a capability verdict"; tfail=$((tfail+1)) ;;
+    *)   d_bad FILES_LISTING "PROPFIND on a folder that cannot exist answered HTTP $code (expected a definite 404)"; tfail=$((tfail+1)) ;;
   esac
+  if ! $control_ok; then
+    :
+  elif ! $nested_ok; then
+    # FILES_NESTED already carries this lane's red; a second one for the same
+    # missing folder would double-count the finding, and a GREEN here would
+    # claim a listing that was never performed.
+    note "  [FILES_LISTING] skipped — need a folder with a known file in it to list."
+  else
+    lout=$(doctor_fs_lists_entry "$nkey" "n.txt")
+    case "$lout" in
+      OK) d_ok FILES_LISTING "PROPFIND Depth: 1 lists a folder's contents in a body the app accepts, and a folder that cannot exist INSIDE that folder answers 404" ;;
+      MISSING)
+        d_bad FILES_LISTING "PROPFIND Depth: 1 answered 207 but did not list the file that folder holds"
+        d_say FILES_LISTING "(a folder the server cannot read into answers with only the collection itself —"
+        d_say FILES_LISTING " the app would see an empty reply folder and deliver nothing)"
+        tfail=$((tfail+1)) ;;
+      REFUSED:*)
+        d_bad FILES_LISTING "PROPFIND Depth: 1 answered 207 with a body Conduck refuses to read (${lout#REFUSED:})"
+        d_say FILES_LISTING "(the app parses a listing strictly and fails the WHOLE body rather than keeping the rows"
+        d_say FILES_LISTING " it understood — so this server's listings deliver nothing, however well a direct GET of"
+        d_say FILES_LISTING " a known name works. See the rule list on strict_listing_verdict.)"
+        tfail=$((tfail+1)) ;;
+      000) d_bad FILES_LISTING "no answer to PROPFIND Depth: 1 — transport trouble, not a capability verdict"; tfail=$((tfail+1)) ;;
+      *)   d_bad FILES_LISTING "PROPFIND Depth: 1 answered HTTP $lout (expected 207)"; tfail=$((tfail+1)) ;;
+    esac
+  fi
   rm -rf "$tmpd" 2>/dev/null
 
   if   [ "$terr" -gt 0 ];  then DOCTOR_FILE_TRANSPORT="ERROR"
@@ -453,22 +616,39 @@ PY
 # Sets DOCTOR_FILE_ACCESS + DOCTOR_FILE_E2E.
 doctor_files_agent() {
   if ! doctor_files_dir_ok; then
-    note "  [FILE_COPY_BYTES] [FILE_REPLY_REFERENCE] [FILE_E2E] skipped — the shared folder failed its identity check."
+    note "  [FILE_COPY_BYTES] [FILE_E2E] skipped — the shared folder failed its identity check."
     return 0
   fi
   if [ -z "${MODELS_FIRST_ID:-}" ]; then
     note "  [FILE_COPY_BYTES] skipped — /v1/models offered no usable model id (already failed above)."
     return 0
   fi
-  local ih okey ikey used_key content tmp code out
+  local ih boxtag oname okey ikey used_key content tmp code out dir
   ih=$(python3 -c 'import secrets; print(secrets.token_hex(4))' 2>/dev/null)
+  # 32 hex, matching the app's own per-dispatch nonce width. Nothing creates the
+  # box in advance, so there is no server-observed creation event left to lean
+  # on: randomness is the whole of what keeps one reply's folder apart from
+  # another's, and there is no reason to economise on the bits.
+  boxtag=$(python3 -c 'import secrets; print(secrets.token_hex(16))' 2>/dev/null)
   content=$(python3 -c 'import secrets; print(secrets.token_hex(32))' 2>/dev/null)
   tmp=$(mktemp "${TMPDIR:-/tmp}/conduck-check.XXXXXX" 2>/dev/null) || tmp=""
-  if [ -z "$ih" ] || [ -z "$content" ] || [ -z "$tmp" ]; then
+  if [ -z "$ih" ] || [ -z "$boxtag" ] || [ -z "$content" ] || [ -z "$tmp" ]; then
     d_bad FILE_COPY_BYTES "could not stage the sentinel (python3/mktemp failed)"
     DOCTOR_FILE_ACCESS="ERROR"; return 0
   fi
-  okey="output-$DF_RUN.txt"
+  # The destination is TWO segments and the doctor creates neither, exactly as
+  # the app names <conversation>/out-<nonce> and creates neither. Two rather
+  # than one because creating the parent is the part an agent write tool is
+  # likeliest to skip, and it is the app's real shape.
+  DF_BOX_OUTER="conduck-check-$DF_RUN-out"
+  DF_BOX="$DF_BOX_OUTER/out-$boxtag"
+  oname="output-$DF_RUN.txt"
+  okey="$DF_BOX/$oname"
+  DF_OKEY="$okey"
+  # The input folder is a SIBLING of the box's outer segment, never its parent:
+  # uploading inside it would create the very segment the run has to prove
+  # absent, and would hand the agent a ready-made parent — the pre-created case
+  # this check exists to stop measuring.
   ikey="conduck-check-$DF_RUN/${ih}__input-$DF_RUN.txt"
   printf '%s\n' "$content" > "$tmp"
 
@@ -525,10 +705,41 @@ PY
     note "  (input sentinel placed directly on disk — the WebDAV upload path failed ($uwhy), see tier 1.)"
   fi
 
-  # The output name must not pre-exist — and the WebDAV 404 doubles as cache
-  # priming (same rationale as FILES_READ_FRESH: a cold directory cache must
-  # not hand the adapter a freshness pass it didn't earn).
+  # BOTH segments of the box must be provably absent before the turn, or the run
+  # measures nothing: a folder that already exists could be anyone's, and its
+  # contents could predate the request. Both are registered first anyway — the
+  # registry states INTENT, and a name that was never created answers its DELETE
+  # with a 404, which cleanup already reads as removed.
+  #
+  # PROPFIND rather than a GET, because that is the verb the app finds a
+  # returned file with, and a directory GET answers a different question on a
+  # server that renders indexes. A definite 404 is only meaningful once the
+  # negative control in tier 1 proved this lane CAN say no, so a disqualified
+  # control is reported as itself rather than as a collision.
+  df_register A dir "$DF_BOX_OUTER"
+  df_register A dir "$DF_BOX"
   df_register A file "$okey"
+  if ! $DF_ABSENCE_TRUSTED; then
+    d_bad FILE_COPY_BYTES "this server's listing route never proved it can report a folder ABSENT, so a fresh one could not be witnessed"
+    d_say FILE_COPY_BYTES "(see FILES_LISTING — no agent turn was sent, because a folder this run cannot prove empty"
+    d_say FILE_COPY_BYTES " beforehand grades whatever was already in it. Fix the listing route, then re-run.)"
+    DOCTOR_FILE_ACCESS="ERROR"; rm -f "$tmp" 2>/dev/null; return 0
+  fi
+  for dir in "$DF_BOX_OUTER" "$DF_BOX"; do
+    code=$(doctor_fs_code real -X PROPFIND -H 'Depth: 0' "$DF_URL/$dir/")
+    case "$code" in
+      404) ;;
+      2??)
+        d_bad FILE_COPY_BYTES "the randomized folder $dir already exists before the turn — collision, refusing"
+        DOCTOR_FILE_ACCESS="ERROR"; rm -f "$tmp" 2>/dev/null; return 0 ;;
+      *)
+        d_bad FILE_COPY_BYTES "PROPFIND on the reply's folder answered HTTP $code before the turn — cannot prove it fresh"
+        DOCTOR_FILE_ACCESS="ERROR"; rm -f "$tmp" 2>/dev/null; return 0 ;;
+    esac
+  done
+  # The output name must not pre-exist either — and the WebDAV 404 doubles as
+  # cache priming (same rationale as FILES_READ_FRESH: a cold directory cache
+  # must not hand the adapter a freshness pass it didn't earn).
   code=$(doctor_fs_code real -r 0-0 "$DF_URL/$okey")
   if [ "$code" != "404" ] && [ "$code" != "401" ] && [ "$code" != "403" ]; then
     if [ "$code" = "000" ]; then
@@ -540,23 +751,29 @@ PY
   fi
 
   local payload
-  payload=$(DF_MODEL="$MODELS_FIRST_ID" DF_OKEY="$okey" DF_IKEY="$used_key" DF_INAME="input-$DF_RUN.txt" \
+  payload=$(DF_MODEL="$MODELS_FIRST_ID" DF_ONAME="$oname" DF_BOX="$DF_BOX" \
+            DF_IKEY="$used_key" DF_INAME="input-$DF_RUN.txt" \
             python3 - <<'PY' 2>/dev/null
 import json, os
 e = os.environ
-task = ("Copy the input file listed below to a new file named %s at the ROOT of your "
-        "working directory, byte-for-byte. Then confirm in one short sentence that names "
-        "the new file." % e["DF_OKEY"])
-# GOLDEN WIRE TEXT — byte-identical to the app (ConverseRequest.swift:
-# spliceServerFileRefs + fileDeliveryInstruction). The doctor must certify the
-# prompt shape Conduck actually sends, not a paraphrase.
-ref = ("The following file(s) are in your working directory — use them for this request. "
-       "Each input lives under its conversation folder at the path shown:\n"
-       "- %s (saved as %s)" % (e["DF_INAME"], e["DF_IKEY"]))
-instr = ("[Conduck file transfer] To return a file, write it to the root of your working "
-         "directory and state its exact filename in plain text in your reply. Attachment "
-         "directives (MEDIA: lines or similar) do not reach this user — only files named "
-         "in plain reply text are delivered.")
+# The task names the FILE and never the folder, and never says "create it"
+# either. Where the file goes is stated once, by the one line the app itself
+# sends, so what this grades is obedience to that line rather than to an extra
+# imperative no real turn carries. A task that repeated the destination would
+# certify a prompt Conduck does not use, and would hide the exact behaviour
+# automatic delivery depends on.
+task = ("Copy the input file listed below into a new file named %s, byte for byte. "
+        "Finish the write before replying. Do not reconstruct or guess the file "
+        "contents. Then reply with one short sentence saying you are done."
+        % e["DF_ONAME"])
+# GOLDEN WIRE TEXT — byte-identical to the app: `ref` is
+# ConverseRequest.spliceServerFileRefs' header plus one bullet, `instr` is
+# ConverseRequest.outboxLocationLine. Verify any edit against that source, never
+# against a description of it: a block LABELLED byte-identical that is not is
+# worse than no claim at all, because every later reader trusts the label.
+ref = ("The following file(s) are in your working directory — use them for this request:\n"
+       "- \"%s\" (saved as %s)" % (e["DF_INAME"], e["DF_IKEY"]))
+instr = ("[Conduck file transfer] Files you produce for this reply go in: %s" % e["DF_BOX"])
 print(json.dumps({"model": e["DF_MODEL"],
                   "messages": [{"role": "user", "content": task + "\n\n" + ref + "\n\n" + instr}],
                   "stream": False}))
@@ -568,17 +785,18 @@ PY
   fi
 
   say ""
-  say "  The file sentinel — one real turn against model '$(safe_display "$MODELS_FIRST_ID" 60)': the agent must copy a"
-  say "  small input file to the folder root and name the output in its reply. Agents can be slow;"
+  say "  The file sentinel — one real turn against model '$(safe_display "$MODELS_FIRST_ID" 60)': the agent must create"
+  say "  the two-part folder this turn names and copy a small input file into it. Agents can be slow;"
   say "  I wait up to 5 minutes…"
   DF_AGENT_RAN=true
   local turn_ok=false shape_reason=""
   if doctor_chat_eval "$payload"; then turn_ok=true; else shape_reason="$DCE_REASON"; fi
 
-  # THE APP-SHAPED MOMENT: one ranged existence probe, immediately, no retry —
-  # exactly what Conduck fires when the reply lands (headers only).
-  local probe_code
-  probe_code=$(doctor_fs_code real -r 0-0 "$DF_URL/$okey")
+  # THE APP-SHAPED MOMENT: one PROPFIND Depth: 1 of the folder, immediately, no
+  # retry — exactly what Conduck fires when the reply lands. It never guesses a
+  # filename; it lists the folder it named and offers what the listing holds.
+  local probe_out
+  probe_out=$(doctor_fs_lists_entry "$DF_BOX" "$oname")
   out=$(doctor_files_disk_verify "$okey" "$tmp")
   local copy_ok=false
   [ "$out" = "OK" ] && copy_ok=true
@@ -591,15 +809,28 @@ PY
   fi
 
   if $turn_ok && $copy_ok; then
-    d_ok FILE_COPY_BYTES "model '$(safe_display "$MODELS_FIRST_ID" 60)' copied the sentinel byte-for-byte to the folder root (${DCC_TIME:-?}s)"
+    d_ok FILE_COPY_BYTES "model '$(safe_display "$MODELS_FIRST_ID" 60)' created the named folder and copied the sentinel into it byte-for-byte (${DCC_TIME:-?}s)"
   elif $turn_ok; then
     case "$out" in
       MISSING)
-        d_bad FILE_COPY_BYTES "agent reply arrived before a complete byte-identical output file existed"
-        d_say FILE_COPY_BYTES "(Conduck probes as soon as the reply lands: wait for the agent's file tools to finish"
-        d_say FILE_COPY_BYTES " before returning HTTP 200 — no grace period or retry was applied. If the engine has"
-        d_say FILE_COPY_BYTES " no file tools or a different working folder, that is the real finding: this lane"
-        d_say FILE_COPY_BYTES " cannot deliver files as configured.)"
+        # One probe cannot separate "no file tools", "wrote the wrong bytes" and
+        # "wrote somewhere else" — but it CAN say whether the folder appeared,
+        # and that is the distinction worth drawing: an agent whose write tool
+        # cannot create a directory is a different problem, with a different
+        # fix, from one that wrote into a folder it made. Read from the served
+        # root rather than asked over WebDAV, because it costs no request.
+        if [ -n "$DF_DIR" ] && [ ! -d "$DF_DIR/$DF_BOX" ]; then
+          d_bad FILE_COPY_BYTES "the agent replied without creating the folder this reply's files were told to go in"
+          d_say FILE_COPY_BYTES "(Conduck names <conversation>/out-<nonce> and creates neither segment — a folder made"
+          d_say FILE_COPY_BYTES " over WebDAV belongs to whoever the file server runs as, and would lock the agent out."
+          d_say FILE_COPY_BYTES " So the agent's file tools must be able to create a directory, parents included.)"
+        else
+          d_bad FILE_COPY_BYTES "agent reply arrived before a complete byte-identical output file existed in that folder"
+          d_say FILE_COPY_BYTES "(Conduck lists the folder as soon as the reply lands: wait for the agent's file tools"
+          d_say FILE_COPY_BYTES " to finish before returning HTTP 200 — no grace period or retry was applied. A file"
+          d_say FILE_COPY_BYTES " written correctly BESIDE the named folder counts as nothing: that is the one path"
+          d_say FILE_COPY_BYTES " delivery reads.)"
+        fi
         ;;
       MISMATCH)   d_bad FILE_COPY_BYTES "an output file exists but is NOT byte-identical to the input" ;;
       NOTREGULAR) d_bad FILE_COPY_BYTES "the output exists but is not a regular file — refusing it" ;;
@@ -611,62 +842,43 @@ PY
     $copy_ok && d_say FILE_COPY_BYTES "(the file DID land correctly — but a reply Conduck can't parse means it never finds out)"
   fi
 
-  local ref_ok=false
-  if $turn_ok; then
-    out=$(printf '%s' "$DCC_BODY" | DF_OKEY="$okey" DF_IKEY="$used_key" python3 -c '
-import json, os, re, sys
-d = json.load(sys.stdin)
-reply = d["choices"][0]["message"]["content"]
-# Mirror of the app detector (FileTransferOutputDetector): filename-shaped
-# tokens -> allowlisted extensions -> dedup by first appearance -> drop the
-# echoed inbound stored key (full key AND its last path component) -> cap 5.
-allow = {"pdf","csv","tsv","json","xml","yaml","yml","txt","md","log","zip","tar","gz",
-         "png","jpg","jpeg","gif","svg","xlsx","xls","docx","doc","pptx","html",
-         "py","js","ts","sh","sql","parquet"}
-seen, ordered = set(), []
-for tok in re.findall(r"[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8}", reply):
-    ext = tok.rsplit(".", 1)[1].lower()
-    if ext in allow and tok not in seen:
-        seen.add(tok); ordered.append(tok)
-ik = os.environ["DF_IKEY"]
-inbound = {ik, ik.rsplit("/", 1)[-1]}
-outputs = [t for t in ordered if t not in inbound][:5]
-print("YES" if os.environ["DF_OKEY"] in outputs else "NO")' 2>/dev/null)
-    if [ "$out" = "YES" ]; then
-      d_ok FILE_REPLY_REFERENCE "the reply names the output file where Conduck's detector will find it"
-      ref_ok=true
-    else
-      d_bad FILE_REPLY_REFERENCE "the reply does not name the output file detectably"
-      d_say FILE_REPLY_REFERENCE "(Conduck scans reply text for allowlisted filenames — the first 5 candidates after"
-      d_say FILE_REPLY_REFERENCE " dropping echoed input names — and probes only those. A correct file the app cannot"
-      d_say FILE_REPLY_REFERENCE " DISCOVER is not a working lane: state the exact filename in plain reply text.)"
-    fi
-  fi
-
   if $copy_ok; then
-    if [ "$probe_code" = "200" ] || [ "$probe_code" = "206" ]; then
-      # Discoverable at the app's moment — now the byte-faithful download.
-      # A separate step on purpose: the app's landing probe reads headers only,
-      # so the full GET proves fidelity without claiming to BE landing behavior.
-      local dl; dl=$(doctor_curl_fs real "$DF_URL/$okey" 2>/dev/null) || dl=""
-      if [ "$dl" = "$content" ]; then
-        d_ok FILE_E2E "output discoverable the instant the reply landed (HTTP $probe_code) and downloads byte-faithful"
-        DOCTOR_FILE_E2E="PASS"
-      else
-        d_bad FILE_E2E "the probe saw the file, but the downloaded bytes differ from the on-disk output"
-        DOCTOR_FILE_E2E="FAIL"
-      fi
-    else
-      d_bad FILE_E2E "agent output existed on disk when the reply landed, but Conduck's immediate ranged WebDAV probe returned HTTP $probe_code"
-      d_say FILE_E2E "(Agent file creation completed; the failure is disk-to-WebDAV visibility, not agent timing —"
-      d_say FILE_E2E " see FILES_READ_FRESH and --dir-cache-time.)"
-      DOCTOR_FILE_E2E="FAIL"
-    fi
+    case "$probe_out" in
+      OK)
+        # Discoverable at the app's moment — now the byte-faithful download.
+        # A separate step on purpose: the app's landing probe is a listing, so
+        # the full GET proves fidelity without claiming to BE landing behavior.
+        local dl; dl=$(doctor_curl_fs real "$DF_URL/$okey" 2>/dev/null) || dl=""
+        if [ "$dl" = "$content" ]; then
+          d_ok FILE_E2E "the reply's folder listed the output the instant the reply landed, and it downloads byte-faithful"
+          DOCTOR_FILE_E2E="PASS"
+        else
+          d_bad FILE_E2E "the listing named the file, but the downloaded bytes differ from the on-disk output"
+          DOCTOR_FILE_E2E="FAIL"
+        fi ;;
+      MISSING)
+        d_bad FILE_E2E "the output was on disk when the reply landed, and the folder holding it does not list it"
+        d_say FILE_E2E "(Conduck lists that one folder and offers what the listing holds — it never guesses a"
+        d_say FILE_E2E " filename — so a file the listing omits cannot be delivered however well a direct GET of"
+        d_say FILE_E2E " it works. A folder the agent created that this server cannot read into (another user,"
+        d_say FILE_E2E " 0700), or a server that only reflects its own writes, both answer exactly this way;"
+        d_say FILE_E2E " see FILES_LISTING and FILES_READ_FRESH.)"
+        DOCTOR_FILE_E2E="FAIL" ;;
+      REFUSED:*)
+        d_bad FILE_E2E "the output was on disk when the reply landed, and its folder's listing is one Conduck refuses to read (${probe_out#REFUSED:})"
+        d_say FILE_E2E "(The agent did its part. The app grades a 207 body whole — a listing it cannot account for"
+        d_say FILE_E2E " in full is refused rather than half-read — so this lane delivers nothing. See FILES_LISTING.)"
+        DOCTOR_FILE_E2E="FAIL" ;;
+      *)
+        d_bad FILE_E2E "agent output existed on disk when the reply landed, but Conduck's immediate PROPFIND Depth: 1 of its folder returned HTTP $probe_out"
+        d_say FILE_E2E "(Agent file creation completed; the failure is on the listing route — see FILES_LISTING.)"
+        DOCTOR_FILE_E2E="FAIL" ;;
+    esac
   else
     note "  [FILE_E2E] skipped — no verified output file to probe."
   fi
 
-  if $turn_ok && $copy_ok && $ref_ok; then DOCTOR_FILE_ACCESS="PASS"; else DOCTOR_FILE_ACCESS="FAIL"; fi
+  if $turn_ok && $copy_ok; then DOCTOR_FILE_ACCESS="PASS"; else DOCTOR_FILE_ACCESS="FAIL"; fi
   [ "${MODELS_ID_COUNT:-0}" -gt 1 ] 2>/dev/null \
     && note "  (file_access grades model '$(safe_display "$MODELS_FIRST_ID" 60)' only — other advertised models may differ.)"
   rm -f "$tmp" 2>/dev/null
@@ -684,6 +896,10 @@ doctor_files_delete() {
     code=$(doctor_fs_code real -X DELETE "$DF_URL/$rel")
     case "$code" in 2??|404) ;; 403|405|501) webdav_ok=false; del_unsupported="$code" ;; *) webdav_ok=false ;; esac
   done
+  # Directories after files, and order among them does not matter: DELETE on a
+  # collection is recursive in RFC 4918, so removing the box's outer segment
+  # also takes the inner one, and the inner request then answers 404 — which
+  # this loop already accepts as removed.
   for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)
     [ "$kind" = "dir" ] || continue
@@ -701,15 +917,28 @@ doctor_files_delete() {
     vout=$(for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do printf '%s\n' "$entry"; done \
       | python3 -c '
 import os, stat, sys
-root = sys.argv[1]
+root, run = sys.argv[1], sys.argv[2]
 left = []
 dirs = []
+# Ownership is decided by the FIRST COMPONENT carrying the prefix this run
+# minted. It must stay anchored there: the deepest keys now sit two segments
+# down, inside a folder the agent made, and their leaves (the box segment, the
+# agent output, the "<8hex>__<name>" input) carry no prefix at all. A predicate
+# reading the leaf would refuse to remove artifacts this very run created; one
+# accepting ANY component would reach a name it never minted. Scoping to the run
+# nonce keeps a concurrent check out of reach as well.
+prefix = "conduck-check-" + run
+def owned(rel):
+    parts = rel.split("/")
+    if not run or any(p in ("", ".", "..") for p in parts):
+        return False
+    return parts[0].startswith(prefix)
 for line in sys.stdin.read().splitlines():
     try:
         tier, kind, rel = line.split("\t", 2)
     except ValueError:
         continue
-    if not rel.split("/", 1)[0].startswith(("conduck-check-", "output-")):
+    if not owned(rel):
         left.append(tier + " " + rel); continue
     p = os.path.join(root, rel)
     rp = os.path.realpath(p)
@@ -730,15 +959,25 @@ for line in sys.stdin.read().splitlines():
             left.append(tier + " " + rel); continue
     except Exception:
         left.append(tier + " " + rel)
+# Deepest first: os.rmdir is not recursive, so a parent removed before its child
+# fails with ENOTEMPTY and reports a leftover the run could have cleaned. The
+# registry is nested now (the box outer segment holds the box), so registration
+# order alone no longer gives a safe sequence.
+dirs.sort(key=lambda d: d[2].count("/"), reverse=True)
 for tier, p, rel in dirs:
-    if os.path.isdir(p):
-        try:
+    # islink before isdir: a symlink to a directory answers isdir true and then
+    # refuses rmdir, which would read as an uncleanable leftover. The box is
+    # created by the AGENT, so a symlinked segment is a shape this run can meet.
+    try:
+        if os.path.islink(p):
+            os.unlink(p); continue
+        if os.path.isdir(p):
             os.rmdir(p)
-        except OSError:
-            left.append(tier + " " + rel)
+    except OSError:
+        left.append(tier + " " + rel)
 for x in left:
     print(x)
-print("VERIFIED")' "$DF_DIR" 2>/dev/null)
+print("VERIFIED")' "$DF_DIR" "$DF_RUN" 2>/dev/null)
     if [ "$vout" = "VERIFIED" ]; then leftovers=""
     elif [ "${vout%$'\n'VERIFIED}" != "$vout" ]; then leftovers="${vout%$'\n'VERIFIED}"
     else leftovers="? the cleanup checker itself failed — nothing proven"
@@ -758,7 +997,8 @@ print("VERIFIED")' "$DF_DIR" 2>/dev/null)
     DF_ARTS=()
   else
     d_bad FILES_DELETE "check artifacts could NOT all be removed"
-    d_say FILES_DELETE "(remove anything starting with 'conduck-check-$DF_RUN' — and 'output-$DF_RUN.txt' — from the shared folder by hand)"
+    d_say FILES_DELETE "(remove anything starting with 'conduck-check-$DF_RUN' from the shared folder by hand — the"
+    d_say FILES_DELETE " agent's own output file is inside 'conduck-check-$DF_RUN-out/', so that one folder covers it)"
     case "$leftovers" in *"T "*|\?*) DOCTOR_FILE_TRANSPORT="ERROR" ;; esac
     case "$leftovers" in *"A "*|\?*)
       DOCTOR_FILE_ACCESS="ERROR"
@@ -766,22 +1006,38 @@ print("VERIFIED")' "$DF_DIR" 2>/dev/null)
     esac
   fi
   # Late-write backstop: a broken adapter can answer 200 and write the output
-  # AFTER cleanup. One bounded second look — verdicts above stay unchanged.
-  if $DF_AGENT_RAN && doctor_files_dir_ok; then
+  # AFTER cleanup. One bounded second look — verdicts above stay unchanged. It
+  # watches the EXACT nested key, never a name at the served root: the output
+  # lives inside the folder the agent creates, so a root-anchored watcher would
+  # look where nothing is ever written and report clean every time.
+  if $DF_AGENT_RAN && [ -n "$DF_OKEY" ] && doctor_files_dir_ok; then
     sleep 2
     python3 -c '
-import os, sys
-p = os.path.join(sys.argv[1], sys.argv[2])
+import os, stat, sys
+root, key = sys.argv[1], sys.argv[2]
+p = os.path.join(root, key)
+late = False
 try:
     st = os.lstat(p)
-    import stat
     if stat.S_ISREG(st.st_mode):
         os.unlink(p)
-        print("LATE")
+        late = True
 except FileNotFoundError:
     pass
 except Exception:
-    pass' "$DF_DIR" "output-$DF_RUN.txt" 2>/dev/null | grep -q LATE \
+    pass
+# A late write recreates the WHOLE chain, because the agent makes both segments
+# of the folder as well. Removing only the leaf would leave two empty
+# directories the graded cleanup already reported as gone.
+if late:
+    d = os.path.dirname(key)
+    while d:
+        try:
+            os.rmdir(os.path.join(root, d))
+        except OSError:
+            break
+        d = os.path.dirname(d)
+    print("LATE")' "$DF_DIR" "$DF_OKEY" 2>/dev/null | grep -q LATE \
       && note "  (the output file appeared AFTER cleanup — removed; the adapter answered before its file tools finished)"
   fi
   return 0
@@ -810,9 +1066,10 @@ doctor_files_cleanup_backstop() {
 run_doctor_files() {
   say ""
   say "  ${BOLD}--files — the file-lane probes.${RESET} Three meters: file_transport (this host's WebDAV <->"
-  say "  disk lane), file_access (the selected agent copies a sentinel and names it), file_e2e"
-  say "  (the app-shaped immediate delivery probe). This is the one adapter-check profile that MUTATES:"
-  say "  small conduck-check-* files are written to and removed from the shared folder."
+  say "  disk lane), file_access (the selected agent creates the folder this reply names and copies a"
+  say "  sentinel into it), file_e2e (the app-shaped immediate delivery probe). This is the one"
+  say "  adapter-check profile that MUTATES: small conduck-check-* files and folders are written to"
+  say "  and removed from the shared folder."
   DF_RUN=$(python3 -c 'import secrets; print(secrets.token_hex(4))' 2>/dev/null)
   if [ -z "$DF_RUN" ]; then
     d_bad FILES_CONFIG "could not generate a run nonce (python3 failed)"
@@ -937,9 +1194,9 @@ run_doctor() {
   explain_check_adapter
   say "  Graded against contract revision $DOCTOR_CONTRACT_REV: ${BOLD}conduck.com/setup/adapter/v1/${RESET}"
   if $DOCTOR_FILES; then
-    say "  --files writes and removes small conduck-check-* files in the configured shared folder,"
-    say "  and asks the selected agent to copy one. I clean up after myself, but I can't promise a"
-    say "  MISBEHAVING agent touches nothing else."
+    say "  --files writes and removes small conduck-check-* files and folders in the configured shared"
+    say "  folder, and asks the selected agent to create one folder and copy a file into it. I clean up"
+    say "  after myself, but I can't promise a MISBEHAVING agent touches nothing else."
   fi
   note "Building your own adapter? Loop me from a shell — exit code 0 means every check passed."
   if interactive_terminal; then

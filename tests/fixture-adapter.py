@@ -112,17 +112,20 @@ diverge only on the doctor's --files turn — a user message carrying the
 "[Conduck file transfer]" instruction — and only when $CONDUCK_FILES_DIR is
 set, the shared folder the fixture-webdav server also serves):
     files-good           copy the named input file to the requested
-                         output-<hex>.txt at the folder ROOT before replying,
-                         and name that output file in plain reply text
+                         output-<hex>.txt before replying, creating the folder the
+                         turn's "[Conduck file transfer]" line names (the folder
+                         ROOT when the caller names none), and name that output
+                         file in plain reply text
+    files-writes-to-root write a byte-perfect, correctly named output BESIDE the
+                         named folder, at the served root, and never create that
+                         folder — an agent that can write somewhere but not where
+                         delivery reads
     files-no-write       reply naming the output file but never write it
     files-late-write     reply first, write the correct output ~LATE (a
                          background thread, $CONDUCK_FILES_LATE_DELAY s) — after
                          the doctor's immediate no-grace probe has already fired
     files-wrong-bytes    write the output but with different (non-identical) bytes
     files-no-final-newline write the output without the input's final newline
-    files-no-reference   write a correct output but reply naming no filename
-    files-reference-substring write a correct output but mention its name only
-                         as a substring of a longer, non-allowlisted token
     files-slow           like files-good, but sleep $CONDUCK_FILES_SLOW_DELAY s
                          BEFORE replying to the file turn (a window for the
                          signal-cleanup case to SIGINT the doctor mid-turn)
@@ -161,8 +164,8 @@ class LoopbackHTTPServer(HTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 FILE_MODES = {"files-good", "files-no-write", "files-late-write",
-              "files-wrong-bytes", "files-no-final-newline",
-              "files-no-reference", "files-reference-substring", "files-slow"}
+              "files-wrong-bytes", "files-no-final-newline", "files-slow",
+              "files-writes-to-root"}
 
 # Every mode that rejects a chat request carrying no "model" field. Three probes
 # deliberately omit it, so on a model-requiring adapter they all fail for that one
@@ -203,18 +206,33 @@ def handle_file_turn(mode, files_dir, text):
         return "I could not find the file details in the request."
     okey = m_out.group(0)
     ikey = m_in.group(1).strip()
+    # A compliant agent takes the destination from the one line that states it,
+    # and from nowhere else. A caller that names no folder means the served root,
+    # which is what an empty box resolves to here.
+    m_box = re.search(
+        r"\[Conduck file transfer\] Files you produce for this reply go in: (\S+)", text)
+    box = m_box.group(1) if m_box else ""
     ipath = os.path.join(files_dir, ikey)
-    opath = os.path.join(files_dir, okey)
+    opath = os.path.join(files_dir, box, okey)
+    rootpath = os.path.join(files_dir, okey)
     try:
         data = open(ipath, "rb").read()
     except Exception:
         data = b""
 
-    def write(payload):
-        with open(opath, "wb") as fh:
+    def write(payload, path=None):
+        # A compliant agent CREATES the named folder: nothing creates it in
+        # advance, so a fixture that only opened the file would fail every case
+        # for the one reason none of them is about. `exist_ok` because the modes
+        # that write twice (late writes) reuse this path.
+        target = path or opath
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(target, "wb") as fh:
             fh.write(payload)
 
-    named = "Done — I copied the input to %s at the root of the working directory." % okey
+    named = "Done — I copied the input to %s." % okey
     if mode == "files-good" or mode == "files-slow":
         write(data)
         return named
@@ -226,12 +244,13 @@ def handle_file_turn(mode, files_dir, text):
     if mode == "files-no-final-newline":
         write(data[:-1] if data.endswith(b"\n") else data)
         return named
-    if mode == "files-no-reference":
-        write(data)
-        return "Done — the requested file has been written to the working directory root."
-    if mode == "files-reference-substring":
-        write(data)
-        return "Done — details are in prefix%s.bak." % okey
+    if mode == "files-writes-to-root":
+        # The agent writes a byte-perfect file, correctly named, beside the folder
+        # it was told to create. This is the failure the canary exists for and the
+        # one every earlier shape graded green: writing SOMEWHERE proves nothing
+        # about the one path delivery reads.
+        write(data, rootpath)
+        return named
     if mode == "files-late-write":
         threading.Thread(target=lambda: (time.sleep(LATE_DELAY), write(data)),
                          daemon=True).start()

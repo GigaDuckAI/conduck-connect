@@ -447,7 +447,7 @@ custom_agent_file_lane_gate() {
   say "  Asking your agent to copy a randomized sentinel file with whatever file tools it has (up to 5 minutes)…"
   if agent_file_probe; then
     FS_AGENT_PROOF="proved"
-    ok "agent file lane: your agent read the sentinel, wrote it back byte-identically, and named it in its reply"
+    ok "agent file lane: your agent read the sentinel, created the folder it was named, wrote the copy back byte-identically, and that folder listed it"
     agent_file_proof_scope_note
     return 0
   fi
@@ -505,14 +505,14 @@ agent_probe_model_label() { # agent_probe_model_label <agent-name>
 }
 
 # "What to fix", chosen by the probe's failure CATEGORY. One string for every
-# outcome pointed at ~/.hermes/config.yaml even for failures that had nothing to
-# do with it — most sharply the one where the agent read the file, wrote a
-# byte-identical copy, and only its REPLY fell short, ninety seconds after this
-# same run applied and re-checked exactly those keys.
+# outcome points at ~/.hermes/config.yaml even for failures that have nothing to
+# do with it — most sharply the ones where the file server refused the request or
+# the agent finished its write and the server never showed it, ninety seconds
+# after this same run applied and re-checked exactly those keys.
 agent_file_lane_fix_hint() { # agent_file_lane_fix_hint <agent-name> <config-hint>
   case "$AGENT_FILE_PROBE_REASON_KIND" in
-    reply-naming)    printf '%s' "how $1 answers — its file access already passed" ;;
     visibility)      printf '%s' "the file server, not $1 — it did write the file" ;;
+    listing)         printf '%s' "the file server's ability to read a folder $1 made" ;;
     turn)            printf '%s' "whatever made that request fail" ;;
     transport)       printf '%s' "the file server this run set up" ;;
     harness|cleanup) printf '%s' "this machine's temp-file and file-server access" ;;
@@ -552,20 +552,6 @@ agent_file_lane_cause_notes() { # agent_file_lane_cause_notes <agent-name> [conf
     turn)
       note "The chat request failed before any file work could be graded, so this says nothing"
       note "about $agent's file tools. The gateway checks above are the ones about the request." ;;
-    reply-naming)
-      note "The transport worked and so did $agent's file access: it read the sentinel and wrote a"
-      note "byte-identical copy. Only the last step is missing — Conduck finds a returned file by"
-      note "the filename in the reply TEXT, and this reply did not carry one."
-      if [ -n "$cfg_hint" ]; then
-        note "So this is about the answer, not about $cfg_hint, which this run already aligned and"
-        note "re-checked. Where to look: $model, and the Conduck guidance block that tells the agent"
-        note "to state the exact filename in plain text."
-      else
-        note "So this is about the answer, not about the folder or the file server."
-        note "Where to look: $model."
-        note "This wizard installs no guidance on a gateway it did not configure, so \"name the"
-        note "file you wrote, in plain text\" is a rule you add on your side."
-      fi ;;
     visibility)
       note "The transport worked and $agent did finish writing before it replied — the file simply"
       note "never became visible through the file server in time. Look at the file server and the"
@@ -573,6 +559,22 @@ agent_file_lane_cause_notes() { # agent_file_lane_cause_notes <agent-name> [conf
         note "folder it serves, not at $cfg_hint."
       else
         note "folder it serves, not at the agent."
+      fi ;;
+    listing)
+      # The compatibility class this direction accepts, and the only place it is
+      # ever named: the folder belongs to the agent, so the file server has to be
+      # able to read something it did not create. A direct fetch of the name can
+      # succeed while the listing stays empty, which is why the fetch is not the
+      # test — Conduck never guesses a name, it reads the folder.
+      note "$agent did everything asked of it: the folder is there, the file is in it, and the"
+      note "bytes came back correct. What failed is reading that folder — Conduck lists it and"
+      note "offers what the listing holds, and this one lists nothing. Two causes do this: the"
+      note "folder the agent created may not be readable by the account your file server runs as"
+      note "(different users, restrictive permissions), or the server may index its own writes"
+      if [ -n "$cfg_hint" ]; then
+        note "only and never notice a folder made outside it. Look there, not at $cfg_hint."
+      else
+        note "only and never notice a folder made outside it. Look there, not at the agent."
       fi ;;
     *)
       # output-boundary and anything unclassified. Causes, never a diagnosis: one
@@ -595,8 +597,15 @@ agent_file_lane_cause_notes() { # agent_file_lane_cause_notes <agent-name> [conf
         note "  - $model may not call tools even where the server has them; a chat-only model"
         note "    behind an agent gateway produces exactly this result"
       fi
-      note "  - the agent may write somewhere other than the folder you named, or see a different"
-      note "    filesystem than this machine does — a container, another account, another box"
+      note "  - the agent may write somewhere other than the folder it was named, or see a"
+      note "    different filesystem than this machine does — a container, another account,"
+      note "    another box"
+      # Named as its own cause because the destination is a folder nothing has
+      # created yet: a write tool that happily writes a file can still refuse to
+      # make the directories above it, and the screen already says whether the
+      # folder appeared, so an operator can tell these two apart in one line.
+      note "  - the agent's file tools may write a file but not create the folders above it;"
+      note "    the reason line above says whether that folder appeared at all"
       note "  - what it wrote may not match byte for byte, or may not be a plain file at that name"
       note "  - the turn may simply have failed this once" ;;
   esac
@@ -629,7 +638,7 @@ agent_file_lane_gate() {
   say "  Asking $agent_name to read and copy a randomized sentinel with its file tools (up to 5 minutes)…"
   if agent_file_probe; then
     FS_AGENT_PROOF="proved"
-    ok "$agent_name agent file lane: tool read + byte-identical write + reply discovery all green"
+    ok "$agent_name agent file lane: tool read + folder created by the agent + byte-identical write + Conduck could list it"
     agent_file_proof_scope_note
     return 0
   fi

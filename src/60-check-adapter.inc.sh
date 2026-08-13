@@ -1,7 +1,7 @@
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.6). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.7). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -41,19 +41,21 @@
 # diagnosed as one.
 #
 # --files adds the file-lane probes (MUTATING — the one adapter-check profile that
-# is: it writes + removes small conduck-check-* files in the configured
-# shared folder, and asks the selected agent to copy one). Three meters,
-# graded independently: file_transport (this host's WebDAV <-> disk lane),
-# file_access (the selected engine can read/write the shared folder and
-# names its output detectably), file_e2e (the combined output-delivery path,
-# probed exactly the way the app probes it). It does NOT prove public
-# exposure or remote-device reachability — the wizard verifies the
-# app-facing lane during setup; the plain adapter check proves conformance.
+# is: it writes + removes small conduck-check-* files and folders in the
+# configured shared folder, and asks the selected agent to create one folder
+# and copy a file into it). Three meters, graded independently:
+# file_transport (this host's WebDAV <-> disk lane, listings included),
+# file_access (the selected engine creates the folder the turn names and
+# writes a byte-identical file inside it), file_e2e (the combined
+# output-delivery path, probed exactly the way the app probes it). It does
+# NOT prove public exposure or remote-device reachability — the wizard
+# verifies the app-facing lane during setup; the plain adapter check proves
+# conformance.
 #
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.6 harness=<ver>
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.7 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
 #     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
 #     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
@@ -84,7 +86,7 @@
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.6"
+DOCTOR_CONTRACT_REV="1.7"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.

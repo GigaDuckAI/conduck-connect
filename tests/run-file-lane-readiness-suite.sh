@@ -1268,8 +1268,23 @@ test_hermes_guidance() {
     "$target" 'untrusted content'
   # …and the two rules that were already there, which the PDF bullets sit between
   # and above rather than replace.
-  expect_block_says "Hermes guidance keeps the return-a-file rule" \
-    "$target" 'finish writing it at the working-directory root'
+  # The destination is stated once per reply by the app, on the wire, so the
+  # block may not name one of its own: an installed copy that outlives a release
+  # would otherwise keep pointing the agent at a folder Conduck stopped reading.
+  expect_block_says "Hermes guidance sends a returned file to the folder the message names" \
+    "$target" 'write the file inside it'
+  # Nothing creates that folder before the turn, so an instruction that
+  # only says WHERE leaves the agent nothing to write into. The two flagship
+  # gateways fail on exactly this hop.
+  expect_block_says "Hermes guidance tells the agent to create the folder itself" \
+    "$target" 'create the folder the message names for that reply'
+  expect_block_says "Hermes guidance keeps the finish-before-replying rule" \
+    "$target" 'finish writing before you reply'
+  if grep -Fq -- 'working-directory root' "$target"; then
+    fail "Hermes guidance names no destination of its own" "the block still names the working-directory root"
+  else
+    pass "Hermes guidance names no destination of its own"
+  fi
   expect_block_says "Hermes guidance keeps the MEDIA refusal" \
     "$target" 'Do not use `MEDIA:`'
   expect_eq "Hermes guidance installs exactly the seven rules" \
@@ -1374,8 +1389,8 @@ test_hermes_guidance_consent() {
     "answering from the filename" 'say exactly that'
   expect_consent_claim "the untrusted-attachment promise is what gets installed" "$out" "$target" \
     "untrusted" 'untrusted content'
-  expect_consent_claim "the name-the-file promise is what gets installed" "$out" "$target" \
-    "plain reply text" 'state its exact filename in plain reply text'
+  expect_consent_claim "the where-to-write promise is what gets installed" "$out" "$target" \
+    "create the folder the message names" 'create the folder the message names for that reply'
 
   # WHAT THIS SCREEN MAY NOT SAY. It describes the rules the block carries. It
   # does not know whether pdftotext exists where Hermes runs, and it does not
@@ -3458,21 +3473,6 @@ test_local_service_gate() {
   stop_webdav
 }
 
-test_reply_candidate_parity() {
-  expect_true "reply discovery accepts exact app candidate" \
-    agent_reply_names_output "Done: output-a1b2.txt" "output-a1b2.txt" "folder/input.txt"
-  expect_false "reply discovery rejects output-name substring" \
-    agent_reply_names_output "Done: prefixoutput-a1b2.txt.bak" "output-a1b2.txt" "folder/input.txt"
-  expect_false "reply discovery enforces app five-candidate cap" \
-    agent_reply_names_output \
-      "a.txt b.txt c.txt d.txt e.txt output-a1b2.txt" \
-      "output-a1b2.txt" "folder/input.txt"
-  expect_true "reply discovery excludes echoed inbound before cap" \
-    agent_reply_names_output \
-      "input.txt a.txt b.txt c.txt d.txt output-a1b2.txt" \
-      "output-a1b2.txt" "folder/input.txt"
-}
-
 LAST_AGENT_PAYLOAD=""
 LAST_AGENT_TIMEOUT=""
 doctor_chat_request() {
@@ -3488,10 +3488,11 @@ doctor_chat_request() {
   return 0
 }
 
-# One hint covered eight failures, and for at least one of them it pointed the
-# wrong way: an agent that read the sentinel and wrote a byte-identical copy, and
-# only failed to name the file in its reply, was sent to the same config keys
-# this run had applied and re-checked ninety seconds earlier.
+# A single hint for every outcome points the wrong way for most of them: a file
+# server that refused the request, a temp file this script could not stage, and a
+# chat that never came back all reach the same screen, and sending any of them to
+# config keys this run applied and re-checked ninety seconds earlier costs the
+# operator the one fact that would have told them where to look.
 #
 # Graded on the CATEGORY, never on the reason text. That is the whole design
 # claim, so it is also what these cases exercise: the reason string is left empty
@@ -3503,21 +3504,38 @@ test_agent_file_lane_reason_branching() {
   # Every kind must produce a hint, and the ones this run can distinguish must
   # not collapse onto the configuration answer.
   GW_MODEL=""
-  for k in reply-naming visibility turn transport harness cleanup output-boundary unsupported; do
+  for k in visibility listing turn transport harness cleanup output-boundary unsupported; do
     AGENT_FILE_PROBE_REASON_KIND="$k"
     hint=$(agent_file_lane_fix_hint "Hermes" "Hermes's file toolset and terminal.cwd")
     [ -n "$hint" ] || fail "reason branch: $k has a fix hint" "empty"
   done
 
-  AGENT_FILE_PROBE_REASON_KIND="reply-naming"
+  # The hop the agent-created folder adds, and the one the ambiguous category has
+  # to offer: nothing exists at the named path before the turn, so a write tool
+  # that cannot make a directory fails while every byte-level capability is fine.
+  AGENT_FILE_PROBE_REASON_KIND="output-boundary"
+  out=$(agent_file_lane_cause_notes "Hermes" "Hermes's file toolset and terminal.cwd" 2>&1)
+  case "$out" in *"not create the folders above it"*)
+      pass "reason branch: the ambiguous case offers a missing folder-creation ability" ;;
+    *) fail "reason branch: the ambiguous case offers a missing folder-creation ability" "$out" ;; esac
+
+  # The compatibility class this direction accepts in exchange, and the only
+  # branch that names it: the agent owns the folder now, so a file server that
+  # cannot read into it delivers nothing while every other step reads green. A
+  # branch that blamed the agent here would send an operator to fix the one half
+  # that demonstrably worked.
+  AGENT_FILE_PROBE_REASON_KIND="listing"
+  out=$(agent_file_lane_cause_notes "Hermes" "Hermes's file toolset and terminal.cwd" 2>&1)
+  case "$out" in *"did everything asked of it"*)
+      pass "reason branch: an unreadable folder credits the agent" ;;
+    *) fail "reason branch: an unreadable folder credits the agent" "$out" ;; esac
+  case "$out" in *"readable by the account your file server runs as"*)
+      pass "reason branch: an unreadable folder names the permission cause" ;;
+    *) fail "reason branch: an unreadable folder names the permission cause" "$out" ;; esac
   hint=$(agent_file_lane_fix_hint "Hermes" "Hermes's file toolset and terminal.cwd")
   case "$hint" in *terminal.cwd*|*toolset*)
-      fail "reason branch: a reply-only failure is not blamed on the config" "$hint" ;;
-    *) pass "reason branch: a reply-only failure is not blamed on the config" ;; esac
-  out=$(agent_file_lane_cause_notes "Hermes" "Hermes's file toolset and terminal.cwd" 2>&1)
-  case "$out" in *"file access"*)
-      pass "reason branch: a reply-only failure credits the file access that passed" ;;
-    *) fail "reason branch: a reply-only failure credits the file access that passed" "$out" ;; esac
+      fail "reason branch: an unreadable folder is not blamed on the config" "$hint" ;;
+    *) pass "reason branch: an unreadable folder is not blamed on the config" ;; esac
 
   # The kinds where the transport is what FAILED must not repeat the old claim
   # that the transport worked.
@@ -3577,7 +3595,7 @@ test_agent_file_lane_reason_branching() {
   # branch has to answer without one, and the two ways that goes wrong are both
   # pinned: a sentence left with a hole where the hint used to be, and a clause
   # crediting keys "this run applied and re-checked" when it applied none.
-  for k in reply-naming visibility turn transport harness cleanup output-boundary unsupported; do
+  for k in visibility listing turn transport harness cleanup output-boundary unsupported; do
     AGENT_FILE_PROBE_REASON_KIND="$k"
     out=$(agent_file_lane_cause_notes "your agent" "" 2>&1)
     [ -n "$out" ] || fail "custom cause notes: $k says something" "empty"
@@ -3597,17 +3615,30 @@ test_agent_file_lane_reason_branching() {
       *) pass "custom cause notes: $k does not claim the transport worked" ;; esac
   done
 
-  # The sharpest wrong answer the flat paragraph gave: the agent provably read the
-  # sentinel and wrote a byte-identical copy, and was told its server may have no
-  # file tools at all.
-  AGENT_FILE_PROBE_REASON_KIND="reply-naming"
+  # The one kind whose finding is about the file server rather than the agent has
+  # to keep saying so: the snapshot proved the write finished before the reply, so
+  # a paragraph that offers "your server may have no file tools" is pointing at
+  # the half that demonstrably worked.
+  AGENT_FILE_PROBE_REASON_KIND="visibility"
   out=$(agent_file_lane_cause_notes "your agent" "" 2>&1)
-  case "$out" in *"file access"*)
-      pass "custom cause notes: a reply-only failure credits the file access that passed" ;;
-    *) fail "custom cause notes: a reply-only failure credits the file access that passed" "$out" ;; esac
+  case "$out" in *"did finish writing"*)
+      pass "custom cause notes: a visibility failure credits the write that finished" ;;
+    *) fail "custom cause notes: a visibility failure credits the write that finished" "$out" ;; esac
   case "$out" in *"no file tools"*)
-      fail "custom cause notes: a reply-only failure does not suggest missing file tools" "$out" ;;
-    *) pass "custom cause notes: a reply-only failure does not suggest missing file tools" ;; esac
+      fail "custom cause notes: a visibility failure does not suggest missing file tools" "$out" ;;
+    *) pass "custom cause notes: a visibility failure does not suggest missing file tools" ;; esac
+
+  # The same rule for the kind that is newly possible now the folder belongs to
+  # the agent. Every step the agent owns passed here, so a paragraph offering
+  # "maybe your server has no file tools" is the wrong half again.
+  AGENT_FILE_PROBE_REASON_KIND="listing"
+  out=$(agent_file_lane_cause_notes "your agent" "" 2>&1)
+  case "$out" in *"did everything asked of it"*)
+      pass "custom cause notes: an unreadable folder credits the agent" ;;
+    *) fail "custom cause notes: an unreadable folder credits the agent" "$out" ;; esac
+  case "$out" in *"no file tools"*)
+      fail "custom cause notes: an unreadable folder does not suggest missing file tools" "$out" ;;
+    *) pass "custom cause notes: an unreadable folder does not suggest missing file tools" ;; esac
 
   # …and the genuinely ambiguous one keeps the answer that is correct for the
   # commonest custom gateway, which is that nothing on the host is wrong.
@@ -3626,6 +3657,112 @@ test_agent_file_lane_reason_branching() {
 
   GW_KIND="$saved_kind"; GW_MODEL="$saved_model"
   AGENT_FILE_PROBE_REASON_KIND=""
+}
+
+# The one question both listing loci ask — the wizard's sentinel here, and the
+# doctor's FILES_LISTING / FILE_E2E in the assembled script — graded against the
+# rules the APP applies in FileServerClient.parseListing. The verdict has to be
+# the client's verdict: a checker that accepts a body the client refuses hands an
+# operator a green setup and a lane that never delivers a file.
+#
+# Most rows below are 207s that a matcher reading basenames out of the document
+# calls a hit: a foreign origin, a grandchild, a percent-encoded escape, a
+# not-found propstat row, a directory, a truncated document, a duplicate. Each is
+# the app refusing or dropping something no looser reading would.
+slv() { # slv <body> -> the mirror's verdict for output.txt in /box/out-abc/
+  printf '%s' "$1" | strict_listing_verdict "http://127.0.0.1:8080/box/out-abc/" "output.txt"
+}
+
+test_strict_listing_mirror() {
+  local head='<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">'
+  local selfrow='<d:response><d:href>/box/out-abc/</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>'
+  local ok200='<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat>'
+  local tailx='</d:multistatus>'
+  local big many
+
+  expect_eq "listing mirror: a direct child is present" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href>$ok200</d:response>$tailx")" \
+    "PRESENT"
+  expect_eq "listing mirror: a relative href resolves as a child" \
+    "$(slv "$head$selfrow<d:response><d:href>output.txt</d:href>$ok200</d:response>$tailx")" \
+    "PRESENT"
+  expect_eq "listing mirror: a folder without it is absent, not refused" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/other.txt</d:href>$ok200</d:response>$tailx")" \
+    "ABSENT"
+  expect_eq "listing mirror: an empty folder is absent" \
+    "$(slv "$head$selfrow$tailx")" "ABSENT"
+
+  # Provenance — every href must land on the requested origin as an exact direct
+  # child, or the body is not describing the folder that was asked about.
+  expect_eq "listing mirror: an href on another origin refuses the body" \
+    "$(slv "$head$selfrow<d:response><d:href>http://elsewhere.invalid/box/out-abc/output.txt</d:href>$ok200</d:response>$tailx")" \
+    "REFUSED:entryOutsideCollection"
+  expect_eq "listing mirror: a grandchild refuses the body" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/sub/output.txt</d:href>$ok200</d:response>$tailx")" \
+    "REFUSED:entryOutsideCollection"
+  expect_eq "listing mirror: a percent-encoded escape refuses the body" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/%2E%2E%2Foutput.txt</d:href>$ok200</d:response>$tailx")" \
+    "REFUSED:entryOutsideCollection"
+
+  # Completeness and shape — a body understood in part is refused whole, because
+  # a truncated listing is indistinguishable from a real short one.
+  expect_eq "listing mirror: a truncated document refuses" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href>$ok200")" \
+    "REFUSED:malformedBody"
+  expect_eq "listing mirror: a non-multistatus root refuses" \
+    "$(slv '<html><body><d:href>/box/out-abc/output.txt</d:href></body></html>')" \
+    "REFUSED:malformedBody"
+  expect_eq "listing mirror: two hrefs in one response refuse" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href><d:href>/box/out-abc/output.txt</d:href>$ok200</d:response>$tailx")" \
+    "REFUSED:malformedBody"
+  expect_eq "listing mirror: a declared entity refuses" \
+    "$(slv '<!DOCTYPE d:multistatus [<!ENTITY x "output.txt">]><d:multistatus xmlns:d="DAV:"><d:response><d:href>/box/out-abc/&x;</d:href></d:response></d:multistatus>')" \
+    "REFUSED:malformedBody"
+  expect_eq "listing mirror: an empty body refuses" "$(slv "")" "REFUSED:malformedBody"
+
+  # Per-resource status — RFC 4918 lets a 207 carry rows about resources the
+  # server does NOT have, and emitting one as an entry offers a file that is not
+  # there.
+  expect_eq "listing mirror: a not-found propstat row is dropped" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href><d:propstat><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat></d:response>$tailx")" \
+    "ABSENT"
+  expect_eq "listing mirror: a not-found response status is dropped" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href><d:status>HTTP/1.1 404 Not Found</d:status>$ok200</d:response>$tailx")" \
+    "ABSENT"
+  expect_eq "listing mirror: a response with no propstat states nothing" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href></d:response>$tailx")" \
+    "ABSENT"
+  expect_eq "listing mirror: a 404 propstat beside a 200 one still counts" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href><d:propstat><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>$ok200</d:response>$tailx")" \
+    "PRESENT"
+
+  # A nested folder is not a deliverable, and one real collection cannot hold two
+  # entries under one name.
+  expect_eq "listing mirror: a collection child is not a deliverable" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>$tailx")" \
+    "ABSENT"
+  expect_eq "listing mirror: a repeated name refuses the body" \
+    "$(slv "$head$selfrow<d:response><d:href>/box/out-abc/output.txt</d:href>$ok200</d:response><d:response><d:href>/box/out-abc/output.txt</d:href>$ok200</d:response>$tailx")" \
+    "REFUSED:duplicateEntry"
+
+  # Bounds — refused, never truncated: a silently shortened listing looks
+  # complete, and the file that fell off it is simply never delivered.
+  many=$(python3 -c '
+rows = "".join(
+    "<d:response><d:href>/box/out-abc/f%d.txt</d:href>"
+    "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>" % i
+    for i in range(201))
+print("<d:multistatus xmlns:d=\"DAV:\">" + rows + "</d:multistatus>", end="")') || many=""
+  expect_eq "listing mirror: past the entry cap the body refuses" \
+    "$(slv "$many")" "REFUSED:tooManyEntries"
+  big=$(python3 -c '
+pad = "<!--" + "p" * 300000 + "-->"
+print("<d:multistatus xmlns:d=\"DAV:\">" + pad
+      + "<d:response><d:href>/box/out-abc/output.txt</d:href>"
+        "<d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+      + "</d:multistatus>", end="")') || big=""
+  expect_eq "listing mirror: past the byte cap the body refuses" \
+    "$(slv "$big")" "REFUSED:bodyTooLarge"
 }
 
 test_agent_sentinel() {
@@ -3656,7 +3793,7 @@ test_agent_sentinel() {
   expect_eq "agent sentinel chat allows more than 30 seconds" \
     "$LAST_AGENT_TIMEOUT" "301"
   openclaw_payload="$LAST_AGENT_PAYLOAD"
-  uploaded_secret=$(awk -F 'body=' '/^PUT .*input-.* body=/{value=$2} END{print value}' "$TMP/webdav.capture")
+  uploaded_secret=$(awk -F 'body=' '/^PUT .*-input\.txt body=/{value=$2} END{print value}' "$TMP/webdav.capture")
   if [ -n "$uploaded_secret" ] && [[ "$openclaw_payload" != *"$uploaded_secret"* ]]; then
     pass "agent sentinel content is unknown to the model"
   else
@@ -3719,6 +3856,50 @@ raise SystemExit(0 if generic and not tooled and guards
     fail "custom sentinel is tool-agnostic, keeps both false-green guards, and uses the paired model" \
       "tool names, a missing guard clause, or the wrong model"
   fi
+
+  # WHERE the file goes is said exactly once, in the one line the app itself
+  # sends. A task that repeated the destination, or spelled out the mkdir, would
+  # grade an imperative no real turn carries and would hide the exact behaviour
+  # delivery depends on.
+  #
+  # The shape is pinned too, and both halves matter. TWO segments, because the
+  # app's box sits under a conversation folder and creating a missing parent is
+  # the part an agent write tool is likeliest to skip. A 32-hex nonce, because
+  # nothing creates the path in advance, so randomness is the whole of
+  # the freshness argument. And the input must NOT be inside either segment: a
+  # file uploaded there would create the folder the agent is being measured on.
+  if printf '%s' "$LAST_AGENT_PAYLOAD" | python3 -c '
+import json, re, sys
+t = json.load(sys.stdin)["messages"][0]["content"]
+wire = re.findall(
+    r"^\[Conduck file transfer\] Files you produce for this reply go in: "
+    r"(conduck-connect-agent-([0-9a-f]{32})/out-\2)$", t, re.M)
+saved = re.search(
+    r"\(saved as conduck-connect-agent-([0-9a-f]{32})-input\.txt\)", t)
+stale = ("ROOT of your working" in t or "root of your working" in t
+         or "working-directory root" in t
+         or "state its exact filename" in t
+         or "plain reply text" in t
+         or "conversation folder at the path shown" in t
+         or "create the folder" in t or "mkdir" in t)
+# One nonce derives every name, so an input staged under a different tag would
+# mean the run registered paths it did not measure.
+raise SystemExit(0 if len(wire) == 1 and saved and not stale
+                 and saved.group(1) == wire[0][1] else 1)
+'; then
+    pass "sentinel names a two-segment 32-hex folder once, on the app's own wire line"
+  else
+    fail "sentinel names a two-segment 32-hex folder once, on the app's own wire line" \
+      "the line is missing, duplicated, the wrong shape, or a retired directive survived"
+  fi
+  # The assertion that keeps the canary pointed the right way, and the one a
+  # runtime check cannot make once cleanup has run: the probe creates NO folder.
+  # The fleet scored 4/6 on a client-created folder and 16/18 on one the client
+  # only named, because a folder made over WebDAV belongs to the file server's
+  # user and the agent is refused inside it — so a probe that quietly issues a
+  # MKCOL grades the losing shape and grades it green.
+  expect_eq "the probe creates no folder of its own" \
+    "$(declare -f agent_file_probe | grep -c 'MKCOL')" "0"
   GW_MODEL=""
   stop_adapter
 
@@ -3890,8 +4071,12 @@ raise SystemExit(0 if generic and not tooled and guards
   GW_URL="http://127.0.0.1:$READY_PORT"
   if agent_file_probe; then
     fail "OpenClaw reply-first late write is rejected" "post-reply output earned a pass"
+  # Searched through the whole served tree, not just its top level: the sentinel
+  # the late write produces lands inside the folder the agent creates for it, so a
+  # depth-limited search would report a clean folder without looking where the
+  # artifact actually is, and the case would pass whether or not cleanup ran.
   elif [[ "$AGENT_FILE_PROBE_REASON" == *"replied before"* ]] \
-       && ! find "$served" -maxdepth 1 -name 'output-*.txt' -print -quit | grep -q .; then
+       && ! find "$served" -name 'output-*.txt' -print -quit | grep -q .; then
     pass "OpenClaw reply-first late write is rejected"
   else
     fail "OpenClaw reply-first late write is rejected" "wrong diagnostic or late artifact remained"
@@ -3907,18 +4092,6 @@ raise SystemExit(0 if generic and not tooled and guards
     pass "OpenClaw newline-mismatch false green rejected"
   else
     fail "OpenClaw newline-mismatch false green rejected" "failure had no diagnostic"
-  fi
-  stop_adapter
-
-  start_adapter files-reference-substring "$served" "$token" || {
-    fail "OpenClaw substring-only reply rejected" "adapter fixture failed to start"; stop_webdav; return; }
-  GW_URL="http://127.0.0.1:$READY_PORT"
-  if agent_file_probe; then
-    fail "OpenClaw substring-only reply rejected" "longer filename token earned a pass"
-  elif [ -n "$AGENT_FILE_PROBE_REASON" ]; then
-    pass "OpenClaw substring-only reply rejected"
-  else
-    fail "OpenClaw substring-only reply rejected" "failure had no diagnostic"
   fi
   stop_adapter
 
@@ -3964,9 +4137,182 @@ raise SystemExit(0 if generic and not tooled and guards
   stop_webdav
 }
 
+# The capability delivery is actually built on, proven to FAIL the probe rather
+# than degrade it — and the one it is NOT built on, proven not to fail it.
+# Conduck names one folder per reply, creates nothing, and then reads exactly
+# that folder, so PROPFIND is the whole route and there is nothing weaker to fall
+# back to. MKCOL is not on that route at all: the app never issues one, so a lane
+# that refuses the verb still delivers, and failing it would gate on a capability
+# no turn uses.
+test_agent_lane_capability_gates() {
+  local served="$TMP/agent-capability" password="capability-secret" token="adapter-secret"
+  local kind out
+  mkdir -p "$served"
+  GW_TOKEN="$token"
+  GW_MODEL=""
+  GW_KIND="openclaw"
+  FS_FOLDER="$served"
+  FS_CRED="$password"
+
+  # A file server with no MKCOL at all, and an agent that creates its own folder:
+  # that is a WORKING lane. The verb is still worth a case of its own, because
+  # gating on it again is how a regression here would look — the probe has to
+  # reach the same green verdict as it does on a lane that answers MKCOL.
+  start_webdav no-mkcol "$served" "$password" || {
+    fail "a lane that cannot create a folder still passes" "fixture failed to start"; return; }
+  FS_URL="http://127.0.0.1:$READY_PORT"
+  start_adapter files-good "$served" "$token" || {
+    fail "a lane that cannot create a folder still passes" "adapter fixture failed to start"
+    stop_webdav; return; }
+  GW_URL="http://127.0.0.1:$READY_PORT"
+  if agent_file_probe; then
+    pass "a lane that cannot create a folder still passes"
+  else
+    fail "a lane that cannot create a folder still passes" "$AGENT_FILE_PROBE_REASON"
+  fi
+  agent_probe_abandon_registry
+  stop_adapter
+  stop_webdav
+
+  # A refused PUT creates nothing. On a lane that also refuses DELETE the backstop
+  # cannot prove its own cleanup, so it would warn the operator to remove paths
+  # that were never created — the residue this suite exists to forbid. The probe
+  # proves absence and says nothing instead.
+  # A no-delete fixture cannot show this: its PUT succeeds, so there IS something
+  # to remove. Only a lane that refuses both discriminates.
+  # Assert on TEXT, not variables — agent_file_probe runs in a subshell here.
+  rm -rf "$served"; mkdir -p "$served"
+  start_webdav read-only "$served" "$password" || {
+    fail "a refused upload leaves no residue warning" "fixture failed to start"; return; }
+  FS_URL="http://127.0.0.1:$READY_PORT"
+  out=$(agent_file_probe 2>&1 || true)
+  case "$out" in *"leanup was not proven"*)
+      fail "a refused upload leaves no residue warning" "$out" ;;
+    *) pass "a refused upload leaves no residue warning" ;; esac
+  agent_probe_abandon_registry
+  stop_webdav
+
+  # No fixture mode refuses PROPFIND, and one is not worth adding to a shared
+  # file for a single refusal: the gate is the response code, so answering 405
+  # for exactly that verb reproduces the lane under test. Run in a subshell so
+  # the override cannot outlive the case, and carry the verdict out on stdout —
+  # a subshell's variables never reach the parent.
+  rm -rf "$served"; mkdir -p "$served"
+  start_webdav good "$served" "$password" || {
+    fail "a lane that cannot answer PROPFIND fails the probe" "fixture failed to start"; return; }
+  FS_URL="http://127.0.0.1:$READY_PORT"
+  out=$(
+    eval "conduck_real_curl_fs_with_timeout() $(declare -f curl_fs_with_timeout | tail -n +2)"
+    curl_fs_with_timeout() {
+      local a
+      for a in "$@"; do
+        [ "$a" = "PROPFIND" ] && { printf '405'; return 0; }
+      done
+      conduck_real_curl_fs_with_timeout "$@"
+    }
+    agent_file_probe >/dev/null 2>&1 && printf 'PASSED' \
+      || printf '%s' "$AGENT_FILE_PROBE_REASON_KIND"
+  )
+  if [ "$out" = "transport" ]; then
+    pass "a lane that cannot answer PROPFIND fails the probe"
+  else
+    fail "a lane that cannot answer PROPFIND fails the probe" "probe reported '$out', not transport"
+  fi
+  agent_probe_abandon_registry
+  stop_webdav
+
+  # The whole point of the direction, end to end: an agent that writes a
+  # byte-perfect, correctly named file BESIDE the folder it was told to make.
+  # Every byte-level capability is present and the app would deliver nothing, so
+  # a green verdict here would be the exact false pass the fleet measured.
+  rm -rf "$served"; mkdir -p "$served"
+  start_webdav good "$served" "$password" || {
+    fail "a write beside the named folder is rejected" "fixture failed to start"; return; }
+  FS_URL="http://127.0.0.1:$READY_PORT"
+  start_adapter files-writes-to-root "$served" "$token" || {
+    fail "a write beside the named folder is rejected" "adapter fixture failed to start"
+    stop_webdav; return; }
+  GW_URL="http://127.0.0.1:$READY_PORT"
+  if agent_file_probe; then
+    fail "a write beside the named folder is rejected" "a root write earned a pass"
+  else
+    kind="$AGENT_FILE_PROBE_REASON_KIND"
+    case "$kind:$AGENT_FILE_PROBE_REASON" in
+      "output-boundary:"*"before creating the folder"*)
+        pass "a write beside the named folder is rejected" ;;
+      *) fail "a write beside the named folder is rejected" "kind '$kind': $AGENT_FILE_PROBE_REASON" ;;
+    esac
+  fi
+  agent_probe_abandon_registry
+  # The fixture's root write is outside every registered name, so nothing removes
+  # it and the next case would inherit it.
+  rm -f "$served"/output-*.txt
+  stop_adapter
+  stop_webdav
+
+  # The compatibility class this direction accepts: the agent creates the folder,
+  # so the file server has to read something it did not create. A folder mode
+  # 0700 under another user, or a server that indexes only its own writes, answers
+  # this exact request with a listing that holds nothing — while a direct fetch of
+  # the name still works. Conduck never fetches a name it did not read from a
+  # listing, so this lane delivers nothing and the probe has to say so.
+  rm -rf "$served"; mkdir -p "$served"
+  start_webdav propfind-hides-contents "$served" "$password" || {
+    fail "a folder the file server cannot list fails the probe" "fixture failed to start"; return; }
+  FS_URL="http://127.0.0.1:$READY_PORT"
+  start_adapter files-good "$served" "$token" || {
+    fail "a folder the file server cannot list fails the probe" "adapter fixture failed to start"
+    stop_webdav; return; }
+  GW_URL="http://127.0.0.1:$READY_PORT"
+  if agent_file_probe; then
+    fail "a folder the file server cannot list fails the probe" "an unlistable folder earned a pass"
+  else
+    kind="$AGENT_FILE_PROBE_REASON_KIND"
+    if [ "$kind" = "listing" ]; then
+      pass "a folder the file server cannot list fails the probe"
+    else
+      fail "a folder the file server cannot list fails the probe" \
+        "kind was '$kind', not listing: $AGENT_FILE_PROBE_REASON"
+    fi
+  fi
+  agent_probe_abandon_registry
+  stop_adapter
+  stop_webdav
+
+  # The wiring, not the parser: the mirror's rules are pinned row by row in
+  # test_strict_listing_mirror, and this proves the sentinel actually asks it.
+  # This 207 names the folder that was asked about and then points every entry
+  # at another server — an answer the app refuses whole, and one a matcher
+  # reading basenames out of the document reads as a delivered file.
+  rm -rf "$served"; mkdir -p "$served"
+  start_webdav listing-foreign-href "$served" "$password" || {
+    fail "a listing Conduck refuses to read fails the probe" "fixture failed to start"; return; }
+  FS_URL="http://127.0.0.1:$READY_PORT"
+  start_adapter files-good "$served" "$token" || {
+    fail "a listing Conduck refuses to read fails the probe" "adapter fixture failed to start"
+    stop_webdav; return; }
+  GW_URL="http://127.0.0.1:$READY_PORT"
+  if agent_file_probe; then
+    fail "a listing Conduck refuses to read fails the probe" "a refused listing earned a pass"
+  else
+    kind="$AGENT_FILE_PROBE_REASON_KIND"
+    case "$kind:$AGENT_FILE_PROBE_REASON" in
+      "listing:"*"entryOutsideCollection"*)
+        pass "a listing Conduck refuses to read fails the probe" ;;
+      *) fail "a listing Conduck refuses to read fails the probe" \
+           "kind '$kind': $AGENT_FILE_PROBE_REASON" ;;
+    esac
+  fi
+  agent_probe_abandon_registry
+  stop_adapter
+  stop_webdav
+  rm -rf "$served"
+}
+
 test_agent_deadlines_and_cleanup() {
   local served="$TMP/agent-deadline" password="deadline-secret" token="adapter-secret"
-  local t0 t1 elapsed warning warning_file tag="a1b2c3d4e5f60708"
+  local t0 t1 elapsed warning warning_file box
+  local tag="a1b2c3d4e5f60708a1b2c3d4e5f60708"
   mkdir -p "$served"
   WEBDAV_HANG_SECONDS=10
   start_webdav hang-output-get "$served" "$password" || {
@@ -3989,10 +4335,16 @@ test_agent_deadlines_and_cleanup() {
   else
     t1=$(agent_probe_now_ms)
     elapsed=$((t1 - t0))
-    if [ "$elapsed" -lt 2500 ] && [ -n "$AGENT_FILE_PROBE_REASON" ]; then
+    # Pin the ARM, not just the clock. An output-boundary failure also lands
+    # under the deadline, so time alone would let a regression that gives up
+    # before it ever reaches the stalled download pass this test under its own
+    # name. "visibility" is the arm a stalled GET must fail at.
+    if [ "$elapsed" -lt 2500 ] && [ -n "$AGENT_FILE_PROBE_REASON" ] \
+       && [ "$AGENT_FILE_PROBE_REASON_KIND" = "visibility" ]; then
       pass "hanging output GET obeys real deadline"
     else
-      fail "hanging output GET obeys real deadline" "elapsed ${elapsed}ms"
+      fail "hanging output GET obeys real deadline" \
+        "elapsed ${elapsed}ms, kind '${AGENT_FILE_PROBE_REASON_KIND}'"
     fi
   fi
   unset CONDUCK_AGENT_OUTPUT_DEADLINE_MS CONDUCK_AGENT_OUTPUT_REQUEST_TIMEOUT_MS
@@ -4025,13 +4377,12 @@ test_agent_deadlines_and_cleanup() {
     fail "cleanup proves fallback directory absence" "adapter fixture failed to start"; stop_webdav; return; }
   GW_URL="http://127.0.0.1:$READY_PORT"
   if agent_file_probe; then
-    fail "cleanup proves fallback directory absence" "lying directory DELETE earned a clean pass"
+    fail "cleanup proves directory absence" "lying directory DELETE earned a clean pass"
   elif [ "$AGENT_PROBE_ACTIVE" = true ] \
-       && [ "$AGENT_PROBE_DIR_VERIFY_METHOD" = "propfind" ] \
-       && [ -d "$served/$AGENT_PROBE_DIRKEY" ]; then
-    pass "cleanup proves fallback directory absence"
+       && [ -d "$served/$AGENT_PROBE_BOXKEY" ]; then
+    pass "cleanup proves directory absence"
   else
-    fail "cleanup proves fallback directory absence" "directory absence was not checked/retained"
+    fail "cleanup proves directory absence" "directory absence was not checked/retained"
   fi
   stop_adapter
   stop_webdav
@@ -4042,14 +4393,21 @@ test_agent_deadlines_and_cleanup() {
     fail "exact-name EXIT cleanup backstop" "WebDAV fixture failed to start"; return; }
   FS_URL="http://127.0.0.1:$READY_PORT"
   FS_CRED="$password"
-  mkdir -p "$served/conduck-connect-agent-$tag"
-  printf 'owned\n' > "$served/conduck-connect-agent-$tag/input-$tag.txt"
-  printf 'owned\n' > "$served/output-$tag.txt"
+  # The output lives two segments down, inside folders the AGENT creates, and the
+  # input is a sibling of the outer one. Staging any of them anywhere else would
+  # prove nothing about the cleanup that ships: the exact keys registered for
+  # deletion are these, and a file of the same name elsewhere is a file this run
+  # never created and must never delete.
+  box="conduck-connect-agent-$tag/out-$tag"
+  mkdir -p "$served/$box"
+  printf 'owned\n' > "$served/conduck-connect-agent-$tag-input.txt"
+  printf 'owned\n' > "$served/$box/output-$tag.txt"
   printf 'keep\n' > "$served/unrelated.txt"
   AGENT_PROBE_TAG="$tag"
   AGENT_PROBE_DIRKEY="conduck-connect-agent-$tag"
-  AGENT_PROBE_INPUTKEY="$AGENT_PROBE_DIRKEY/input-$tag.txt"
-  AGENT_PROBE_OUTPUTKEY="output-$tag.txt"
+  AGENT_PROBE_BOXKEY="$box"
+  AGENT_PROBE_INPUTKEY="$AGENT_PROBE_DIRKEY-input.txt"
+  AGENT_PROBE_OUTPUTKEY="$box/output-$tag.txt"
   AGENT_PROBE_FS_URL="$FS_URL"
   AGENT_PROBE_FS_CRED="$FS_CRED"
   AGENT_PROBE_DIR_ARMED=true
@@ -4059,46 +4417,81 @@ test_agent_deadlines_and_cleanup() {
   if agent_file_probe_cleanup_backstop \
      && [ -f "$served/unrelated.txt" ] \
      && [ ! -e "$served/conduck-connect-agent-$tag" ] \
-     && [ ! -e "$served/output-$tag.txt" ]; then
+     && [ ! -e "$served/conduck-connect-agent-$tag-input.txt" ]; then
     pass "exact-name EXIT cleanup backstop"
   else
     fail "exact-name EXIT cleanup backstop" "owned targets or unrelated file handled incorrectly"
   fi
 
-  mkdir -p "$served/conduck-connect-agent-$tag"
-  printf 'small\n' > "$served/conduck-connect-agent-$tag/input-$tag.txt"
-  printf 'not-the-small-sentinel-but-deliberately-larger\n' > "$served/output-$tag.txt"
-  if ! agent_output_local_snapshot "$served" "output-$tag.txt" \
-       "$served/conduck-connect-agent-$tag/input-$tag.txt"; then
+  mkdir -p "$served/$box"
+  printf 'small\n' > "$served/conduck-connect-agent-$tag-input.txt"
+  printf 'not-the-small-sentinel-but-deliberately-larger\n' \
+    > "$served/$box/output-$tag.txt"
+  if ! agent_output_local_snapshot "$served" "$box/output-$tag.txt" \
+       "$served/conduck-connect-agent-$tag-input.txt"; then
     pass "reply-boundary snapshot rejects wrong-sized output before comparison"
   else
     fail "reply-boundary snapshot rejects wrong-sized output before comparison" "wrong-sized output passed"
   fi
-  rm -f "$served/output-$tag.txt"
-  rm -f "$served/conduck-connect-agent-$tag/input-$tag.txt"
-  rmdir "$served/conduck-connect-agent-$tag"
 
-  tag="b1c2d3e4f5a60718"
+  # A byte-perfect sentinel at the served ROOT is the defect this direction exists
+  # to catch, and it must not be graded as a pass: an agent that writes there
+  # without creating the folder it was named delivers nothing to the app.
+  cp "$served/conduck-connect-agent-$tag-input.txt" "$served/output-$tag.txt"
+  rm -f "$served/$box/output-$tag.txt"
+  if ! agent_output_local_snapshot "$served" "$box/output-$tag.txt" \
+       "$served/conduck-connect-agent-$tag-input.txt"; then
+    pass "reply-boundary snapshot rejects a byte-perfect output at the served root"
+  else
+    fail "reply-boundary snapshot rejects a byte-perfect output at the served root" "a root write passed"
+  fi
+
+  # …and one segment up, inside the outer folder rather than the box. This is the
+  # near miss the app cannot deliver either: it lists exactly the named folder, so
+  # a file one level above it is a file no listing ever reaches.
+  cp "$served/conduck-connect-agent-$tag-input.txt" \
+    "$served/conduck-connect-agent-$tag/output-$tag.txt"
+  if ! agent_output_local_snapshot "$served" "$box/output-$tag.txt" \
+       "$served/conduck-connect-agent-$tag-input.txt"; then
+    pass "reply-boundary snapshot rejects an output one folder above the box"
+  else
+    fail "reply-boundary snapshot rejects an output one folder above the box" "a parent-folder write passed"
+  fi
+  rm -f "$served/output-$tag.txt"
+  rm -f "$served/conduck-connect-agent-$tag-input.txt"
+  rm -rf "$served/conduck-connect-agent-$tag"
+
+  tag="b1c2d3e4f5a60718b1c2d3e4f5a60718"
+  box="conduck-connect-agent-$tag/out-$tag"
   AGENT_PROBE_TAG="$tag"
   AGENT_PROBE_DIRKEY="conduck-connect-agent-$tag"
-  AGENT_PROBE_INPUTKEY="$AGENT_PROBE_DIRKEY/input-$tag.txt"
-  AGENT_PROBE_OUTPUTKEY="output-$tag.txt"
+  AGENT_PROBE_BOXKEY="$box"
+  AGENT_PROBE_INPUTKEY="$AGENT_PROBE_DIRKEY-input.txt"
+  AGENT_PROBE_OUTPUTKEY="$box/output-$tag.txt"
   AGENT_PROBE_FS_URL="$FS_URL"
   AGENT_PROBE_FS_CRED="$FS_CRED"
   AGENT_PROBE_FS_FOLDER="$served"
   AGENT_PROBE_DIR_ARMED=false
   AGENT_PROBE_INPUT_ARMED=false
   AGENT_PROBE_OUTPUT_ARMED=true
-  AGENT_PROBE_DIR_VERIFY_METHOD=""
   AGENT_PROBE_LATE_RISK=true
   AGENT_PROBE_ACTIVE=true
   warning_file="$TMP/future-write-warning.txt"
   agent_file_probe_cleanup_backstop true > "$warning_file" 2>&1
   warning=$(cat "$warning_file")
-  if [[ "$warning" == *"$served/output-$tag.txt"* ]] && ! $AGENT_PROBE_ACTIVE; then
+  if [[ "$warning" == *"$served/$box/output-$tag.txt"* ]] \
+     && ! $AGENT_PROBE_ACTIVE; then
     pass "timeout/cancel cleanup prints exact future-write recovery"
   else
     fail "timeout/cancel cleanup prints exact future-write recovery" "exact later-recheck path was absent"
+  fi
+  # A late write recreates the folders too, so the recovery advice has to name the
+  # folder as well as the file — an operator told only about the file leaves an
+  # empty directory pair behind on a run this script warned them about.
+  if [[ "$warning" == *"$served/conduck-connect-agent-$tag/"* ]]; then
+    pass "timeout/cancel cleanup names the folder the late write recreates"
+  else
+    fail "timeout/cancel cleanup names the folder the late write recreates" "$warning"
   fi
   if grep -q 'agent_file_probe_cleanup_backstop true' "$ROOT/src/30-exposure.inc.sh" \
      && grep -q "trap 'exit 130' INT" "$ROOT/src/30-exposure.inc.sh"; then
@@ -6283,9 +6676,10 @@ test_hermes_checked_handoff
 test_hermes_guidance
 test_hermes_guidance_consent
 test_local_service_gate
-test_reply_candidate_parity
 test_agent_file_lane_reason_branching
+test_strict_listing_mirror
 test_agent_sentinel
+test_agent_lane_capability_gates
 test_agent_deadlines_and_cleanup
 test_request_credential_controls
 test_show_code_live_folder

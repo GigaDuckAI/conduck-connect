@@ -2241,8 +2241,9 @@ install_conduck_tools_block() { # install_conduck_tools_block <workspace-host-pa
   say "  I can install a short, marker-delimited Conduck block there that teaches the agent:"
   say "    - attached files: open them directly with file tools (never web-search for them)"
   say "    - media/pdf tools: retry with the file's ABSOLUTE workspace path if a bare name fails"
-  say "    - returning files: write the file, then NAME it in plain reply text — never a"
-  say "      MEDIA: directive (Conduck turns only; your other channels are unaffected)"
+  say "    - returning files: create the folder that turn's message names and write the file"
+  say "      into it, finishing before the reply — never a MEDIA: directive (Conduck turns"
+  say "      only; your other channels are unaffected)"
   if [ -f "$target" ]; then
     say "  Your TOOLS.md exists — the block is appended (or refreshed in place between its"
     say "  markers); everything else in the file stays byte-identical."
@@ -2279,10 +2280,14 @@ block = BEGIN + "\n" + (
     "message names each file's exact saved path). Open them with your file tools — "
     "never search the web for an attached file.\n"
     "- Your `read` tool accepts the saved path as shown. " + path_hint + "\n"
-    "- To RETURN a file: write it to the ROOT of your working directory and state its "
-    "exact filename in plain text in your reply. Never use `MEDIA:` or other "
-    "attachment directives in these conversations — this endpoint strips them and "
-    "the file will not reach the user.\n"
+    "- To RETURN a file: create the folder that turn's message names for its output "
+    "— all of it, including any parent, because none of it exists yet — write the "
+    "file inside it, and finish writing before you reply. Conduck reads that one "
+    "folder as soon as the reply arrives, so a file written anywhere else, or "
+    "written afterwards, does not reach the user.\n"
+    "- Never use `MEDIA:` or other attachment directives in these conversations — "
+    "this endpoint strips them and the file will not reach the user. Write the file "
+    "into the folder that message names instead.\n"
 ) + END
 
 if os.path.islink(target):
