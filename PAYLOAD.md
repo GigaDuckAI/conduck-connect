@@ -21,7 +21,9 @@ The base64 is standard and unwrapped (single line). The decoded JSON:
   },
   "fileServer": {
     "url": "https://…",
-    "credential": "<hex secret>"
+    "credential": "<hex secret>",
+    "autoDeliver": true,
+    "filenamePolicy": "preserve"
   },
   "transport": "tailscale | funnel | cloudflare | public"
 }
@@ -32,6 +34,7 @@ The base64 is standard and unwrapped (single line). The decoded JSON:
 - **`v` gates parsing.** An unknown major version means "update the app, or update the script." Unknown keys are ignored (tolerant decode).
 - **Conditional fields are omitted, not null.** `name` only for custom gateways; `token` only when `auth` is `bearer`; the whole `fileServer` object only when the file lane is configured. `model` is present whenever setup ended up with one — because you named it with `CONDUCK_CHECK_SERVER_MODEL` and continued from that check into setup, because a check proved the gateway requires it, because the server advertised exactly one and you accepted that default, or because you typed it — and omitted when you left model selection to the app.
 - **No URL carries userinfo.** `conduck-connect` refuses a `user:password@` address at every prompt, so a code it mints never puts a credential inside a routing field.
+- **`autoDeliver` and `filenamePolicy` are reserved, and this script does not emit them.** They are the two per-gateway file-delivery properties the app already stores and syncs — "may this gateway put files on my device automatically", and how a delivered file's name is treated (`preserve` is the only value). The app parses both and ignores their absence, which is what every code minted today looks like; a missing key means "unstated, keep the app's own default", never an explicit `false` or an empty policy. They are named here so the field names are fixed before anything sets them: this contract permits compatible additions but forbids repurposing, so a name chosen late is a name that can never be corrected. An unrecognised `filenamePolicy` resolves to the default rather than failing the import.
 - **`transport` is informational.** It is your explicit path choice, and it drives display copy only — it is never load-bearing for trust.
 - **The payload carries no certificate material.** Every endpoint in a code must present a certificate the receiving device already trusts on its own. A pin is an *additional* restriction on a connection the system already accepts; it can never rescue an untrusted chain, so there is no field through which a code could grant trust. `conduck-connect` refuses to mint a code for an endpoint whose certificate this machine does not trust.
 - **The token and the file-lane credential are secrets.** The code is scannable by anyone who can see your screen; the script warns you when it emits it.

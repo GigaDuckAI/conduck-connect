@@ -2,6 +2,58 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [Unreleased]
+
+- **The file-lane sentinel now proves the thing that actually breaks — and the
+  requirement it proves has changed.** It used to ask the agent for a file at the
+  root of the shared folder, which proves the agent can write *somewhere*. What
+  Conduck depends on is narrower: it names one folder per reply, creates nothing,
+  and reads only that folder. So the bar is no longer *your WebDAV server can
+  create a writable folder*, it is **your agent can create a folder and Conduck
+  can read it**. Measured across 26 live turns on six gateways, that distinction
+  decides the lane: a folder created over WebDAV belongs to whoever the file
+  server runs as, and both flagship gateways run their agent as someone else and
+  are refused inside it — a *successful* creation is worse than a refused one,
+  because the agent can neither write in it nor replace it. The sentinel now
+  names a two-part folder, proves both parts absent, creates neither, and requires
+  the agent to make them and write the file inside. `PROPFIND` becomes a hard
+  requirement of the sentinel, because it is how the folder is proved fresh
+  beforehand and read afterwards, and the sentinel itself now issues no `MKCOL`
+  at all. The verb is still a requirement of the lane, though, and
+  `--check-adapter --files` still fails a server that refuses it: the app mints
+  no reply folder — and so delivers nothing automatically — on a lane where its
+  own nested write was rejected.
+- **The sentinel now also proves Conduck can read what the agent made.** The
+  folder belongs to the agent, so the file server has to list something it did not
+  create — and a folder that is `0700` under another user, or a server that
+  indexes only its own writes, answers a direct fetch perfectly while listing
+  nothing. Conduck never guesses a filename; it lists that one folder. So the
+  sentinel lists it too, and requires the output to be in the listing. That
+  failure now reports as its own cause and says plainly that the agent did
+  everything asked of it.
+- **The sentinel stopped grading how the agent words its reply.** Whether the reply
+  named the file was a pass/fail step, on the theory that a filename in plain text
+  was how a file reached you. It is not any more: the folder is. That check carried
+  its own copy of the app's filename rules, which is a copy that drifts, and it
+  could fail an agent whose file work was perfect.
+- **Existing Hermes installs will be asked to refresh their guidance block.** The
+  Conduck block in `.hermes.md` / `HERMES.md` no longer tells the agent to write
+  returned files at the working-directory root; it tells the agent to create the
+  folder that turn's message names and write the file inside it. Nothing creates
+  that folder in advance, so an instruction that only said *where* would leave the
+  agent nothing to write into. Because the wizard recognises its own block by its
+  exact text, every already-installed copy now reads as an older revision and is
+  offered a refresh, with your yes, in place between its markers. Nothing outside
+  the markers is touched. Under `--reuse-only`, where nothing may be written, an
+  older block no longer costs you the file lane: it is kept, with a note, and the
+  live sentinel a few steps later is what decides whether returned files actually
+  arrive. A **missing** block still leaves the lane out. OpenClaw's `TOOLS.md`
+  block changed the same way and has never had the staleness comparison, so it
+  simply refreshes.
+- **No host permission change is needed for any of this.** No unit file is edited,
+  no umask is widened, and no service is restarted: putting folder creation on the
+  agent's side removes the ownership mismatch instead of working around it.
+
 ## [0.14.1] — the photo check stops accusing gateways that did nothing wrong
 
 - **`--forget` now really closes the address in front of the gateway.** Removing a
