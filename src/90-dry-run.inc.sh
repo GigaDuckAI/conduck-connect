@@ -42,7 +42,7 @@ print_plan() {
     local a; for a in "${PLAN[@]}"; do say "    • $a"; done
   fi
   say ""
-  note "No secrets were prompted, no credentials minted, no requests sent, no QR emitted (the QR appears only on a real run)."
+  note "No secrets were prompted, no passwords minted, no requests sent, no QR emitted (the QR appears only on a real run)."
   print_plan_real_run_command
 }
 

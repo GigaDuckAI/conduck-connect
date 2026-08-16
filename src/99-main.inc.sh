@@ -74,7 +74,7 @@ print("%s\t%s" % (u.port or 80, u.path.rstrip("/")))' 2>/dev/null) \
   # above deliberately empties it, so by the time somebody backs out of the exposure
   # menu the only surviving spelling of "the thing you just graded" is this one.
   SETUP_FROM_CHECK_URL="$checked_url"
-  note "Reusing the checked address and authentication in memory; your token is not saved."
+  note "Reusing the checked address and authentication in memory; your key is not saved."
 }
 
 # The two endings that leave a COMPLETED check behind without pairing anything: the
@@ -175,7 +175,7 @@ refuse_without_a_terminal() { # refuse_without_a_terminal <subject> [reason-line
   say "    CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-server https://ai.example.com"
   say "    CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-adapter https://ai.example.com"
   note "Both end in one machine-readable summary line and never wait for an answer."
-  note "CONDUCK_TOKEN keeps the bearer token out of argv and shell history; drop it for"
+  note "CONDUCK_TOKEN keeps the key out of argv and shell history; drop it for"
   note "a gateway with no key."
   say ""
   say "    bash conduck-connect.sh --list --json"

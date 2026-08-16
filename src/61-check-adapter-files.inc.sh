@@ -202,7 +202,7 @@ doctor_files_resolve() {
     fi
     if ! DF_URL=$(doctor_accept_url "$CONDUCK_FILES_URL"); then
       if url_has_userinfo "$CONDUCK_FILES_URL"; then
-        d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" credential in the address — give the plain URL"
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" password in the address — give the plain URL"
         d_say FILES_CONFIG "(the file-lane password goes in CONDUCK_FILES_PASS, the user in CONDUCK_FILES_USER)"
       else
         d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
@@ -255,7 +255,7 @@ PY
     # here: doctor mode never writes profiles or units (REUSE_ONLY is forced).
     GW_ID="$pid"
     if ! existing_fs_config; then
-      d_bad FILES_CONFIG "the profile names a file lane, but no live file-server unit + credential was found for it"
+      d_bad FILES_CONFIG "the profile names a file lane, but no live file-server unit + password was found for it"
       d_say FILES_CONFIG "(re-run the wizard to repair the lane, or use the CONDUCK_FILES_* overrides)"
       return 1
     fi
@@ -277,7 +277,7 @@ PY
     DF_DIR="$pfolder"; DF_CRED="$FS_CRED"; DF_USER="conduck"
   fi
   if ! credential_value_safe "$DF_CRED"; then
-    d_bad FILES_CONFIG "the recovered credential contains control characters — refusing"
+    d_bad FILES_CONFIG "the recovered password contains control characters — refusing"
     return 1
   fi
   out=$(python3 - "$DF_DIR" <<'PY' 2>/dev/null
@@ -367,7 +367,7 @@ doctor_files_transport() {
           d_bad FILES_WRITE_THROUGH "could not verify the folder safely — direct-disk checks disabled this run"
           terr=$((terr+1)); disk_ok=false ;;
       esac ;;
-    401|403) d_bad FILES_WRITE_THROUGH "authenticated PUT rejected (HTTP $code) — read-only folder or wrong credential"; tfail=$((tfail+1)) ;;
+    401|403) d_bad FILES_WRITE_THROUGH "authenticated PUT rejected (HTTP $code) — read-only folder or wrong password"; tfail=$((tfail+1)) ;;
     000)     d_bad FILES_WRITE_THROUGH "no answer from $DF_URL — is the file server running?"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_WRITE_THROUGH "authenticated PUT answered HTTP $code"; tfail=$((tfail+1)) ;;
   esac
@@ -377,15 +377,15 @@ doctor_files_transport() {
   if $wt_ok; then
     code=$(doctor_fs_code none "$DF_URL/$wkey")
     case "$code" in
-      401|403) d_ok FILES_AUTH_READ_MISSING "GET without credentials is refused (HTTP $code)" ;;
-      2??)     d_bad FILES_AUTH_READ_MISSING "GET with NO credentials answered HTTP $code — the lane is open"; tfail=$((tfail+1)) ;;
-      *)       d_bad FILES_AUTH_READ_MISSING "GET without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+      401|403) d_ok FILES_AUTH_READ_MISSING "GET without a password is refused (HTTP $code)" ;;
+      2??)     d_bad FILES_AUTH_READ_MISSING "GET with NO password answered HTTP $code — the lane is open"; tfail=$((tfail+1)) ;;
+      *)       d_bad FILES_AUTH_READ_MISSING "GET without a password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
     esac
     code=$(doctor_fs_code wrong "$DF_URL/$wkey")
     case "$code" in
-      401|403) d_ok FILES_AUTH_READ_WRONG "GET with a WRONG credential is refused (HTTP $code)" ;;
-      2??)     d_bad FILES_AUTH_READ_WRONG "GET with a WRONG credential answered HTTP $code — any password works"; tfail=$((tfail+1)) ;;
-      *)       d_bad FILES_AUTH_READ_WRONG "GET with a wrong credential answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+      401|403) d_ok FILES_AUTH_READ_WRONG "GET with a WRONG password is refused (HTTP $code)" ;;
+      2??)     d_bad FILES_AUTH_READ_WRONG "GET with a WRONG password answered HTTP $code — any password works"; tfail=$((tfail+1)) ;;
+      *)       d_bad FILES_AUTH_READ_WRONG "GET with a wrong password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
     esac
   else
     note "  [FILES_AUTH_READ_MISSING] [FILES_AUTH_READ_WRONG] skipped — need the write-through file to probe against."
@@ -394,16 +394,16 @@ doctor_files_transport() {
   printf 'conduck-check unauth probe\n' > "$uprobe"
   code=$(doctor_fs_write none -T "$uprobe" "$DF_URL/$ukey1")
   case "$code" in
-    401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without credentials is refused (HTTP $code)" ;;
-    2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO credentials was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
-    *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+    401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without a password is refused (HTTP $code)" ;;
+    2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO password was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
+    *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without a password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   df_register T file "$ukey2"
   code=$(doctor_fs_write wrong -T "$uprobe" "$DF_URL/$ukey2")
   case "$code" in
-    401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential is refused (HTTP $code)" ;;
-    2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
-    *)       d_bad FILES_AUTH_WRITE_WRONG "PUT with a wrong credential answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+    401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG password is refused (HTTP $code)" ;;
+    2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG password was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
+    *)       d_bad FILES_AUTH_WRITE_WRONG "PUT with a wrong password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   rm -f "$uprobe" 2>/dev/null
 
@@ -1238,22 +1238,22 @@ run_doctor() {
     note "Keyless by explicit \$CONDUCK_TOKEN=."
   elif [ -n "${CONDUCK_TOKEN:-}" ]; then
     GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
-    note "Using the bearer token from \$CONDUCK_TOKEN."
+    note "Using the key from \$CONDUCK_TOKEN."
   else
     say ""
-    note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
+    note "Tip: export CONDUCK_TOKEN=<key> to skip this prompt on re-runs."
     # Two failures, two different meanings, and they must not share a message.
     # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
     # supply a token, so printing it to someone who deliberately stopped is both
     # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
     # still emits the machine summary, with exit=3.
     local token_rc=0
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — this server has no token" "gateway.token") \
+    GW_TOKEN=$(ask_secret "Key the server expects" "keyless — this server has no key" "gateway.token") \
       || token_rc=$?
     case "$token_rc" in
       0)  ;;
       11) quit_run ;;
-      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+      *)  die "No key given and no answer possible (the input ended). Set CONDUCK_TOKEN=<key> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
     esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi

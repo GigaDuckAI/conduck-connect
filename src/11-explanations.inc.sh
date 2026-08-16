@@ -224,16 +224,16 @@ explain_action() { # explain_action <action-id>
 
     gateway.custom.has_auth)
       explain_panel \
-        "Say whether this server checks for a secret key before it answers" \
-        "Most servers want a key — a long random string, sometimes called an API key or a bearer token — sent with every request, and refuse anyone who cannot produce it. Some are set up with no key at all, which means anyone who can reach the address can use it." \
+        "Say whether this server checks for a key before it answers" \
+        "Most servers want a key — a long random string — sent with every request, and refuse anyone who cannot produce it. Some are set up with no key at all, which means anyone who can reach the address can use it." \
         "Takes the key at a hidden prompt: nothing at all appears as you type, so a paste never lands on screen or in your scroll-back. The key rides inside the setup code your phone scans and is never written to this machine's saved record. Pressing Enter with nothing typed does not quietly mean \"no key\" — it opens a separate question that makes you say so." \
         "" \
         "No key means anyone who reaches the address can use whatever your gateway allows. Setup refuses to put a no-key server on a public address unless you explicitly override it." \
         "Look at how the server was started, or at the config file your gateway was given. If you were handed a long random string when it was installed, that is the key. If you never saw one, and the server only answers on this machine, it is probably keyless."
       ;;
 
-    # For the hidden token prompts themselves (the custom-gateway key, OpenClaw's
-    # and Hermes's, the two check commands' bearer prompt, and --show-code's
+    # For the hidden key prompts themselves (the custom-gateway key, OpenClaw's
+    # and Hermes's, the two check commands' key prompt, and --show-code's
     # re-entry). It answers the one question the hidden prompt cannot: where does
     # this string come from.
     #
@@ -247,12 +247,12 @@ explain_action() { # explain_action <action-id>
     # the reader is standing.
     gateway.token)
       explain_panel \
-        "Paste the secret key your server checks on every request" \
+        "Paste the key your server checks on every request" \
         "Without it the server answers every request with a refusal, and the app would be paired to an address it can never use." \
         "Nothing appears on screen while you type or paste — that is deliberate, not a frozen prompt. The key travels inside the setup code your phone scans and is never written into the record this script saves, which is why --show-code has to ask you for it again." \
         "" \
         "Nothing on the server changes. If you later rotate the key, re-run setup or --show-code and pair the devices again with the new one." \
-        "It is wherever your gateway was configured: the line in its config file or its start-up command that names a key or token, or the string whoever installed it wrote down for you. If your server genuinely has no key, Enter is safe to try — an empty answer is never read as a quiet yes here. The prompt line above says what it does: stop, offer keyless and make you confirm it, or grade the server keyless and say so."
+        "It is wherever your gateway was configured: the line in its config file or its start-up command that names the key, or the string whoever installed it wrote down for you. If your server genuinely has no key, Enter is safe to try — an empty answer is never read as a quiet yes here. The prompt line above says what it does: stop, offer keyless and make you confirm it, or grade the server keyless and say so."
       ;;
 
     # Three prompts share this panel and they do NOT share an Enter: the
@@ -507,7 +507,7 @@ explain_action() { # explain_action <action-id>
       explain_panel \
         "Give the gateway an encrypted address anyone on the internet can reach" \
         "A public address means no Tailscale app on your phone, and it means an Apple Watch works on its own with no iPhone nearby. Tailscale's own name for this is \"Funnel\"." \
-        "Goes on to show you the exact Tailscale command and ask about it separately. If you approve it there, a public encrypted address is pointed at your gateway's local door. Anyone who finds that address can knock on it; your gateway's secret key is the only lock, which is why setup refuses to do this for a gateway that has no key." \
+        "Goes on to show you the exact Tailscale command and ask about it separately. If you approve it there, a public encrypted address is pointed at your gateway's local door. Anyone who finds that address can knock on it; your gateway's key is the only lock, which is why setup refuses to do this for a gateway that has no key." \
         "The gateway stays private, or unreachable by this route." \
         "Switch that public address off, or put back the mapping setup shows you, to reverse this one change. Nothing else is affected." \
         "Choose the private option instead unless you need a standalone Apple Watch or a device that cannot run Tailscale. You can re-run this script and change your mind."
@@ -864,7 +864,7 @@ explain_show_code() {
   say ""
   say "  ${BOLD}Why it may still ask you something${RESET}"
   say "  Secrets are deliberately not stored on this machine, so a gateway with a"
-  say "  secret key asks you to paste it again. That is the price of not keeping"
+  say "  key asks you to paste it again. That is the price of not keeping"
   say "  your key in a file here."
   say ""
 }
@@ -873,9 +873,9 @@ explain_show_code() {
 # It is the only place the tool says what the code actually is.
 explain_setup_code_secrecy() {
   say ""
-  say "  ${BOLD}Treat this code like a password.${RESET} It carries your gateway's secret key,"
+  say "  ${BOLD}Treat this code like a password.${RESET} It carries your gateway's key,"
   say "  and the file password when file transfer is set up. Anyone who photographs"
-  say "  the QR square, or copies the text, has exactly the access those credentials"
+  say "  the QR square, or copies the text, has exactly the access those two secrets"
   say "  give — until you change them at the gateway. Do not paste it into a chat,"
   say "  an issue, or a screenshot."
   say ""

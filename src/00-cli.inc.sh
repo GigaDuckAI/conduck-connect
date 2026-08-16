@@ -43,11 +43,11 @@
 #   5. Verifies everything with real requests. An OpenClaw/Hermes file lane must
 #      pass a real agent read -> byte-identical write sentinel before a code.
 #   6. Prints a setup code — as a QR you scan with the Conduck app, and as text.
-#      URL, token, and file-lane credentials arrive in one scan; nothing to
+#      URL, key, and file-lane password arrive in one scan; nothing to
 #      retype on your phone (iPhone or iPad).
 #   7. Afterwards: lists what it set up, changes one thing about a saved setup
 #      without re-asking the rest, and removes one completely — the file-lane
-#      service, its credentials and the saved gateway. Removal never deletes the
+#      service, its password and the saved gateway. Removal never deletes the
 #      folder you shared, and it asks you to type the setup's id first.
 #
 # What this script NEVER does
@@ -69,7 +69,7 @@
 #   Tailscale's control plane, each shown in full and approved before it runs; the
 #   Cloudflare path runs `cloudflared tunnel list` to read the tunnels your
 #   existing Cloudflare login can already see, so it can name yours back to you.
-#   Both are that vendor's own client, on this machine, under your credentials.
+#   Both are that vendor's own client, on this machine, signed in as you.
 #   Reading local state is a different thing and is not gated on your choice:
 #   `tailscale status` and `tailscale serve status` ask the daemon on THIS
 #   machine, so the menu can label what you already have and the port logic never
@@ -82,7 +82,7 @@
 #   Scriptable: --check-server [url], --check-adapter [url] and --list [--json].
 #   Set CI=1 and the two checks never prompt; the last line is always a machine
 #   summary, and the exit status is the verdict. --list asks nothing in any case:
-#   it reports the setups saved on this machine, with no token, password or setup
+#   it reports the setups saved on this machine, with no key, password or setup
 #   code anywhere in its output.
 #   Need a person at a terminal: no arguments (the welcome menu), --setup,
 #   --show-code, --edit [id] and --forget <id>. Setup ends in a setup code that
@@ -97,7 +97,7 @@
 #   version and exits.
 #
 # Environment
-#   CONDUCK_TOKEN=<token>   bearer token for a check, so it never reaches your
+#   CONDUCK_TOKEN=<key>     the key for a check, so it never reaches your
 #                           shell history or argv. Export it EMPTY to declare a
 #                           keyless target deliberately.
 #   CONDUCK_CHECK_SERVER_MODEL=<model-id>
@@ -134,13 +134,13 @@
 # Re-running is safe: every step detects existing state and reuses what's done.
 # --show-code re-shows a saved gateway's code without the setup questions — handy
 # for pairing your own second device, and the code is the same reusable secret, so
-# treat every copy of it like the token it carries.
+# treat every copy of it like the key it carries.
 #
 # Once something is set up you don't have to walk the wizard again to change it.
 # --list shows every saved setup and whether its file-lane service is running,
 # --edit [id] re-asks ONE value — the web address a restarted quick tunnel just
 # changed, the model, the shared folder — and re-verifies only what that affects,
-# and --forget <id> removes one setup's service, credentials and saved gateway. It
+# and --forget <id> removes one setup's service, password and saved gateway. It
 # leaves the folder you shared, your agent's own files, and the pairing already on
 # your phone exactly where they are, and says so before it starts.
 #

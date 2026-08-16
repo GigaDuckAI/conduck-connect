@@ -307,12 +307,12 @@ gw_403_route_note() { # reads GW_AUTH / GW_LOCAL_PORT / MODELS_CURL_RC / MODELS_
   if [ -n "$base" ] && gw_answers_on_loopback "$base"; then
     warn "Your gateway answers this very request on this machine ($base) and forbids it when it"
     # The all-clear is worded per auth mode for the same reason the status line above is:
-    # clearing "your credentials" on a run that carries none re-imports the credential
-    # framing this whole arm exists to remove, and leaves the reader looking for a token
+    # clearing "your key" on a run that carries none re-imports the key
+    # framing this whole arm exists to remove, and leaves the reader looking for a key
     # to inspect. The probe carried whatever the public request carried, so a bearer run
-    # really has cleared its token and a keyless run has cleared nothing but the server.
+    # really has cleared its key and a keyless run has cleared nothing but the server.
     if [ "$GW_AUTH" = "bearer" ]; then
-      warn "arrives through your HTTPS address, so the server is up and your token is fine."
+      warn "arrives through your HTTPS address, so the server is up and your key is fine."
     else
       warn "arrives through your HTTPS address, so the server is up and accepting this request."
     fi
@@ -379,12 +379,12 @@ gw_5xx_credential_note() { # reads GW_AUTH / GW_URL / MODELS_CURL_RC / MODELS_HT
     -o /dev/null -w '%{http_code}' "$GW_URL/v1/models" 2>/dev/null) || return 0
   [ -n "$code" ] || return 0
   [ "$code" != "$MODELS_HTTP_CODE" ] || return 0
-  warn "This gateway is configured as keyless, but its answer CHANGES when a credential is"
-  warn "sent — HTTP $MODELS_HTTP_CODE without one, HTTP $code with one. It wants a token after all."
-  note "A server that is simply broken answers both the same way, so this is the credential."
+  warn "This gateway is configured as keyless, but its answer CHANGES when a key is"
+  warn "sent — HTTP $MODELS_HTTP_CODE without one, HTTP $code with one. It wants a key after all."
+  note "A server that is simply broken answers both the same way, so this is the key."
   note "Some servers report a missing one as a 5xx from inside their own error handler rather"
   note "than as 401 — LiteLLM without a database does exactly this."
-  note "Re-run setup, say this gateway DOES need a bearer token, and give it the expected one."
+  note "Re-run setup, say this gateway DOES need a key, and give it the expected one."
 }
 
 # What BOTH file-lane gates do when gateway verification has already failed, held
@@ -469,10 +469,10 @@ custom_agent_file_lane_gate() {
   # gateway it did not set up, so there is no key it applied to point at.
   agent_file_lane_cause_notes "your agent" ""
   # The decisive fact for the choice below, and the operator cannot discover it
-  # from anywhere else: the payload carries an address and a credential and has no
+  # from anywhere else: the payload carries an address and a password and has no
   # field for a caveat, so a kept lane arrives in the app looking fully working.
   note "Conduck cannot be told about this: the setup code carries only the address and the"
-  note "credential, so the app will show file transfer as enabled either way."
+  note "password, so the app will show file transfer as enabled either way."
   if confirm "  Include the file server in the setup code anyway?" "file.agent.unproved"; then
     note "Keeping it. This run's screen marks it as unproved; the app cannot."
     return 0
@@ -1025,17 +1025,17 @@ verify_all() {
         # route refused is what gw_403_route_note goes and finds out.
         401)
           if [ "$GW_AUTH" = "bearer" ]; then
-            why="HTTP 401 — token rejected (or an access layer in front wants a login)"
+            why="HTTP 401 — key rejected (or an access layer in front wants a login)"
           else
-            why="HTTP 401 — this gateway is keyless, so no token was sent: either the server wants one after all, or an access layer in front of it does"
+            why="HTTP 401 — this gateway is keyless, so no key was sent: either the server wants one after all, or an access layer in front of it does"
           fi ;;
         403)
           if [ "$GW_AUTH" = "bearer" ]; then
-            why="HTTP 403 — refused: either the token, or the request itself as it arrived over your HTTPS route"
+            why="HTTP 403 — refused: either the key, or the request itself as it arrived over your HTTPS route"
           else
-            why="HTTP 403 — this gateway is keyless, so there is no token to reject: the request itself was refused as it arrived over your HTTPS route"
+            why="HTTP 403 — this gateway is keyless, so there is no key to reject: the request itself was refused as it arrived over your HTTPS route"
           fi ;;
-        3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward credentials across redirects)" ;;
+        3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward your key across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
         # 530 BEFORE the 5xx bucket, which would file it as a server fault. It is the
         # answer of an HTTPS front that has nothing to forward to: Cloudflare returns it

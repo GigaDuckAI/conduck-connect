@@ -40,7 +40,7 @@ url_host_lc() { # url_host_lc <https-url>
 # the app shows, the address the code will point at, and how that address is
 # reached. Printed for a lone profile as well as for a list — auto-selecting the
 # only saved setup is right, showing it anyway is the other half of right. The very
-# next thing --show-code does on a custom gateway is ask for a bearer token, and
+# next thing --show-code does on a custom gateway is ask for a key, and
 # being asked for a password before being told what it unlocks is how somebody
 # pastes the key to a different gateway.
 show_qr_describe_saved_setup() { # show_qr_describe_saved_setup <profile-file>
@@ -103,7 +103,7 @@ show_qr_pick_profile() {
   if [ ${#cand[@]} -eq 0 ]; then
     [ "$rejected" = "1" ] && die "There IS a saved setup code on this machine, and this version ($VERSION) can't use it. $reason"
     [ "$rejected" = "0" ] || die "There are $rejected saved setup codes on this machine, and this version ($VERSION) can't use any of them. The first one says: $reason"
-    die "No usable saved setup code on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick one, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
+    die "No usable saved setup code on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick one, re-enter a custom gateway's key, or confirm a gateway-only code; live verification still runs)."
   fi
   local k
   if [ ${#cand[@]} -eq 1 ]; then
@@ -430,21 +430,21 @@ show_qr_recover_gateway_secret() {
       ok "Re-read API_SERVER_KEY from ~/.hermes/.env (not shown)."
       ;;
     *)
-      # Custom gateway: nothing on disk to read (by design — this tool never stores tokens).
+      # Custom gateway: nothing on disk to read (by design — this tool never stores keys).
       say ""
-      note "Custom gateways have no config file I can read, and this tool deliberately never stores your token."
+      note "Custom gateways have no config file I can read, and this tool deliberately never stores your key."
       # prompt_into so q here stops the RUN. Inside $(…) a quit_run kills only the
-      # subshell, and the parent then reads the empty answer as "no token given" and
-      # dies with the wrong reason. The action-id gives `i` the token panel — the one
-      # shared by all six hidden-token prompts in the tool.
-      prompt_into GW_TOKEN ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" \
-        "stop; this saved setup requires a token" "gateway.token"
-      [ -n "$GW_TOKEN" ] || die "A token is required (this saved setup says auth=bearer). Re-run when you have it."
+      # subshell, and the parent then reads the empty answer as "no key given" and
+      # dies with the wrong reason. The action-id gives `i` the key panel — the one
+      # shared by all six hidden-key prompts in the tool.
+      prompt_into GW_TOKEN ask_secret "Paste the gateway key again — what the gateway checks on each request (hidden)" \
+        "stop; this saved setup requires a key" "gateway.token"
+      [ -n "$GW_TOKEN" ] || die "A key is required (this saved setup says auth=bearer). Re-run when you have it."
       ;;
   esac
 }
 
-# Recover the file-lane credential from disk when the profile carries a lane. If it
+# Recover the file-lane password from disk when the profile carries a lane. If it
 # can't be recovered, WARN loudly and (with an explicit confirm) continue gateway-only.
 show_qr_recover_file_lane() {
   local fsurl; fsurl=$(json_get "$PROFILE_FILE" "fileServer.url")
@@ -452,7 +452,7 @@ show_qr_recover_file_lane() {
   local saved_port saved_folder
   saved_port=$(json_get "$PROFILE_FILE" "fileServer.localPort")
   saved_folder=$(json_get "$PROFILE_FILE" "fileServer.folder")
-  # existing_fs_config recovers the credential (state cred file / env file / unit) and
+  # existing_fs_config recovers the password (state password file / env file / unit) and
   # sets FS_CRED + FS_LOCAL_PORT + FS_FOLDER; keep the profile's URL/port authoritative.
   if existing_fs_config && [ -n "$FS_CRED" ]; then
     FS_URL="$fsurl"
@@ -460,13 +460,13 @@ show_qr_recover_file_lane() {
     if [ -n "$saved_folder" ] && [ "$saved_folder" != "$FS_FOLDER" ]; then
       note "The saved profile's informational folder differs from the live service definition; using the structurally parsed live folder."
     fi
-    ok "Recovered the file-lane credential from this machine (not shown)."
+    ok "Recovered the file-lane password from this machine (not shown)."
     if $FS_CRED_LEGACY_ARGV; then
       note "Heads-up: that file-server unit keeps its password on the command line (visible via 'ps'). The QR is still correct."
     fi
   else
-    warn "The saved profile includes a file lane at $fsurl, but I can't recover its credential on this machine"
-    warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
+    warn "The saved profile includes a file lane at $fsurl, but I can't recover its password on this machine"
+    warn "(its 0600 password file and the file-server unit are both gone). Without it, the QR can't carry the file password."
     if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?" "verification.gateway_only"; then
       note "Leaving the file lane out of this QR — re-run setup (bash conduck-connect.sh --setup) to rebuild it."
       FS_URL=""; FS_CRED=""; FS_FOLDER=""
@@ -629,7 +629,7 @@ show_qr_next_steps() {
   say "  ${BOLD}Pairing another device${RESET}"
   say "  Scan this same code, or paste it, on every device you want connected — a second"
   say "  phone, an iPad, a Mac. There is no per-device setup and nothing else to run."
-  note "They share one token, so rotating it at the gateway cuts off all of them together."
+  note "They share one key, so rotating it at the gateway cuts off all of them together."
   say ""
   say "  ${BOLD}Still not connecting?${RESET} The --check-server line above grades exactly the route"
   say "  this code points at, and changes nothing on your machine or your server."

@@ -2436,14 +2436,14 @@ run_menu_show_code_case() {
   if ! grep -qF 'Using saved profile: custom (Good gateway) → https://good.example.test' "$TMP/doctor.out"; then
     fail_case "$name" "the complete profile was not loaded before the controlled token stop"; return
   fi
-  # The token is deliberately not on disk, so re-showing a code for a bearer
+  # The key is deliberately not on disk, so re-showing a code for a bearer
   # gateway has to ask for it — and no answer is a hard stop, never a silent
   # keyless code. This is the fail-closed rule in words, then in behaviour.
-  if ! grep -qF 'this saved setup requires a token' "$TMP/doctor.out"; then
-    fail_case "$name" "the token prompt no longer says the saved setup requires one"; return
+  if ! grep -qF 'this saved setup requires a key' "$TMP/doctor.out"; then
+    fail_case "$name" "the key prompt no longer says the saved setup requires one"; return
   fi
-  if ! grep -qF 'A token is required (this saved setup says auth=bearer)' "$TMP/doctor.out"; then
-    fail_case "$name" "an unanswered token prompt did not stop the re-show"; return
+  if ! grep -qF 'A key is required (this saved setup says auth=bearer)' "$TMP/doctor.out"; then
+    fail_case "$name" "an unanswered key prompt did not stop the re-show"; return
   fi
   # …and it stopped BEFORE emitting anything. A code minted here would be a
   # keyless one for a gateway whose profile says it needs a bearer token.
@@ -3318,7 +3318,7 @@ warning_states() { # warning_states <flattened-warning-block> <extended-regex>
 }
 
 # The emitted warning is the only place a user is told what the code they are
-# about to show around actually IS — a reusable bearer credential. SECURITY.md
+# about to show around actually IS — a reusable key. SECURITY.md
 # makes specific promises about that text, and nothing but this case keeps the
 # two from drifting (they already did once: the doc promised a file-lane and
 # rotation clause the script never printed).
@@ -3396,26 +3396,26 @@ run_pairing_warning_case() {
 
   local b
   for b in "$block_files" "$block_bare"; do
-    # FACT 1 — the code carries the gateway token, and that token is a secret.
-    if ! warning_states "$b" 'token' ||
+    # FACT 1 — the code carries the gateway key, and that key is a secret.
+    if ! warning_states "$b" 'key' ||
        ! warning_states "$b" 'like a password|is a secret|keep (it|them|these) secret'; then
-      fail_case "$name" "the warning no longer names the gateway token as a secret"; return
+      fail_case "$name" "the warning no longer names the gateway key as a secret"; return
     fi
-    # FACT 2 — whoever ends up holding the code gets exactly the access the
-    # credentials in it give. This covers both halves of what used to be two facts
+    # FACT 2 — whoever ends up holding the code gets exactly the access the two
+    # secrets in it give. This covers both halves of what used to be two facts
     # ("the holder gets the gateway's capabilities" and "handing it to a person
     # hands them the same access"); the passage now says them in one sentence, and
     # asserting them separately would only be asserting the same clause twice.
     # Every route by which somebody else comes to hold it counts as holding it —
     # that is the point of naming the photograph and the copy.
     if ! warning_states "$b" 'whoever holds|anyone who|the holder|photograph' ||
-       ! warning_states "$b" 'your gateway (allows|permits|lets)|anything the gateway (allows|permits)|same access|(exactly )?the access (those|these) credentials give'; then
+       ! warning_states "$b" 'your gateway (allows|permits|lets)|anything the gateway (allows|permits)|same access|(exactly )?the access (those|these)( two)? (secrets|credentials) give'; then
       fail_case "$name" "the warning no longer states that whoever holds the code gets that access"; return
     fi
     # FACT 3 — it stays valid until the credentials are changed at the gateway.
     # There is no expiry, and the code cannot be revoked on its own.
-    if ! warning_states "$b" 'until you rotate|until you change (it|them)|until (that secret|those secrets|the token) (is|are) rotated'; then
-      fail_case "$name" "the warning no longer states the code works until the credentials are changed"; return
+    if ! warning_states "$b" 'until you rotate|until you change (it|them)|until (that secret|those secrets|the key|the token) (is|are) rotated'; then
+      fail_case "$name" "the warning no longer states the code works until the secrets are changed"; return
     fi
     # FACT 4 — where NOT to put it, concretely. A rule stated only in the abstract
     # ("keep it secret") is the one people obey right up to the moment they paste a
@@ -3424,29 +3424,30 @@ run_pairing_warning_case() {
        ! warning_states "$b" 'chat|issue|screenshot'; then
       fail_case "$name" "the warning no longer names the places the code must not be pasted"; return
     fi
-    # FACT 5 — a shared credential has no per-device revoke; rotation hits every
-    # device on THAT token (a custom gateway may issue several, so not "every device").
+    # FACT 5 — a shared key has no per-device revoke; rotation hits every
+    # device on THAT key (a custom gateway may issue several, so not "every device").
     if ! warning_states "$b" '(cannot|can ?not|can.t) be (cut off|revoked|removed)( one at a time| individually| separately)?' ||
-       ! warning_states "$b" 'every device (using|on|that uses) that token|all devices (using|on) that token'; then
-      fail_case "$name" "the warning no longer states the shared-credential revocation consequence"; return
+       ! warning_states "$b" 'every device (using|on|that uses) that (key|token)|all devices (using|on) that (key|token)'; then
+      fail_case "$name" "the warning no longer states the shared-key revocation consequence"; return
     fi
   done
 
   # FACT 6 — the file-lane clause is CONDITIONAL. Present when the code really
-  # carries the file-server credential; absent when it does not, so the wizard
+  # carries the file-server password; absent when it does not, so the wizard
   # never claims a shared folder this run has no lane for.
   #
-  # Both patterns name the FILE lane specifically. A bare `credential` would also
-  # match the shared secrecy panel's "the access those credentials give", which is
-  # a statement about whatever the code happens to carry and is true on every run —
-  # the negative below would then fail every lane-less run for saying something
-  # correct, and the usual repair for that is to delete the assertion.
-  if ! warning_states "$block_files" 'file[- ]server credential' ||
+  # Both patterns name the FILE lane specifically. A bare `password` would also
+  # match the shared secrecy panel's "the file password when file transfer is set
+  # up", which is a statement about whatever the code happens to carry and is
+  # printed on every run — the negative below would then fail every lane-less run
+  # for saying something correct, and the usual repair for that is to delete the
+  # assertion.
+  if ! warning_states "$block_files" 'file[- ]server (password|credential)' ||
      ! warning_states "$block_files" 'shared folder'; then
-    fail_case "$name" "a run WITH a file lane did not warn that the code carries the file-server credential"; return
+    fail_case "$name" "a run WITH a file lane did not warn that the code carries the file-server password"; return
   fi
-  if warning_states "$block_bare" 'file[- ]server credential|shared folder|file server'; then
-    fail_case "$name" "a run WITHOUT a file lane still claimed a file-server credential or shared folder"; return
+  if warning_states "$block_bare" 'file[- ]server (password|credential)|shared folder|file server'; then
+    fail_case "$name" "a run WITHOUT a file lane still claimed a file-server password or shared folder"; return
   fi
 
   # FACT 7 — say what the code CARRIES, before it is shown. Every route that
@@ -4179,8 +4180,8 @@ gw_5xx_credential_note
 
     case "$expect" in
       yes)
-        if ! printf '%s\n' "$out" | grep -qF 'wants a token after all'; then
-          fail_case "$name" "[$arm] a keyless gateway whose answer depends on the credential was not told so"
+        if ! printf '%s\n' "$out" | grep -qF 'wants a key after all'; then
+          fail_case "$name" "[$arm] a keyless gateway whose answer depends on the key was not told so"
           kill "$FPID" 2>/dev/null; return
         fi
         # Both observed statuses must be shown, or the operator is asked to take the
@@ -4232,16 +4233,16 @@ keyless-404|none|404|11434|yes|no|no|no'
     flat=$(printf '%s\n' "$out" | tr '\n' ' ')
 
     # FACT 1 — the false sentence, in the exact words that sent keyless users after a
-    # credential they never configured. Never sayable when GW_AUTH is none, whatever
+    # key they never configured. Never sayable when GW_AUTH is none, whatever
     # the status; still sayable for a bearer gateway, where it is true.
-    if [ "$auth" = "none" ] && warning_states "$flat" 'token (was )?(rejected|refused)|rejected (your|the) token'; then
-      fail_case "$name" "[$arm] a keyless gateway was told its token was rejected"; return
+    if [ "$auth" = "none" ] && warning_states "$flat" 'key (was )?(rejected|refused)|rejected (your|the) key'; then
+      fail_case "$name" "[$arm] a keyless gateway was told its key was rejected"; return
     fi
-    if [ "$auth" = "bearer" ] && [ "$code" = "401" ] && ! warning_states "$flat" 'token rejected'; then
-      fail_case "$name" "[$arm] a real rejected bearer token no longer reads as one"; return
+    if [ "$auth" = "bearer" ] && [ "$code" = "401" ] && ! warning_states "$flat" 'key rejected'; then
+      fail_case "$name" "[$arm] a real rejected key no longer reads as one"; return
     fi
     # FACT 2 — on the two statuses that ARE about being allowed in, a keyless run says
-    # so, which is what tells the reader why no credential is named. Scoped to those two
+    # so, which is what tells the reader why no key is named. Scoped to those two
     # deliberately: a 404 is not an authentication answer, and saying "keyless" there
     # would be noise attached to a status the auth mode has nothing to do with.
     if [ "$auth" = "none" ] && case "$code" in 401|403) true ;; *) false ;; esac &&
@@ -5004,7 +5005,7 @@ run_manage_token_row_case() {
   if [ "$rc" != "0" ]; then
     fail_case "$name" "--list with four saved kinds exited $rc, expected 0"; return
   fi
-  # One row per kind, each naming the place a code really re-reads the token from.
+  # One row per kind, each naming the place a code really re-reads the key from.
   for kind in \
     "keyless|not stored — this gateway is keyless" \
     "custom|not saved here — you re-enter it when a code is printed" \
@@ -5012,16 +5013,16 @@ run_manage_token_row_case() {
     "openclaw|not saved here — a code re-reads it from OpenClaw's own config" \
   ; do
     if ! grep -qF "${kind#*|}" "$TMP/tokenrow.out"; then
-      fail_case "$name" "the ${kind%%|*} setup's Token row did not say where its token comes from"; return
+      fail_case "$name" "the ${kind%%|*} setup's Key row did not say where its key comes from"; return
     fi
   done
   # Four DISTINCT rows. Without this, one sentence printed four times satisfies
   # every assertion above that happens to match it.
-  if [ "$(grep -c 'Token:' "$TMP/tokenrow.out")" != "4" ]; then
-    fail_case "$name" "expected one Token row per saved setup, found $(grep -c 'Token:' "$TMP/tokenrow.out")"; return
+  if [ "$(grep -c 'Key:' "$TMP/tokenrow.out")" != "4" ]; then
+    fail_case "$name" "expected one Key row per saved setup, found $(grep -c 'Key:' "$TMP/tokenrow.out")"; return
   fi
-  if [ "$(grep 'Token:' "$TMP/tokenrow.out" | sort -u | wc -l | tr -d ' ')" != "4" ]; then
-    fail_case "$name" "two gateway kinds were given the same Token row"; return
+  if [ "$(grep 'Key:' "$TMP/tokenrow.out" | sort -u | wc -l | tr -d ' ')" != "4" ]; then
+    fail_case "$name" "two gateway kinds were given the same Key row"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -7360,9 +7361,9 @@ printf "CONFIRM_RC=%s\n" "$?"
   if [ "$hits" != "0" ]; then
     fail_case "$name" "the wizard reprinted the pasted credential $hits time(s) — the caution must never echo the value"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'looked like a token or password' ||
+  if ! printf '%s\n' "$out" | grep -qF 'looked like a key or password' ||
      ! printf '%s\n' "$out" | grep -qF 'If it was real, rotate it.'; then
-    fail_case "$name" "a credential-shaped answer was refused without naming it as a credential"; return
+    fail_case "$name" "a secret-shaped answer was refused without naming it as one"; return
   fi
   # The branch that belongs to a pipe. Telling a piped session the value is in its
   # scroll-back states something the operator can see is untrue, which is how they
@@ -7385,9 +7386,9 @@ printf "CONFIRM_RC=%s\n" "$?"
   if [ "$hits" != "1" ]; then
     fail_case "$name" "the credential appears $hits time(s) on a real terminal; exactly 1 is the tty echo and any more is a copy the wizard added"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'looked like a token or password' ||
+  if ! printf '%s\n' "$out" | grep -qF 'looked like a key or password' ||
      ! printf '%s\n' "$out" | grep -qF 'If it was real, rotate it.'; then
-    fail_case "$name" "a credential-shaped answer was refused without naming it as a credential"; return
+    fail_case "$name" "a secret-shaped answer was refused without naming it as one"; return
   fi
   if ! printf '%s\n' "$out" | grep -qF 'It was shown as you typed it' ||
      printf '%s\n' "$out" | grep -qF 'Assume this session may have recorded it.'; then
@@ -7397,7 +7398,7 @@ printf "CONFIRM_RC=%s\n" "$?"
   # count above — pty-run.py writes the whole input up front, so the echo lands
   # early no matter what — but it still catches a caution emitted before the read.
   tok_line=$(printf '%s\n' "$out" | grep -n -F -- "$secret" | head -1 | cut -d: -f1)
-  caution_line=$(printf '%s\n' "$out" | grep -n -F 'looked like a token or password' | head -1 | cut -d: -f1)
+  caution_line=$(printf '%s\n' "$out" | grep -n -F 'looked like a key or password' | head -1 | cut -d: -f1)
   if [ -z "$tok_line" ] || [ -z "$caution_line" ] || [ "$caution_line" -le "$tok_line" ]; then
     fail_case "$name" "the caution did not follow the answer it is about"; return
   fi
@@ -7687,8 +7688,8 @@ warn() { printf "! %s\n" "$*"; }
 printf "%s\nhttps://gateway.example.test\n" "$CRED" | ask_url "Address" "https://ai.example.com"
 ' 2>&1) || { fail_case "$name" "ask_url failed to run in isolation"; return; }
   printf '%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qF 'the token goes in the token prompt'; then
-    fail_case "$name" "ask_url did not explain where the credential actually belongs"; return
+  if ! printf '%s\n' "$out" | grep -qF 'it is asked for separately, at a hidden prompt'; then
+    fail_case "$name" "ask_url did not explain where the secret actually belongs"; return
   fi
   if printf '%s\n' "$out" | grep -qF 'hunter2@gateway'; then
     fail_case "$name" "ask_url accepted or echoed back the credential-bearing URL"; return
@@ -8091,12 +8092,12 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.clos
   if [ "$rc" != "0" ]; then
     fail_case "$name" "the retried address did not finish green (exit $rc)"; return
   fi
-  prompts=$(grep -c 'Bearer token the server expects' "$TMP/doctor.out")
+  prompts=$(grep -c 'Key the server expects' "$TMP/doctor.out")
   if [ "$prompts" != "1" ]; then
-    fail_case "$name" "the token was asked for $prompts times, expected 1"; return
+    fail_case "$name" "the key was asked for $prompts times, expected 1"; return
   fi
-  if ! grep -qF 'The token you already entered is kept' "$TMP/doctor.out"; then
-    fail_case "$name" "the re-ask never said the token is kept"; return
+  if ! grep -qF 'The key you already entered is kept' "$TMP/doctor.out"; then
+    fail_case "$name" "the re-ask never said the key is kept"; return
   fi
   if [ "$(grep -c '^CONDUCK_CHECK_SERVER schema=' "$TMP/doctor.out")" != "1" ]; then
     fail_case "$name" "expected exactly 1 CONDUCK_CHECK_SERVER summary line"; return
@@ -8387,8 +8388,8 @@ run_auth_eof_case() { # run_auth_eof_case <server|adapter>
   if [ "$rc" != "1" ]; then
     fail_case "$name" "missing runtime token exited $rc, expected 1"; return
   fi
-  if ! grep -qF 'No token given and no answer possible' "$TMP/doctor.out"; then
-    fail_case "$name" "died for some other reason than the missing token answer"; return
+  if ! grep -qF 'No key given and no answer possible' "$TMP/doctor.out"; then
+    fail_case "$name" "died for some other reason than the missing key answer"; return
   fi
   if ! grep -qF 'CONDUCK_TOKEN= (empty) to declare keyless deliberately' "$TMP/doctor.out"; then
     fail_case "$name" "the fail-closed error doesn't name the explicit-keyless escape hatch"; return

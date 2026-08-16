@@ -86,7 +86,7 @@ PY
     # Names the directory, because this is the last screen of a successful run and
     # $STATE_DIR otherwise reaches the operator only inside a permissions warning —
     # so somebody who never hits a failure never learns where their setups live.
-    note "Saved a non-secret pairing profile (no token) in $STATE_DIR."
+    note "Saved a non-secret pairing profile (no key) in $STATE_DIR."
     note "Re-show this code — to pair another device, or after something changes — with:  bash conduck-connect.sh --show-code"
   else
     rm -f "$pf.tmp" 2>/dev/null || true        # never leave a partial temp behind
@@ -237,9 +237,9 @@ emit_payload() {
   # The file-lane clause must ride the SAME condition build_pairing_payload_json uses to
   # attach fileServer — warning about a shared folder that isn't in this code is a lie the
   # user cannot check, and omitting it when it IS in the code understates what they hold.
-  warn "The setup code below CONTAINS YOUR GATEWAY TOKEN — both the QR and the plain-text string."
+  warn "The setup code below CONTAINS YOUR GATEWAY KEY — both the QR and the plain-text string."
   if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
-    warn "It also carries the FILE-SERVER CREDENTIAL for your shared folder, so whoever holds"
+    warn "It also carries the FILE-SERVER PASSWORD for your shared folder, so whoever holds"
     warn "this code can read and change the files in it."
   fi
   # What the code IS, said in the one place every route to a code passes through:
@@ -248,8 +248,8 @@ emit_payload() {
   # that nothing secret is written to this machine — and it replaces the two
   # hand-written sentences that used to say the first half twice, once per branch.
   explain_setup_code_secrecy
-  warn "Devices sharing one token cannot be cut off one at a time — rotating it at the gateway"
-  warn "cuts off every device using that token."
+  warn "Devices sharing one key cannot be cut off one at a time — rotating it at the gateway"
+  warn "cuts off every device using that key."
   warn "Note: over SSH, Ctrl-L only clears the visible screen — the code stays in your"
   warn "scroll-back, so close the terminal (or clear scroll-back) when you're done."
   say ""

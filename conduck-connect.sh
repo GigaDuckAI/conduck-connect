@@ -43,11 +43,11 @@
 #   5. Verifies everything with real requests. An OpenClaw/Hermes file lane must
 #      pass a real agent read -> byte-identical write sentinel before a code.
 #   6. Prints a setup code — as a QR you scan with the Conduck app, and as text.
-#      URL, token, and file-lane credentials arrive in one scan; nothing to
+#      URL, key, and file-lane password arrive in one scan; nothing to
 #      retype on your phone (iPhone or iPad).
 #   7. Afterwards: lists what it set up, changes one thing about a saved setup
 #      without re-asking the rest, and removes one completely — the file-lane
-#      service, its credentials and the saved gateway. Removal never deletes the
+#      service, its password and the saved gateway. Removal never deletes the
 #      folder you shared, and it asks you to type the setup's id first.
 #
 # What this script NEVER does
@@ -69,7 +69,7 @@
 #   Tailscale's control plane, each shown in full and approved before it runs; the
 #   Cloudflare path runs `cloudflared tunnel list` to read the tunnels your
 #   existing Cloudflare login can already see, so it can name yours back to you.
-#   Both are that vendor's own client, on this machine, under your credentials.
+#   Both are that vendor's own client, on this machine, signed in as you.
 #   Reading local state is a different thing and is not gated on your choice:
 #   `tailscale status` and `tailscale serve status` ask the daemon on THIS
 #   machine, so the menu can label what you already have and the port logic never
@@ -82,7 +82,7 @@
 #   Scriptable: --check-server [url], --check-adapter [url] and --list [--json].
 #   Set CI=1 and the two checks never prompt; the last line is always a machine
 #   summary, and the exit status is the verdict. --list asks nothing in any case:
-#   it reports the setups saved on this machine, with no token, password or setup
+#   it reports the setups saved on this machine, with no key, password or setup
 #   code anywhere in its output.
 #   Need a person at a terminal: no arguments (the welcome menu), --setup,
 #   --show-code, --edit [id] and --forget <id>. Setup ends in a setup code that
@@ -97,7 +97,7 @@
 #   version and exits.
 #
 # Environment
-#   CONDUCK_TOKEN=<token>   bearer token for a check, so it never reaches your
+#   CONDUCK_TOKEN=<key>     the key for a check, so it never reaches your
 #                           shell history or argv. Export it EMPTY to declare a
 #                           keyless target deliberately.
 #   CONDUCK_CHECK_SERVER_MODEL=<model-id>
@@ -134,13 +134,13 @@
 # Re-running is safe: every step detects existing state and reuses what's done.
 # --show-code re-shows a saved gateway's code without the setup questions — handy
 # for pairing your own second device, and the code is the same reusable secret, so
-# treat every copy of it like the token it carries.
+# treat every copy of it like the key it carries.
 #
 # Once something is set up you don't have to walk the wizard again to change it.
 # --list shows every saved setup and whether its file-lane service is running,
 # --edit [id] re-asks ONE value — the web address a restarted quick tunnel just
 # changed, the model, the shared folder — and re-verifies only what that affects,
-# and --forget <id> removes one setup's service, credentials and saved gateway. It
+# and --forget <id> removes one setup's service, password and saved gateway. It
 # leaves the folder you shared, your agent's own files, and the pairing already on
 # your phone exactly where they are, and says so before it starts.
 #
@@ -212,7 +212,7 @@ url_has_userinfo() { # url_has_userinfo <url> -> 0 when the authority carries us
   local a="${1#*://}"; a="${a%%[/?#]*}"
   case "$a" in *@*) return 0 ;; *) return 1 ;; esac
 }
-URL_USERINFO_HINT="Credentials don't belong in the address. Drop the \"user:pass@\" part and give the plain URL — the token goes in the token prompt, not the URL."
+URL_USERINFO_HINT="A key or password doesn't belong in the address. Drop the \"user:pass@\" part and give the plain URL — it is asked for separately, at a hidden prompt."
 
 OS="$(uname -s)"   # Linux | Darwin
 # ${HOME:-} so a check run in a HOME-less environment (a bare CI shell) doesn't
@@ -302,7 +302,7 @@ print_help() {
   say "  --list [--json]        List what is already set up on this machine: each saved"
   say "                         gateway's id, address, transport, model and shared folder,"
   say "                         and whether its file-lane service is running. Asks nothing,"
-  say "                         changes nothing, and prints no token, password or setup code."
+  say "                         changes nothing, and prints no key, password or setup code."
   say ""
   say "COMMANDS — need a person at a terminal"
   say "  (no command)           Welcome menu: pick one of the actions below."
@@ -316,7 +316,7 @@ print_help() {
   say "                         changed. Removal lives here too. Without an id, it asks"
   say "                         which saved setup you mean."
   say "  --forget <id>          Remove one saved setup: stop and delete its file-lane"
-  say "                         service, its saved credentials and its saved gateway."
+  say "                         service, its saved password and its saved gateway."
   say "                         You confirm by typing the id, not by pressing Enter. It"
   say "                         never deletes your shared folder, and exits 1 if no setup"
   say "                         has that id — run --list to see the ids."
@@ -327,7 +327,7 @@ print_help() {
   say "  --reuse-only           With --setup: use only what already exists. The first step"
   say "                         that would change host configuration stops the run and names"
   say "                         it — it is not skipped."
-  say "  --allow-keyless-public With --setup: expert — permit a gateway with no token on a"
+  say "  --allow-keyless-public With --setup: expert — permit a gateway with no key on a"
   say "                         publicly reachable transport."
   say "  --deep                 With --check-adapter: add a semantic image-input check."
   say "  --files                With --check-adapter: also grade the configured file lane."
@@ -337,7 +337,7 @@ print_help() {
   say "  bash conduck-connect.sh --version    print the version and exit"
   say ""
   say "ENVIRONMENT"
-  say "  CONDUCK_TOKEN               Bearer token for a check, so it never reaches your"
+  say "  CONDUCK_TOKEN               The key for a check, so it never reaches your"
   say "                              shell history or argv."
   say "  CONDUCK_CHECK_SERVER_MODEL  --check-server only: grade the model you plan to use."
   say "                              Without it the named-model checks take whichever id"
@@ -365,7 +365,7 @@ print_help() {
   say ""
   say "FILES"
   say "  $STATE_DIR"
-  say "      Saved gateways and file-lane credentials. A gateway token is never stored."
+  say "      Saved gateways and file-lane passwords. A gateway key is never stored."
   say "      --list reports what is in here; --forget <id> removes one setup's share of it."
   say ""
   say "SEE ALSO"
@@ -1037,13 +1037,13 @@ looks_like_a_secret() { # looks_like_a_secret <answer>
 # not echo, so "it is on your screen" would be false — and a warning that states
 # something the operator can see is untrue is how they learn to skip the next one.
 warn_answer_looked_like_a_secret() {
-  warn "That looked like a token or password, and this question is not where one goes." >&2
+  warn "That looked like a key or password, and this question is not where one goes." >&2
   if [ -t 0 ]; then
     warn "It was shown as you typed it, so it is in this terminal's scroll-back." >&2
   else
     warn "Assume this session may have recorded it." >&2
   fi
-  warn "If it was real, rotate it. A secret is only ever asked for at a hidden prompt —" >&2
+  warn "If it was real, rotate it. A key or password is only ever asked for at a hidden prompt —" >&2
   warn "one that shows nothing at all while you type." >&2
 }
 
@@ -1278,8 +1278,8 @@ ask_default() {  # ask_default "prompt" "default" [action-id] [allow-back] -> re
 # infer no-auth from a missing answer — the fail-closed-auth invariant.
 #
 # `i` and `q` are read as controls here with NO "did you mean it literally?"
-# question, unlike the visible value prompts. A bearer token that is exactly one
-# character is not a real token, so there is nothing to disambiguate — and the two
+# question, unlike the visible value prompts. A key that is exactly one
+# character is not a real key, so there is nothing to disambiguate — and the two
 # failure modes are wildly asymmetric. Taking `q` as a control costs a stopped run
 # the operator asked for; taking it as data costs a run that authenticates with
 # the single byte "q", fails verification minutes later somewhere else entirely,
@@ -1491,7 +1491,7 @@ ensure_state_dir() {  # -> 1 when the directory does not exist and could not be 
     warn "Their 0600 protects what is inside those files, not the folder that holds them."
   else
     warn "$STATE_DIR can be listed by other accounts on this machine (it already existed with that mode)."
-    warn "The credential files inside are 0600, but the folder itself names every gateway you have paired."
+    warn "The password files inside are 0600, but the folder itself names every gateway you have paired."
   fi
   warn "Fix it when you can:  chmod 700 $STATE_DIR"
   return 0
@@ -2159,16 +2159,16 @@ explain_action() { # explain_action <action-id>
 
     gateway.custom.has_auth)
       explain_panel \
-        "Say whether this server checks for a secret key before it answers" \
-        "Most servers want a key — a long random string, sometimes called an API key or a bearer token — sent with every request, and refuse anyone who cannot produce it. Some are set up with no key at all, which means anyone who can reach the address can use it." \
+        "Say whether this server checks for a key before it answers" \
+        "Most servers want a key — a long random string — sent with every request, and refuse anyone who cannot produce it. Some are set up with no key at all, which means anyone who can reach the address can use it." \
         "Takes the key at a hidden prompt: nothing at all appears as you type, so a paste never lands on screen or in your scroll-back. The key rides inside the setup code your phone scans and is never written to this machine's saved record. Pressing Enter with nothing typed does not quietly mean \"no key\" — it opens a separate question that makes you say so." \
         "" \
         "No key means anyone who reaches the address can use whatever your gateway allows. Setup refuses to put a no-key server on a public address unless you explicitly override it." \
         "Look at how the server was started, or at the config file your gateway was given. If you were handed a long random string when it was installed, that is the key. If you never saw one, and the server only answers on this machine, it is probably keyless."
       ;;
 
-    # For the hidden token prompts themselves (the custom-gateway key, OpenClaw's
-    # and Hermes's, the two check commands' bearer prompt, and --show-code's
+    # For the hidden key prompts themselves (the custom-gateway key, OpenClaw's
+    # and Hermes's, the two check commands' key prompt, and --show-code's
     # re-entry). It answers the one question the hidden prompt cannot: where does
     # this string come from.
     #
@@ -2182,12 +2182,12 @@ explain_action() { # explain_action <action-id>
     # the reader is standing.
     gateway.token)
       explain_panel \
-        "Paste the secret key your server checks on every request" \
+        "Paste the key your server checks on every request" \
         "Without it the server answers every request with a refusal, and the app would be paired to an address it can never use." \
         "Nothing appears on screen while you type or paste — that is deliberate, not a frozen prompt. The key travels inside the setup code your phone scans and is never written into the record this script saves, which is why --show-code has to ask you for it again." \
         "" \
         "Nothing on the server changes. If you later rotate the key, re-run setup or --show-code and pair the devices again with the new one." \
-        "It is wherever your gateway was configured: the line in its config file or its start-up command that names a key or token, or the string whoever installed it wrote down for you. If your server genuinely has no key, Enter is safe to try — an empty answer is never read as a quiet yes here. The prompt line above says what it does: stop, offer keyless and make you confirm it, or grade the server keyless and say so."
+        "It is wherever your gateway was configured: the line in its config file or its start-up command that names the key, or the string whoever installed it wrote down for you. If your server genuinely has no key, Enter is safe to try — an empty answer is never read as a quiet yes here. The prompt line above says what it does: stop, offer keyless and make you confirm it, or grade the server keyless and say so."
       ;;
 
     # Three prompts share this panel and they do NOT share an Enter: the
@@ -2442,7 +2442,7 @@ explain_action() { # explain_action <action-id>
       explain_panel \
         "Give the gateway an encrypted address anyone on the internet can reach" \
         "A public address means no Tailscale app on your phone, and it means an Apple Watch works on its own with no iPhone nearby. Tailscale's own name for this is \"Funnel\"." \
-        "Goes on to show you the exact Tailscale command and ask about it separately. If you approve it there, a public encrypted address is pointed at your gateway's local door. Anyone who finds that address can knock on it; your gateway's secret key is the only lock, which is why setup refuses to do this for a gateway that has no key." \
+        "Goes on to show you the exact Tailscale command and ask about it separately. If you approve it there, a public encrypted address is pointed at your gateway's local door. Anyone who finds that address can knock on it; your gateway's key is the only lock, which is why setup refuses to do this for a gateway that has no key." \
         "The gateway stays private, or unreachable by this route." \
         "Switch that public address off, or put back the mapping setup shows you, to reverse this one change. Nothing else is affected." \
         "Choose the private option instead unless you need a standalone Apple Watch or a device that cannot run Tailscale. You can re-run this script and change your mind."
@@ -2799,7 +2799,7 @@ explain_show_code() {
   say ""
   say "  ${BOLD}Why it may still ask you something${RESET}"
   say "  Secrets are deliberately not stored on this machine, so a gateway with a"
-  say "  secret key asks you to paste it again. That is the price of not keeping"
+  say "  key asks you to paste it again. That is the price of not keeping"
   say "  your key in a file here."
   say ""
 }
@@ -2808,9 +2808,9 @@ explain_show_code() {
 # It is the only place the tool says what the code actually is.
 explain_setup_code_secrecy() {
   say ""
-  say "  ${BOLD}Treat this code like a password.${RESET} It carries your gateway's secret key,"
+  say "  ${BOLD}Treat this code like a password.${RESET} It carries your gateway's key,"
   say "  and the file password when file transfer is set up. Anyone who photographs"
-  say "  the QR square, or copies the text, has exactly the access those credentials"
+  say "  the QR square, or copies the text, has exactly the access those two secrets"
   say "  give — until you change them at the gateway. Do not paste it into a chat,"
   say "  an issue, or a screenshot."
   say ""
@@ -3001,19 +3001,19 @@ hermes_api_server_port() {
   printf '%s' "${port:-8642}"
 }
 
-# Prompt for the OpenClaw bearer credential (hidden), or die with <die-msg> on empty input.
+# Prompt for the OpenClaw gateway key (hidden), or die with <die-msg> on empty input.
 # In the wizard's dry-run it only notes the intent (a real run would ask). Sets GW_TOKEN.
 _openclaw_prompt_secret() { # _openclaw_prompt_secret <ctx> <ask-prompt> <die-msg-on-empty>
   local ctx="$1" ask="$2" diemsg="$3"
   if [ "$ctx" = "wizard" ] && $DRY_RUN; then
-    note "(dry-run: would prompt for the gateway credential)"
+    note "(dry-run: would prompt for the gateway key)"
     return 0
   fi
   # prompt_into, not a plain $(…): ask_secret answers `q` with rc 11, and acting
   # on that has to happen in THIS shell — a quit_run inside a command
   # substitution would stop the subshell and let the wizard walk on with an
   # empty token.
-  prompt_into GW_TOKEN ask_secret "$ask" "stop; this credential is required" "gateway.token"
+  prompt_into GW_TOKEN ask_secret "$ask" "stop; this key is required" "gateway.token"
   [ -n "$GW_TOKEN" ] || die "$diemsg"
 }
 
@@ -3031,19 +3031,19 @@ openclaw_resolve_secret() { # openclaw_resolve_secret <ctx>
   local ctx="$1"
   local cfg="$HOME/.openclaw/openclaw.json"
   local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
-  [ -f "$cfg" ] || die "Can't find $cfg to read the OpenClaw credential — is this the machine you paired on? Re-run the wizard (bash conduck-connect.sh) if OpenClaw moved."
+  [ -f "$cfg" ] || die "Can't find $cfg to read the OpenClaw gateway key — is this the machine you paired on? Re-run the wizard (bash conduck-connect.sh) if OpenClaw moved."
   local mode; mode=$(json_get "$cfg" "gateway.auth.mode")
   case "$mode" in
     none)
       if [ "$ctx" = "showqr" ]; then
-        warn "OpenClaw's config now shows auth mode 'none', but your saved profile expects a token."
+        warn "OpenClaw's config now shows auth mode 'none', but your saved profile expects a key."
         _openclaw_prompt_secret "$ctx" \
-          "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" \
-          "A token is required (your saved profile says auth=bearer). Re-run when you have it."
+          "Paste the gateway key again — what the gateway checks on each request (hidden)" \
+          "A key is required (your saved profile says auth=bearer). Re-run when you have it."
         return 0
       fi
       GW_AUTH="none"; GW_TOKEN=""
-      note "OpenClaw's gateway auth mode is 'none' — this gateway has no token. Fine on a private network; I'll guard against publishing it keyless below."
+      note "OpenClaw's gateway auth mode is 'none' — this gateway has no key. Fine on a private network; I'll guard against publishing it keyless below."
       ;;
     ""|token|password)
       GW_AUTH="bearer"
@@ -3052,36 +3052,36 @@ openclaw_resolve_secret() { # openclaw_resolve_secret <ctx>
       case "$cls" in
         literal$'\t'*)
           GW_TOKEN="${cls#*$'\t'}"
-          ok "Read the gateway bearer credential (the secret key the app sends to log in) from openclaw.json (not shown)."
+          ok "Read the gateway key (what the app sends to log in) from openclaw.json (not shown)."
           ;;
         ref)
-          warn "Your OpenClaw config references the credential indirectly (an env placeholder or secret reference), not as a literal value."
+          warn "Your OpenClaw config references the key indirectly (an env placeholder or secret reference), not as a literal value."
           _openclaw_prompt_secret "$ctx" \
-            "Paste the actual secret value the gateway checks (hidden)" \
-            "OpenClaw's config points at the credential indirectly, so I can't read it — paste the real value and re-run."
+            "Paste the actual key the gateway checks (hidden)" \
+            "OpenClaw's config points at the key indirectly, so I can't read it — paste the real value and re-run."
           ;;
         *)
           # Absent in the config → try the compose .env (OPENCLAW_GATEWAY_TOKEN; token mode
           # only), then prompt. The seed .env can drift, but it beats no token at all.
           [ "$mode" = "password" ] || GW_TOKEN=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_TOKEN")
           if [ -n "$GW_TOKEN" ]; then
-            ok "Read the gateway bearer token from the OpenClaw compose .env (not shown)."
+            ok "Read the gateway key from the OpenClaw compose .env (not shown)."
           else
-            warn "No literal token found at $key in $cfg (or in the compose .env)."
+            warn "No literal key found at $key in $cfg (or in the compose .env)."
             _openclaw_prompt_secret "$ctx" \
-              "Paste the gateway bearer token — the secret key the gateway checks on each request (hidden)" \
-              "OpenClaw needs its access token (the secret key the gateway checks). Find it in openclaw.json under $key, then re-run."
+              "Paste the gateway key — what the gateway checks on each request (hidden)" \
+              "OpenClaw needs its key. Find it in openclaw.json under $key, then re-run."
           fi
           ;;
       esac
       ;;
     *)
-      # trusted-proxy or anything unknown: we can't infer the credential to send.
+      # trusted-proxy or anything unknown: we can't infer the key to send.
       GW_AUTH="bearer"
-      note "OpenClaw's gateway auth mode is '$mode' — I won't guess a credential for it; paste whatever bearer value the gateway expects."
+      note "OpenClaw's gateway auth mode is '$mode' — I won't guess a key for it; paste whatever key the gateway expects."
       _openclaw_prompt_secret "$ctx" \
-        "Paste the bearer credential the gateway expects (hidden)" \
-        "This auth mode ('$mode') needs a credential I can't read automatically — paste it and re-run."
+        "Paste the key the gateway expects (hidden)" \
+        "This auth mode ('$mode') needs a key I can't read automatically — paste it and re-run."
       ;;
   esac
 }
@@ -3297,7 +3297,7 @@ gw_guard_single_saved_setup() { # gw_guard_single_saved_setup <id> <display-name
 }
 
 configure_openclaw() {
-  head_ "Step 2 — OpenClaw: chat endpoint + token"
+  head_ "Step 2 — OpenClaw: chat endpoint + key"
   GW_ID="openclaw"
   local cfg="$HOME/.openclaw/openclaw.json"
   [ -f "$cfg" ] || die "Cannot find $cfg — is OpenClaw onboarded on this machine? (Run its onboarding first; this script doesn't install gateways.)"
@@ -3885,7 +3885,7 @@ report_gateway_id_collision() { # report_gateway_id_collision <id> [name-just-ty
     # most, so it names both and then points at the one surface that can say
     # which of them this machine has.
     bad "Something on this machine already answers to the id '$id', with no saved setup beside it."
-    say "  A file server and its credential are filed under that id — left either by an"
+    say "  A file server and its password are filed under that id — left either by an"
     say "  earlier, unfinished run, or by a saved setup that was deleted by hand while its"
     say "  file server carried on running. Reusing the id would silently adopt them: the"
     say "  same service, the same port, the same password."
@@ -3970,15 +3970,15 @@ pick_existing_custom_gateway() { # 0 = editing (globals set) / 1 = new gateway
   # wrong exposure path. The auth mode because the profile holds no token by
   # design, so bearer has to be re-established at the hidden prompt anyway.
   ok "Changing the saved gateway: $(safe_display "${GW_NAME:-$GW_ID}" 60)  (id: $GW_ID)"
-  note "I'll ask for its address and token again — the address can have moved, and the"
-  note "token is never saved."
+  note "I'll ask for its address and key again — the address can have moved, and the"
+  note "key is never saved."
   return 0
 }
 
 # Auth for a custom gateway, taken at ONE hidden prompt rather than a visible
-# [y/N] followed by a hidden one. A question whose own wording is "bearer token /
-# API key" invites a paste, and an echoing prompt shows what it receives: the
-# token was printed, refused as not-a-yes-or-no, and left in the terminal's
+# [y/N] followed by a hidden one. A question whose own wording names the key
+# invites a paste, and an echoing prompt shows what it receives: the
+# key was printed, refused as not-a-yes-or-no, and left in the terminal's
 # scroll-back — one line before the hidden prompt that would have taken it
 # safely. Asking for the secret directly gives the paste exactly one place to
 # land, and that place shows nothing.
@@ -3987,14 +3987,14 @@ pick_existing_custom_gateway() { # 0 = editing (globals set) / 1 = new gateway
 # too: an empty answer opens a question, never settles one, and only an
 # affirmative confirm sets auth=none. EOF is not an empty answer — ask_secret
 # returns nonzero for it, so a redirected run dies instead of reading "nobody
-# was there to answer" as "this gateway needs no token".
+# was there to answer" as "this gateway needs no key".
 ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
   # A dry run must never solicit a real secret, so it takes the mode as a
   # bounded choice instead. `<token>` is the same placeholder the rest of the
   # dry-run path already carries; nothing is stored either way.
   if $DRY_RUN; then
-    say "  Does this server require a token (API key) on every request?"
-    say "    1) Yes — it requires a token"
+    say "  Does this server require a key on every request?"
+    say "    1) Yes — it requires a key"
     say "    2) No  — it is keyless"
     # No hand-rolled "('i' explains)" here: require_choice renders its own
     # control list, and a second one beside it is what trains a reader to stop
@@ -4003,7 +4003,7 @@ ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
     prompt_into c require_choice "Choose 1-2" '^[12]$' "gateway.custom.has_auth"
     if [ "$c" = "1" ]; then
       GW_AUTH="bearer"; GW_TOKEN="<token>"
-      note "(dry-run: a real run asks for the token at a hidden prompt)"
+      note "(dry-run: a real run asks for the key at a hidden prompt)"
     else
       GW_AUTH="none"; GW_TOKEN=""
       # The same two cautions the real run gives. A plan that silently omits them
@@ -4014,28 +4014,28 @@ ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
     return 0
   fi
   while true; do
-    say "  If this server needs a token (API key), paste it now — nothing appears as you type."
-    prompt_into GW_TOKEN ask_secret "Token" "this server is keyless" "gateway.token"
+    say "  If this server needs a key, paste it now — nothing appears as you type."
+    prompt_into GW_TOKEN ask_secret "Key" "this server is keyless" "gateway.token"
     # An all-whitespace answer is a fumbled paste, not a token and not a
     # deliberate Enter. Letting it through mints a setup code the app parses and
     # then refuses to save, which strands the operator a step later than here.
     case "$GW_TOKEN" in
       *[![:space:]]*) ;;
-      ?*) warn "That was only whitespace. Paste the token again, or press Enter for keyless."
+      ?*) warn "That was only whitespace. Paste the key again, or press Enter for keyless."
           GW_TOKEN=""; continue ;;
     esac
     if [ -n "$GW_TOKEN" ]; then
       GW_AUTH="bearer"
-      ok "Token held for this run — it rides in the setup code and is never written to the saved profile."
+      ok "Key held for this run — it rides in the setup code and is never written to the saved profile."
       return 0
     fi
     note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
     note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
-    if confirm "  Confirm this server needs NO token?" "gateway.custom.has_auth"; then
+    if confirm "  Confirm this server needs NO key?" "gateway.custom.has_auth"; then
       GW_AUTH="none"; GW_TOKEN=""
       return 0
     fi
-    say ""; note "↩ Let's take the token again."
+    say ""; note "↩ Let's take the key again."
   done
 }
 
@@ -4063,8 +4063,8 @@ review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
   local address auth model reply p
   if [ -n "$GW_URL" ]; then address="$GW_URL"
   else address="http://127.0.0.1:$GW_LOCAL_PORT (local; HTTPS comes next)"; fi
-  if [ "$GW_AUTH" = "bearer" ]; then auth="Bearer token configured (hidden)"
-  else auth="No token — allowed only on a private path unless explicitly overridden"; fi
+  if [ "$GW_AUTH" = "bearer" ]; then auth="Key configured (hidden)"
+  else auth="No key — allowed only on a private path unless explicitly overridden"; fi
   # "Server/app default (no model fixed in the setup code)" described the wire
   # payload, in a row headed by the word the reader typed nothing into — so the
   # commonest, most correct answer here read as a report of something missing.
@@ -5092,13 +5092,13 @@ explain_exposure_paths() {
   say ""
   say "  2) Tailscale Funnel — PUBLIC"
   say "     Who can reach it:  anyone on the internet who finds the URL can knock;"
-  say "                        your gateway's token (its secret key) is the lock."
+  say "                        your gateway's key is the lock."
   say "     What to install:   nothing on your devices."
   say "     Who sees traffic:  nobody in between — encrypted end-to-end, Tailscale only relays."
   say "     Apple Watch:       works on its own, anywhere."
   say ""
   say "  3) Cloudflare Tunnel — PUBLIC"
-  say "     Who can reach it:  anyone on the internet — same lock: the gateway's token."
+  say "     Who can reach it:  anyone on the internet — same lock: the gateway's key."
   say "     What to install:   nothing on your devices; needs a domain you manage in"
   say "                        Cloudflare (~\$8/yr for the domain) and Cloudflare's own"
   say "                        tunnel program (cloudflared) on this machine."
@@ -5196,7 +5196,7 @@ explain_own_https_target() {
   say "    • If the gateway itself listens only on 127.0.0.1, whatever sits in front of it"
   say "      (Caddy, nginx, a tunnel) usually has to rewrite the Host header: a server like"
   say "      that often refuses a request arriving under any other name, and it refuses it"
-  say "      with 403 — which reads like a token problem and is not one. In nginx:"
+  say "      with 403 — which reads like a key problem and is not one. In nginx:"
   say "      ${BOLD}proxy_set_header Host 127.0.0.1:<the gateway's port>;${RESET}"
   say "  Press i at the prompt below for the longer version."
   say ""
@@ -5414,9 +5414,9 @@ explain_scope_choice() {
   say ""
   say "  Why I ask: your answer doesn't change who can reach the address — it only"
   say "  decides how strict I am. If you answer Public, I refuse to pair a gateway"
-  say "  that has no token (secret key). Calling a public address \"private\" would"
+  say "  that has no key. Calling a public address \"private\" would"
   say "  skip that protection; calling a private one \"public\" can at worst block a"
-  say "  token-less private setup — it never weakens anything."
+  say "  keyless private setup — it never weakens anything."
   say ""
   say "  Public  — reachable from the open internet. Typical: Tailscale Funnel,"
   say "            Cloudflare Tunnel, a rented server (VPS) with its own domain."
@@ -5464,7 +5464,7 @@ keyless_public_guard() {
   fi
   bad "This gateway has NO authentication, and this transport is publicly reachable."
   say  "  That would put an unauthenticated, tool-capable agent on the open internet."
-  say  "  Safer options: keep it tailnet-only (Tailscale Serve), or put a token on the"
+  say  "  Safer options: keep it tailnet-only (Tailscale Serve), or put a key on the"
   say  "  gateway itself. If you truly mean to, re-run with --allow-keyless-public."
   die "Refusing to publish a keyless gateway."
 }
@@ -5908,7 +5908,7 @@ fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
   note "The shared folder is served over WebDAV with read AND write access to everything inside it."
   note "It has to be the agent's working folder, never your whole account: served from / or your home"
   note "directory, anything holding the file password can read your keys — and this script's own"
-  note "credential files — and write into them."
+  note "password files — and write into them."
 }
 
 # The folder prompt for a gateway whose working folder this wizard cannot know.
@@ -6085,7 +6085,7 @@ ensure_existing_fs_envfile_linux() {
       # only from state cannot authenticate a unit that has no password source.
       $FS_CRED_LEGACY_ARGV && return 0
       warn "The existing file-server unit has no usable EnvironmentFile directive."
-      warn "I will not expose it because its saved credential is not wired into rclone."
+      warn "I will not expose it because its saved password is not wired into rclone."
       fs_envfile_exposure_warning
       return 1 ;;
     *)
@@ -6097,7 +6097,7 @@ ensure_existing_fs_envfile_linux() {
 
   env_cred=$(env_get "$expected" "RCLONE_PASS" 2>/dev/null || true)
   if ! credential_value_safe "$env_cred" || [ "$env_cred" != "$FS_CRED" ]; then
-    warn "The unit's environment file is missing or does not match its saved credential."
+    warn "The unit's environment file is missing or does not match its saved password."
     warn "Refusing to rewrite or expose it; repair/remove the exact unit and re-run."
     fs_envfile_exposure_warning
     return 1
@@ -6106,12 +6106,12 @@ ensure_existing_fs_envfile_linux() {
 
   warn "A file server this script set up earlier uses the old quoted EnvironmentFile form."
   # Wording verified against rclone 1.74: `--user conduck` with no password does
-  # NOT serve openly. It demands an EMPTY password, so the saved credential gets
+  # NOT serve openly. It demands an EMPTY password, so the saved password gets
   # 401 like every other one. Calling that "unauthenticated" sends the operator
   # hunting for an intrusion, when the real symptom is attachments that can never
   # authenticate.
   note "systemd treats those quotes as part of the path, so rclone never reads the password"
-  note "file and demands an EMPTY password instead: it answers 401 to the saved credential —"
+  note "file and demands an EMPTY password instead: it answers 401 to the saved password —"
   note "and to every other password — while the user 'conduck' with a blank password gets in."
   note "I can replace only that one directive with the same absolute path unquoted,"
   note "then reload and restart this unit."
@@ -6305,7 +6305,7 @@ existing_fs_config() {
     [ -n "$argv_exposed" ] && FS_CRED_LEGACY_ARGV=true
   fi
   if ! credential_value_safe "$FS_CRED"; then
-    warn "Found $unit, but its file-server credential could not be recovered safely."
+    warn "Found $unit, but its file-server password could not be recovered safely."
     FS_EXISTING_UNSAFE=true
     FS_UNIT=""
     return 1
@@ -6378,7 +6378,7 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
      || ! q_ws=$(fs_systemd_quote "$ws") \
      || ! env_directive=$(fs_systemd_envfile_path "$envf") \
      || ! q_rclone=$(fs_systemd_quote "$rclone_bin"); then
-    warn "The file credential or selected paths contain characters this systemd unit cannot encode safely."
+    warn "The file password or selected paths contain characters this systemd unit cannot encode safely."
     return 1
   fi
   FS_UNIT="${HOME:-}/.config/systemd/user/conduck-files-$GW_ID.service"
@@ -6438,7 +6438,7 @@ EOF
 
 write_fs_unit_mac() { # write_fs_unit_mac <workspace>
   credential_value_safe "$FS_CRED" || {
-    warn "The file credential contains control characters and cannot be stored safely."
+    warn "The file password contains control characters and cannot be stored safely."
     return 1
   }
   FS_UNIT="${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
@@ -6549,7 +6549,7 @@ fs_unit_active() { [ "$(fs_unit_state)" = "active" ]; }
 # saved record advertising an address that no longer answers, while MOVING the lane
 # to another port leaves that record entirely correct. Folding an `rm` of the
 # profile in here would hand the port-move path a command that deletes the gateway.
-fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file…]
+fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [password-file…]
   local unit="$1" name f; shift
   if [ -n "$unit" ]; then
     name=$(basename "$unit")
@@ -6651,7 +6651,7 @@ fs_lane_residue_note() {
   [ -n "$served" ] || served="the folder in its service definition"
   note "serving:    $served  →  http://127.0.0.1:${FS_LOCAL_PORT:-?}"
   for f in ${files[@]+"${files[@]}"}; do
-    note "credential: $f"
+    note "password:   $f"
   done
   if $FS_ROUTE_SELF_MANAGED; then
     warn "The HTTPS route you set up for it still points at 127.0.0.1:${FS_LOCAL_PORT:-?}. That route lives in"
@@ -6664,7 +6664,7 @@ fs_lane_residue_note() {
   note "The shared folder itself is left alone — on OpenClaw and Hermes it doubles as the agent's"
   note "own working directory."
   note "Leaving it running is fine too: fix what failed, re-run me, and this same lane ships again"
-  note "with the same credential."
+  note "with the same password."
   # Last, because it is the one part of the residue that is not on this machine's
   # service manager, and the one a reader who stopped at the commands above will
   # otherwise never learn about.
@@ -6709,7 +6709,7 @@ fs_inactive_unit_report() {
   note "and the port stays taken — which is why re-running me alone never fixes it."
   $DRY_RUN && return 1
   if [ -z "$FS_FOLDER" ] || [ -z "$FS_CRED" ]; then
-    note "I can't rebuild it here — its served folder or credential isn't recoverable. Remove the unit"
+    note "I can't rebuild it here — its served folder or password isn't recoverable. Remove the unit"
     note "and re-run me to build the lane again."
     return 1
   fi
@@ -6804,7 +6804,7 @@ fs_local_service_ready() {
     i=$((i+1)); sleep 0.25
   done
   case "$code" in 2??|3??|404) ;; *)
-    warn "The active file-server service did not answer with its saved credential on 127.0.0.1:$FS_LOCAL_PORT."
+    warn "The active file-server service did not answer with its saved password on 127.0.0.1:$FS_LOCAL_PORT."
     return 1 ;;
   esac
 
@@ -6911,7 +6911,7 @@ PY
   case "$missing:$wrong" in
     401:401|401:403|403:401|403:403) ;;
     *)
-      warn "The local file server did not reject both missing and wrong credentials — leaving the lane out."
+      warn "The local file server did not reject both missing and wrong passwords — leaving the lane out."
       return 1 ;;
   esac
   $cleanup_ok || return 1
@@ -7027,7 +7027,7 @@ ask_fs_url() { # ask_fs_url <prompt> -> sets ASK_FS_URL_RESULT; 1 on URL-prompt 
 # Publication event → a SECOND explicit confirm on top of the menu choice.
 fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
-  if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?" "file.exposure.make_public"; then
+  if ! confirm "  Expose your files to the PUBLIC internet (only the password guards them)?" "file.exposure.make_public"; then
     FS_CRED=""; note "Leaving the file lane out — keeping your files off the public internet."
     fs_note_existing_mapping "$ehttps" "$everb"
     fs_lane_residue_note
@@ -8050,12 +8050,12 @@ setup_file_lane() {
     # for every later run.
     case "$(fs_unit_state)" in
       active)
-        ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered." ;;
+        ok "Found your existing file server: folder + port $FS_LOCAL_PORT, password recovered." ;;
       inactive)
-        warn "Found this gateway's file-server unit (folder + port $FS_LOCAL_PORT, credential recovered),"
+        warn "Found this gateway's file-server unit (folder + port $FS_LOCAL_PORT, password recovered),"
         warn "but its service is NOT running." ;;
       *)
-        ok "Found this gateway's file-server unit: folder + port $FS_LOCAL_PORT, credential recovered."
+        ok "Found this gateway's file-server unit: folder + port $FS_LOCAL_PORT, password recovered."
         note "(I can't ask this machine whether its service is running.)" ;;
     esac
     workspace="$FS_FOLDER"
@@ -8282,13 +8282,13 @@ setup_file_lane() {
       # its mode is left alone), so listing it as a change would be a lie the real
       # run never tells.
       if [ -d "$workspace" ]; then
-        plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve the EXISTING folder $workspace (permissions untouched) on 127.0.0.1:$FS_LOCAL_PORT"
+        plan_add "MINT a file-server password; write unit conduck-files-$GW_ID + 0600 password file; serve the EXISTING folder $workspace (permissions untouched) on 127.0.0.1:$FS_LOCAL_PORT"
       else
-        plan_add "CREATE the shared agent folder $workspace (0700); MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
+        plan_add "CREATE the shared agent folder $workspace (0700); MINT a file-server password; write unit conduck-files-$GW_ID + 0600 password file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
       fi
-      note "(dry-run: would mint a credential and write the file-server unit)"
+      note "(dry-run: would mint a password and write the file-server unit)"
     else
-      mutate_guard "write file-server unit + credential" || {
+      mutate_guard "write file-server unit + password" || {
         hermes_residual_state_note
         FS_CRED=""; return 0
       }
@@ -8308,8 +8308,8 @@ setup_file_lane() {
         note "On a shared host, 'chmod 700 $workspace' keeps your attachments and the agent's output files private."
       fi
       FS_CRED=$(openssl rand -hex 16)
-      ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
-      # From the next line on there is a credential on disk and, moments later, a
+      ok "Minted a fresh high-entropy password (stored 0600; rides in the QR, never on the command line)."
+      # From the next line on there is a password on disk and, moments later, a
       # boot-enabled server over the agent's folder. Recorded BEFORE the writer
       # runs, because a writer that fails halfway leaves exactly that behind.
       FS_LANE_PREPARED=true
@@ -11365,12 +11365,12 @@ gw_403_route_note() { # reads GW_AUTH / GW_LOCAL_PORT / MODELS_CURL_RC / MODELS_
   if [ -n "$base" ] && gw_answers_on_loopback "$base"; then
     warn "Your gateway answers this very request on this machine ($base) and forbids it when it"
     # The all-clear is worded per auth mode for the same reason the status line above is:
-    # clearing "your credentials" on a run that carries none re-imports the credential
-    # framing this whole arm exists to remove, and leaves the reader looking for a token
+    # clearing "your key" on a run that carries none re-imports the key
+    # framing this whole arm exists to remove, and leaves the reader looking for a key
     # to inspect. The probe carried whatever the public request carried, so a bearer run
-    # really has cleared its token and a keyless run has cleared nothing but the server.
+    # really has cleared its key and a keyless run has cleared nothing but the server.
     if [ "$GW_AUTH" = "bearer" ]; then
-      warn "arrives through your HTTPS address, so the server is up and your token is fine."
+      warn "arrives through your HTTPS address, so the server is up and your key is fine."
     else
       warn "arrives through your HTTPS address, so the server is up and accepting this request."
     fi
@@ -11437,12 +11437,12 @@ gw_5xx_credential_note() { # reads GW_AUTH / GW_URL / MODELS_CURL_RC / MODELS_HT
     -o /dev/null -w '%{http_code}' "$GW_URL/v1/models" 2>/dev/null) || return 0
   [ -n "$code" ] || return 0
   [ "$code" != "$MODELS_HTTP_CODE" ] || return 0
-  warn "This gateway is configured as keyless, but its answer CHANGES when a credential is"
-  warn "sent — HTTP $MODELS_HTTP_CODE without one, HTTP $code with one. It wants a token after all."
-  note "A server that is simply broken answers both the same way, so this is the credential."
+  warn "This gateway is configured as keyless, but its answer CHANGES when a key is"
+  warn "sent — HTTP $MODELS_HTTP_CODE without one, HTTP $code with one. It wants a key after all."
+  note "A server that is simply broken answers both the same way, so this is the key."
   note "Some servers report a missing one as a 5xx from inside their own error handler rather"
   note "than as 401 — LiteLLM without a database does exactly this."
-  note "Re-run setup, say this gateway DOES need a bearer token, and give it the expected one."
+  note "Re-run setup, say this gateway DOES need a key, and give it the expected one."
 }
 
 # What BOTH file-lane gates do when gateway verification has already failed, held
@@ -11527,10 +11527,10 @@ custom_agent_file_lane_gate() {
   # gateway it did not set up, so there is no key it applied to point at.
   agent_file_lane_cause_notes "your agent" ""
   # The decisive fact for the choice below, and the operator cannot discover it
-  # from anywhere else: the payload carries an address and a credential and has no
+  # from anywhere else: the payload carries an address and a password and has no
   # field for a caveat, so a kept lane arrives in the app looking fully working.
   note "Conduck cannot be told about this: the setup code carries only the address and the"
-  note "credential, so the app will show file transfer as enabled either way."
+  note "password, so the app will show file transfer as enabled either way."
   if confirm "  Include the file server in the setup code anyway?" "file.agent.unproved"; then
     note "Keeping it. This run's screen marks it as unproved; the app cannot."
     return 0
@@ -12083,17 +12083,17 @@ verify_all() {
         # route refused is what gw_403_route_note goes and finds out.
         401)
           if [ "$GW_AUTH" = "bearer" ]; then
-            why="HTTP 401 — token rejected (or an access layer in front wants a login)"
+            why="HTTP 401 — key rejected (or an access layer in front wants a login)"
           else
-            why="HTTP 401 — this gateway is keyless, so no token was sent: either the server wants one after all, or an access layer in front of it does"
+            why="HTTP 401 — this gateway is keyless, so no key was sent: either the server wants one after all, or an access layer in front of it does"
           fi ;;
         403)
           if [ "$GW_AUTH" = "bearer" ]; then
-            why="HTTP 403 — refused: either the token, or the request itself as it arrived over your HTTPS route"
+            why="HTTP 403 — refused: either the key, or the request itself as it arrived over your HTTPS route"
           else
-            why="HTTP 403 — this gateway is keyless, so there is no token to reject: the request itself was refused as it arrived over your HTTPS route"
+            why="HTTP 403 — this gateway is keyless, so there is no key to reject: the request itself was refused as it arrived over your HTTPS route"
           fi ;;
-        3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward credentials across redirects)" ;;
+        3??)     why="HTTP $MODELS_HTTP_CODE redirect — enter the final gateway base URL directly (this tool does not forward your key across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
         # 530 BEFORE the 5xx bucket, which would file it as a server fault. It is the
         # answer of an HTTPS front that has nothing to forward to: Cloudflare returns it
@@ -12676,7 +12676,7 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
   fi
   if $desynced; then
     d_say "$id" "(a follow-up probe got 401, then HTTP $second for the SAME request on the SAME reused"
-    d_say "$id" " connection — that is the signature of an undrained request body, not of a broken token"
+    d_say "$id" " connection — that is the signature of an undrained request body, not of a broken key"
     d_say "$id" " check. A response that REJECTS a request must still consume that request's body (read"
     d_say "$id" " the Content-Length bytes, drain the chunked stream) or answer \"Connection: close\" and"
     d_say "$id" " close: whatever is left in the socket gets read as the start of the NEXT request, and"
@@ -12691,7 +12691,7 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
     d_say "$id" " http://127.0.0.1:<port> and fail through your HTTPS front. Compare those two runs.)"
   elif [ -n "$first" ]; then
     d_say "$id" "(HTTP $code repeats on a fresh connection, so this really does look like your auth path"
-    d_say "$id" " answering — the contract wants 401 on both the missing and the wrong token. If it turns"
+    d_say "$id" " answering — the contract wants 401 on both the missing and the wrong key. If it turns"
     d_say "$id" " out to reproduce ONLY through your HTTPS front and not against http://127.0.0.1:<port>,"
     d_say "$id" " suspect the other cause instead: a 401 that never consumes the request body leaves those"
     d_say "$id" " bytes to be read as the next request on a pooled connection.)"
@@ -12743,7 +12743,7 @@ doctor_reject_body_check() { # doctor_reject_body_check <curl args addressing th
   fi
   if ! doctor_desync_parse "$pair"; then
     d_ok "$id" "rejected-request body — the follow-up probe never completed, so nothing was observed"
-    d_say "$id" "(two more wrong-token requests down ONE connection would have shown whether a rejected"
+    d_say "$id" "(two more wrong-key requests down ONE connection would have shown whether a rejected"
     d_say "$id" " request's body is left behind for the next request to trip over; neither finished, so"
     d_say "$id" " this run has no evidence either way and does not hold that against you. For the reading"
     d_say "$id" " with nothing in between, run me ON the adapter's host against http://127.0.0.1:<port>.)"
@@ -12782,7 +12782,7 @@ doctor_reject_body_check() { # doctor_reject_body_check <curl args addressing th
     d_say "$id" " route is idle if you want that answered.)"
     return 0
   fi
-  d_bad "$id" "rejected-request body — the wrong token → 401 alone, but $first then $second down one connection"
+  d_bad "$id" "rejected-request body — the wrong key → 401 alone, but $first then $second down one connection"
   d_say "$id" "(the same request got two different-looking answers seconds apart, so something in the path"
   d_say "$id" " is not deciding consistently. The usual cause is a rejection answered without consuming the"
   d_say "$id" " request's body: the leftovers desync whichever pooled connection they land on, so the damage"
@@ -12847,19 +12847,19 @@ doctor_models_check() {
   else
     case "$MODELS_HTTP_CODE" in
       401)     if [ "${GW_AUTH:-}" = "none" ]; then
-                 why="HTTP 401 and no token was sent — this run is keyless, so the server is asking for auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+                 why="HTTP 401 and no key was sent — this run is keyless, so the server is asking for auth you didn't supply (set CONDUCK_TOKEN=<key>)"
                else
-                 why="HTTP 401 with the token you gave me — the server rejected it (typo? or an access layer in front wants its own login)"
+                 why="HTTP 401 with the key you gave me — the server rejected it (typo? or an access layer in front wants its own login)"
                fi ;;
       # 403 split from 401 for the same reason as in --check-server: a server that WANTS auth
       # answers 401, while 403 means it read the request and refused it as it arrived. Telling
       # a keyless run to supply a token names the one thing that cannot be the cause.
       403)     if [ "${GW_AUTH:-}" = "none" ]; then
-                 why="HTTP 403 and no token was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
+                 why="HTTP 403 and no key was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
                else
-                 why="HTTP 403 — refused: either the token you gave me, or the request itself as it arrived (typo? an access layer in front? a Host check?)"
+                 why="HTTP 403 — refused: either the key you gave me, or the request itself as it arrived (typo? an access layer in front? a Host check?)"
                fi ;;
-      3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (the check does not forward credentials across redirects)" ;;
+      3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (the check does not forward your key across redirects)" ;;
       404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
       5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
       200)     why="answered 200, but the body isn't strict JSON (NaN/Infinity also count as not-JSON — Conduck's decoder refuses them)" ;;
@@ -12881,29 +12881,29 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
   out=$(doctor_curl_negauth none -w '\n%{http_code}' "$@" 2>/dev/null); rc=$?
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
   if [ "$rc" != "0" ] || [ -z "$code" ] || [ "$code" = "000" ]; then
-    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token — no answer (the with-token request worked, so this looks like per-request trouble)"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a key — no answer (the with-key request worked, so this looks like per-request trouble)"
   elif [ "$code" = "401" ]; then
-    d_ok "${idp}_MISSING" "auth ($route): WITHOUT a token → 401 (enforced)"
+    d_ok "${idp}_MISSING" "auth ($route): WITHOUT a key → 401 (enforced)"
     # Soft check only — the status is the load-bearing part; the body shape
     # decides how nice the app's error message can be, not whether auth holds.
     if ! printf '%s' "$body" | doctor_is_openai_error; then
       warn "  [${idp}_MISSING] …its 401 body isn't the OpenAI error shape — send {\"error\": {\"message\": …, \"type\": …}} (both non-empty) so the app can show a real message."
     fi
   elif [ "$code" = "200" ]; then
-    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → 200 — the server did the work anyway"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a key → 200 — the server did the work anyway"
     d_say "${idp}_MISSING" "(this is the dangerous one: anyone who can reach this address can drive your AI and"
     d_say "${idp}_MISSING" " its tools. Check the Authorization header BEFORE doing anything else, on every route.)"
   else
-    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → HTTP $code (the contract pins exactly 401)"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a key → HTTP $code (the contract pins exactly 401)"
   fi
   code=$(doctor_curl_negauth wrong -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || code=""
   DOCTOR_AUTH_WRONG_CODE="$code"
   case "$code" in
-    401) d_ok "${idp}_WRONG" "auth ($route): WRONG token → 401 (enforced)" ;;
-    200) d_bad "${idp}_WRONG" "auth ($route): WRONG token → 200 — the token isn't actually compared"
-         d_say "${idp}_WRONG" "(compare byte-for-byte against the token you issued — e.g. hmac.compare_digest in Python)" ;;
-    ""|000) d_bad "${idp}_WRONG" "auth ($route): WRONG token — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
-    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)"
+    401) d_ok "${idp}_WRONG" "auth ($route): WRONG key → 401 (enforced)" ;;
+    200) d_bad "${idp}_WRONG" "auth ($route): WRONG key → 200 — the key isn't actually compared"
+         d_say "${idp}_WRONG" "(compare byte-for-byte against the key you issued — e.g. hmac.compare_digest in Python)" ;;
+    ""|000) d_bad "${idp}_WRONG" "auth ($route): WRONG key — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
+    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG key → HTTP $code (the contract pins exactly 401)"
          doctor_auth_wrong_diagnose "${idp}_WRONG" "$code" "$@" ;;
   esac
 }
@@ -12921,9 +12921,9 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
 doctor_auth_checks() {
   local body='{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
   if [ "$GW_AUTH" != "bearer" ]; then
-    d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
-    d_say AUTH_NOT_ENFORCED "(the contract requires a bearer token on EVERY route — a keyless adapter that can run"
-    d_say AUTH_NOT_ENFORCED " tools is wide open to whoever can reach it. Add a token check, then re-run me.)"
+    d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no key, so I must assume the server is keyless"
+    d_say AUTH_NOT_ENFORCED "(the contract requires a key on EVERY route — a keyless adapter that can run"
+    d_say AUTH_NOT_ENFORCED " tools is wide open to whoever can reach it. Add a key check, then re-run me.)"
     return 0
   fi
   doctor_auth_route AUTH_MODELS "/v1/models" "$GW_URL/v1/models"
@@ -13028,7 +13028,7 @@ doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
   esac
   if [ "$DCC_CODE" != "200" ]; then
     case "$DCC_CODE" in
-      3??) DCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (the check does not forward credentials across redirects)" ;;
+      3??) DCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (the check does not forward your key across redirects)" ;;
       *)   DCE_REASON="HTTP ${DCC_CODE:-?}" ;;
     esac
     DCE_HINT="http"; return 1
@@ -13829,7 +13829,7 @@ doctor_files_resolve() {
     fi
     if ! DF_URL=$(doctor_accept_url "$CONDUCK_FILES_URL"); then
       if url_has_userinfo "$CONDUCK_FILES_URL"; then
-        d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" credential in the address — give the plain URL"
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" password in the address — give the plain URL"
         d_say FILES_CONFIG "(the file-lane password goes in CONDUCK_FILES_PASS, the user in CONDUCK_FILES_USER)"
       else
         d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
@@ -13882,7 +13882,7 @@ PY
     # here: doctor mode never writes profiles or units (REUSE_ONLY is forced).
     GW_ID="$pid"
     if ! existing_fs_config; then
-      d_bad FILES_CONFIG "the profile names a file lane, but no live file-server unit + credential was found for it"
+      d_bad FILES_CONFIG "the profile names a file lane, but no live file-server unit + password was found for it"
       d_say FILES_CONFIG "(re-run the wizard to repair the lane, or use the CONDUCK_FILES_* overrides)"
       return 1
     fi
@@ -13904,7 +13904,7 @@ PY
     DF_DIR="$pfolder"; DF_CRED="$FS_CRED"; DF_USER="conduck"
   fi
   if ! credential_value_safe "$DF_CRED"; then
-    d_bad FILES_CONFIG "the recovered credential contains control characters — refusing"
+    d_bad FILES_CONFIG "the recovered password contains control characters — refusing"
     return 1
   fi
   out=$(python3 - "$DF_DIR" <<'PY' 2>/dev/null
@@ -13994,7 +13994,7 @@ doctor_files_transport() {
           d_bad FILES_WRITE_THROUGH "could not verify the folder safely — direct-disk checks disabled this run"
           terr=$((terr+1)); disk_ok=false ;;
       esac ;;
-    401|403) d_bad FILES_WRITE_THROUGH "authenticated PUT rejected (HTTP $code) — read-only folder or wrong credential"; tfail=$((tfail+1)) ;;
+    401|403) d_bad FILES_WRITE_THROUGH "authenticated PUT rejected (HTTP $code) — read-only folder or wrong password"; tfail=$((tfail+1)) ;;
     000)     d_bad FILES_WRITE_THROUGH "no answer from $DF_URL — is the file server running?"; tfail=$((tfail+1)) ;;
     *)       d_bad FILES_WRITE_THROUGH "authenticated PUT answered HTTP $code"; tfail=$((tfail+1)) ;;
   esac
@@ -14004,15 +14004,15 @@ doctor_files_transport() {
   if $wt_ok; then
     code=$(doctor_fs_code none "$DF_URL/$wkey")
     case "$code" in
-      401|403) d_ok FILES_AUTH_READ_MISSING "GET without credentials is refused (HTTP $code)" ;;
-      2??)     d_bad FILES_AUTH_READ_MISSING "GET with NO credentials answered HTTP $code — the lane is open"; tfail=$((tfail+1)) ;;
-      *)       d_bad FILES_AUTH_READ_MISSING "GET without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+      401|403) d_ok FILES_AUTH_READ_MISSING "GET without a password is refused (HTTP $code)" ;;
+      2??)     d_bad FILES_AUTH_READ_MISSING "GET with NO password answered HTTP $code — the lane is open"; tfail=$((tfail+1)) ;;
+      *)       d_bad FILES_AUTH_READ_MISSING "GET without a password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
     esac
     code=$(doctor_fs_code wrong "$DF_URL/$wkey")
     case "$code" in
-      401|403) d_ok FILES_AUTH_READ_WRONG "GET with a WRONG credential is refused (HTTP $code)" ;;
-      2??)     d_bad FILES_AUTH_READ_WRONG "GET with a WRONG credential answered HTTP $code — any password works"; tfail=$((tfail+1)) ;;
-      *)       d_bad FILES_AUTH_READ_WRONG "GET with a wrong credential answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+      401|403) d_ok FILES_AUTH_READ_WRONG "GET with a WRONG password is refused (HTTP $code)" ;;
+      2??)     d_bad FILES_AUTH_READ_WRONG "GET with a WRONG password answered HTTP $code — any password works"; tfail=$((tfail+1)) ;;
+      *)       d_bad FILES_AUTH_READ_WRONG "GET with a wrong password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
     esac
   else
     note "  [FILES_AUTH_READ_MISSING] [FILES_AUTH_READ_WRONG] skipped — need the write-through file to probe against."
@@ -14021,16 +14021,16 @@ doctor_files_transport() {
   printf 'conduck-check unauth probe\n' > "$uprobe"
   code=$(doctor_fs_write none -T "$uprobe" "$DF_URL/$ukey1")
   case "$code" in
-    401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without credentials is refused (HTTP $code)" ;;
-    2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO credentials was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
-    *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without credentials answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+    401|403) d_ok FILES_AUTH_WRITE_MISSING "PUT without a password is refused (HTTP $code)" ;;
+    2??)     d_bad FILES_AUTH_WRITE_MISSING "PUT with NO password was ACCEPTED (HTTP $code) — anyone can write into this folder"; tfail=$((tfail+1)) ;;
+    *)       d_bad FILES_AUTH_WRITE_MISSING "PUT without a password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   df_register T file "$ukey2"
   code=$(doctor_fs_write wrong -T "$uprobe" "$DF_URL/$ukey2")
   case "$code" in
-    401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential is refused (HTTP $code)" ;;
-    2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG credential was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
-    *)       d_bad FILES_AUTH_WRITE_WRONG "PUT with a wrong credential answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
+    401|403) d_ok FILES_AUTH_WRITE_WRONG "PUT with a WRONG password is refused (HTTP $code)" ;;
+    2??)     d_bad FILES_AUTH_WRITE_WRONG "PUT with a WRONG password was ACCEPTED (HTTP $code)"; tfail=$((tfail+1)) ;;
+    *)       d_bad FILES_AUTH_WRITE_WRONG "PUT with a wrong password answered HTTP $code (expected 401/403)"; tfail=$((tfail+1)) ;;
   esac
   rm -f "$uprobe" 2>/dev/null
 
@@ -14865,22 +14865,22 @@ run_doctor() {
     note "Keyless by explicit \$CONDUCK_TOKEN=."
   elif [ -n "${CONDUCK_TOKEN:-}" ]; then
     GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
-    note "Using the bearer token from \$CONDUCK_TOKEN."
+    note "Using the key from \$CONDUCK_TOKEN."
   else
     say ""
-    note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
+    note "Tip: export CONDUCK_TOKEN=<key> to skip this prompt on re-runs."
     # Two failures, two different meanings, and they must not share a message.
     # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
     # supply a token, so printing it to someone who deliberately stopped is both
     # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
     # still emits the machine summary, with exit=3.
     local token_rc=0
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — this server has no token" "gateway.token") \
+    GW_TOKEN=$(ask_secret "Key the server expects" "keyless — this server has no key" "gateway.token") \
       || token_rc=$?
     case "$token_rc" in
       0)  ;;
       11) quit_run ;;
-      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+      *)  die "No key given and no answer possible (the input ended). Set CONDUCK_TOKEN=<key> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
     esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else GW_AUTH="none"; fi
   fi
@@ -15117,7 +15117,7 @@ app_chat_loaded_eval() { # app_chat_loaded_eval [expected-digit-code] — grades
   case "$DCC_CODE" in
     2??) ;;
     3??)
-      CCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)"
+      CCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (this check does not forward your key across redirects)"
       return 1
       ;;
     *)
@@ -15282,7 +15282,7 @@ compat_reask_url() {
   local reply url p
   interactive_terminal || return 1
   say ""
-  say "  Another address to try? The token you already entered is kept."
+  say "  Another address to try? The key you already entered is kept."
   # Enter and q both end the asking, and they are two different endings, which is
   # why both are offered: Enter says "I am done trying, give me the verdict" and
   # leaves the FAIL summary and its exit 1 behind, while q stops the run outright.
@@ -15366,9 +15366,9 @@ compat_models_check() {
     else
       case "$MODELS_HTTP_CODE" in
         401)     if [ "${GW_AUTH:-}" = "none" ]; then
-                   why="HTTP 401 and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+                   why="HTTP 401 and no key was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<key>)"
                  else
-                   why="HTTP 401 with the credential you gave me — the app would fail the same way"
+                   why="HTTP 401 with the key you gave me — the app would fail the same way"
                  fi ;;
         # 403 split from 401, because "supply a credential" is the wrong cure for it. A server
         # that WANTS auth answers 401; 403 means it read the request and refused it as it
@@ -15376,11 +15376,11 @@ compat_models_check() {
         # thing a failed setup now recommends — so a stray "set CONDUCK_TOKEN" here would send
         # the operator to invent a token for the one server that will ignore it.
         403)     if [ "${GW_AUTH:-}" = "none" ]; then
-                   why="HTTP 403 and no credential was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
+                   why="HTTP 403 and no key was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
                  else
-                   why="HTTP 403 — refused: either the credential you gave me, or the request itself as it arrived (the app would fail the same way)"
+                   why="HTTP 403 — refused: either the key you gave me, or the request itself as it arrived (the app would fail the same way)"
                  fi ;;
-        3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
+        3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward your key across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
         5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
         2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
@@ -15406,7 +15406,7 @@ run_compat() {
   # nobody read a README first. The two facts below are the ones it leaves out,
   # both of which decide what the operator types next.
   explain_check_server
-  say "  It grades the address you give me DIRECTLY: no redirect is followed and your credential"
+  say "  It grades the address you give me DIRECTLY: no redirect is followed and your key"
   say "  is never forwarded to a Location target, so give me the FINAL server URL."
   say "  And a red ${BOLD}--check-adapter${RESET} here would mean nothing: those rules are written for software"
   say "  built FOR Conduck, and generic servers are expected to fail them."
@@ -15455,22 +15455,22 @@ run_compat() {
     note "Keyless by explicit \$CONDUCK_TOKEN= — mirroring the app's no-auth scheme."
   elif [ -n "${CONDUCK_TOKEN:-}" ]; then
     GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
-    note "Using the bearer token from \$CONDUCK_TOKEN."
+    note "Using the key from \$CONDUCK_TOKEN."
   else
     say ""
-    note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
+    note "Tip: export CONDUCK_TOKEN=<key> to skip this prompt on re-runs."
     # Two failures, two different meanings, and they must not share a message.
     # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
     # supply a token, so printing it to someone who deliberately stopped is both
     # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
     # still emits the machine summary, with exit=3.
     local token_rc=0
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode" "gateway.token") \
+    GW_TOKEN=$(ask_secret "Key the server expects" "keyless — the app's explicit no-auth mode" "gateway.token") \
       || token_rc=$?
     case "$token_rc" in
       0)  ;;
       11) quit_run ;;
-      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+      *)  die "No key given and no answer possible (the input ended). Set CONDUCK_TOKEN=<key> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
     esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
       GW_AUTH="none"
@@ -15588,7 +15588,7 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     [ "$COMPAT_MODEL_FIELD" = "NOT_RUN" ] && [ -z "$MODELS_FIRST_ID" ] && COMPAT_MODEL_FIELD="none_advertised"
     c_bad SERVER_CHAT "chat — $a_reason"
     case "$a_code" in
-      401|403) c_say SERVER_CHAT "(auth works on /v1/models but not on chat — two different credential checks?)" ;;
+      401|403) c_say SERVER_CHAT "(auth works on /v1/models but not on chat — two different key checks?)" ;;
     esac
   fi
 
@@ -15944,7 +15944,7 @@ PY
     # Names the directory, because this is the last screen of a successful run and
     # $STATE_DIR otherwise reaches the operator only inside a permissions warning —
     # so somebody who never hits a failure never learns where their setups live.
-    note "Saved a non-secret pairing profile (no token) in $STATE_DIR."
+    note "Saved a non-secret pairing profile (no key) in $STATE_DIR."
     note "Re-show this code — to pair another device, or after something changes — with:  bash conduck-connect.sh --show-code"
   else
     rm -f "$pf.tmp" 2>/dev/null || true        # never leave a partial temp behind
@@ -16095,9 +16095,9 @@ emit_payload() {
   # The file-lane clause must ride the SAME condition build_pairing_payload_json uses to
   # attach fileServer — warning about a shared folder that isn't in this code is a lie the
   # user cannot check, and omitting it when it IS in the code understates what they hold.
-  warn "The setup code below CONTAINS YOUR GATEWAY TOKEN — both the QR and the plain-text string."
+  warn "The setup code below CONTAINS YOUR GATEWAY KEY — both the QR and the plain-text string."
   if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
-    warn "It also carries the FILE-SERVER CREDENTIAL for your shared folder, so whoever holds"
+    warn "It also carries the FILE-SERVER PASSWORD for your shared folder, so whoever holds"
     warn "this code can read and change the files in it."
   fi
   # What the code IS, said in the one place every route to a code passes through:
@@ -16106,8 +16106,8 @@ emit_payload() {
   # that nothing secret is written to this machine — and it replaces the two
   # hand-written sentences that used to say the first half twice, once per branch.
   explain_setup_code_secrecy
-  warn "Devices sharing one token cannot be cut off one at a time — rotating it at the gateway"
-  warn "cuts off every device using that token."
+  warn "Devices sharing one key cannot be cut off one at a time — rotating it at the gateway"
+  warn "cuts off every device using that key."
   warn "Note: over SSH, Ctrl-L only clears the visible screen — the code stays in your"
   warn "scroll-back, so close the terminal (or clear scroll-back) when you're done."
   say ""
@@ -17241,7 +17241,7 @@ print_plan() {
     local a; for a in "${PLAN[@]}"; do say "    • $a"; done
   fi
   say ""
-  note "No secrets were prompted, no credentials minted, no requests sent, no QR emitted (the QR appears only on a real run)."
+  note "No secrets were prompted, no passwords minted, no requests sent, no QR emitted (the QR appears only on a real run)."
   print_plan_real_run_command
 }
 
@@ -17314,7 +17314,7 @@ url_host_lc() { # url_host_lc <https-url>
 # the app shows, the address the code will point at, and how that address is
 # reached. Printed for a lone profile as well as for a list — auto-selecting the
 # only saved setup is right, showing it anyway is the other half of right. The very
-# next thing --show-code does on a custom gateway is ask for a bearer token, and
+# next thing --show-code does on a custom gateway is ask for a key, and
 # being asked for a password before being told what it unlocks is how somebody
 # pastes the key to a different gateway.
 show_qr_describe_saved_setup() { # show_qr_describe_saved_setup <profile-file>
@@ -17377,7 +17377,7 @@ show_qr_pick_profile() {
   if [ ${#cand[@]} -eq 0 ]; then
     [ "$rejected" = "1" ] && die "There IS a saved setup code on this machine, and this version ($VERSION) can't use it. $reason"
     [ "$rejected" = "0" ] || die "There are $rejected saved setup codes on this machine, and this version ($VERSION) can't use any of them. The first one says: $reason"
-    die "No usable saved setup code on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick one, re-enter a custom gateway's token, or confirm a gateway-only code; live verification still runs)."
+    die "No usable saved setup code on this machine yet — run setup once (bash conduck-connect.sh --setup) to pair and save one. From then on, --show-code re-shows it, skipping the setup questions (it may still ask you to pick one, re-enter a custom gateway's key, or confirm a gateway-only code; live verification still runs)."
   fi
   local k
   if [ ${#cand[@]} -eq 1 ]; then
@@ -17704,21 +17704,21 @@ show_qr_recover_gateway_secret() {
       ok "Re-read API_SERVER_KEY from ~/.hermes/.env (not shown)."
       ;;
     *)
-      # Custom gateway: nothing on disk to read (by design — this tool never stores tokens).
+      # Custom gateway: nothing on disk to read (by design — this tool never stores keys).
       say ""
-      note "Custom gateways have no config file I can read, and this tool deliberately never stores your token."
+      note "Custom gateways have no config file I can read, and this tool deliberately never stores your key."
       # prompt_into so q here stops the RUN. Inside $(…) a quit_run kills only the
-      # subshell, and the parent then reads the empty answer as "no token given" and
-      # dies with the wrong reason. The action-id gives `i` the token panel — the one
-      # shared by all six hidden-token prompts in the tool.
-      prompt_into GW_TOKEN ask_secret "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" \
-        "stop; this saved setup requires a token" "gateway.token"
-      [ -n "$GW_TOKEN" ] || die "A token is required (this saved setup says auth=bearer). Re-run when you have it."
+      # subshell, and the parent then reads the empty answer as "no key given" and
+      # dies with the wrong reason. The action-id gives `i` the key panel — the one
+      # shared by all six hidden-key prompts in the tool.
+      prompt_into GW_TOKEN ask_secret "Paste the gateway key again — what the gateway checks on each request (hidden)" \
+        "stop; this saved setup requires a key" "gateway.token"
+      [ -n "$GW_TOKEN" ] || die "A key is required (this saved setup says auth=bearer). Re-run when you have it."
       ;;
   esac
 }
 
-# Recover the file-lane credential from disk when the profile carries a lane. If it
+# Recover the file-lane password from disk when the profile carries a lane. If it
 # can't be recovered, WARN loudly and (with an explicit confirm) continue gateway-only.
 show_qr_recover_file_lane() {
   local fsurl; fsurl=$(json_get "$PROFILE_FILE" "fileServer.url")
@@ -17726,7 +17726,7 @@ show_qr_recover_file_lane() {
   local saved_port saved_folder
   saved_port=$(json_get "$PROFILE_FILE" "fileServer.localPort")
   saved_folder=$(json_get "$PROFILE_FILE" "fileServer.folder")
-  # existing_fs_config recovers the credential (state cred file / env file / unit) and
+  # existing_fs_config recovers the password (state password file / env file / unit) and
   # sets FS_CRED + FS_LOCAL_PORT + FS_FOLDER; keep the profile's URL/port authoritative.
   if existing_fs_config && [ -n "$FS_CRED" ]; then
     FS_URL="$fsurl"
@@ -17734,13 +17734,13 @@ show_qr_recover_file_lane() {
     if [ -n "$saved_folder" ] && [ "$saved_folder" != "$FS_FOLDER" ]; then
       note "The saved profile's informational folder differs from the live service definition; using the structurally parsed live folder."
     fi
-    ok "Recovered the file-lane credential from this machine (not shown)."
+    ok "Recovered the file-lane password from this machine (not shown)."
     if $FS_CRED_LEGACY_ARGV; then
       note "Heads-up: that file-server unit keeps its password on the command line (visible via 'ps'). The QR is still correct."
     fi
   else
-    warn "The saved profile includes a file lane at $fsurl, but I can't recover its credential on this machine"
-    warn "(its 0600 credential file and the file-server unit are both gone). Without it, the QR can't carry the file password."
+    warn "The saved profile includes a file lane at $fsurl, but I can't recover its password on this machine"
+    warn "(its 0600 password file and the file-server unit are both gone). Without it, the QR can't carry the file password."
     if confirm "  Re-show the code for the GATEWAY ONLY (chat everywhere; no attachments)?" "verification.gateway_only"; then
       note "Leaving the file lane out of this QR — re-run setup (bash conduck-connect.sh --setup) to rebuild it."
       FS_URL=""; FS_CRED=""; FS_FOLDER=""
@@ -17903,7 +17903,7 @@ show_qr_next_steps() {
   say "  ${BOLD}Pairing another device${RESET}"
   say "  Scan this same code, or paste it, on every device you want connected — a second"
   say "  phone, an iPad, a Mac. There is no per-device setup and nothing else to run."
-  note "They share one token, so rotating it at the gateway cuts off all of them together."
+  note "They share one key, so rotating it at the gateway cuts off all of them together."
   say ""
   say "  ${BOLD}Still not connecting?${RESET} The --check-server line above grades exactly the route"
   say "  this code points at, and changes nothing on your machine or your server."
@@ -18212,18 +18212,18 @@ manage_print_one() { # manage_print_one <id> [ordinal]
   # exactly one of the three and this is the most security-relevant line on a
   # screen whose entire purpose is telling somebody what is and is not on their
   # disk. show_qr_recover_gateway_secret is the authority: openclaw reads the
-  # credential back out of OpenClaw's own config (or its compose .env), hermes
+  # key back out of OpenClaw's own config (or its compose .env), hermes
   # reads API_SERVER_KEY out of ~/.hermes/.env, and only a custom gateway has
   # nothing on this machine to read and therefore asks. Telling an OpenClaw or
-  # Hermes operator they will be asked for a token invites the opposite of the
+  # Hermes operator they will be asked for a key invites the opposite of the
   # truth: that nothing on this disk can produce one.
   if [ "$auth" = "none" ]; then
-    say "     Token:         ${DIM}not stored — this gateway is keyless${RESET}"
+    say "     Key:           ${DIM}not stored — this gateway is keyless${RESET}"
   else
     case "$kind" in
-      openclaw) say "     Token:         ${DIM}not saved here — a code re-reads it from OpenClaw's own config${RESET}" ;;
-      hermes)   say "     Token:         ${DIM}not saved here — a code re-reads it from ~/.hermes/.env${RESET}" ;;
-      *)        say "     Token:         ${DIM}not saved here — you re-enter it when a code is printed${RESET}" ;;
+      openclaw) say "     Key:           ${DIM}not saved here — a code re-reads it from OpenClaw's own config${RESET}" ;;
+      hermes)   say "     Key:           ${DIM}not saved here — a code re-reads it from ~/.hermes/.env${RESET}" ;;
+      *)        say "     Key:           ${DIM}not saved here — you re-enter it when a code is printed${RESET}" ;;
     esac
   fi
 
@@ -18710,8 +18710,8 @@ manage_probe_address() { # manage_probe_address <https-url>
 manage_report_probe() { # manage_report_probe <rc> <url>
   case "$1" in
     0) ok "That address answers, and it answers like a gateway the app can use." ;;
-    1) ok "That address answers and asks for a token — which is exactly right for this"
-       note "gateway; the token is not saved here, so I cannot go further than that." ;;
+    1) ok "That address answers and asks for a key — which is exactly right for this"
+       note "gateway; the key is not saved here, so I cannot go further than that." ;;
     2) warn "That address answers, but not the way an OpenAI-compatible gateway does"
        warn "(HTTP ${MODELS_HTTP_CODE:-?}). Something is listening there — a login page, a"
        warn "different service, or the tunnel's own error page." ;;
@@ -18997,17 +18997,17 @@ manage_follow_file_address() { # manage_follow_file_address <id> <old-gateway-ur
 # 0 = the list carries that id · 1 = the list came back without it · 2 = no check
 # was made · 3 = a request went out and no model list came back.
 manage_probe_model() { # manage_probe_model <https-url> <model-id>
-  # Local, so the token falls out of scope on return: this screen holds no
-  # credential before or after, and nothing it saves is built from one.
+  # Local, so the key falls out of scope on return: this screen holds no
+  # key before or after, and nothing it saves is built from one.
   local GW_TOKEN=""
   if [ "${GW_AUTH:-none}" = "bearer" ]; then
     say ""
-    say "  Reading that server's model list needs the token it checks, and this tool never"
+    say "  Reading that server's model list needs the key it checks, and this tool never"
     say "  stored one. Pasting it here sends ONE request — $(safe_display "$1" 160)/v1/models"
     say "  — and no chat turn, so nothing is billed. It is hidden as you type, used for that"
     say "  one request, and written nowhere."
     confirm "  Check the model against the server's list?" explain_manage_model || return 2
-    prompt_into GW_TOKEN ask_secret "Paste the gateway bearer token (hidden)" \
+    prompt_into GW_TOKEN ask_secret "Paste the gateway key (hidden)" \
       "skip the check" "gateway.token" || return 2
     [ -n "$GW_TOKEN" ] || return 2
   fi
@@ -19046,9 +19046,9 @@ manage_report_model_probe() { # manage_report_model_probe <rc> <model-id>
        else
          case "$MODELS_HTTP_CODE" in
            401|403) if [ "${GW_AUTH:-none}" = "bearer" ]; then
-                      why="the server refused that token (HTTP $MODELS_HTTP_CODE)"
+                      why="the server refused that key (HTTP $MODELS_HTTP_CODE)"
                     else
-                      why="that address answered HTTP $MODELS_HTTP_CODE — it wants a credential, and this saved setup records none"
+                      why="that address answered HTTP $MODELS_HTTP_CODE — it wants a key, and this saved setup records none"
                     fi ;;
            *)       why="that address answered HTTP $MODELS_HTTP_CODE instead of a model list" ;;
          esac
@@ -19703,11 +19703,11 @@ manage_forget() { # manage_forget <id>
     say "    any folder on this machine, or anything in one."
   fi
   say "    your agent's TOOLS.md, or any gateway configuration this script edited."
-  say "    the gateway itself — it keeps running, on the same port, with the same token."
+  say "    the gateway itself — it keeps running, on the same port, with the same key."
   say "    the pairing already on your phone, tablet or Mac. That device still holds this"
-  say "      gateway's address and its token, and nothing here can reach it: remove the"
-  say "      connection in the app too. If you are removing this because the token leaked,"
-  say "      rotate the token at the gateway — that is the only thing that revokes it."
+  say "      gateway's address and its key, and nothing here can reach it: remove the"
+  say "      connection in the app too. If you are removing this because the key leaked,"
+  say "      rotate the key at the gateway — that is the only thing that revokes it."
   if [ "$unattributed" -gt 0 ]; then
     say ""
     note "$unattributed recorded exposure(s) here name no gateway, so I cannot tell whether they"
@@ -20148,7 +20148,7 @@ manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> <d
   # remaining action is actually theirs.
   say ""
   say "  Still to do, on the paired device: remove this gateway's connection in the"
-  say "  Conduck app. It holds the address and the token, and nothing on this machine"
+  say "  Conduck app. It holds the address and the key, and nothing on this machine"
   say "  can reach it."
   note "Your configuration folder is $STATE_DIR — run --list to see what is left."
   # An address this command tried to close and could not prove closed IS "some of it
@@ -20274,9 +20274,9 @@ explain_manage_forget() {
   say ""
   say "  ${BOLD}What it cannot reach${RESET}"
   say "  Your shared folder and everything in it. Your gateway, which keeps running"
-  say "  with the same token. And the pairing already on your phone or Mac — that"
-  say "  device holds this gateway's address and token, and nothing here can talk"
-  say "  to it, so remove the connection in the app too. If a token leaked, rotate"
+  say "  with the same key. And the pairing already on your phone or Mac — that"
+  say "  device holds this gateway's address and key, and nothing here can talk"
+  say "  to it, so remove the connection in the app too. If a key leaked, rotate"
   say "  it at the gateway; that is the only thing that revokes it."
   say ""
   say "  ${BOLD}Honestly unsure?${RESET}"
@@ -20316,9 +20316,9 @@ explain_manage_model() {
   say "  typed in it. No message is sent to a model, so nothing is billed and nothing"
   say "  lands in your server's history."
   say ""
-  say "  ${BOLD}Why it asks for the token${RESET}"
-  say "  Most servers will not show their model list to a request with no credential,"
-  say "  and this tool stores none — the token lives in your gateway and in the setup"
+  say "  ${BOLD}Why it asks for the key${RESET}"
+  say "  Most servers will not show their model list to a request with no key,"
+  say "  and this tool stores none — the key lives in your gateway and in the setup"
   say "  code your device scanned, never in the record here. Skipping is a real"
   say "  option: the name is saved either way, unchecked."
   say ""
@@ -20422,7 +20422,7 @@ print("%s\t%s" % (u.port or 80, u.path.rstrip("/")))' 2>/dev/null) \
   # above deliberately empties it, so by the time somebody backs out of the exposure
   # menu the only surviving spelling of "the thing you just graded" is this one.
   SETUP_FROM_CHECK_URL="$checked_url"
-  note "Reusing the checked address and authentication in memory; your token is not saved."
+  note "Reusing the checked address and authentication in memory; your key is not saved."
 }
 
 # The two endings that leave a COMPLETED check behind without pairing anything: the
@@ -20523,7 +20523,7 @@ refuse_without_a_terminal() { # refuse_without_a_terminal <subject> [reason-line
   say "    CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-server https://ai.example.com"
   say "    CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-adapter https://ai.example.com"
   note "Both end in one machine-readable summary line and never wait for an answer."
-  note "CONDUCK_TOKEN keeps the bearer token out of argv and shell history; drop it for"
+  note "CONDUCK_TOKEN keeps the key out of argv and shell history; drop it for"
   note "a gateway with no key."
   say ""
   say "    bash conduck-connect.sh --list --json"

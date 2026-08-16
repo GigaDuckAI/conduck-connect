@@ -180,19 +180,19 @@ hermes_api_server_port() {
   printf '%s' "${port:-8642}"
 }
 
-# Prompt for the OpenClaw bearer credential (hidden), or die with <die-msg> on empty input.
+# Prompt for the OpenClaw gateway key (hidden), or die with <die-msg> on empty input.
 # In the wizard's dry-run it only notes the intent (a real run would ask). Sets GW_TOKEN.
 _openclaw_prompt_secret() { # _openclaw_prompt_secret <ctx> <ask-prompt> <die-msg-on-empty>
   local ctx="$1" ask="$2" diemsg="$3"
   if [ "$ctx" = "wizard" ] && $DRY_RUN; then
-    note "(dry-run: would prompt for the gateway credential)"
+    note "(dry-run: would prompt for the gateway key)"
     return 0
   fi
   # prompt_into, not a plain $(…): ask_secret answers `q` with rc 11, and acting
   # on that has to happen in THIS shell — a quit_run inside a command
   # substitution would stop the subshell and let the wizard walk on with an
   # empty token.
-  prompt_into GW_TOKEN ask_secret "$ask" "stop; this credential is required" "gateway.token"
+  prompt_into GW_TOKEN ask_secret "$ask" "stop; this key is required" "gateway.token"
   [ -n "$GW_TOKEN" ] || die "$diemsg"
 }
 
@@ -210,19 +210,19 @@ openclaw_resolve_secret() { # openclaw_resolve_secret <ctx>
   local ctx="$1"
   local cfg="$HOME/.openclaw/openclaw.json"
   local compose_dir="${OPENCLAW_DIR:-$HOME/openclaw}"
-  [ -f "$cfg" ] || die "Can't find $cfg to read the OpenClaw credential — is this the machine you paired on? Re-run the wizard (bash conduck-connect.sh) if OpenClaw moved."
+  [ -f "$cfg" ] || die "Can't find $cfg to read the OpenClaw gateway key — is this the machine you paired on? Re-run the wizard (bash conduck-connect.sh) if OpenClaw moved."
   local mode; mode=$(json_get "$cfg" "gateway.auth.mode")
   case "$mode" in
     none)
       if [ "$ctx" = "showqr" ]; then
-        warn "OpenClaw's config now shows auth mode 'none', but your saved profile expects a token."
+        warn "OpenClaw's config now shows auth mode 'none', but your saved profile expects a key."
         _openclaw_prompt_secret "$ctx" \
-          "Paste the gateway bearer token again — the secret key the gateway checks (hidden)" \
-          "A token is required (your saved profile says auth=bearer). Re-run when you have it."
+          "Paste the gateway key again — what the gateway checks on each request (hidden)" \
+          "A key is required (your saved profile says auth=bearer). Re-run when you have it."
         return 0
       fi
       GW_AUTH="none"; GW_TOKEN=""
-      note "OpenClaw's gateway auth mode is 'none' — this gateway has no token. Fine on a private network; I'll guard against publishing it keyless below."
+      note "OpenClaw's gateway auth mode is 'none' — this gateway has no key. Fine on a private network; I'll guard against publishing it keyless below."
       ;;
     ""|token|password)
       GW_AUTH="bearer"
@@ -231,36 +231,36 @@ openclaw_resolve_secret() { # openclaw_resolve_secret <ctx>
       case "$cls" in
         literal$'\t'*)
           GW_TOKEN="${cls#*$'\t'}"
-          ok "Read the gateway bearer credential (the secret key the app sends to log in) from openclaw.json (not shown)."
+          ok "Read the gateway key (what the app sends to log in) from openclaw.json (not shown)."
           ;;
         ref)
-          warn "Your OpenClaw config references the credential indirectly (an env placeholder or secret reference), not as a literal value."
+          warn "Your OpenClaw config references the key indirectly (an env placeholder or secret reference), not as a literal value."
           _openclaw_prompt_secret "$ctx" \
-            "Paste the actual secret value the gateway checks (hidden)" \
-            "OpenClaw's config points at the credential indirectly, so I can't read it — paste the real value and re-run."
+            "Paste the actual key the gateway checks (hidden)" \
+            "OpenClaw's config points at the key indirectly, so I can't read it — paste the real value and re-run."
           ;;
         *)
           # Absent in the config → try the compose .env (OPENCLAW_GATEWAY_TOKEN; token mode
           # only), then prompt. The seed .env can drift, but it beats no token at all.
           [ "$mode" = "password" ] || GW_TOKEN=$(env_get "$compose_dir/.env" "OPENCLAW_GATEWAY_TOKEN")
           if [ -n "$GW_TOKEN" ]; then
-            ok "Read the gateway bearer token from the OpenClaw compose .env (not shown)."
+            ok "Read the gateway key from the OpenClaw compose .env (not shown)."
           else
-            warn "No literal token found at $key in $cfg (or in the compose .env)."
+            warn "No literal key found at $key in $cfg (or in the compose .env)."
             _openclaw_prompt_secret "$ctx" \
-              "Paste the gateway bearer token — the secret key the gateway checks on each request (hidden)" \
-              "OpenClaw needs its access token (the secret key the gateway checks). Find it in openclaw.json under $key, then re-run."
+              "Paste the gateway key — what the gateway checks on each request (hidden)" \
+              "OpenClaw needs its key. Find it in openclaw.json under $key, then re-run."
           fi
           ;;
       esac
       ;;
     *)
-      # trusted-proxy or anything unknown: we can't infer the credential to send.
+      # trusted-proxy or anything unknown: we can't infer the key to send.
       GW_AUTH="bearer"
-      note "OpenClaw's gateway auth mode is '$mode' — I won't guess a credential for it; paste whatever bearer value the gateway expects."
+      note "OpenClaw's gateway auth mode is '$mode' — I won't guess a key for it; paste whatever key the gateway expects."
       _openclaw_prompt_secret "$ctx" \
-        "Paste the bearer credential the gateway expects (hidden)" \
-        "This auth mode ('$mode') needs a credential I can't read automatically — paste it and re-run."
+        "Paste the key the gateway expects (hidden)" \
+        "This auth mode ('$mode') needs a key I can't read automatically — paste it and re-run."
       ;;
   esac
 }
@@ -476,7 +476,7 @@ gw_guard_single_saved_setup() { # gw_guard_single_saved_setup <id> <display-name
 }
 
 configure_openclaw() {
-  head_ "Step 2 — OpenClaw: chat endpoint + token"
+  head_ "Step 2 — OpenClaw: chat endpoint + key"
   GW_ID="openclaw"
   local cfg="$HOME/.openclaw/openclaw.json"
   [ -f "$cfg" ] || die "Cannot find $cfg — is OpenClaw onboarded on this machine? (Run its onboarding first; this script doesn't install gateways.)"
@@ -1064,7 +1064,7 @@ report_gateway_id_collision() { # report_gateway_id_collision <id> [name-just-ty
     # most, so it names both and then points at the one surface that can say
     # which of them this machine has.
     bad "Something on this machine already answers to the id '$id', with no saved setup beside it."
-    say "  A file server and its credential are filed under that id — left either by an"
+    say "  A file server and its password are filed under that id — left either by an"
     say "  earlier, unfinished run, or by a saved setup that was deleted by hand while its"
     say "  file server carried on running. Reusing the id would silently adopt them: the"
     say "  same service, the same port, the same password."
@@ -1149,15 +1149,15 @@ pick_existing_custom_gateway() { # 0 = editing (globals set) / 1 = new gateway
   # wrong exposure path. The auth mode because the profile holds no token by
   # design, so bearer has to be re-established at the hidden prompt anyway.
   ok "Changing the saved gateway: $(safe_display "${GW_NAME:-$GW_ID}" 60)  (id: $GW_ID)"
-  note "I'll ask for its address and token again — the address can have moved, and the"
-  note "token is never saved."
+  note "I'll ask for its address and key again — the address can have moved, and the"
+  note "key is never saved."
   return 0
 }
 
 # Auth for a custom gateway, taken at ONE hidden prompt rather than a visible
-# [y/N] followed by a hidden one. A question whose own wording is "bearer token /
-# API key" invites a paste, and an echoing prompt shows what it receives: the
-# token was printed, refused as not-a-yes-or-no, and left in the terminal's
+# [y/N] followed by a hidden one. A question whose own wording names the key
+# invites a paste, and an echoing prompt shows what it receives: the
+# key was printed, refused as not-a-yes-or-no, and left in the terminal's
 # scroll-back — one line before the hidden prompt that would have taken it
 # safely. Asking for the secret directly gives the paste exactly one place to
 # land, and that place shows nothing.
@@ -1166,14 +1166,14 @@ pick_existing_custom_gateway() { # 0 = editing (globals set) / 1 = new gateway
 # too: an empty answer opens a question, never settles one, and only an
 # affirmative confirm sets auth=none. EOF is not an empty answer — ask_secret
 # returns nonzero for it, so a redirected run dies instead of reading "nobody
-# was there to answer" as "this gateway needs no token".
+# was there to answer" as "this gateway needs no key".
 ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
   # A dry run must never solicit a real secret, so it takes the mode as a
   # bounded choice instead. `<token>` is the same placeholder the rest of the
   # dry-run path already carries; nothing is stored either way.
   if $DRY_RUN; then
-    say "  Does this server require a token (API key) on every request?"
-    say "    1) Yes — it requires a token"
+    say "  Does this server require a key on every request?"
+    say "    1) Yes — it requires a key"
     say "    2) No  — it is keyless"
     # No hand-rolled "('i' explains)" here: require_choice renders its own
     # control list, and a second one beside it is what trains a reader to stop
@@ -1182,7 +1182,7 @@ ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
     prompt_into c require_choice "Choose 1-2" '^[12]$' "gateway.custom.has_auth"
     if [ "$c" = "1" ]; then
       GW_AUTH="bearer"; GW_TOKEN="<token>"
-      note "(dry-run: a real run asks for the token at a hidden prompt)"
+      note "(dry-run: a real run asks for the key at a hidden prompt)"
     else
       GW_AUTH="none"; GW_TOKEN=""
       # The same two cautions the real run gives. A plan that silently omits them
@@ -1193,28 +1193,28 @@ ask_custom_gateway_auth() { # sets GW_AUTH + GW_TOKEN; dies on EOF, exits on q
     return 0
   fi
   while true; do
-    say "  If this server needs a token (API key), paste it now — nothing appears as you type."
-    prompt_into GW_TOKEN ask_secret "Token" "this server is keyless" "gateway.token"
+    say "  If this server needs a key, paste it now — nothing appears as you type."
+    prompt_into GW_TOKEN ask_secret "Key" "this server is keyless" "gateway.token"
     # An all-whitespace answer is a fumbled paste, not a token and not a
     # deliberate Enter. Letting it through mints a setup code the app parses and
     # then refuses to save, which strands the operator a step later than here.
     case "$GW_TOKEN" in
       *[![:space:]]*) ;;
-      ?*) warn "That was only whitespace. Paste the token again, or press Enter for keyless."
+      ?*) warn "That was only whitespace. Paste the key again, or press Enter for keyless."
           GW_TOKEN=""; continue ;;
     esac
     if [ -n "$GW_TOKEN" ]; then
       GW_AUTH="bearer"
-      ok "Token held for this run — it rides in the setup code and is never written to the saved profile."
+      ok "Key held for this run — it rides in the setup code and is never written to the saved profile."
       return 0
     fi
     note "Keyless — fine on a private network (Tailscale/LAN) where the network is the auth."
     note "On a PUBLIC transport a keyless server is wide open; I'll guard against that below."
-    if confirm "  Confirm this server needs NO token?" "gateway.custom.has_auth"; then
+    if confirm "  Confirm this server needs NO key?" "gateway.custom.has_auth"; then
       GW_AUTH="none"; GW_TOKEN=""
       return 0
     fi
-    say ""; note "↩ Let's take the token again."
+    say ""; note "↩ Let's take the key again."
   done
 }
 
@@ -1242,8 +1242,8 @@ review_custom_gateway() { # 0 continue / 10 re-enter / exits on q
   local address auth model reply p
   if [ -n "$GW_URL" ]; then address="$GW_URL"
   else address="http://127.0.0.1:$GW_LOCAL_PORT (local; HTTPS comes next)"; fi
-  if [ "$GW_AUTH" = "bearer" ]; then auth="Bearer token configured (hidden)"
-  else auth="No token — allowed only on a private path unless explicitly overridden"; fi
+  if [ "$GW_AUTH" = "bearer" ]; then auth="Key configured (hidden)"
+  else auth="No key — allowed only on a private path unless explicitly overridden"; fi
   # "Server/app default (no model fixed in the setup code)" described the wire
   # payload, in a row headed by the word the reader typed nothing into — so the
   # commonest, most correct answer here read as a report of something missing.

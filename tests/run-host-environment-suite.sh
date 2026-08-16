@@ -1429,7 +1429,7 @@ test_gateway_id_collision_message() {
   expect_has "collision: leftover state from an unfinished run is named as such" \
     "$out" "unfinished run"
   expect_has "collision: the leftover file server is what would be adopted" \
-    "$out" "credential"
+    "$out" "password"
   expect_has "collision: the residue arm still offers both ways forward" \
     "$out" "different name"
 }

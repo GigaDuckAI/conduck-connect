@@ -50,7 +50,7 @@ url_has_userinfo() { # url_has_userinfo <url> -> 0 when the authority carries us
   local a="${1#*://}"; a="${a%%[/?#]*}"
   case "$a" in *@*) return 0 ;; *) return 1 ;; esac
 }
-URL_USERINFO_HINT="Credentials don't belong in the address. Drop the \"user:pass@\" part and give the plain URL — the token goes in the token prompt, not the URL."
+URL_USERINFO_HINT="A key or password doesn't belong in the address. Drop the \"user:pass@\" part and give the plain URL — it is asked for separately, at a hidden prompt."
 
 OS="$(uname -s)"   # Linux | Darwin
 # ${HOME:-} so a check run in a HOME-less environment (a bare CI shell) doesn't
@@ -140,7 +140,7 @@ print_help() {
   say "  --list [--json]        List what is already set up on this machine: each saved"
   say "                         gateway's id, address, transport, model and shared folder,"
   say "                         and whether its file-lane service is running. Asks nothing,"
-  say "                         changes nothing, and prints no token, password or setup code."
+  say "                         changes nothing, and prints no key, password or setup code."
   say ""
   say "COMMANDS — need a person at a terminal"
   say "  (no command)           Welcome menu: pick one of the actions below."
@@ -154,7 +154,7 @@ print_help() {
   say "                         changed. Removal lives here too. Without an id, it asks"
   say "                         which saved setup you mean."
   say "  --forget <id>          Remove one saved setup: stop and delete its file-lane"
-  say "                         service, its saved credentials and its saved gateway."
+  say "                         service, its saved password and its saved gateway."
   say "                         You confirm by typing the id, not by pressing Enter. It"
   say "                         never deletes your shared folder, and exits 1 if no setup"
   say "                         has that id — run --list to see the ids."
@@ -165,7 +165,7 @@ print_help() {
   say "  --reuse-only           With --setup: use only what already exists. The first step"
   say "                         that would change host configuration stops the run and names"
   say "                         it — it is not skipped."
-  say "  --allow-keyless-public With --setup: expert — permit a gateway with no token on a"
+  say "  --allow-keyless-public With --setup: expert — permit a gateway with no key on a"
   say "                         publicly reachable transport."
   say "  --deep                 With --check-adapter: add a semantic image-input check."
   say "  --files                With --check-adapter: also grade the configured file lane."
@@ -175,7 +175,7 @@ print_help() {
   say "  bash conduck-connect.sh --version    print the version and exit"
   say ""
   say "ENVIRONMENT"
-  say "  CONDUCK_TOKEN               Bearer token for a check, so it never reaches your"
+  say "  CONDUCK_TOKEN               The key for a check, so it never reaches your"
   say "                              shell history or argv."
   say "  CONDUCK_CHECK_SERVER_MODEL  --check-server only: grade the model you plan to use."
   say "                              Without it the named-model checks take whichever id"
@@ -203,7 +203,7 @@ print_help() {
   say ""
   say "FILES"
   say "  $STATE_DIR"
-  say "      Saved gateways and file-lane credentials. A gateway token is never stored."
+  say "      Saved gateways and file-lane passwords. A gateway key is never stored."
   say "      --list reports what is in here; --forget <id> removes one setup's share of it."
   say ""
   say "SEE ALSO"
@@ -875,13 +875,13 @@ looks_like_a_secret() { # looks_like_a_secret <answer>
 # not echo, so "it is on your screen" would be false — and a warning that states
 # something the operator can see is untrue is how they learn to skip the next one.
 warn_answer_looked_like_a_secret() {
-  warn "That looked like a token or password, and this question is not where one goes." >&2
+  warn "That looked like a key or password, and this question is not where one goes." >&2
   if [ -t 0 ]; then
     warn "It was shown as you typed it, so it is in this terminal's scroll-back." >&2
   else
     warn "Assume this session may have recorded it." >&2
   fi
-  warn "If it was real, rotate it. A secret is only ever asked for at a hidden prompt —" >&2
+  warn "If it was real, rotate it. A key or password is only ever asked for at a hidden prompt —" >&2
   warn "one that shows nothing at all while you type." >&2
 }
 
@@ -1116,8 +1116,8 @@ ask_default() {  # ask_default "prompt" "default" [action-id] [allow-back] -> re
 # infer no-auth from a missing answer — the fail-closed-auth invariant.
 #
 # `i` and `q` are read as controls here with NO "did you mean it literally?"
-# question, unlike the visible value prompts. A bearer token that is exactly one
-# character is not a real token, so there is nothing to disambiguate — and the two
+# question, unlike the visible value prompts. A key that is exactly one
+# character is not a real key, so there is nothing to disambiguate — and the two
 # failure modes are wildly asymmetric. Taking `q` as a control costs a stopped run
 # the operator asked for; taking it as data costs a run that authenticates with
 # the single byte "q", fails verification minutes later somewhere else entirely,
@@ -1329,7 +1329,7 @@ ensure_state_dir() {  # -> 1 when the directory does not exist and could not be 
     warn "Their 0600 protects what is inside those files, not the folder that holds them."
   else
     warn "$STATE_DIR can be listed by other accounts on this machine (it already existed with that mode)."
-    warn "The credential files inside are 0600, but the folder itself names every gateway you have paired."
+    warn "The password files inside are 0600, but the folder itself names every gateway you have paired."
   fi
   warn "Fix it when you can:  chmod 700 $STATE_DIR"
   return 0

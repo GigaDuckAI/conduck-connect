@@ -302,18 +302,18 @@ manage_print_one() { # manage_print_one <id> [ordinal]
   # exactly one of the three and this is the most security-relevant line on a
   # screen whose entire purpose is telling somebody what is and is not on their
   # disk. show_qr_recover_gateway_secret is the authority: openclaw reads the
-  # credential back out of OpenClaw's own config (or its compose .env), hermes
+  # key back out of OpenClaw's own config (or its compose .env), hermes
   # reads API_SERVER_KEY out of ~/.hermes/.env, and only a custom gateway has
   # nothing on this machine to read and therefore asks. Telling an OpenClaw or
-  # Hermes operator they will be asked for a token invites the opposite of the
+  # Hermes operator they will be asked for a key invites the opposite of the
   # truth: that nothing on this disk can produce one.
   if [ "$auth" = "none" ]; then
-    say "     Token:         ${DIM}not stored — this gateway is keyless${RESET}"
+    say "     Key:           ${DIM}not stored — this gateway is keyless${RESET}"
   else
     case "$kind" in
-      openclaw) say "     Token:         ${DIM}not saved here — a code re-reads it from OpenClaw's own config${RESET}" ;;
-      hermes)   say "     Token:         ${DIM}not saved here — a code re-reads it from ~/.hermes/.env${RESET}" ;;
-      *)        say "     Token:         ${DIM}not saved here — you re-enter it when a code is printed${RESET}" ;;
+      openclaw) say "     Key:           ${DIM}not saved here — a code re-reads it from OpenClaw's own config${RESET}" ;;
+      hermes)   say "     Key:           ${DIM}not saved here — a code re-reads it from ~/.hermes/.env${RESET}" ;;
+      *)        say "     Key:           ${DIM}not saved here — you re-enter it when a code is printed${RESET}" ;;
     esac
   fi
 
@@ -800,8 +800,8 @@ manage_probe_address() { # manage_probe_address <https-url>
 manage_report_probe() { # manage_report_probe <rc> <url>
   case "$1" in
     0) ok "That address answers, and it answers like a gateway the app can use." ;;
-    1) ok "That address answers and asks for a token — which is exactly right for this"
-       note "gateway; the token is not saved here, so I cannot go further than that." ;;
+    1) ok "That address answers and asks for a key — which is exactly right for this"
+       note "gateway; the key is not saved here, so I cannot go further than that." ;;
     2) warn "That address answers, but not the way an OpenAI-compatible gateway does"
        warn "(HTTP ${MODELS_HTTP_CODE:-?}). Something is listening there — a login page, a"
        warn "different service, or the tunnel's own error page." ;;
@@ -1087,17 +1087,17 @@ manage_follow_file_address() { # manage_follow_file_address <id> <old-gateway-ur
 # 0 = the list carries that id · 1 = the list came back without it · 2 = no check
 # was made · 3 = a request went out and no model list came back.
 manage_probe_model() { # manage_probe_model <https-url> <model-id>
-  # Local, so the token falls out of scope on return: this screen holds no
-  # credential before or after, and nothing it saves is built from one.
+  # Local, so the key falls out of scope on return: this screen holds no
+  # key before or after, and nothing it saves is built from one.
   local GW_TOKEN=""
   if [ "${GW_AUTH:-none}" = "bearer" ]; then
     say ""
-    say "  Reading that server's model list needs the token it checks, and this tool never"
+    say "  Reading that server's model list needs the key it checks, and this tool never"
     say "  stored one. Pasting it here sends ONE request — $(safe_display "$1" 160)/v1/models"
     say "  — and no chat turn, so nothing is billed. It is hidden as you type, used for that"
     say "  one request, and written nowhere."
     confirm "  Check the model against the server's list?" explain_manage_model || return 2
-    prompt_into GW_TOKEN ask_secret "Paste the gateway bearer token (hidden)" \
+    prompt_into GW_TOKEN ask_secret "Paste the gateway key (hidden)" \
       "skip the check" "gateway.token" || return 2
     [ -n "$GW_TOKEN" ] || return 2
   fi
@@ -1136,9 +1136,9 @@ manage_report_model_probe() { # manage_report_model_probe <rc> <model-id>
        else
          case "$MODELS_HTTP_CODE" in
            401|403) if [ "${GW_AUTH:-none}" = "bearer" ]; then
-                      why="the server refused that token (HTTP $MODELS_HTTP_CODE)"
+                      why="the server refused that key (HTTP $MODELS_HTTP_CODE)"
                     else
-                      why="that address answered HTTP $MODELS_HTTP_CODE — it wants a credential, and this saved setup records none"
+                      why="that address answered HTTP $MODELS_HTTP_CODE — it wants a key, and this saved setup records none"
                     fi ;;
            *)       why="that address answered HTTP $MODELS_HTTP_CODE instead of a model list" ;;
          esac
@@ -1793,11 +1793,11 @@ manage_forget() { # manage_forget <id>
     say "    any folder on this machine, or anything in one."
   fi
   say "    your agent's TOOLS.md, or any gateway configuration this script edited."
-  say "    the gateway itself — it keeps running, on the same port, with the same token."
+  say "    the gateway itself — it keeps running, on the same port, with the same key."
   say "    the pairing already on your phone, tablet or Mac. That device still holds this"
-  say "      gateway's address and its token, and nothing here can reach it: remove the"
-  say "      connection in the app too. If you are removing this because the token leaked,"
-  say "      rotate the token at the gateway — that is the only thing that revokes it."
+  say "      gateway's address and its key, and nothing here can reach it: remove the"
+  say "      connection in the app too. If you are removing this because the key leaked,"
+  say "      rotate the key at the gateway — that is the only thing that revokes it."
   if [ "$unattributed" -gt 0 ]; then
     say ""
     note "$unattributed recorded exposure(s) here name no gateway, so I cannot tell whether they"
@@ -2238,7 +2238,7 @@ manage_forget_apply() { # manage_forget_apply <id> <pf> <credf> <envf> <unit> <d
   # remaining action is actually theirs.
   say ""
   say "  Still to do, on the paired device: remove this gateway's connection in the"
-  say "  Conduck app. It holds the address and the token, and nothing on this machine"
+  say "  Conduck app. It holds the address and the key, and nothing on this machine"
   say "  can reach it."
   note "Your configuration folder is $STATE_DIR — run --list to see what is left."
   # An address this command tried to close and could not prove closed IS "some of it
@@ -2364,9 +2364,9 @@ explain_manage_forget() {
   say ""
   say "  ${BOLD}What it cannot reach${RESET}"
   say "  Your shared folder and everything in it. Your gateway, which keeps running"
-  say "  with the same token. And the pairing already on your phone or Mac — that"
-  say "  device holds this gateway's address and token, and nothing here can talk"
-  say "  to it, so remove the connection in the app too. If a token leaked, rotate"
+  say "  with the same key. And the pairing already on your phone or Mac — that"
+  say "  device holds this gateway's address and key, and nothing here can talk"
+  say "  to it, so remove the connection in the app too. If a key leaked, rotate"
   say "  it at the gateway; that is the only thing that revokes it."
   say ""
   say "  ${BOLD}Honestly unsure?${RESET}"
@@ -2406,9 +2406,9 @@ explain_manage_model() {
   say "  typed in it. No message is sent to a model, so nothing is billed and nothing"
   say "  lands in your server's history."
   say ""
-  say "  ${BOLD}Why it asks for the token${RESET}"
-  say "  Most servers will not show their model list to a request with no credential,"
-  say "  and this tool stores none — the token lives in your gateway and in the setup"
+  say "  ${BOLD}Why it asks for the key${RESET}"
+  say "  Most servers will not show their model list to a request with no key,"
+  say "  and this tool stores none — the key lives in your gateway and in the setup"
   say "  code your device scanned, never in the record here. Skipping is a real"
   say "  option: the name is saved either way, unchecked."
   say ""

@@ -276,7 +276,7 @@ fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
   note "The shared folder is served over WebDAV with read AND write access to everything inside it."
   note "It has to be the agent's working folder, never your whole account: served from / or your home"
   note "directory, anything holding the file password can read your keys — and this script's own"
-  note "credential files — and write into them."
+  note "password files — and write into them."
 }
 
 # The folder prompt for a gateway whose working folder this wizard cannot know.
@@ -453,7 +453,7 @@ ensure_existing_fs_envfile_linux() {
       # only from state cannot authenticate a unit that has no password source.
       $FS_CRED_LEGACY_ARGV && return 0
       warn "The existing file-server unit has no usable EnvironmentFile directive."
-      warn "I will not expose it because its saved credential is not wired into rclone."
+      warn "I will not expose it because its saved password is not wired into rclone."
       fs_envfile_exposure_warning
       return 1 ;;
     *)
@@ -465,7 +465,7 @@ ensure_existing_fs_envfile_linux() {
 
   env_cred=$(env_get "$expected" "RCLONE_PASS" 2>/dev/null || true)
   if ! credential_value_safe "$env_cred" || [ "$env_cred" != "$FS_CRED" ]; then
-    warn "The unit's environment file is missing or does not match its saved credential."
+    warn "The unit's environment file is missing or does not match its saved password."
     warn "Refusing to rewrite or expose it; repair/remove the exact unit and re-run."
     fs_envfile_exposure_warning
     return 1
@@ -474,12 +474,12 @@ ensure_existing_fs_envfile_linux() {
 
   warn "A file server this script set up earlier uses the old quoted EnvironmentFile form."
   # Wording verified against rclone 1.74: `--user conduck` with no password does
-  # NOT serve openly. It demands an EMPTY password, so the saved credential gets
+  # NOT serve openly. It demands an EMPTY password, so the saved password gets
   # 401 like every other one. Calling that "unauthenticated" sends the operator
   # hunting for an intrusion, when the real symptom is attachments that can never
   # authenticate.
   note "systemd treats those quotes as part of the path, so rclone never reads the password"
-  note "file and demands an EMPTY password instead: it answers 401 to the saved credential —"
+  note "file and demands an EMPTY password instead: it answers 401 to the saved password —"
   note "and to every other password — while the user 'conduck' with a blank password gets in."
   note "I can replace only that one directive with the same absolute path unquoted,"
   note "then reload and restart this unit."
@@ -673,7 +673,7 @@ existing_fs_config() {
     [ -n "$argv_exposed" ] && FS_CRED_LEGACY_ARGV=true
   fi
   if ! credential_value_safe "$FS_CRED"; then
-    warn "Found $unit, but its file-server credential could not be recovered safely."
+    warn "Found $unit, but its file-server password could not be recovered safely."
     FS_EXISTING_UNSAFE=true
     FS_UNIT=""
     return 1
@@ -746,7 +746,7 @@ write_fs_unit_linux() { # write_fs_unit_linux <workspace>
      || ! q_ws=$(fs_systemd_quote "$ws") \
      || ! env_directive=$(fs_systemd_envfile_path "$envf") \
      || ! q_rclone=$(fs_systemd_quote "$rclone_bin"); then
-    warn "The file credential or selected paths contain characters this systemd unit cannot encode safely."
+    warn "The file password or selected paths contain characters this systemd unit cannot encode safely."
     return 1
   fi
   FS_UNIT="${HOME:-}/.config/systemd/user/conduck-files-$GW_ID.service"
@@ -806,7 +806,7 @@ EOF
 
 write_fs_unit_mac() { # write_fs_unit_mac <workspace>
   credential_value_safe "$FS_CRED" || {
-    warn "The file credential contains control characters and cannot be stored safely."
+    warn "The file password contains control characters and cannot be stored safely."
     return 1
   }
   FS_UNIT="${HOME:-}/Library/LaunchAgents/ai.gigaduck.conduck-files-$GW_ID.plist"
@@ -917,7 +917,7 @@ fs_unit_active() { [ "$(fs_unit_state)" = "active" ]; }
 # saved record advertising an address that no longer answers, while MOVING the lane
 # to another port leaves that record entirely correct. Folding an `rm` of the
 # profile in here would hand the port-move path a command that deletes the gateway.
-fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [credential-file…]
+fs_print_teardown() { # fs_print_teardown <unit-path-or-empty> [password-file…]
   local unit="$1" name f; shift
   if [ -n "$unit" ]; then
     name=$(basename "$unit")
@@ -1019,7 +1019,7 @@ fs_lane_residue_note() {
   [ -n "$served" ] || served="the folder in its service definition"
   note "serving:    $served  →  http://127.0.0.1:${FS_LOCAL_PORT:-?}"
   for f in ${files[@]+"${files[@]}"}; do
-    note "credential: $f"
+    note "password:   $f"
   done
   if $FS_ROUTE_SELF_MANAGED; then
     warn "The HTTPS route you set up for it still points at 127.0.0.1:${FS_LOCAL_PORT:-?}. That route lives in"
@@ -1032,7 +1032,7 @@ fs_lane_residue_note() {
   note "The shared folder itself is left alone — on OpenClaw and Hermes it doubles as the agent's"
   note "own working directory."
   note "Leaving it running is fine too: fix what failed, re-run me, and this same lane ships again"
-  note "with the same credential."
+  note "with the same password."
   # Last, because it is the one part of the residue that is not on this machine's
   # service manager, and the one a reader who stopped at the commands above will
   # otherwise never learn about.
@@ -1077,7 +1077,7 @@ fs_inactive_unit_report() {
   note "and the port stays taken — which is why re-running me alone never fixes it."
   $DRY_RUN && return 1
   if [ -z "$FS_FOLDER" ] || [ -z "$FS_CRED" ]; then
-    note "I can't rebuild it here — its served folder or credential isn't recoverable. Remove the unit"
+    note "I can't rebuild it here — its served folder or password isn't recoverable. Remove the unit"
     note "and re-run me to build the lane again."
     return 1
   fi
@@ -1172,7 +1172,7 @@ fs_local_service_ready() {
     i=$((i+1)); sleep 0.25
   done
   case "$code" in 2??|3??|404) ;; *)
-    warn "The active file-server service did not answer with its saved credential on 127.0.0.1:$FS_LOCAL_PORT."
+    warn "The active file-server service did not answer with its saved password on 127.0.0.1:$FS_LOCAL_PORT."
     return 1 ;;
   esac
 
@@ -1279,7 +1279,7 @@ PY
   case "$missing:$wrong" in
     401:401|401:403|403:401|403:403) ;;
     *)
-      warn "The local file server did not reject both missing and wrong credentials — leaving the lane out."
+      warn "The local file server did not reject both missing and wrong passwords — leaving the lane out."
       return 1 ;;
   esac
   $cleanup_ok || return 1
@@ -1395,7 +1395,7 @@ ask_fs_url() { # ask_fs_url <prompt> -> sets ASK_FS_URL_RESULT; 1 on URL-prompt 
 # Publication event → a SECOND explicit confirm on top of the menu choice.
 fs_promote_public() { # fs_promote_public <existing-https-port> <existing-verb> <host>
   local ehttps="$1" everb="$2" host="$3"
-  if ! confirm "  Expose your files to the PUBLIC internet (only the credential guards them)?" "file.exposure.make_public"; then
+  if ! confirm "  Expose your files to the PUBLIC internet (only the password guards them)?" "file.exposure.make_public"; then
     FS_CRED=""; note "Leaving the file lane out — keeping your files off the public internet."
     fs_note_existing_mapping "$ehttps" "$everb"
     fs_lane_residue_note
@@ -2418,12 +2418,12 @@ setup_file_lane() {
     # for every later run.
     case "$(fs_unit_state)" in
       active)
-        ok "Found your existing file server: folder + port $FS_LOCAL_PORT, credential recovered." ;;
+        ok "Found your existing file server: folder + port $FS_LOCAL_PORT, password recovered." ;;
       inactive)
-        warn "Found this gateway's file-server unit (folder + port $FS_LOCAL_PORT, credential recovered),"
+        warn "Found this gateway's file-server unit (folder + port $FS_LOCAL_PORT, password recovered),"
         warn "but its service is NOT running." ;;
       *)
-        ok "Found this gateway's file-server unit: folder + port $FS_LOCAL_PORT, credential recovered."
+        ok "Found this gateway's file-server unit: folder + port $FS_LOCAL_PORT, password recovered."
         note "(I can't ask this machine whether its service is running.)" ;;
     esac
     workspace="$FS_FOLDER"
@@ -2650,13 +2650,13 @@ setup_file_lane() {
       # its mode is left alone), so listing it as a change would be a lie the real
       # run never tells.
       if [ -d "$workspace" ]; then
-        plan_add "MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve the EXISTING folder $workspace (permissions untouched) on 127.0.0.1:$FS_LOCAL_PORT"
+        plan_add "MINT a file-server password; write unit conduck-files-$GW_ID + 0600 password file; serve the EXISTING folder $workspace (permissions untouched) on 127.0.0.1:$FS_LOCAL_PORT"
       else
-        plan_add "CREATE the shared agent folder $workspace (0700); MINT a file-server credential; write unit conduck-files-$GW_ID + 0600 cred file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
+        plan_add "CREATE the shared agent folder $workspace (0700); MINT a file-server password; write unit conduck-files-$GW_ID + 0600 password file; serve $workspace on 127.0.0.1:$FS_LOCAL_PORT"
       fi
-      note "(dry-run: would mint a credential and write the file-server unit)"
+      note "(dry-run: would mint a password and write the file-server unit)"
     else
-      mutate_guard "write file-server unit + credential" || {
+      mutate_guard "write file-server unit + password" || {
         hermes_residual_state_note
         FS_CRED=""; return 0
       }
@@ -2676,8 +2676,8 @@ setup_file_lane() {
         note "On a shared host, 'chmod 700 $workspace' keeps your attachments and the agent's output files private."
       fi
       FS_CRED=$(openssl rand -hex 16)
-      ok "Minted a fresh high-entropy credential (stored 0600; rides in the QR, never on the command line)."
-      # From the next line on there is a credential on disk and, moments later, a
+      ok "Minted a fresh high-entropy password (stored 0600; rides in the QR, never on the command line)."
+      # From the next line on there is a password on disk and, moments later, a
       # boot-enabled server over the agent's folder. Recorded BEFORE the writer
       # runs, because a writer that fails halfway leaves exactly that behind.
       FS_LANE_PREPARED=true

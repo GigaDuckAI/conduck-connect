@@ -468,7 +468,7 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
   fi
   if $desynced; then
     d_say "$id" "(a follow-up probe got 401, then HTTP $second for the SAME request on the SAME reused"
-    d_say "$id" " connection — that is the signature of an undrained request body, not of a broken token"
+    d_say "$id" " connection — that is the signature of an undrained request body, not of a broken key"
     d_say "$id" " check. A response that REJECTS a request must still consume that request's body (read"
     d_say "$id" " the Content-Length bytes, drain the chunked stream) or answer \"Connection: close\" and"
     d_say "$id" " close: whatever is left in the socket gets read as the start of the NEXT request, and"
@@ -483,7 +483,7 @@ doctor_auth_wrong_diagnose() { # doctor_auth_wrong_diagnose <check-id> <status> 
     d_say "$id" " http://127.0.0.1:<port> and fail through your HTTPS front. Compare those two runs.)"
   elif [ -n "$first" ]; then
     d_say "$id" "(HTTP $code repeats on a fresh connection, so this really does look like your auth path"
-    d_say "$id" " answering — the contract wants 401 on both the missing and the wrong token. If it turns"
+    d_say "$id" " answering — the contract wants 401 on both the missing and the wrong key. If it turns"
     d_say "$id" " out to reproduce ONLY through your HTTPS front and not against http://127.0.0.1:<port>,"
     d_say "$id" " suspect the other cause instead: a 401 that never consumes the request body leaves those"
     d_say "$id" " bytes to be read as the next request on a pooled connection.)"
@@ -535,7 +535,7 @@ doctor_reject_body_check() { # doctor_reject_body_check <curl args addressing th
   fi
   if ! doctor_desync_parse "$pair"; then
     d_ok "$id" "rejected-request body — the follow-up probe never completed, so nothing was observed"
-    d_say "$id" "(two more wrong-token requests down ONE connection would have shown whether a rejected"
+    d_say "$id" "(two more wrong-key requests down ONE connection would have shown whether a rejected"
     d_say "$id" " request's body is left behind for the next request to trip over; neither finished, so"
     d_say "$id" " this run has no evidence either way and does not hold that against you. For the reading"
     d_say "$id" " with nothing in between, run me ON the adapter's host against http://127.0.0.1:<port>.)"
@@ -574,7 +574,7 @@ doctor_reject_body_check() { # doctor_reject_body_check <curl args addressing th
     d_say "$id" " route is idle if you want that answered.)"
     return 0
   fi
-  d_bad "$id" "rejected-request body — the wrong token → 401 alone, but $first then $second down one connection"
+  d_bad "$id" "rejected-request body — the wrong key → 401 alone, but $first then $second down one connection"
   d_say "$id" "(the same request got two different-looking answers seconds apart, so something in the path"
   d_say "$id" " is not deciding consistently. The usual cause is a rejection answered without consuming the"
   d_say "$id" " request's body: the leftovers desync whichever pooled connection they land on, so the damage"
@@ -639,19 +639,19 @@ doctor_models_check() {
   else
     case "$MODELS_HTTP_CODE" in
       401)     if [ "${GW_AUTH:-}" = "none" ]; then
-                 why="HTTP 401 and no token was sent — this run is keyless, so the server is asking for auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+                 why="HTTP 401 and no key was sent — this run is keyless, so the server is asking for auth you didn't supply (set CONDUCK_TOKEN=<key>)"
                else
-                 why="HTTP 401 with the token you gave me — the server rejected it (typo? or an access layer in front wants its own login)"
+                 why="HTTP 401 with the key you gave me — the server rejected it (typo? or an access layer in front wants its own login)"
                fi ;;
       # 403 split from 401 for the same reason as in --check-server: a server that WANTS auth
       # answers 401, while 403 means it read the request and refused it as it arrived. Telling
       # a keyless run to supply a token names the one thing that cannot be the cause.
       403)     if [ "${GW_AUTH:-}" = "none" ]; then
-                 why="HTTP 403 and no token was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
+                 why="HTTP 403 and no key was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
                else
-                 why="HTTP 403 — refused: either the token you gave me, or the request itself as it arrived (typo? an access layer in front? a Host check?)"
+                 why="HTTP 403 — refused: either the key you gave me, or the request itself as it arrived (typo? an access layer in front? a Host check?)"
                fi ;;
-      3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (the check does not forward credentials across redirects)" ;;
+      3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (the check does not forward your key across redirects)" ;;
       404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
       5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
       200)     why="answered 200, but the body isn't strict JSON (NaN/Infinity also count as not-JSON — Conduck's decoder refuses them)" ;;
@@ -673,29 +673,29 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
   out=$(doctor_curl_negauth none -w '\n%{http_code}' "$@" 2>/dev/null); rc=$?
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
   if [ "$rc" != "0" ] || [ -z "$code" ] || [ "$code" = "000" ]; then
-    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token — no answer (the with-token request worked, so this looks like per-request trouble)"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a key — no answer (the with-key request worked, so this looks like per-request trouble)"
   elif [ "$code" = "401" ]; then
-    d_ok "${idp}_MISSING" "auth ($route): WITHOUT a token → 401 (enforced)"
+    d_ok "${idp}_MISSING" "auth ($route): WITHOUT a key → 401 (enforced)"
     # Soft check only — the status is the load-bearing part; the body shape
     # decides how nice the app's error message can be, not whether auth holds.
     if ! printf '%s' "$body" | doctor_is_openai_error; then
       warn "  [${idp}_MISSING] …its 401 body isn't the OpenAI error shape — send {\"error\": {\"message\": …, \"type\": …}} (both non-empty) so the app can show a real message."
     fi
   elif [ "$code" = "200" ]; then
-    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → 200 — the server did the work anyway"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a key → 200 — the server did the work anyway"
     d_say "${idp}_MISSING" "(this is the dangerous one: anyone who can reach this address can drive your AI and"
     d_say "${idp}_MISSING" " its tools. Check the Authorization header BEFORE doing anything else, on every route.)"
   else
-    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a token → HTTP $code (the contract pins exactly 401)"
+    d_bad "${idp}_MISSING" "auth ($route): WITHOUT a key → HTTP $code (the contract pins exactly 401)"
   fi
   code=$(doctor_curl_negauth wrong -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || code=""
   DOCTOR_AUTH_WRONG_CODE="$code"
   case "$code" in
-    401) d_ok "${idp}_WRONG" "auth ($route): WRONG token → 401 (enforced)" ;;
-    200) d_bad "${idp}_WRONG" "auth ($route): WRONG token → 200 — the token isn't actually compared"
-         d_say "${idp}_WRONG" "(compare byte-for-byte against the token you issued — e.g. hmac.compare_digest in Python)" ;;
-    ""|000) d_bad "${idp}_WRONG" "auth ($route): WRONG token — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
-    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG token → HTTP $code (the contract pins exactly 401)"
+    401) d_ok "${idp}_WRONG" "auth ($route): WRONG key → 401 (enforced)" ;;
+    200) d_bad "${idp}_WRONG" "auth ($route): WRONG key → 200 — the key isn't actually compared"
+         d_say "${idp}_WRONG" "(compare byte-for-byte against the key you issued — e.g. hmac.compare_digest in Python)" ;;
+    ""|000) d_bad "${idp}_WRONG" "auth ($route): WRONG key — no answer (a wide-open server may instead be running a slow agent turn on the probe — check its logs)" ;;
+    *)   d_bad "${idp}_WRONG" "auth ($route): WRONG key → HTTP $code (the contract pins exactly 401)"
          doctor_auth_wrong_diagnose "${idp}_WRONG" "$code" "$@" ;;
   esac
 }
@@ -713,9 +713,9 @@ doctor_auth_route() { # doctor_auth_route <id-prefix> <route-label> <curl-args�
 doctor_auth_checks() {
   local body='{"messages":[{"role":"user","content":"conduck-connect auth probe"}],"stream":false}'
   if [ "$GW_AUTH" != "bearer" ]; then
-    d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no token, so I must assume the server is keyless"
-    d_say AUTH_NOT_ENFORCED "(the contract requires a bearer token on EVERY route — a keyless adapter that can run"
-    d_say AUTH_NOT_ENFORCED " tools is wide open to whoever can reach it. Add a token check, then re-run me.)"
+    d_bad AUTH_NOT_ENFORCED "auth enforcement — untestable: you gave me no key, so I must assume the server is keyless"
+    d_say AUTH_NOT_ENFORCED "(the contract requires a key on EVERY route — a keyless adapter that can run"
+    d_say AUTH_NOT_ENFORCED " tools is wide open to whoever can reach it. Add a key check, then re-run me.)"
     return 0
   fi
   doctor_auth_route AUTH_MODELS "/v1/models" "$GW_URL/v1/models"
@@ -820,7 +820,7 @@ doctor_chat_eval() { # doctor_chat_eval <payload-json> [expected-digit-code]
   esac
   if [ "$DCC_CODE" != "200" ]; then
     case "$DCC_CODE" in
-      3??) DCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (the check does not forward credentials across redirects)" ;;
+      3??) DCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (the check does not forward your key across redirects)" ;;
       *)   DCE_REASON="HTTP ${DCC_CODE:-?}" ;;
     esac
     DCE_HINT="http"; return 1

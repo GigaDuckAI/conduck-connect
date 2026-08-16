@@ -133,7 +133,7 @@ app_chat_loaded_eval() { # app_chat_loaded_eval [expected-digit-code] — grades
   case "$DCC_CODE" in
     2??) ;;
     3??)
-      CCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)"
+      CCE_REASON="HTTP $DCC_CODE redirect — use the final server URL directly (this check does not forward your key across redirects)"
       return 1
       ;;
     *)
@@ -298,7 +298,7 @@ compat_reask_url() {
   local reply url p
   interactive_terminal || return 1
   say ""
-  say "  Another address to try? The token you already entered is kept."
+  say "  Another address to try? The key you already entered is kept."
   # Enter and q both end the asking, and they are two different endings, which is
   # why both are offered: Enter says "I am done trying, give me the verdict" and
   # leaves the FAIL summary and its exit 1 behind, while q stops the run outright.
@@ -382,9 +382,9 @@ compat_models_check() {
     else
       case "$MODELS_HTTP_CODE" in
         401)     if [ "${GW_AUTH:-}" = "none" ]; then
-                   why="HTTP 401 and no credential was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<token>)"
+                   why="HTTP 401 and no key was sent — this run is keyless, so the server wants auth you didn't supply (set CONDUCK_TOKEN=<key>)"
                  else
-                   why="HTTP 401 with the credential you gave me — the app would fail the same way"
+                   why="HTTP 401 with the key you gave me — the app would fail the same way"
                  fi ;;
         # 403 split from 401, because "supply a credential" is the wrong cure for it. A server
         # that WANTS auth answers 401; 403 means it read the request and refused it as it
@@ -392,11 +392,11 @@ compat_models_check() {
         # thing a failed setup now recommends — so a stray "set CONDUCK_TOKEN" here would send
         # the operator to invent a token for the one server that will ignore it.
         403)     if [ "${GW_AUTH:-}" = "none" ]; then
-                   why="HTTP 403 and no credential was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
+                   why="HTTP 403 and no key was sent — nothing to reject, so the request itself was refused as it arrived (a Host check? servers meant to be reached only from their own machine, Ollama above all, accept only a local name — make whatever fronts this one rewrite Host rather than forward it)"
                  else
-                   why="HTTP 403 — refused: either the credential you gave me, or the request itself as it arrived (the app would fail the same way)"
+                   why="HTTP 403 — refused: either the key you gave me, or the request itself as it arrived (the app would fail the same way)"
                  fi ;;
-        3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward credentials across redirects)" ;;
+        3??)     why="HTTP $MODELS_HTTP_CODE redirect — use the final server URL directly (this check does not forward your key across redirects)" ;;
         404)     why="HTTP 404 — nothing at that path (wrong base address?)" ;;
         5??)     why="HTTP $MODELS_HTTP_CODE — the server errored" ;;
         2??)     why="answered HTTP $MODELS_HTTP_CODE, but the body isn't strict JSON (the app's decoder refuses NaN/Infinity too)" ;;
@@ -422,7 +422,7 @@ run_compat() {
   # nobody read a README first. The two facts below are the ones it leaves out,
   # both of which decide what the operator types next.
   explain_check_server
-  say "  It grades the address you give me DIRECTLY: no redirect is followed and your credential"
+  say "  It grades the address you give me DIRECTLY: no redirect is followed and your key"
   say "  is never forwarded to a Location target, so give me the FINAL server URL."
   say "  And a red ${BOLD}--check-adapter${RESET} here would mean nothing: those rules are written for software"
   say "  built FOR Conduck, and generic servers are expected to fail them."
@@ -471,22 +471,22 @@ run_compat() {
     note "Keyless by explicit \$CONDUCK_TOKEN= — mirroring the app's no-auth scheme."
   elif [ -n "${CONDUCK_TOKEN:-}" ]; then
     GW_AUTH="bearer"; GW_TOKEN="$CONDUCK_TOKEN"
-    note "Using the bearer token from \$CONDUCK_TOKEN."
+    note "Using the key from \$CONDUCK_TOKEN."
   else
     say ""
-    note "Tip: export CONDUCK_TOKEN=<token> to skip this prompt on re-runs."
+    note "Tip: export CONDUCK_TOKEN=<key> to skip this prompt on re-runs."
     # Two failures, two different meanings, and they must not share a message.
     # rc 11 is an operator who pressed q; the message below tells a SCRIPT how to
     # supply a token, so printing it to someone who deliberately stopped is both
     # wrong and alarming. quit_run runs HERE, in the parent shell — the EXIT trap
     # still emits the machine summary, with exit=3.
     local token_rc=0
-    GW_TOKEN=$(ask_secret "Bearer token the server expects" "keyless — the app's explicit no-auth mode" "gateway.token") \
+    GW_TOKEN=$(ask_secret "Key the server expects" "keyless — the app's explicit no-auth mode" "gateway.token") \
       || token_rc=$?
     case "$token_rc" in
       0)  ;;
       11) quit_run ;;
-      *)  die "No token given and no answer possible (the input ended). Set CONDUCK_TOKEN=<token> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
+      *)  die "No key given and no answer possible (the input ended). Set CONDUCK_TOKEN=<key> for a scripted run, or set CONDUCK_TOKEN= (empty) to declare keyless deliberately." ;;
     esac
     if [ -n "$GW_TOKEN" ]; then GW_AUTH="bearer"; else
       GW_AUTH="none"
@@ -604,7 +604,7 @@ print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: 
     [ "$COMPAT_MODEL_FIELD" = "NOT_RUN" ] && [ -z "$MODELS_FIRST_ID" ] && COMPAT_MODEL_FIELD="none_advertised"
     c_bad SERVER_CHAT "chat — $a_reason"
     case "$a_code" in
-      401|403) c_say SERVER_CHAT "(auth works on /v1/models but not on chat — two different credential checks?)" ;;
+      401|403) c_say SERVER_CHAT "(auth works on /v1/models but not on chat — two different key checks?)" ;;
     esac
   fi
 
