@@ -644,6 +644,74 @@ test_tools_block_is_agent_readable() {
   else
     fail "an unreadable existing TOOLS.md is refused unchanged, with the remedy named" "the mode changed, the block was installed, or the remedy was not named"
   fi
+
+  # The workspace belongs to the AGENT's uid while this write happens as root, so
+  # the name TOOLS.md is attacker-controllable and a check-then-write would be a
+  # race, not a guard: plant the link between the check and the open and root
+  # writes chosen content to a chosen path. The assertion is the VICTIM file,
+  # never merely the exit status — a write that landed somewhere else still
+  # reports whatever the wizard reports.
+  local victim_dir="$TMP/tools-victim" link_ws="$TMP/tools-link-ws"
+  local victim="$victim_dir/keys"
+  mkdir -p "$victim_dir" "$link_ws"
+  printf '%s\n' 'ORIGINAL' > "$victim"
+  ln -s "$victim" "$link_ws/TOOLS.md"
+  if (
+    DRY_RUN=false
+    REUSE_ONLY=false
+    OPENCLAW_DIR="$TMP/no-compose-here"
+    confirm() { return 0; }
+    local out
+    out=$(install_conduck_tools_block "$link_ws" 2>&1)
+    printf '%s' "$out" | grep -q 'symlink' \
+      && ! printf '%s' "$out" | grep -q 'block installed' \
+      && [ "$(cat "$victim")" = "ORIGINAL" ] \
+      && ! grep -q 'conduck-connect:begin' "$victim"
+  ); then
+    pass "a symlinked TOOLS.md cannot capture the write"
+  else
+    fail "a symlinked TOOLS.md cannot capture the write" "the link was followed or the refusal was not reported"
+  fi
+
+  # A DANGLING link is the same attack against a victim that does not exist yet,
+  # and it is the case a plain O_CREAT would lose: creating through the link is
+  # exactly how root is made to author a file at a path it never chose.
+  local dangling_ws="$TMP/tools-dangling-ws"
+  mkdir -p "$dangling_ws"
+  ln -s "$victim_dir/not-there" "$dangling_ws/TOOLS.md"
+  if (
+    DRY_RUN=false
+    REUSE_ONLY=false
+    OPENCLAW_DIR="$TMP/no-compose-here"
+    confirm() { return 0; }
+    local out
+    out=$(install_conduck_tools_block "$dangling_ws" 2>&1)
+    printf '%s' "$out" | grep -q 'symlink' \
+      && ! printf '%s' "$out" | grep -q 'block installed' \
+      && [ ! -e "$victim_dir/not-there" ]
+  ); then
+    pass "a dangling symlinked TOOLS.md creates nothing at its target"
+  else
+    fail "a dangling symlinked TOOLS.md creates nothing at its target" "the link was followed or the refusal was not reported"
+  fi
+
+  # The last two cases pass against a check-then-use writer too: a link planted
+  # BEFORE the run is refused by any guard, so no black-box case can tell the two
+  # apart. The defect was never the pre-planted link, it was the WINDOW — check
+  # the name, then open the name, in a directory owned by the agent's uid while
+  # the write happens as root — and the only observable proof that the window is
+  # gone is that the refusal and the open are the same syscall. So it is pinned
+  # as source: O_NOFOLLOW present, and every later decision riding that one
+  # descriptor rather than re-reaching the file by name.
+  local writer path_reached
+  writer=$(sed -n '/^install_conduck_tools_block()/,/^}/p' "$ROOT/src/40-file-lane.inc.sh")
+  case "$writer" in *O_NOFOLLOW*)
+      pass "TOOLS.md's open refuses a symlink in the same syscall that opens it" ;;
+    *) fail "TOOLS.md's open refuses a symlink in the same syscall that opens it" "no O_NOFOLLOW in the writer" ;;
+  esac
+  path_reached=$(printf '%s\n' "$writer" \
+    | grep -cE 'os\.chmod\(|os\.stat\(target|os\.path\.islink\(|[^.]open\(target')
+  expect_eq "TOOLS.md is never re-reached by name after that open" "$path_reached" "0"
 }
 
 analysis_status() {
@@ -3765,6 +3833,67 @@ print("<d:multistatus xmlns:d=\"DAV:\">" + pad
     "$(slv "$big")" "REFUSED:bodyTooLarge"
 }
 
+# The same question asked from the SHARED corpus in tests/fixtures/webdav-listing:
+# bodies on disk, byte-exact, each with the verdict both readers of a listing owe
+# it. The cases above are this file's own; these are the contract the app's
+# FileServerClient.parseListing must satisfy too, so a change to either parser
+# has a net under it. See that directory's README.md.
+#
+# The body is redirected from the file rather than read into a variable on
+# purpose: two fixtures sit exactly on the 256 KiB bound, and a command
+# substitution would strip their trailing bytes and grade a different document.
+test_strict_listing_corpus() {
+  local dir="$ROOT/tests/fixtures/webdav-listing" manifest
+  local name url want expected parity verdict rows=0 file
+  manifest="$dir/manifest.tsv"
+  if [ ! -f "$manifest" ]; then
+    fail "listing corpus: the manifest is readable" "missing $manifest"
+    return
+  fi
+  # The format marker, so a corpus reshaped without a version bump trips here
+  # rather than in whatever reads it next.
+  if grep -q '^# corpus-version: 1$' "$manifest"; then
+    pass "listing corpus: the manifest declares the format it is in"
+  else
+    fail "listing corpus: the manifest declares the format it is in" "no corpus-version line"
+  fi
+
+  while IFS="$(printf '\t')" read -r name url want expected parity; do
+    case "$name" in ''|'#'*) continue ;; esac
+    rows=$((rows+1))
+    file="$dir/$name.xml"
+    if [ ! -f "$file" ]; then
+      fail "listing corpus: $name has a body" "missing $name.xml"
+      continue
+    fi
+    verdict=$(strict_listing_verdict "$url" "$want" < "$file")
+    expect_eq "listing corpus: $name ($parity)" "$verdict" "$expected"
+  done < "$manifest"
+
+  [ "$rows" -gt 0 ] || fail "listing corpus: the manifest names cases" "no rows"
+
+  # Both directions, so neither half can be added or dropped alone: a body with
+  # no row is a case nobody grades, and a row with no body was caught above.
+  for file in "$dir"/*.xml; do
+    name=$(basename "$file" .xml)
+    if grep -q "^$name	" "$manifest"; then
+      continue
+    fi
+    fail "listing corpus: every body is graded" "$name.xml is named by no manifest row"
+  done
+
+  # The three cases that exist because the mirror once disagreed with the app on
+  # exactly them. Named individually so a corpus edit cannot quietly retire the
+  # regression it was written for.
+  for name in proxy-stripped-prefix nested-response nfc-nfd-collision; do
+    if grep -q "^$name	" "$manifest"; then
+      pass "listing corpus: $name is still graded"
+    else
+      fail "listing corpus: $name is still graded" "the manifest no longer names it"
+    fi
+  done
+}
+
 test_agent_sentinel() {
   local served="$TMP/agent-sentinel" password="sentinel-secret" token="adapter-secret"
   local openclaw_payload uploaded_secret
@@ -4745,6 +4874,32 @@ test_shared_folder_gate() {
   else
     fail "served root resolves a symlink to its target" "got '$FS_FOLDER_RESOLVED'"
   fi
+
+  # $STATE_DIR holds fileserver-*.cred/.env and profile-*.json, and it follows
+  # XDG_CONFIG_HOME rather than sitting directly under $HOME — so an operator can
+  # nominate an ancestor of it (`~/.config` is the everyday one) that no other
+  # rule here touches, and hand out this script's own passwords read AND write
+  # over WebDAV. reset_fake_home puts $STATE_DIR one level down, where the home
+  # rule would refuse its parent for the wrong reason, so these cases model the
+  # real two-level shape.
+  local xdg="$HOME/.config"
+  STATE_DIR="$xdg/conduck"
+  mkdir -p "$STATE_DIR" "${xdg}uration/conduck"
+  expect_false "served root refuses an ancestor of \$STATE_DIR" fs_resolve_shared_folder "$xdg"
+  case "$FS_FOLDER_REFUSAL" in
+    *"saved passwords"*) pass "the \$STATE_DIR refusal names what it protects" ;;
+    *) fail "the \$STATE_DIR refusal names what it protects" "got '$FS_FOLDER_REFUSAL'" ;;
+  esac
+  expect_false "served root refuses \$STATE_DIR itself" fs_resolve_shared_folder "$STATE_DIR"
+  ln -s "$xdg" "$HOME/xdg-link"
+  expect_false "served root refuses a symlink to an ancestor of \$STATE_DIR" \
+    fs_resolve_shared_folder "$HOME/xdg-link"
+  # Containment is tested on path BOUNDARIES, not string prefixes: a sibling
+  # whose name merely begins with the config directory's is a legitimate answer,
+  # and refusing it would send an operator hunting for a risk that is not there.
+  expect_true "served root accepts a boundary-adjacent sibling of the state tree" \
+    fs_resolve_shared_folder "${xdg}uration"
+  STATE_DIR="$HOME/state"
 }
 
 # One real pass through Step 4 for a NEW lane: the refused answer must be re-asked
@@ -6678,6 +6833,7 @@ test_hermes_guidance_consent
 test_local_service_gate
 test_agent_file_lane_reason_branching
 test_strict_listing_mirror
+test_strict_listing_corpus
 test_agent_sentinel
 test_agent_lane_capability_gates
 test_agent_deadlines_and_cleanup

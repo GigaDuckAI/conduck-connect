@@ -3408,6 +3408,11 @@ configure_hermes() {
   elif $DRY_RUN; then
     note "(dry-run: would append API_SERVER_* to $envf and restart Hermes)"
     plan_add "APPEND API_SERVER_ENABLED/HOST/PORT/KEY to $envf, then restart hermes-gateway"
+    # --dry-run's contract is every file it would touch and every command it would
+    # run, and the mode change below is one of them whenever the file is already open.
+    if [ -f "$envf" ] && file_mode_is_open "$envf"; then
+      plan_add "RUN  chmod 600 $envf   (before the key is appended — other accounts can read it today)"
+    fi
   else
     warn "Hermes's OpenAI API server is OFF (the setup wizard does not enable it)."
     mutate_guard "append API_SERVER_* to $envf" || return 0
@@ -3415,14 +3420,36 @@ configure_hermes() {
     local newkey keyline=""
     newkey=$(env_get "$envf" "API_SERVER_KEY")
     [ -n "$newkey" ] || { newkey=$(openssl rand -hex 32); keyline="API_SERVER_KEY=$newkey"; }
+    # The `umask 077` below only covers a file we CREATE. A ~/.hermes/.env that
+    # Hermes itself wrote under umask 022 is 0644, and the API server key is about
+    # to land in it — so the mode is part of THIS step, announced with the lines
+    # below and carried by the same yes, never a second question the secret has to
+    # wait behind. SECURITY.md's promise is that a config we did not create is
+    # never changed without the exact change SHOWN first; it is shown here, and
+    # the one "Append these now?" answer decides both halves together.
+    local tighten_first=false
+    [ -f "$envf" ] && file_mode_is_open "$envf" && tighten_first=true
     say "  I'd append to $envf:"
     say "    API_SERVER_ENABLED=true"
     say "    API_SERVER_HOST=127.0.0.1"
     say "    API_SERVER_PORT=$GW_LOCAL_PORT"
     if [ -n "$keyline" ]; then say "    API_SERVER_KEY=<freshly generated, not shown>"
     else say "    (keeping the API_SERVER_KEY already in your .env)"; fi
+    if $tighten_first; then
+      say "  …and first, because other accounts on this machine can read that file today"
+      say "  and the API server key goes inside it:"
+      say "    chmod 600 $envf"
+    fi
     if confirm "  Append these now?" "gateway.hermes.enable_api"; then
       [ -f "$envf" ] || ( umask 077; : > "$envf" )   # the key lands inside — never create it world-readable
+      # BEFORE the append, never after: a secret must not exist in a world-readable
+      # file, not even for the moment between two commands. Deliberately silent when
+      # the chmod does not take — the secure_owned_file_mode gate below re-reads the
+      # mode and owns that wording, so a still-exposed key is stated once, with the
+      # offer to retry, instead of twice in two different voices.
+      if $tighten_first && chmod 600 "$envf" 2>/dev/null && ! file_mode_is_open "$envf"; then
+        ok "Tightened $envf to 0600 — only you can read it."
+      fi
       # No `|| true` here: a failed append (read-only fs, perms) must NOT report
       # "Written." and send the user on to a verify step that mis-diagnoses it.
       { echo ""; echo "# added by conduck-connect $(date -u +%Y-%m-%dT%H:%MZ)";
@@ -3431,11 +3458,11 @@ configure_hermes() {
         if [ -n "$keyline" ]; then echo "$keyline"; fi; } >> "$envf" \
         || die "Could not write to $envf. Fix its permissions (or add the API_SERVER_* lines yourself), then re-run me."
       ok "Written."
-      # The `umask 077` above only covers a file we CREATE. A ~/.hermes/.env that
-      # Hermes already wrote under umask 022 is 0644, and the API server key just
-      # appended (or re-read) is a live gateway credential sitting in it. The
-      # announce-then-confirm gate, and what it says when the answer is no or the
-      # chmod fails, both live in secure_owned_file_mode.
+      # The backstop, and the only arm that still ASKS. Silent when the tighten
+      # above took. When it did not — a read-only mount, a file owned by another
+      # account, a mode that moved underneath us — it names the exposure, offers
+      # the chmod again, and re-reads the file to say whether the key is still
+      # readable by other accounts.
       secure_owned_file_mode "$envf" "your API server key" || true
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "gateway.hermes.restart_api" "restart Hermes so the API server starts" \
@@ -5862,9 +5889,18 @@ fs_shell_arg() { # fs_shell_arg <literal>
 }
 
 # Resolve the shared folder before ANY service definition records it, and refuse
-# the two roots that turn this lane into a remote file browser for the whole
-# account. Mirrors the doctor's gate in 61-check-adapter-files.inc.sh, so setup
-# cannot certify a root the doctor refuses to grade.
+# every root that turns this lane into a remote file browser for the whole
+# account: /, the home directory itself, and any ancestor of $STATE_DIR. The
+# third is not a special case of the second — $STATE_DIR follows
+# XDG_CONFIG_HOME, so `~/.config` (or wherever XDG_CONFIG_HOME points, which
+# need not be under home at all) is a perfectly ordinary-looking answer that
+# publishes this script's own fileserver-*.cred / .env / profile-*.json over
+# WebDAV with WRITE access, and the operator who typed it would be warned about
+# nothing, because fs_folder_refusal_warn is the only place that risk is named
+# and it prints solely on the refusal path.
+#
+# Strictly tighter than the doctor's gate in 61-check-adapter-files.inc.sh:
+# setup never certifies a root the doctor refuses to grade.
 #
 # Resolving is load-bearing beyond the refusal: rclone re-resolves the served
 # path on every request, so a symlink recorded verbatim in the unit serves
@@ -5877,9 +5913,9 @@ fs_shell_arg() { # fs_shell_arg <literal>
 fs_resolve_shared_folder() { # fs_resolve_shared_folder <path> -> 0 + FS_FOLDER_RESOLVED · 1 + FS_FOLDER_REFUSAL
   FS_FOLDER_RESOLVED=""; FS_FOLDER_REFUSAL=""
   local out
-  out=$(python3 - "$1" <<'PY' 2>/dev/null
+  out=$(python3 - "$1" "${STATE_DIR:-}" <<'PY' 2>/dev/null
 import os, sys
-p = sys.argv[1]
+p, state = sys.argv[1], sys.argv[2]
 if not p or not os.path.isabs(p) or any(c in p for c in "\r\n"):
     print("BAD\tit is not a plain absolute path"); sys.exit(0)
 rp = os.path.realpath(p)
@@ -5890,6 +5926,16 @@ if rp == home:
     print("BAD\tit resolves to your home directory itself"); sys.exit(0)
 if os.path.isfile(rp):
     print("BAD\tit resolves to a file, not a folder"); sys.exit(0)
+# Both sides are realpath'd first, so a symlinked candidate cannot step around
+# the test, and the comparison is on path BOUNDARIES: appending the separator is
+# what keeps /home/u/.config from matching /home/u/.configuration. $STATE_DIR
+# need not exist yet — realpath normalises a path that is not there — and an
+# empty one means the caller has no state directory to protect.
+if state:
+    sp = os.path.realpath(state)
+    if sp == rp or sp.startswith(rp.rstrip(os.sep) + os.sep):
+        print("BAD\tit contains %s, where I keep this setup's saved passwords" % sp)
+        sys.exit(0)
 print("OK\t" + rp)
 PY
 ) || out=""
@@ -5906,9 +5952,9 @@ PY
 fs_folder_refusal_warn() { # fs_folder_refusal_warn <path as given>
   warn "I can't serve $1 — ${FS_FOLDER_REFUSAL:-I could not resolve that path on this machine}."
   note "The shared folder is served over WebDAV with read AND write access to everything inside it."
-  note "It has to be the agent's working folder, never your whole account: served from / or your home"
-  note "directory, anything holding the file password can read your keys — and this script's own"
-  note "password files — and write into them."
+  note "It has to be the agent's working folder, never your whole account: served from a folder that"
+  note "wide, anything holding the file password can read your keys — and this script's own password"
+  note "files — and write into them."
 }
 
 # The folder prompt for a gateway whose working folder this wizard cannot know.
@@ -7834,7 +7880,9 @@ openclaw_tool_policy_step() {
 # markers on re-runs; the rest of the file is never touched. Scoped to Conduck
 # turns via the app's "[Conduck file transfer]" wire tag so the same agent's
 # messaging channels (where MEDIA: is the correct way to send a file) keep
-# their behavior.
+# their behavior. The directory this writes into belongs to the AGENT's uid
+# while the write happens as root, so the file is opened O_NOFOLLOW and every
+# mode decision is made through that one descriptor — never through the path.
 install_conduck_tools_block() { # install_conduck_tools_block <workspace-host-path>
   local ws="$1"
   if [ -z "$ws" ]; then
@@ -7886,11 +7934,17 @@ install_conduck_tools_block() { # install_conduck_tools_block <workspace-host-pa
   fi
 
   if python3 - "$target" "$agent_ws" <<'PY'
-import os, stat, sys
+import errno, os, stat, sys
 
 target, agent_ws = sys.argv[1], sys.argv[2]
 BEGIN = "<!-- conduck-connect:begin -->"
 END = "<!-- conduck-connect:end -->"
+# The agent reads this file as ITS OWN uid — 1000 in the standard OpenClaw
+# container, never the uid running this wizard. TOOLS.md carries no secret and
+# is useless unless a uid that is not ours can read it, so the mode is part of
+# the contract, not an afterthought.
+TOOLS_MD_MODE = 0o644
+AGENT_READ_BIT = 0o004
 
 if agent_ws:
     path_hint = ('If a media/PDF tool rejects that path ("not under an allowed directory"), '
@@ -7922,48 +7976,86 @@ block = BEGIN + "\n" + (
     "into the folder that message names instead.\n"
 ) + END
 
-if os.path.islink(target):
-    print("TOOLS.md is a symlink — refusing to edit through it", file=sys.stderr)
+# The workspace directory belongs to the AGENT's uid and this wizard writes as
+# root, so every path-based inspection here is a check-then-use window: an
+# islink() that passes, then an open() that lands on a link planted in the gap,
+# with root writing attacker-chosen content to an attacker-chosen path. The
+# window is not narrowed, it is removed — O_NOFOLLOW makes the refusal and the
+# open the SAME syscall, so there is no moment between them to win. It is
+# preferred over write-a-temp-then-os.replace because os.replace still needs
+# the destination proven symlink-free at the instant it runs, which is the very
+# check-then-use shape being eliminated.
+#
+# O_EXCL first tells "we created it" from "it was already there" without a
+# second lookup to race either. O_NOFOLLOW guards the final component; the
+# workspace directory above it is the root fs_resolve_shared_folder already
+# resolved and pinned.
+created = True
+try:
+    fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 TOOLS_MD_MODE)
+except FileExistsError:
+    created = False
+    try:
+        fd = os.open(target, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError as exc:
+        # ELOOP is the POSIX answer for O_NOFOLLOW on a symlink; some BSDs
+        # answer EMLINK. Either way the name is a link and we do not follow it.
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            print("TOOLS.md is a symlink — refusing to edit through it", file=sys.stderr)
+        else:
+            print("could not open TOOLS.md: %s" % exc.strerror, file=sys.stderr)
+        sys.exit(1)
+except OSError as exc:
+    print("could not create TOOLS.md: %s" % exc.strerror, file=sys.stderr)
     sys.exit(1)
 
-# The agent reads this file as ITS OWN uid — 1000 in the standard OpenClaw
-# container, never the uid running this wizard. A TOOLS.md only its owner can
-# read installs perfectly and stays invisible to the agent: the wizard reports
-# green for a step that did not take effect. Refuse instead, and name the fix —
-# broadening a file the operator already owns is not ours to decide.
-existed = os.path.exists(target)
-if existed and not (stat.S_IMODE(os.stat(target).st_mode) & 0o004):
-    print("TOOLS.md exists but only its owner can read it, so the agent would "
-          "never see the block. Fix the mode first:  chmod 644 %s" % target,
-          file=sys.stderr)
-    sys.exit(1)
-
-if existed:
-    s = open(target).read()
-    nb, ne = s.count(BEGIN), s.count(END)
-    if nb == 0 and ne == 0:
-        s2 = s.rstrip("\n") + ("\n\n" if s.strip() else "") + block + "\n"
-    elif nb == 1 and ne == 1 and s.index(BEGIN) < s.index(END):
-        s2 = s[:s.index(BEGIN)] + block + s[s.index(END) + len(END):]
+with os.fdopen(fd, "r+", encoding="utf-8") as fh:
+    st = os.fstat(fh.fileno())
+    if not stat.S_ISREG(st.st_mode):
+        print("TOOLS.md is not a regular file — refusing to write through it",
+              file=sys.stderr)
+        sys.exit(1)
+    if created:
+        # A file WE created must not inherit whatever mask happens to be in
+        # force. fchmod, not chmod: the descriptor is the one handle already
+        # proven not to be a symlink, and a path-based chmod would reopen the
+        # window just closed. Verified rather than assumed — a chmod that
+        # silently does nothing recreates the exact failure this path exists to
+        # close.
+        os.fchmod(fh.fileno(), TOOLS_MD_MODE)
+        if not (stat.S_IMODE(os.fstat(fh.fileno()).st_mode) & AGENT_READ_BIT):
+            print("could not make TOOLS.md readable by the agent: %s" % target,
+                  file=sys.stderr)
+            sys.exit(1)
+        s2 = block + "\n"
     else:
-        print("TOOLS.md has malformed conduck-connect markers — fix or remove them first",
-              file=sys.stderr)
-        sys.exit(1)
-else:
-    s2 = block + "\n"
-
-open(target, "w").write(s2)
-
-# A file WE created must not inherit whatever mask happens to be in force: it
-# carries no secret and is useless unless a uid that is not ours can read it.
-# Verified rather than assumed — a chmod that silently does nothing would
-# recreate the exact failure this whole path exists to close.
-if not existed:
-    os.chmod(target, 0o644)
-    if not (stat.S_IMODE(os.stat(target).st_mode) & 0o004):
-        print("could not make TOOLS.md readable by the agent: %s" % target,
-              file=sys.stderr)
-        sys.exit(1)
+        # A TOOLS.md only its owner can read installs perfectly and stays
+        # invisible to the agent: the wizard reports green for a step that did
+        # not take effect. Refuse instead, and name the fix — broadening a file
+        # the operator already owns is not ours to decide. Nothing has been
+        # written at this point, so the refusal leaves the file byte-identical.
+        if not (stat.S_IMODE(st.st_mode) & AGENT_READ_BIT):
+            print("TOOLS.md exists but only its owner can read it, so the agent would "
+                  "never see the block. Fix the mode first:  chmod %o %s"
+                  % (TOOLS_MD_MODE, target), file=sys.stderr)
+            sys.exit(1)
+        s = fh.read()
+        nb, ne = s.count(BEGIN), s.count(END)
+        if nb == 0 and ne == 0:
+            s2 = s.rstrip("\n") + ("\n\n" if s.strip() else "") + block + "\n"
+        elif nb == 1 and ne == 1 and s.index(BEGIN) < s.index(END):
+            s2 = s[:s.index(BEGIN)] + block + s[s.index(END) + len(END):]
+        else:
+            print("TOOLS.md has malformed conduck-connect markers — fix or remove them first",
+                  file=sys.stderr)
+            sys.exit(1)
+    # Truncate AFTER the write, never before: the file is never momentarily
+    # empty, so an interrupted run cannot leave the agent with no guidance at
+    # all where it previously had some.
+    fh.seek(0)
+    fh.write(s2)
+    fh.truncate()
 PY
   then
     ok "Conduck agent-guidance block installed in $target."
@@ -10397,16 +10489,25 @@ agent_probe_abandon_registry() { # no registered remote target was created
 #   * root element `multistatus`, document parsed to completion with no fault —
 #     a truncated listing is indistinguishable from a real short one
 #   * element nesting and `<response>` count bounded
+#   * every `<response>` sits DIRECTLY under `<multistatus>`; one in an
+#     unrecognised wrapper refuses the body rather than being skipped, because a
+#     row nobody understood would otherwise report a file that exists as an
+#     empty folder
 #   * exactly one `<href>` per `<response>`
 #   * properties read only out of a `2xx` `<propstat>`; a resource whose own
 #     `<status>` is not 2xx, or that carries no successful propstat, is dropped
 #     (RFC 4918 lets a 207 carry not-found rows)
-#   * every href resolved against the REQUESTED url, on the same origin, and an
-#     exact DIRECT child of it — the collection's own row is dropped, parents,
-#     grandchildren and foreign hosts refuse
+#   * every href resolved against the REQUESTED url, on the same origin, with
+#     its parent ANCHORED AT THE END of the requested path — a non-empty tail of
+#     it, so a path-stripping reverse proxy (Caddy `handle_path`, an nginx
+#     `proxy_pass` with a trailing slash) that returns `/<conv>/out-<hex>/f.txt`
+#     for a base of `https://host/files/<conv>/out-<hex>/` still reads. The
+#     collection's own row is dropped; parents, grandchildren, a href on the
+#     served root and foreign hosts refuse
 #   * path split into components BEFORE each is percent-decoded, and a component
 #     decoding to a separator, a NUL or a dot segment refuses
-#   * no repeated name
+#   * no repeated name, compared by UNICODE CANONICAL EQUIVALENCE — the two
+#     spellings of `café` are one name, and a folder holding both refuses
 #   * directories dropped — a nested folder is not a deliverable
 #
 # DELIBERATE DIVERGENCES — the complete list, so the comparison with the Swift is
@@ -10433,6 +10534,7 @@ agent_probe_abandon_registry() { # no registered remote target was created
 STRICT_LISTING_MIRROR=$(cat <<'PY'
 import os
 import sys
+import unicodedata
 import xml.parsers.expat as expat
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -10502,6 +10604,25 @@ base_origin = origin(requested)
 collection_base = requested if requested.endswith("/") else requested + "/"
 
 
+def is_requested_collection_tail(candidate):
+    """Whether candidate names the requested collection as the server sees it:
+    the whole requested path, or the tail of it that survives a path-stripping
+    proxy.
+
+    A tail, never a head and never a subsequence, so what is accepted always ends
+    where the request ended. On the collection this actually decides in
+    production — the per-dispatch box, whose path ends in `out-<32 hex>` — even
+    the shortest accepted match pins an entry's immediate parent to 128 bits of
+    freshly-minted entropy. An EMPTY candidate matches only an empty base;
+    otherwise a server answering about its own root would satisfy every
+    listing."""
+    if not candidate:
+        return not base_components
+    if len(candidate) > len(base_components):
+        return False
+    return base_components[len(base_components) - len(candidate):] == candidate
+
+
 def resolve(href):
     """SELF_ROW, the child's name, or None — and None refuses the whole body."""
     text = href.strip()
@@ -10517,12 +10638,15 @@ def resolve(href):
     components = path_components(resolved)
     if components is None or base_components is None:
         return None
-    if components == base_components:
+    # The collection's own row is tested FIRST. Under a stripped prefix an href
+    # can satisfy both readings (its components tail-match the base, and so does
+    # its parent), and calling that the folder rather than a child of a shorter
+    # folder is the reading that cannot invent an entry.
+    if is_requested_collection_tail(components):
         return SELF_ROW
-    if len(components) == len(base_components) + 1 \
-            and components[:len(base_components)] == base_components:
-        return components[-1]
-    return None
+    if not components or not is_requested_collection_tail(components[:-1]):
+        return None
+    return components[-1]
 
 
 class StrictListing(object):
@@ -10625,6 +10749,14 @@ class StrictListing(object):
                 # No propstat at all means the response stated nothing about the
                 # resource, which is not evidence that it is there.
                 self.resource_status_is_2xx and self.usable_propstats > 0))
+        elif local == "response":
+            # A <response> anywhere but directly under <multistatus> REFUSES the
+            # document. RFC 4918 puts it exactly one level down, so a deeper one
+            # means this body has a structure nobody here understood — and the
+            # only two ways to handle a row you did not understand are to refuse
+            # the answer or to lose a file. Silently ignoring it would certify a
+            # lane whose every listing the app throws away.
+            raise Refused("malformedBody")
 
 
 body = sys.stdin.buffer.read(MAX_BYTES + 1)
@@ -10662,6 +10794,21 @@ except expat.ExpatError:
 if not listing.saw_multistatus:
     verdict("REFUSED:malformedBody")
 
+
+def one_name(text):
+    """A name reduced to the single form every comparison here uses.
+
+    The Swift keeps its names in a `Set<String>`, and Swift string equality is
+    UNICODE CANONICAL EQUIVALENCE, not a code-point match: `café` spelled NFC and
+    the same name spelled NFD are ONE name to it, so a folder holding both
+    refuses as a duplicate. Python's own `==` is by code point and would grade
+    that folder as an ordinary two-entry listing. NFC is the bridge — two strings
+    are canonically equivalent exactly when their NFC forms are equal — and it is
+    applied to the wanted name too, because the app's downstream comparisons are
+    the same canonical ones."""
+    return unicodedata.normalize("NFC", text)
+
+
 entries = []
 seen = set()
 for href, is_directory, is_usable in listing.responses:
@@ -10673,13 +10820,14 @@ for href, is_directory, is_usable in listing.responses:
     # itself oddly must not refuse a listing that is otherwise fine.
     if resolved is SELF_ROW:
         continue
-    if resolved in seen:
+    name = one_name(resolved)
+    if name in seen:
         verdict("REFUSED:duplicateEntry")
-    seen.add(resolved)
+    seen.add(name)
     if not is_usable or is_directory:
         continue
-    entries.append(resolved)
-verdict("PRESENT" if want in entries else "ABSENT")
+    entries.append(name)
+verdict("PRESENT" if one_name(want) in entries else "ABSENT")
 PY
 )
 
@@ -12975,7 +13123,17 @@ doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
   DCC_TIME="${tail_%% *}"
-  [ "$tail_" != "${tail_#* }" ] && DCC_CT="${tail_#* }"
+  # safe_display here, at the parser's exit — the same rule models_is_json applies
+  # to the header it captures. The value is whatever the server chose, curl does
+  # not strip control bytes out of a header, and doctor_chat_eval echoes it into
+  # the check transcript: a newline forges an extra "[CHECK_ID] …" line (a hostile
+  # server printing its own green PASS) and an ANSI escape repaints the FAIL the
+  # operator just read. Substring bounds cap length and strip nothing, so the bound
+  # at the print site is not the guard. Sanitising the PARSER's output instead of
+  # each print site means every later reader of DCC_CT inherits the clean value.
+  # A real Content-Type is control-free and far inside the 200-char bound, so
+  # ct_is_json's grading is unaffected.
+  [ "$tail_" != "${tail_#* }" ] && DCC_CT=$(safe_display "${tail_#* }" 200)
   DCC_TIME=$(printf '%s' "$DCC_TIME" | awk '{printf "%.1f", $1}' 2>/dev/null)
   return 0
 }

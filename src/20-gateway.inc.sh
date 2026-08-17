@@ -587,6 +587,11 @@ configure_hermes() {
   elif $DRY_RUN; then
     note "(dry-run: would append API_SERVER_* to $envf and restart Hermes)"
     plan_add "APPEND API_SERVER_ENABLED/HOST/PORT/KEY to $envf, then restart hermes-gateway"
+    # --dry-run's contract is every file it would touch and every command it would
+    # run, and the mode change below is one of them whenever the file is already open.
+    if [ -f "$envf" ] && file_mode_is_open "$envf"; then
+      plan_add "RUN  chmod 600 $envf   (before the key is appended — other accounts can read it today)"
+    fi
   else
     warn "Hermes's OpenAI API server is OFF (the setup wizard does not enable it)."
     mutate_guard "append API_SERVER_* to $envf" || return 0
@@ -594,14 +599,36 @@ configure_hermes() {
     local newkey keyline=""
     newkey=$(env_get "$envf" "API_SERVER_KEY")
     [ -n "$newkey" ] || { newkey=$(openssl rand -hex 32); keyline="API_SERVER_KEY=$newkey"; }
+    # The `umask 077` below only covers a file we CREATE. A ~/.hermes/.env that
+    # Hermes itself wrote under umask 022 is 0644, and the API server key is about
+    # to land in it — so the mode is part of THIS step, announced with the lines
+    # below and carried by the same yes, never a second question the secret has to
+    # wait behind. SECURITY.md's promise is that a config we did not create is
+    # never changed without the exact change SHOWN first; it is shown here, and
+    # the one "Append these now?" answer decides both halves together.
+    local tighten_first=false
+    [ -f "$envf" ] && file_mode_is_open "$envf" && tighten_first=true
     say "  I'd append to $envf:"
     say "    API_SERVER_ENABLED=true"
     say "    API_SERVER_HOST=127.0.0.1"
     say "    API_SERVER_PORT=$GW_LOCAL_PORT"
     if [ -n "$keyline" ]; then say "    API_SERVER_KEY=<freshly generated, not shown>"
     else say "    (keeping the API_SERVER_KEY already in your .env)"; fi
+    if $tighten_first; then
+      say "  …and first, because other accounts on this machine can read that file today"
+      say "  and the API server key goes inside it:"
+      say "    chmod 600 $envf"
+    fi
     if confirm "  Append these now?" "gateway.hermes.enable_api"; then
       [ -f "$envf" ] || ( umask 077; : > "$envf" )   # the key lands inside — never create it world-readable
+      # BEFORE the append, never after: a secret must not exist in a world-readable
+      # file, not even for the moment between two commands. Deliberately silent when
+      # the chmod does not take — the secure_owned_file_mode gate below re-reads the
+      # mode and owns that wording, so a still-exposed key is stated once, with the
+      # offer to retry, instead of twice in two different voices.
+      if $tighten_first && chmod 600 "$envf" 2>/dev/null && ! file_mode_is_open "$envf"; then
+        ok "Tightened $envf to 0600 — only you can read it."
+      fi
       # No `|| true` here: a failed append (read-only fs, perms) must NOT report
       # "Written." and send the user on to a verify step that mis-diagnoses it.
       { echo ""; echo "# added by conduck-connect $(date -u +%Y-%m-%dT%H:%MZ)";
@@ -610,11 +637,11 @@ configure_hermes() {
         if [ -n "$keyline" ]; then echo "$keyline"; fi; } >> "$envf" \
         || die "Could not write to $envf. Fix its permissions (or add the API_SERVER_* lines yourself), then re-run me."
       ok "Written."
-      # The `umask 077` above only covers a file we CREATE. A ~/.hermes/.env that
-      # Hermes already wrote under umask 022 is 0644, and the API server key just
-      # appended (or re-read) is a live gateway credential sitting in it. The
-      # announce-then-confirm gate, and what it says when the answer is no or the
-      # chmod fails, both live in secure_owned_file_mode.
+      # The backstop, and the only arm that still ASKS. Silent when the tighten
+      # above took. When it did not — a read-only mount, a file owned by another
+      # account, a mode that moved underneath us — it names the exposure, offers
+      # the chmod again, and re-reads the file to say whether the key is still
+      # readable by other accounts.
       secure_owned_file_mode "$envf" "your API server key" || true
       if [ "$OS" = "Linux" ] && have systemctl && systemctl --user is-enabled hermes-gateway.service >/dev/null 2>&1; then
         run_step "gateway.hermes.restart_api" "restart Hermes so the API server starts" \

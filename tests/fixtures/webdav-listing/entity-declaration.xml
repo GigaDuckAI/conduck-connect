@@ -1,0 +1,1 @@
+<!DOCTYPE d:multistatus [<!ENTITY x "output.txt">]><d:multistatus xmlns:d="DAV:"><d:response><d:href>/box/out-abc/&x;</d:href><d:propstat><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>

@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><multistatus xmlns="DAV:"><response><href>/box/out-abc/output.txt</href><propstat><status>HTTP/1.1 200 OK</status></propstat></response></multistatus>

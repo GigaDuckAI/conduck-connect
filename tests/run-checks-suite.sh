@@ -7712,24 +7712,28 @@ printf "%s\nhttps://gateway.example.test\n" "$CRED" | ask_url "Address" "https:/
 # A gate that goes quiet when the user says no leaves a live gateway key readable
 # by every account on the box and says nothing about it — a worse outcome than
 # the silent chmod the gate replaced. So all three arms are driven end to end
-# through the shipped secure_owned_file_mode, plus a wiring check that the caller
-# has not gone back to chmodding the file directly.
+# through the shipped secure_owned_file_mode, plus a wiring check on the order
+# the caller does things in.
 run_owned_config_mode_change_case() {
   local name="owned-config-mode-change-is-announced" funcs body out
   local envf="$TMP/announce-hermes.env" mode
 
-  # Wiring: configure_hermes must not chmod the user's .env itself. A bare
-  # `chmod 600 "$envf"` there would satisfy every behavioural assertion below
-  # while bypassing the gate entirely. Line continuations are joined first —
-  # `run_step "…" \` / `  chmod 600 "$envf"` is ONE statement, and a
-  # per-physical-line grep reads its second half as a bare chmod.
+  # Wiring, and it is entirely about ORDER. The promise is that the exact change
+  # is SHOWN first — not that it waits behind a second question, which is what put
+  # a live key into a 0644 file for as long as it took to ask. So configure_hermes
+  # prints `chmod 600 <path>` beside the lines it would append, applies it once the
+  # one "Append these now?" answer is yes, and only THEN writes the key;
+  # secure_owned_file_mode stays behind the append as the backstop for a chmod that
+  # could not be applied. Every one of those relationships is an inequality below.
+  # Line continuations are joined first — `run_step "…" \` / `  chmod 600 "$envf"`
+  # is ONE statement, and a per-physical-line grep reads its second half as a bare
+  # chmod.
   body=$(extract_funcs configure_hermes)
   if [ -z "$body" ]; then
     fail_case "$name" "could not extract configure_hermes from the release artifact"; return
   fi
-  printf '%s\n' "$body" > "$TMP/doctor.out"
-  local chmod_lines ungated
-  chmod_lines=$(printf '%s\n' "$body" | awk '
+  local joined="$TMP/announce-hermes-body.txt"
+  printf '%s\n' "$body" | awk '
     {
       line = $0
       while (line ~ /\\$/) {
@@ -7739,14 +7743,38 @@ run_owned_config_mode_change_case() {
         line = line " " nxt
       }
       print line
-    }' | grep -F 'chmod')
-  ungated=$(printf '%s\n' "$chmod_lines" | grep -F 'envf' | grep -vF 'run_step')
-  if [ -n "$ungated" ]; then
-    printf 'ungated chmod:\n%s\n' "$ungated" >> "$TMP/doctor.out"
-    fail_case "$name" "configure_hermes chmods the user's .env directly, bypassing the announce gate"; return
+    }' > "$joined"
+  cp "$joined" "$TMP/doctor.out"
+
+  # Exactly ONE line may actually run a chmod on the user's .env. The others that
+  # name it are the announcement and the --dry-run plan entry, and neither touches
+  # the file — but a second real one would be a mode change nobody was shown.
+  local exec_chmod announce_ln confirm_ln chmod_ln append_ln gate_ln
+  exec_chmod=$(grep -F 'chmod' "$joined" | grep -F 'envf' \
+                 | grep -vE '^[[:space:]]*(#|say |note |plan_add )' | grep -c .)
+  if [ "$exec_chmod" != "1" ]; then
+    fail_case "$name" "expected exactly one executable chmod of the user's .env, found $exec_chmod"; return
   fi
-  if ! printf '%s\n' "$body" | grep -qF 'secure_owned_file_mode'; then
-    fail_case "$name" "configure_hermes no longer routes the .env mode through the announce gate"; return
+  announce_ln=$(grep -nF 'say "    chmod 600 $envf"' "$joined" | head -1 | cut -d: -f1)
+  confirm_ln=$(grep -nF 'confirm "  Append these now?"' "$joined" | head -1 | cut -d: -f1)
+  chmod_ln=$(grep -nF 'chmod 600 "$envf"' "$joined" | head -1 | cut -d: -f1)
+  append_ln=$(grep -nF '>> "$envf"' "$joined" | head -1 | cut -d: -f1)
+  gate_ln=$(grep -nF 'secure_owned_file_mode "$envf"' "$joined" | head -1 | cut -d: -f1)
+  if [ -z "$announce_ln" ] || [ -z "$confirm_ln" ] || [ -z "$chmod_ln" ] \
+     || [ -z "$append_ln" ] || [ -z "$gate_ln" ]; then
+    fail_case "$name" "could not locate the announce / confirm / chmod / append / backstop steps"; return
+  fi
+  if [ "$announce_ln" -ge "$confirm_ln" ]; then
+    fail_case "$name" "the exact chmod is not shown before the operator is asked"; return
+  fi
+  if [ "$chmod_ln" -le "$confirm_ln" ]; then
+    fail_case "$name" "the chmod runs before the operator has said yes"; return
+  fi
+  if [ "$chmod_ln" -ge "$append_ln" ]; then
+    fail_case "$name" "the key is appended before the file is tightened"; return
+  fi
+  if [ "$gate_ln" -le "$append_ln" ]; then
+    fail_case "$name" "the secure_owned_file_mode backstop no longer follows the append"; return
   fi
 
   funcs=$(extract_funcs file_mode_is_open secure_owned_file_mode run_step mutate_guard \
@@ -7825,6 +7853,223 @@ printf "quiet-rc=%d\n" "$?"
   printf -- '--- already private ---\n%s\n' "$out" >> "$TMP/doctor.out"
   if [ "$(printf '%s\n' "$out" | grep -c .)" != "1" ]; then
     fail_case "$name" "an already-0600 file produced output instead of staying silent"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The mode the Hermes API server key is written INTO, observed at the instant it
+# is written rather than inferred from the file afterwards. The exposure this
+# pins is a window, not an end state: a ~/.hermes/.env Hermes wrote under umask
+# 022 is 0644, and a key appended into it is world-readable from the moment it
+# lands — for however long it takes to ask a question, and for good if the answer
+# is no. So the test hooks the append itself: an `echo` that sees the
+# API_SERVER_KEY line stats the file right then, and that reading is the
+# assertion.
+#
+# The other two arms grade the cases where 0600 is NOT reachable, because both
+# are deliberate. A chmod that cannot be applied does not abort the setup — on
+# the reuse path the key is already in that file, so refusing would leave the
+# exposure AND an unconfigured gateway — it falls through to the backstop, which
+# has to say the key is still readable. And a declined append changes nothing at
+# all: no mode, no key.
+run_hermes_key_lands_in_private_file_case() {
+  local name="hermes-key-lands-in-a-0600-file" funcs out mode
+  local home="$TMP/hermes-key-mode-home" envf
+  envf="$home/.hermes/.env"
+
+  funcs=$(extract_funcs configure_hermes hermes_api_server_port show_qr_is_port env_get \
+            file_mode_is_open secure_owned_file_mode run_step mutate_guard)
+  if ! printf '%s\n' "$funcs" | grep -qF 'configure_hermes()'; then
+    fail_case "$name" "could not extract configure_hermes from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # The runtime every arm shares. OS is Darwin so the restart arm is the
+  # print-by-hand one on every host — a real `systemctl --user` probe would make
+  # the case's path depend on the machine running it. The `echo` override is the
+  # measuring instrument: it latches the file's mode on the key line and nothing
+  # else, so an unrelated `echo` earlier in the function cannot move the reading.
+  local runtime='
+eval "$FUNCS"
+DRY_RUN=false; REUSE_ONLY=false; OS="Darwin"; PLAN=()
+BOLD=""; RESET=""; DIM=""; YELLOW=""; GREEN=""; RED=""
+GW_ID=""; GW_LOCAL_PORT=""; GW_HEALTH_PATH=""; GW_TOKEN=""; GW_AUTH=""
+HOME="$FAKE_HOME"
+KEY_MODE=""
+echo() {
+  case "${1:-}" in
+    API_SERVER_KEY=*) KEY_MODE=$(python3 -c "import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))" "$ENVF") ;;
+  esac
+  builtin echo "$@"
+}
+head_() { printf "== %s ==\n" "$*"; }
+say()   { printf "%s\n" "$*"; }
+ok()    { printf "  OK %s\n" "$*"; }
+note()  { printf "  .. %s\n" "$*"; }
+warn()  { printf "  ! %s\n" "$*"; }
+die()   { printf "die: %s\n" "$*"; exit 1; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+plan_add() { printf "PLAN %s\n" "$*"; }
+gw_guard_single_saved_setup() { return 0; }
+print_and_wait() { printf "[by-hand] %s\n" "$2"; return 0; }
+prompt_into() { eval "$1=fixture-key"; return 0; }
+confirm() { printf "[confirm] %s -> %s\n" "$1" "$CONFIRM_ANSWER"; [ "$CONFIRM_ANSWER" = "y" ]; }
+'
+
+  # Arm 1 — the file pre-exists at 0644 with no key in it, so a fresh one is
+  # generated and appended. This is the arm the fix exists for.
+  rm -rf "$home"; mkdir -p "$home/.hermes"
+  printf 'API_SERVER_PORT=8642\n' > "$envf"
+  chmod 644 "$envf"
+  out=$(FUNCS="$funcs" FAKE_HOME="$home" ENVF="$envf" CONFIRM_ANSWER=y \
+        bash -c "$runtime"'
+configure_hermes
+printf "key-write-mode=%s\n" "$KEY_MODE"
+' 2>&1) || true
+  printf -- '--- accepted on a 0644 file ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+  if ! printf '%s\n' "$out" | grep -qF 'key-write-mode=0o600'; then
+    fail_case "$name" "the API server key was written into a file that was not 0600"; return
+  fi
+  mode=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$envf")
+  if [ "$mode" != "0o600" ]; then
+    fail_case "$name" "the .env did not end up 0600 (mode $mode)"; return
+  fi
+  if ! grep -q '^API_SERVER_KEY=' "$envf"; then
+    fail_case "$name" "no API_SERVER_KEY was appended, so the mode reading proves nothing"; return
+  fi
+  # One question, not two. The whole point of announcing the chmod with the
+  # append is that the secret does not wait behind a second default-No prompt.
+  if [ "$(printf '%s\n' "$out" | grep -c '^\[confirm\]')" != "1" ]; then
+    fail_case "$name" "the mode change asked its own question instead of riding the append's"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF "chmod 600 $envf"; then
+    fail_case "$name" "the exact chmod was never shown to the operator"; return
+  fi
+  # The generated key is a secret; it may reach the file and nothing else.
+  if printf '%s\n' "$out" | grep -qE '[0-9a-f]{64}'; then
+    fail_case "$name" "the generated API server key appeared in the run's output"; return
+  fi
+
+  # Arm 2 — the chmod cannot be applied (read-only mount, foreign owner). Setup
+  # still completes, and the backstop after the append has to say the key is
+  # exposed rather than let a failed tighten pass as a done one.
+  rm -rf "$home"; mkdir -p "$home/.hermes"
+  printf 'API_SERVER_PORT=8642\n' > "$envf"
+  chmod 644 "$envf"
+  out=$(FUNCS="$funcs" FAKE_HOME="$home" ENVF="$envf" CONFIRM_ANSWER=y \
+        bash -c "$runtime"'
+chmod() { return 1; }
+configure_hermes
+printf "key-write-mode=%s\n" "$KEY_MODE"
+' 2>&1) || true
+  printf -- '--- chmod refused ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+  if ! printf '%s\n' "$out" | grep -qF 'key-write-mode=0o644'; then
+    fail_case "$name" "the arm meant to prove a failed chmod did not actually fail one"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'STILL readable'; then
+    fail_case "$name" "a chmod that did not take was reported as success"; return
+  fi
+  if ! grep -q '^API_SERVER_KEY=' "$envf"; then
+    fail_case "$name" "an unreachable 0600 left the gateway unconfigured as well as exposed"; return
+  fi
+
+  # Arm 3 — declined. One answer covers both halves, so no means no to both: the
+  # mode is untouched and nothing is appended.
+  rm -rf "$home"; mkdir -p "$home/.hermes"
+  printf 'API_SERVER_PORT=8642\n' > "$envf"
+  chmod 644 "$envf"
+  out=$(FUNCS="$funcs" FAKE_HOME="$home" ENVF="$envf" CONFIRM_ANSWER=n \
+        bash -c "$runtime"'
+configure_hermes
+printf "key-write-mode=%s\n" "$KEY_MODE"
+' 2>&1) || true
+  printf -- '--- declined ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+  mode=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$envf")
+  if [ "$mode" != "0o644" ]; then
+    fail_case "$name" "a declined step changed the mode anyway (now $mode)"; return
+  fi
+  if grep -q '^API_SERVER_KEY=' "$envf"; then
+    fail_case "$name" "a declined step appended the key anyway"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A gateway's Content-Type header is attacker-controlled text on its way to the
+# operator's terminal, and the chat probe's failure line quotes it back. Bounding
+# it with ${DCC_CT:0:60} caps LENGTH and strips NOTHING, so an ESC reaches the
+# terminal: the gateway erases the ✗ line it just earned and repaints a green
+# [CHAT_BASIC], and a newline forges a whole extra transcript line. safe_display
+# at the parser's exit is the answer, and this case grades the exit rather than
+# the print site — every later reader of DCC_CT has to inherit the clean value.
+#
+# The clean arm is not decoration. Sanitising the value the grader reads would be
+# a real defect if it moved the grade, so a legitimate header has to arrive
+# byte-identical and still classify as JSON.
+run_chat_content_type_is_sanitised_case() {
+  local name="chat-content-type-is-sanitised" funcs out dir
+  dir="$TMP/chat-ct-sanitise"
+  rm -rf "$dir"; mkdir -p "$dir"
+
+  funcs=$(extract_funcs doctor_chat_request doctor_chat_eval doctor_transfer_reason \
+            ct_is_json safe_display)
+  if ! printf '%s\n' "$funcs" | grep -qF 'doctor_chat_request()'; then
+    fail_case "$name" "could not extract doctor_chat_request from the release artifact"; return
+  fi
+  : > "$TMP/doctor.out"
+
+  # The hostile header carries the two bytes that matter: ESC (repaint what the
+  # operator already read) and CR (rewrite the current line). curl hands
+  # %{content_type} over verbatim, so the stub reproduces exactly the -w line the
+  # real call asks for: "<code> <seconds> <content-type>" after the body.
+  out=$(FUNCS="$funcs" OUTDIR="$dir" bash -c '
+eval "$FUNCS"
+GW_URL="http://127.0.0.1:1"
+DCC_ACCEPT="application/json"
+ESC=$(printf "\033"); CR=$(printf "\r")
+CT_TO_SERVE="application/json${ESC}[2K${CR}  [CHAT_BASIC] forged green line"
+curl_gw() { printf "%s\n200 0.5 %s" "{}" "$CT_TO_SERVE"; }
+doctor_chat_eval "{}"
+printf "%s" "$DCC_CT" > "$OUTDIR/ct.bin"
+printf "%s" "$DCE_REASON" > "$OUTDIR/reason.bin"
+printf "hint=%s\n" "$DCE_HINT"
+
+CT_TO_SERVE="application/json; charset=utf-8"
+doctor_chat_request "{}"
+printf "%s" "$DCC_CT" > "$OUTDIR/clean-ct.bin"
+if ct_is_json "$DCC_CT"; then printf "clean-graded=json\n"; else printf "clean-graded=other\n"; fi
+' 2>&1) || true
+  printf -- '--- hostile + clean content-type ---\n%s\n' "$out" >> "$TMP/doctor.out"
+  assert_runtime_defined "$name" "$out" || return
+
+  local f
+  for f in ct reason; do
+    if [ ! -f "$dir/$f.bin" ]; then
+      fail_case "$name" "the probe produced no $f value"; return
+    fi
+    if ! python3 -c 'import sys
+b = open(sys.argv[1], "rb").read()
+sys.exit(1 if any(x < 0x20 or x == 0x7f for x in b) else 0)' "$dir/$f.bin"; then
+      fail_case "$name" "a control byte survived into $f — the terminal can still be repainted"; return
+    fi
+  done
+  if ! grep -qF 'Content-Type is' "$dir/reason.bin"; then
+    fail_case "$name" "the failure reason stopped naming the Content-Type it rejected"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'hint=ct'; then
+    fail_case "$name" "a hostile Content-Type no longer grades as the content-type failure"; return
+  fi
+  if ! printf '%s\n' "$out" | grep -qF 'clean-graded=json'; then
+    fail_case "$name" "sanitising moved the grade of a legitimate Content-Type"; return
+  fi
+  if [ "$(cat "$dir/clean-ct.bin")" != "application/json; charset=utf-8" ]; then
+    fail_case "$name" "a legitimate Content-Type did not survive byte-identical"; return
   fi
 
   PASS=$((PASS+1))
@@ -9641,6 +9886,14 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" owned-config-mode-change-is-announced "*) true ;; *) false ;; esac; then
   run_owned_config_mode_change_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" hermes-key-lands-in-a-0600-file "*) true ;; *) false ;; esac; then
+  run_hermes_key_lands_in_private_file_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" chat-content-type-is-sanitised "*) true ;; *) false ;; esac; then
+  run_chat_content_type_is_sanitised_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" env-ports-are-validated "*) true ;; *) false ;; esac; then

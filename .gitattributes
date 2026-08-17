@@ -2,3 +2,7 @@
 # Preserve its upstream trailing whitespace; scripts/verify-vendored-encoder.sh
 # protects the embedded bytes and its allowed imports.
 src/80-pairing.inc.sh whitespace=-blank-at-eol
+
+# The WebDAV listing corpus is graded by byte count — two bodies sit exactly on
+# the 256 KiB bound — so no checkout may rewrite a line ending inside it.
+tests/fixtures/webdav-listing/** -text

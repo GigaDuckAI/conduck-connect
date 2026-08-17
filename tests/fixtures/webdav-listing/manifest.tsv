@@ -1,0 +1,148 @@
+# conduck-connect WebDAV listing fixture corpus.
+# corpus-version: 1
+#
+# Columns, TAB-separated: case, requested-url, wanted-entry,
+# expected-verdict, parity. The body is <case>.xml in this directory,
+# byte-exact and without a trailing newline. See README.md.
+#
+# The ordinary listing: the collection's own row plus one direct child.
+child-direct	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# A relative href resolves against the collection WITH its trailing slash,
+# which is what makes it a child rather than a sibling.
+child-relative	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# A fully absolute href on the requested origin is the same child.
+child-absolute-url	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# A byte size changes no verdict. The app keeps it for the download chip; the
+# mirror does not read it, and neither side's answer moves.
+child-with-size	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# Local names are matched with any prefix or none: a prefix is a serialization
+# choice, and refusing one would refuse real servers.
+namespace-unprefixed	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# A path-stripping reverse proxy (Caddy handle_path, nginx proxy_pass with a
+# trailing slash) hands the WebDAV server a shortened path, so the hrefs come
+# back without the /box mount point. The match is anchored at the END of the
+# requested path, so this reads; demanding the full prefix would refuse every
+# row of a listing the app reads perfectly.
+proxy-stripped-prefix	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# A nested folder is dropped as undeliverable without touching the file beside
+# it.
+collection-beside-file	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# One 404 propstat beside a 200 one still leaves a resource the server found:
+# properties are read out of the successful propstat.
+mixed-propstat	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# Exactly listingMaxEntries responses is accepted — the bound is inclusive.
+entries-at-cap	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# Nesting exactly maxElementDepth deep is accepted.
+depth-at-limit	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# Exactly listingMaxBytes is accepted — the bound is inclusive.
+bytes-at-limit	http://127.0.0.1:8080/box/out-abc/	output.txt	PRESENT	app
+#
+# A readable folder that simply does not hold the wanted name. ABSENT, never
+# REFUSED: the two are different repairs on the operator's side.
+absent-other-name	http://127.0.0.1:8080/box/out-abc/	output.txt	ABSENT	app
+#
+# A collection whose only row is itself.
+empty-collection	http://127.0.0.1:8080/box/out-abc/	output.txt	ABSENT	app
+#
+# The wanted name is a folder. A nested folder is not a deliverable.
+collection-child	http://127.0.0.1:8080/box/out-abc/	output.txt	ABSENT	app
+#
+# RFC 4918 lets a 207 carry rows about resources the server does NOT have.
+# Emitting one as an entry would offer a file that is not there.
+notfound-propstat	http://127.0.0.1:8080/box/out-abc/	output.txt	ABSENT	app
+#
+# The same rule at the response level rather than the propstat level.
+notfound-response-status	http://127.0.0.1:8080/box/out-abc/	output.txt	ABSENT	app
+#
+# A response that states nothing about the resource is not evidence that the
+# resource is there.
+response-without-propstat	http://127.0.0.1:8080/box/out-abc/	output.txt	ABSENT	app
+#
+# A tail match is not a free-for-all: an EMPTY parent matches only an empty
+# requested path, so a server answering about its own root cannot satisfy
+# every listing.
+proxy-served-root	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:entryOutsideCollection	app
+#
+# The parent must be a TAIL of the requested path, never a subsequence of it:
+# a same-named folder under a different mount is refused.
+proxy-wrong-mount	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:entryOutsideCollection	app
+#
+# A row about the parent directory is not describing the folder asked about.
+parent-href	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:entryOutsideCollection	app
+#
+# Exactly one component past the folder, so a grandchild refuses the whole
+# body rather than being dropped — a server must not hand over a curated
+# subset of a listing the client believes is complete.
+grandchild	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:entryOutsideCollection	app
+#
+# An href on another host is not describing the configured file server,
+# whatever it claims about the path.
+foreign-origin	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:entryOutsideCollection	app
+#
+# The path is split into components BEFORE each is decoded, so an escape that
+# decodes to a separator or a dot segment cannot smuggle a second component
+# past the direct-child test.
+percent-encoded-dot-segment	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:entryOutsideCollection	app
+#
+# A response below anything but multistatus REFUSES the body. RFC 4918 puts it
+# exactly one level down, so a deeper one is a row nobody understood, and
+# dropping it would report a file that exists as an empty folder.
+nested-response	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# Exactly one href per response. None means the row names nothing.
+response-without-href	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# Two hrefs mean the row names two things, and nobody here decides which.
+two-hrefs	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# A control-UI HTML page answering a PROPFIND is not a listing.
+not-multistatus-root	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# A document that does not parse to completion is refused: a truncated listing
+# is indistinguishable from a real short one.
+truncated	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# Malformed XML, refused rather than salvaged.
+mismatched-tag	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# An empty 207 body states nothing.
+empty-body	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# One level past maxElementDepth. A body nested deeper than a flat collection
+# needs is doing something other than listing a directory.
+depth-over-limit	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	app
+#
+# The two spellings of café — NFC U+00E9, and NFD e + U+0301 — are ONE name
+# under Unicode canonical equivalence, which is what Swift string equality is.
+# One real collection cannot hold two entries under one name, so the folder
+# refuses. A code-point comparison would grade it an ordinary two-entry
+# listing.
+nfc-nfd-collision	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:duplicateEntry	app
+#
+# The same collision spelled identically.
+duplicate-name	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:duplicateEntry	app
+#
+# One response past listingMaxEntries. Refused, never truncated: a silently
+# shortened listing looks complete, and the file that fell off it is never
+# delivered.
+entries-over-cap	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:tooManyEntries	app
+#
+# One byte past listingMaxBytes.
+bytes-over-limit	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:bodyTooLarge	app
+#
+# An entity DECLARATION of any kind is refused outright — that is fail-closed
+# against billion-laughs. The app switches off EXTERNAL entity resolution and
+# lets Foundation expand an internal one, so it may well accept this body.
+# Refusing more than the client is the safe direction for a checker; accepting
+# more is the one that mints a setup code for a lane that never delivers.
+entity-declaration	http://127.0.0.1:8080/box/out-abc/	output.txt	REFUSED:malformedBody	mirror-stricter

@@ -1939,16 +1939,25 @@ agent_probe_abandon_registry() { # no registered remote target was created
 #   * root element `multistatus`, document parsed to completion with no fault —
 #     a truncated listing is indistinguishable from a real short one
 #   * element nesting and `<response>` count bounded
+#   * every `<response>` sits DIRECTLY under `<multistatus>`; one in an
+#     unrecognised wrapper refuses the body rather than being skipped, because a
+#     row nobody understood would otherwise report a file that exists as an
+#     empty folder
 #   * exactly one `<href>` per `<response>`
 #   * properties read only out of a `2xx` `<propstat>`; a resource whose own
 #     `<status>` is not 2xx, or that carries no successful propstat, is dropped
 #     (RFC 4918 lets a 207 carry not-found rows)
-#   * every href resolved against the REQUESTED url, on the same origin, and an
-#     exact DIRECT child of it — the collection's own row is dropped, parents,
-#     grandchildren and foreign hosts refuse
+#   * every href resolved against the REQUESTED url, on the same origin, with
+#     its parent ANCHORED AT THE END of the requested path — a non-empty tail of
+#     it, so a path-stripping reverse proxy (Caddy `handle_path`, an nginx
+#     `proxy_pass` with a trailing slash) that returns `/<conv>/out-<hex>/f.txt`
+#     for a base of `https://host/files/<conv>/out-<hex>/` still reads. The
+#     collection's own row is dropped; parents, grandchildren, a href on the
+#     served root and foreign hosts refuse
 #   * path split into components BEFORE each is percent-decoded, and a component
 #     decoding to a separator, a NUL or a dot segment refuses
-#   * no repeated name
+#   * no repeated name, compared by UNICODE CANONICAL EQUIVALENCE — the two
+#     spellings of `café` are one name, and a folder holding both refuses
 #   * directories dropped — a nested folder is not a deliverable
 #
 # DELIBERATE DIVERGENCES — the complete list, so the comparison with the Swift is
@@ -1975,6 +1984,7 @@ agent_probe_abandon_registry() { # no registered remote target was created
 STRICT_LISTING_MIRROR=$(cat <<'PY'
 import os
 import sys
+import unicodedata
 import xml.parsers.expat as expat
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -2044,6 +2054,25 @@ base_origin = origin(requested)
 collection_base = requested if requested.endswith("/") else requested + "/"
 
 
+def is_requested_collection_tail(candidate):
+    """Whether candidate names the requested collection as the server sees it:
+    the whole requested path, or the tail of it that survives a path-stripping
+    proxy.
+
+    A tail, never a head and never a subsequence, so what is accepted always ends
+    where the request ended. On the collection this actually decides in
+    production — the per-dispatch box, whose path ends in `out-<32 hex>` — even
+    the shortest accepted match pins an entry's immediate parent to 128 bits of
+    freshly-minted entropy. An EMPTY candidate matches only an empty base;
+    otherwise a server answering about its own root would satisfy every
+    listing."""
+    if not candidate:
+        return not base_components
+    if len(candidate) > len(base_components):
+        return False
+    return base_components[len(base_components) - len(candidate):] == candidate
+
+
 def resolve(href):
     """SELF_ROW, the child's name, or None — and None refuses the whole body."""
     text = href.strip()
@@ -2059,12 +2088,15 @@ def resolve(href):
     components = path_components(resolved)
     if components is None or base_components is None:
         return None
-    if components == base_components:
+    # The collection's own row is tested FIRST. Under a stripped prefix an href
+    # can satisfy both readings (its components tail-match the base, and so does
+    # its parent), and calling that the folder rather than a child of a shorter
+    # folder is the reading that cannot invent an entry.
+    if is_requested_collection_tail(components):
         return SELF_ROW
-    if len(components) == len(base_components) + 1 \
-            and components[:len(base_components)] == base_components:
-        return components[-1]
-    return None
+    if not components or not is_requested_collection_tail(components[:-1]):
+        return None
+    return components[-1]
 
 
 class StrictListing(object):
@@ -2167,6 +2199,14 @@ class StrictListing(object):
                 # No propstat at all means the response stated nothing about the
                 # resource, which is not evidence that it is there.
                 self.resource_status_is_2xx and self.usable_propstats > 0))
+        elif local == "response":
+            # A <response> anywhere but directly under <multistatus> REFUSES the
+            # document. RFC 4918 puts it exactly one level down, so a deeper one
+            # means this body has a structure nobody here understood — and the
+            # only two ways to handle a row you did not understand are to refuse
+            # the answer or to lose a file. Silently ignoring it would certify a
+            # lane whose every listing the app throws away.
+            raise Refused("malformedBody")
 
 
 body = sys.stdin.buffer.read(MAX_BYTES + 1)
@@ -2204,6 +2244,21 @@ except expat.ExpatError:
 if not listing.saw_multistatus:
     verdict("REFUSED:malformedBody")
 
+
+def one_name(text):
+    """A name reduced to the single form every comparison here uses.
+
+    The Swift keeps its names in a `Set<String>`, and Swift string equality is
+    UNICODE CANONICAL EQUIVALENCE, not a code-point match: `café` spelled NFC and
+    the same name spelled NFD are ONE name to it, so a folder holding both
+    refuses as a duplicate. Python's own `==` is by code point and would grade
+    that folder as an ordinary two-entry listing. NFC is the bridge — two strings
+    are canonically equivalent exactly when their NFC forms are equal — and it is
+    applied to the wanted name too, because the app's downstream comparisons are
+    the same canonical ones."""
+    return unicodedata.normalize("NFC", text)
+
+
 entries = []
 seen = set()
 for href, is_directory, is_usable in listing.responses:
@@ -2215,13 +2270,14 @@ for href, is_directory, is_usable in listing.responses:
     # itself oddly must not refuse a listing that is otherwise fine.
     if resolved is SELF_ROW:
         continue
-    if resolved in seen:
+    name = one_name(resolved)
+    if name in seen:
         verdict("REFUSED:duplicateEntry")
-    seen.add(resolved)
+    seen.add(name)
     if not is_usable or is_directory:
         continue
-    entries.append(resolved)
-verdict("PRESENT" if want in entries else "ABSENT")
+    entries.append(name)
+verdict("PRESENT" if one_name(want) in entries else "ABSENT")
 PY
 )
 

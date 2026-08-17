@@ -767,7 +767,17 @@ doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
   DCC_TIME="${tail_%% *}"
-  [ "$tail_" != "${tail_#* }" ] && DCC_CT="${tail_#* }"
+  # safe_display here, at the parser's exit — the same rule models_is_json applies
+  # to the header it captures. The value is whatever the server chose, curl does
+  # not strip control bytes out of a header, and doctor_chat_eval echoes it into
+  # the check transcript: a newline forges an extra "[CHECK_ID] …" line (a hostile
+  # server printing its own green PASS) and an ANSI escape repaints the FAIL the
+  # operator just read. Substring bounds cap length and strip nothing, so the bound
+  # at the print site is not the guard. Sanitising the PARSER's output instead of
+  # each print site means every later reader of DCC_CT inherits the clean value.
+  # A real Content-Type is control-free and far inside the 200-char bound, so
+  # ct_is_json's grading is unaffected.
+  [ "$tail_" != "${tail_#* }" ] && DCC_CT=$(safe_display "${tail_#* }" 200)
   DCC_TIME=$(printf '%s' "$DCC_TIME" | awk '{printf "%.1f", $1}' 2>/dev/null)
   return 0
 }
