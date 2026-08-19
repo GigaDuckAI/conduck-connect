@@ -259,6 +259,10 @@ extract_funcs() { # extract_funcs <fn-name>… -> function source on stdout
 
 PASS=0
 FAIL=0
+# Coverage a case could not run — reported after SUITE RESULT, never as a pass.
+# Separate from NOT_RUN (set at the very end for rclone), because a case in the
+# body of the suite has to be able to append to it while it runs.
+COVERAGE_SKIPPED=""
 fail_case() { # fail_case <name> <why>
   FAIL=$((FAIL+1))
   printf 'SUITE ✗ %s — %s\n' "$1" "$2"
@@ -315,6 +319,13 @@ assert_machine_output() { # assert_machine_output <name> <prefix>
   return 0
 }
 
+# THE RULE, and it is not PTY-specific: any case that drives an INTERACTIVE path —
+# through a PTY here, or through a pipe carrying answers (run_direct_setup_case,
+# the --forget/--edit cases) — must run under `env -u CI`. nobody_can_answer()
+# gives CI precedence over the shape of stdin, so a case that forgets it grades
+# the refusal path instead of the path it names. run_direct_setup_case is the one
+# that forgot, and it cost nine days of red CI.
+#
 # Every INTENTIONAL-PTY case runs through here. `env -u CI` is the whole point:
 # interactive_terminal() returns false whenever $CI is set, and every GitHub
 # Actions runner exports CI=true — so without stripping it, these cases would
@@ -1149,7 +1160,7 @@ run_direct_setup_case() {
   # a gateway than on a clean runner, and the difference is invisible until the
   # laptop is the thing that fails.
   mkdir -p "$home" "$state"
-  printf '3\n' | env HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
+  printf '3\n' | env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb \
     bash "$SCRIPT" --setup --dry-run \
     > "$TMP/doctor.out" 2>&1 || rc=$?
   if [ "$rc" != "1" ]; then
@@ -4432,7 +4443,7 @@ run_file_lane_failure_names_the_gateway_case() {
 run_manage_surface_case() {
   local name="manage-surface-machine-contract" rc=0 out id
   local home="$TMP/manage-home" state="$TMP/manage-state" sd="$TMP/manage-state/conduck"
-  mkdir -p "$home/Library/LaunchAgents" "$sd"
+  mkdir -p "$home/Library/LaunchAgents" "$home/.config/systemd/user" "$sd"
   : > "$TMP/doctor.out"
 
   # -- an empty state dir is a valid answer -----------------------------------
@@ -4469,8 +4480,13 @@ run_manage_surface_case() {
       # leftovers scan exists: it is a live authenticated WebDAV server over the
       # agent's working folder, restarted at every login, that nothing else in the
       # tool would ever mention again.
+      # Both platforms' paths, same idiom as manage-list-renders-untrusted-names
+      # below: fs_all_units scans ONLY the native format, so a plist-only fixture
+      # is invisible on Linux and leftovers[] comes back empty there.
       printf '<?xml version="1.0"?><plist><dict></dict></plist>\n' \
         > "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-orphan.plist"
+      printf '[Service]\nExecStart=/usr/local/bin/rclone serve webdav /tmp/x --addr 127.0.0.1:8080\n' \
+        > "$home/.config/systemd/user/conduck-files-orphan.service"
     fi
     rc=0
     env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --list --json \
@@ -4617,7 +4633,8 @@ PY
   done
   # Every fixture file survived all five attempts.
   if [ ! -f "$sd/profile-custom-good.json" ] || [ ! -f "$sd/profile-broken.json" ] ||
-     [ ! -f "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-orphan.plist" ]; then
+     [ ! -f "$home/Library/LaunchAgents/ai.gigaduck.conduck-files-orphan.plist" ] ||
+     [ ! -f "$home/.config/systemd/user/conduck-files-orphan.service" ]; then
     fail_case "$name" "a refused --forget deleted something anyway"; return
   fi
 
@@ -4811,7 +4828,7 @@ PY
 ) || { fail_case "$name" "could not read the fixture's fileServer block"; return; }
 
   funcs=$(extract_funcs manage_show_code manage_save_profile manage_profile_path \
-    show_qr_load_profile show_qr_validate_profile show_qr_profile_invalid \
+    show_qr_load_profile show_qr_validate_profile show_qr_profile_invalid ascii_id_ok \
     show_qr_profile_field_invalid show_qr_is_https_host show_qr_is_port \
     show_qr_recover_gateway_secret show_qr_recover_file_lane \
     existing_fs_config linux_unit_candidates mac_unit_candidates \
@@ -6839,6 +6856,168 @@ PY
   printf 'SUITE ✓ %s\n' "$name"
 }
 
+# The bug this lint exists to prevent cost nine days of red CI and shipped a
+# destructive defect: a bracket RANGE in a shell pattern resolves through the
+# locale's COLLATION order, not ASCII. Under en_US.UTF-8 — GitHub's macOS runners,
+# and most desktops — [a-z] also matches A-Y, and EVERY alphabetic range, [A-Za-z]
+# included, also matches accented letters. manage_id_ok is the only guard on
+# --forget; on case-insensitive APFS an accepted uppercase id aliases the
+# lowercase profile, so --forget deleted a setup while every exact string
+# comparison around it still read "a different setup".
+#
+# Ranges of DIGITS are safe (no case to interleave) and stay allowed, or this lint
+# would fail on every port check in the tool. Python and awk regexes are safe too —
+# their engines are codepoint-based — so heredoc bodies are skipped rather than
+# exempted by name, which is what keeps the vendored QR encoder out of scope
+# without an exclusion list that rots.
+run_locale_range_lint_case() {
+  local name="ascii-classes-stay-enumerated" hits probe lint="$TMP/ascii-range-lint.awk"
+  : > "$TMP/doctor.out"
+
+  # awk in its own FILE, not inline: bash 3.2 (the oldest shell this suite grades)
+  # mis-parses a heredoc nested inside a command substitution, and this program
+  # needs a heredoc to survive its own quoting.
+  #
+  # awk rather than grep for two reasons the problem's shape forces:
+  #   - the python3/QR heredocs must be SKIPPED, not exempted by path. Their
+  #     regexes are codepoint-based and safe, and a path exclusion list rots the
+  #     moment a module moves.
+  #   - `[max-chars]`, `[allow-back]` and `docker-compose.yml` all contain an x-y
+  #     a naive grep reads as a range, so comments are stripped first and the
+  #     bracket body must be a pure CHARSET — no spaces, quotes or pipes.
+  cat > "$lint" <<'AWK'
+FNR==1 { inheredoc=0; tag="" }
+inheredoc { if ($0 == tag) inheredoc=0; next }
+/<<-?'?[A-Za-z_][A-Za-z0-9_]*'?/ {
+  if (match($0, /<<-?'?[A-Za-z_][A-Za-z0-9_]*'?/)) {
+    tag=substr($0, RSTART, RLENGTH)
+    sub(/^<<-?/, "", tag); gsub(/'/, "", tag)
+    if (tag != "") inheredoc=1
+  }
+  next
+}
+{
+  line=$0
+  sub(/^[[:space:]]*#.*$/, "", line)
+  sub(/[[:space:]]#.*$/, "", line)
+  if (line ~ /\[!?[A-Za-z0-9._\/@:+^-]*[A-Za-z]-[A-Za-z][A-Za-z0-9._\/@:+^-]*\]/)
+    printf "%s:%d: %s\n", FILENAME, FNR, substr(line,1,120)
+  else if (line ~ /(^|[^A-Za-z_])tr[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*'[^']*[A-Za-z]-[A-Za-z]/)
+    printf "%s:%d: [tr] %s\n", FILENAME, FNR, substr(line,1,120)
+}
+AWK
+
+  hits=$(awk -f "$lint" "$SRC_DIR"/*.inc.sh "$SRC_DIR/../scripts/build-release.sh")
+  if [ -n "$hits" ]; then
+    printf -- '--- alphabetic ranges found ---\n%s\n' "$hits" >> "$TMP/doctor.out"
+    fail_case "$name" "a shell pattern uses an alphabetic RANGE — spell the charset out (see above)"; return
+  fi
+
+  # Non-vacuous, five ways. A lint that stopped reading the files, or stopped
+  # recognising the shape it forbids, passes for free forever.
+  if [ "$(awk 'END {print NR}' "$SRC_DIR"/*.inc.sh)" -lt 5000 ]; then
+    fail_case "$name" "the lint read almost no source — its glob is broken"; return
+  fi
+  # A single-case range…
+  probe=$(printf 'x *[!a-z0-9-]* y\n' | awk -f "$lint")
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint no longer recognises a single-case range"; return
+  fi
+  # …a BOTH-case range, which is not safe either: under dictionary collation
+  # [A-Za-z] also matches accented letters…
+  probe=$(printf 'x *[!A-Za-z0-9.-]* y\n' | awk -f "$lint")
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint no longer recognises a both-case range"; return
+  fi
+  # …a tr range, a different construct with the same defect…
+  probe=$(printf "x tr -cs 'a-z0-9' y\n" | awk -f "$lint")
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint no longer recognises a tr range"; return
+  fi
+  # …but NOT a digit range, which has no case to interleave and is used by every
+  # port and number check in the tool…
+  probe=$(printf 'x *[!0-9]* y\n' | awk -f "$lint")
+  if [ -n "$probe" ]; then
+    fail_case "$name" "the lint fires on a digit range, which is safe and everywhere"; return
+  fi
+  # …and NOT prose in a comment, or the lint is unusable and gets deleted.
+  probe=$(printf '%s\n' "fn() { # fn <value> [max-chars, default 120] -> bounded" | awk -f "$lint")
+  if [ -n "$probe" ]; then
+    fail_case "$name" "the lint fires on a comment, which would make it noise"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The runtime half of the same fact, because the lint above only proves the SOURCE
+# has no ranges — not that the ids actually mean the same thing on a machine whose
+# locale sorts dictionary-style. The hostile locale is chosen by BEHAVIOUR, never
+# by name: which locales exist differs across runners and distributions, so the
+# case probes for one where bash genuinely matches A against [a-z] and reports
+# honestly when the host has none.
+run_ascii_id_locale_case() {
+  local name="ids-mean-the-same-in-every-locale" hostile="" loc rc out
+  local home="$TMP/idlocale-home" state="$TMP/idlocale-state" sd="$TMP/idlocale-state/conduck"
+  mkdir -p "$home" "$sd"
+  : > "$TMP/doctor.out"
+
+  # By BEHAVIOUR, never by name: which locales exist differs across runners and
+  # distributions, and a name filter turns an unfamiliar suffix into a false SKIP.
+  # The probe asks the only question that matters — does [a-z] match A here?
+  for loc in $(locale -a 2>/dev/null); do
+    if LC_ALL="$loc" bash -c 'case "A" in *[a-z]*) exit 0 ;; esac; exit 1' 2>/dev/null; then
+      hostile="$loc"; break
+    fi
+  done
+  if [ -z "$hostile" ]; then
+    # Visible, and next to the result rather than buried among the passes: this is
+    # coverage that did not run, which is a different thing from coverage that passed.
+    printf 'SUITE — %s: SKIPPED, no dictionary-collation locale on this host\n' "$name"
+    COVERAGE_SKIPPED="${COVERAGE_SKIPPED}${COVERAGE_SKIPPED:+; }$name (no dictionary-collation locale installed — the id charset was proved in this host's locale only)"
+    return
+  fi
+  printf -- 'hostile locale: %s\n' "$hostile" >> "$TMP/doctor.out"
+
+  write_valid_profile "$sd/profile-custom-good.json" \
+    "custom-good" "Good gateway" "https://good.example.test"
+
+  # Uppercase, mixed case and a non-ASCII letter. CUSTOM-GOOD is the dangerous one:
+  # on a case-insensitive filesystem it names an EXISTING profile, so an id check
+  # that lets it through deletes a setup the operator did not ask to remove.
+  local id
+  for id in 'Foo' 'SHOUTY' 'CUSTOM-GOOD' 'custom-gooK' 'Ä'; do
+    rc=0
+    out=$(printf '\n' | LC_ALL="$hostile" env -u CI HOME="$home" XDG_CONFIG_HOME="$state" \
+            TERM=dumb bash "$SCRIPT" --forget "$id" 2>&1) || rc=$?
+    printf -- '--- --forget %s (%s) ---\n%s\n' "$id" "$hostile" "$out" >> "$TMP/doctor.out"
+    if [ "$rc" != "1" ]; then
+      fail_case "$name" "--forget '$id' exited $rc under $hostile, expected 1"; return
+    fi
+    if ! printf '%s\n' "$out" | grep -qF 'is not a saved setup id'; then
+      fail_case "$name" "--forget '$id' was not refused under $hostile — the id charset widened with the locale"; return
+    fi
+  done
+
+  # The refusals were real refusals, not a report about a deletion that happened.
+  if [ ! -f "$sd/profile-custom-good.json" ]; then
+    fail_case "$name" "a refused --forget deleted the profile its id case-aliased"; return
+  fi
+
+  # …and a legitimate lowercase id is still accepted under the same locale, or the
+  # guard would be "green because it refuses everything".
+  rc=0
+  out=$(printf 'n\n' | LC_ALL="$hostile" env -u CI HOME="$home" XDG_CONFIG_HOME="$state" \
+          TERM=dumb bash "$SCRIPT" --forget custom-good 2>&1) || rc=$?
+  printf -- '--- --forget custom-good (%s) ---\n%s\n' "$hostile" "$out" >> "$TMP/doctor.out"
+  if printf '%s\n' "$out" | grep -qF 'is not a saved setup id'; then
+    fail_case "$name" "a valid lowercase id was refused under $hostile"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s (hostile locale: %s)\n' "$name" "$hostile"
+}
+
 run_terminology_lint_case() {
   local name="retired-words-stay-retired" hits words
   words='connector|pairing[ -]code|helpers?'
@@ -8742,7 +8921,7 @@ run_generic_alias_case() { # run_generic_alias_case <plain|dry-run>
   printf '{}\n' > "$home/.openclaw/openclaw.json"
 
   # -- lane 1: no terminal -----------------------------------------------------
-  env HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --generic ${extra[@]+"${extra[@]}"} \
+  env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --generic ${extra[@]+"${extra[@]}"} \
     > "$TMP/doctor.out" 2>&1 < /dev/null || rc=$?
   if [ "$rc" != "4" ]; then
     fail_case "$name" "a no-terminal --generic run exited $rc, expected 4"; return
@@ -9788,6 +9967,14 @@ if [ -z "$ONLY" ] || case " $ONLY " in *" retired-words-stay-retired "*) true ;;
   run_terminology_lint_case
 fi
 
+if [ -z "$ONLY" ] || case " $ONLY " in *" ascii-classes-stay-enumerated "*) true ;; *) false ;; esac; then
+  run_locale_range_lint_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" ids-mean-the-same-in-every-locale "*) true ;; *) false ;; esac; then
+  run_ascii_id_locale_case
+fi
+
 if [ -z "$ONLY" ] || case " $ONLY " in *" retired-gateway-claim-does-not-come-back "*) true ;; *) false ;; esac; then
   run_retired_gateway_claim_case
 fi
@@ -9998,6 +10185,7 @@ printf '\nSUITE RESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 # Printed AFTER the result, where it cannot be lost above a wall of passing lines:
 # a green run that skipped a coverage area has to say so on its last line.
 [ -z "$NOT_RUN" ] || printf 'SUITE COVERAGE NOT RUN: %s\n' "$NOT_RUN"
+[ -z "$COVERAGE_SKIPPED" ] || printf 'SUITE COVERAGE NOT RUN: %s\n' "$COVERAGE_SKIPPED"
 [ "$FAIL" = "0" ] || exit 1
 [ "$PASS" -gt 0 ] || { echo "no cases ran" >&2; exit 1; }
 exit 0

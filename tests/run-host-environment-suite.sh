@@ -64,7 +64,7 @@ lift() { # lift <file> <function-name>…
 }
 
 lift "$UT" priv_prefix linux_install_cmd preflight run_step mutate_guard \
-           safe_display file_mode_is_open ensure_state_dir \
+           safe_display ascii_id_ok file_mode_is_open ensure_state_dir \
            setup_lock_proc_sig setup_lock_holder_state setup_lock_acquire setup_lock_release \
            saved_profile_exists choose_main_action json_query
 lift "$EX" ts_priv_retry tailscale_expose ts_unmap sweep_stale_public_funnels \

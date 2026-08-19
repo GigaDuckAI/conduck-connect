@@ -1798,7 +1798,7 @@ PY
 # third party in a chat message before they exist, and the reply that comes back
 # is untrusted text.
 agent_probe_registered_names_safe() {
-  case "$AGENT_PROBE_TAG" in ''|*[!a-f0-9]*) return 1 ;; esac
+  case "$AGENT_PROBE_TAG" in ''|*[!abcdef0123456789]*) return 1 ;; esac
   [ "${#AGENT_PROBE_TAG}" -eq 32 ] || return 1
   [ "$AGENT_PROBE_DIRKEY" = "conduck-connect-agent-$AGENT_PROBE_TAG" ] || return 1
   [ "$AGENT_PROBE_BOXKEY" = "$AGENT_PROBE_DIRKEY/out-$AGENT_PROBE_TAG" ] || return 1

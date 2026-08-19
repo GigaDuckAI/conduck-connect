@@ -199,6 +199,36 @@ safe_display() { # safe_display <value> [max-chars, default 120] -> printable, b
   printf '%s' "$s"
 }
 
+# Bracket RANGES in a shell pattern resolve through the locale's COLLATION order,
+# not ASCII. Under en_US.UTF-8 — the default on macOS and most desktops, and what
+# the CI runners use — [a-z] also matches A-Y, and every alphabetic range, [A-Za-z]
+# included, also matches accented letters such as Ä, é and ß. Bash 3.2 has no
+# `globasciiranges` to turn that off; LC_COLLATE=C is ignored whenever LC_ALL is
+# set; and a global LC_ALL=C would drag LC_CTYPE with it and break the multi-byte
+# handling safe_display above depends on. So every class in this script that means
+# "ASCII" is written out in full, and tests/run-checks-suite.sh lints for the
+# reintroduction of a range. This is not style: the id charset below is the only
+# guard on the only irreversible command in the tool.
+ASCII_LOWER='abcdefghijklmnopqrstuvwxyz'
+ASCII_UPPER='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+ASCII_DIGIT='0123456789'
+
+# THE gateway-id charset — one definition, shared by the saved-profile validator
+# (show_qr_validate_profile) and the --forget/--edit guard (manage_id_ok), because
+# two literal allowlists for one rule is how they drift apart.
+#
+# Lowercase letters, digits and hyphens, and nothing else. An id is concatenated
+# into $STATE_DIR/profile-<id>.json and into a systemd/launchd unit filename, and
+# the default macOS filesystem is case-INSENSITIVE: an accepted uppercase id opens
+# the lowercase setup it is not addressing, so --forget would delete a profile
+# while every exact string comparison around it still reads "a different setup".
+ascii_id_ok() { # ascii_id_ok <id>
+  case "${1:-}" in
+    ''|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # https://user:pass@host is a legal URL that NO endpoint here may carry. It is a
 # credential the app would have to store inside a routing field, and this script
 # echoes the URL back on screen, writes it to the pairing profile that
@@ -904,7 +934,7 @@ plan_add() { PLAN+=("$*"); }
 explain_prompt() { # explain_prompt [action-id | help-function]
   local help="${1:-}"
   case "$help" in
-    ''|*[!a-zA-Z0-9_]*) ;;
+    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*) ;;
     *) if declare -F "$help" >/dev/null 2>&1; then "$help"; return 0; fi ;;
   esac
   if declare -F explain_action >/dev/null 2>&1; then
@@ -1024,7 +1054,7 @@ looks_like_a_secret() { # looks_like_a_secret <answer>
   case "$lower" in http://*|https://*) return 1 ;; esac   # an address is not a secret
   case "$s" in *[[:space:]]*) return 1 ;; esac             # a sentence is not a paste
   case "$s" in *[0-9]*) return 0 ;; esac
-  case "$s" in *[A-Z]*) case "$s" in *[a-z]*) return 0 ;; esac ;; esac
+  case "$s" in *[ABCDEFGHIJKLMNOPQRSTUVWXYZ]*) case "$s" in *[abcdefghijklmnopqrstuvwxyz]*) return 0 ;; esac ;; esac
   return 1
 }
 
@@ -1896,8 +1926,12 @@ env_get() { # env_get <file> <KEY>  (last assignment wins; strips quotes)
   sed -n "s/^[[:space:]]*${2}=//p" "$1" | tail -1 | sed 's/^"\(.*\)"$/\1/' | sed "s/^'\(.*\)'$/\1/"
 }
 
-# Sanitize a free-form gateway name into a safe id token ([a-z0-9-], no injection).
-slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//' | cut -c1-32; }
+# Sanitize a free-form gateway name into a safe id token (ascii_id_ok's charset,
+# no injection). LC_ALL=C is scoped to each tr and cannot reach anything else: GNU
+# tr documents both ranges and multi-byte handling as non-portable, and [:upper:]
+# means "uppercase per LC_CTYPE", which in a UTF-8 locale includes Ä — folding it
+# to a lowercase Ä that the -cs pass would then have to strip anyway.
+slug() { printf '%s' "$1" | LC_ALL=C tr "$ASCII_UPPER" "$ASCII_LOWER" | LC_ALL=C tr -cs "$ASCII_LOWER$ASCII_DIGIT" '-' | sed 's/^-*//;s/-*$//' | cut -c1-32; }
 
 normalize_gateway_base_url() { # normalize_gateway_base_url <url> -> echoes the app-parity base URL
   # Mirror of the app's SettingsViewModel.normalizedGatewayBaseURL — keep the two
@@ -4558,7 +4592,7 @@ read_exposure_record() { # read_exposure_record <file> -> 0 and sets REC_*, else
   # slug(), or the literal `unknown` — all of them this charset. A record whose id
   # is any other shape was not written by a version of this script, and the whole
   # file is refused rather than half-trusted.
-  case "${gwid:-}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${gwid:-}" in ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;; esac
   case "${prior:-}" in
     EMPTY) ;;
     serve$'\t'*|funnel$'\t'*) exposure_proxy_ok "${prior#*$'\t'}" || return 1 ;;
@@ -5880,7 +5914,7 @@ fs_systemd_quote() { # fs_systemd_quote <literal>
 # with a space in it is a `rm -f` that removes something else, or nothing.
 fs_shell_arg() { # fs_shell_arg <literal>
   case "$1" in
-    ""|*[!A-Za-z0-9._/@:+-]*)
+    ""|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/@:+-]*)
       local value="$1"
       value="${value//\'/\'\\\'\'}"   # ' → '\'' (close, escape, reopen)
       printf "'%s'" "$value" ;;
@@ -10348,7 +10382,7 @@ PY
 # third party in a chat message before they exist, and the reply that comes back
 # is untrusted text.
 agent_probe_registered_names_safe() {
-  case "$AGENT_PROBE_TAG" in ''|*[!a-f0-9]*) return 1 ;; esac
+  case "$AGENT_PROBE_TAG" in ''|*[!abcdef0123456789]*) return 1 ;; esac
   [ "${#AGENT_PROBE_TAG}" -eq 32 ] || return 1
   [ "$AGENT_PROBE_DIRKEY" = "conduck-connect-agent-$AGENT_PROBE_TAG" ] || return 1
   [ "$AGENT_PROBE_BOXKEY" = "$AGENT_PROBE_DIRKEY/out-$AGENT_PROBE_TAG" ] || return 1
@@ -17582,15 +17616,15 @@ show_qr_is_https_host() { # show_qr_is_https_host <url> -> 0 iff https:// + sane
   local ip
   case "$a" in
     \[*\]:*) show_qr_is_port "${a##*\]:}" || return 1; ip="${a#\[}"; ip="${ip%%\]*}"
-             case "$ip" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; *) return 0 ;; esac ;;
+             case "$ip" in ''|*[!0123456789ABCDEFabcdef:.]*) return 1 ;; *) return 0 ;; esac ;;
     \[*\])   ip="${a#\[}"; ip="${ip%\]}"
-             case "$ip" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; *) return 0 ;; esac ;;
+             case "$ip" in ''|*[!0123456789ABCDEFabcdef:.]*) return 1 ;; *) return 0 ;; esac ;;
     \[*)     return 1 ;;   # opened a bracket but no valid close → reject
   esac
   local h="$a"
   case "$a" in *:*) show_qr_is_port "${a##*:}" || return 1; h="${a%:*}" ;; esac
   [ -n "$h" ] || return 1
-  case "$h" in *[!A-Za-z0-9.-]*) return 1 ;; esac
+  case "$h" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]*) return 1 ;; esac
   return 0
 }
 show_qr_is_port() { # show_qr_is_port <str> -> 0 if a decimal in 1..65535
@@ -17694,12 +17728,14 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
         "That saved setup names an unknown gateway kind '$kind' — this tool pairs only openclaw, hermes, or custom gateways."
       return 1 ;;
   esac
-  case "$id" in
-    *[!a-z0-9-]*|'')
-      show_qr_profile_field_invalid "$pf" 'The field is "gateway.id", which may hold only lowercase letters, digits and hyphens' \
-        "That saved setup's gateway id isn't a safe lowercase id."
-      return 1 ;;
-  esac
+  # ascii_id_ok, not a literal charset: manage_id_ok gates --forget on the same
+  # rule, and a profile blessed here that --forget then refuses is a setup nothing
+  # can remove.
+  if ! ascii_id_ok "$id"; then
+    show_qr_profile_field_invalid "$pf" 'The field is "gateway.id", which may hold only lowercase letters, digits and hyphens' \
+      "That saved setup's gateway id isn't a safe lowercase id."
+    return 1
+  fi
   case "$kind:$id" in
     openclaw:openclaw|hermes:hermes|custom:custom-*) ;;
     *)
@@ -18105,13 +18141,11 @@ MANAGE_ID=""
 # `$STATE_DIR/profile-$id.json` and `conduck-files-$id.service` are both built by
 # concatenation, so an id containing `/` or `..` addresses a file this tool has no
 # business touching — and the one command here that deletes files takes its id
-# straight from the command line. The charset is the one show_qr_validate_profile
-# already enforces on gateway.id, so nothing this script ever wrote can fail it.
+# straight from the command line. The charset is LITERALLY the one
+# show_qr_validate_profile enforces on gateway.id — both call ascii_id_ok — so
+# nothing this script ever wrote can fail it, and neither can drift from the other.
 manage_id_ok() { # manage_id_ok <id>
-  case "${1:-}" in
-    ''|*[!a-z0-9-]*) return 1 ;;
-    *) return 0 ;;
-  esac
+  ascii_id_ok "${1:-}"
 }
 
 manage_profile_path() { printf '%s/profile-%s.json' "$STATE_DIR" "$1"; }

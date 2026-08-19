@@ -221,7 +221,7 @@ fs_systemd_quote() { # fs_systemd_quote <literal>
 # with a space in it is a `rm -f` that removes something else, or nothing.
 fs_shell_arg() { # fs_shell_arg <literal>
   case "$1" in
-    ""|*[!A-Za-z0-9._/@:+-]*)
+    ""|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/@:+-]*)
       local value="$1"
       value="${value//\'/\'\\\'\'}"   # ' → '\'' (close, escape, reopen)
       printf "'%s'" "$value" ;;

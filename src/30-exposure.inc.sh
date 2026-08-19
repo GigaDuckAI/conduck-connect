@@ -313,7 +313,7 @@ read_exposure_record() { # read_exposure_record <file> -> 0 and sets REC_*, else
   # slug(), or the literal `unknown` — all of them this charset. A record whose id
   # is any other shape was not written by a version of this script, and the whole
   # file is refused rather than half-trusted.
-  case "${gwid:-}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${gwid:-}" in ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;; esac
   case "${prior:-}" in
     EMPTY) ;;
     serve$'\t'*|funnel$'\t'*) exposure_proxy_ok "${prior#*$'\t'}" || return 1 ;;

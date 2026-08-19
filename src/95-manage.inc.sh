@@ -37,13 +37,11 @@ MANAGE_ID=""
 # `$STATE_DIR/profile-$id.json` and `conduck-files-$id.service` are both built by
 # concatenation, so an id containing `/` or `..` addresses a file this tool has no
 # business touching — and the one command here that deletes files takes its id
-# straight from the command line. The charset is the one show_qr_validate_profile
-# already enforces on gateway.id, so nothing this script ever wrote can fail it.
+# straight from the command line. The charset is LITERALLY the one
+# show_qr_validate_profile enforces on gateway.id — both call ascii_id_ok — so
+# nothing this script ever wrote can fail it, and neither can drift from the other.
 manage_id_ok() { # manage_id_ok <id>
-  case "${1:-}" in
-    ''|*[!a-z0-9-]*) return 1 ;;
-    *) return 0 ;;
-  esac
+  ascii_id_ok "${1:-}"
 }
 
 manage_profile_path() { printf '%s/profile-%s.json' "$STATE_DIR" "$1"; }

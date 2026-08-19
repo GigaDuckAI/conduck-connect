@@ -150,15 +150,15 @@ show_qr_is_https_host() { # show_qr_is_https_host <url> -> 0 iff https:// + sane
   local ip
   case "$a" in
     \[*\]:*) show_qr_is_port "${a##*\]:}" || return 1; ip="${a#\[}"; ip="${ip%%\]*}"
-             case "$ip" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; *) return 0 ;; esac ;;
+             case "$ip" in ''|*[!0123456789ABCDEFabcdef:.]*) return 1 ;; *) return 0 ;; esac ;;
     \[*\])   ip="${a#\[}"; ip="${ip%\]}"
-             case "$ip" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; *) return 0 ;; esac ;;
+             case "$ip" in ''|*[!0123456789ABCDEFabcdef:.]*) return 1 ;; *) return 0 ;; esac ;;
     \[*)     return 1 ;;   # opened a bracket but no valid close → reject
   esac
   local h="$a"
   case "$a" in *:*) show_qr_is_port "${a##*:}" || return 1; h="${a%:*}" ;; esac
   [ -n "$h" ] || return 1
-  case "$h" in *[!A-Za-z0-9.-]*) return 1 ;; esac
+  case "$h" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]*) return 1 ;; esac
   return 0
 }
 show_qr_is_port() { # show_qr_is_port <str> -> 0 if a decimal in 1..65535
@@ -262,12 +262,14 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
         "That saved setup names an unknown gateway kind '$kind' — this tool pairs only openclaw, hermes, or custom gateways."
       return 1 ;;
   esac
-  case "$id" in
-    *[!a-z0-9-]*|'')
-      show_qr_profile_field_invalid "$pf" 'The field is "gateway.id", which may hold only lowercase letters, digits and hyphens' \
-        "That saved setup's gateway id isn't a safe lowercase id."
-      return 1 ;;
-  esac
+  # ascii_id_ok, not a literal charset: manage_id_ok gates --forget on the same
+  # rule, and a profile blessed here that --forget then refuses is a setup nothing
+  # can remove.
+  if ! ascii_id_ok "$id"; then
+    show_qr_profile_field_invalid "$pf" 'The field is "gateway.id", which may hold only lowercase letters, digits and hyphens' \
+      "That saved setup's gateway id isn't a safe lowercase id."
+    return 1
+  fi
   case "$kind:$id" in
     openclaw:openclaw|hermes:hermes|custom:custom-*) ;;
     *)

@@ -89,7 +89,7 @@ first_module=true
 while IFS= read -r module || [ -n "$module" ]; do
   case "$module" in
     ''|'#'*) continue ;;
-    *'/'*|*'..'*|*[!A-Za-z0-9._-]*)
+    *'/'*|*'..'*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
       printf 'error: invalid source module in manifest: %s\n' "$module" >&2
       exit 1
       ;;

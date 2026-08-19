@@ -79,6 +79,20 @@ carry the long form.
 
 ### Security
 
+- **`--forget` now refuses the same setup ids on every machine.** The check that
+  decides whether an id is real was written as a shorthand range — "a through z"
+  — and in the shell that range means whatever the machine's language setting
+  says it means. On a system set to a language that sorts dictionary-style
+  (`en_US.UTF-8`, the default on macOS and most desktops), "a through z" also
+  covers capitals and accented letters, so ids the tool promised to reject were
+  quietly accepted. That mattered because macOS ignores capitalisation in
+  filenames: `--forget CUSTOM-GOOD` got past the guard and then removed the saved
+  setup `custom-good`, while every comparison after it still read the two as
+  different setups — so the profile, its password file and its service could all
+  be deleted while the address in front of the gateway was left open, with
+  nothing left on your machine naming it. Every character set in the script is
+  now written out in full rather than as a range, so an id means the same thing
+  in every language setting, and the tests refuse a range coming back.
 - **A root-owned write can no longer be steered by the agent's own account.**
   The `TOOLS.md` installer refused a symlink and then wrote through the same
   name a moment later, and the agent's own uid could win the gap between the two.
