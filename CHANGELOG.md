@@ -2,57 +2,265 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
-## [Unreleased]
+## [0.15.0] — the folder your agent makes, and three releases that never shipped
 
-- **The file-lane sentinel now proves the thing that actually breaks — and the
-  requirement it proves has changed.** It used to ask the agent for a file at the
-  root of the shared folder, which proves the agent can write *somewhere*. What
-  Conduck depends on is narrower: it names one folder per reply, creates nothing,
-  and reads only that folder. So the bar is no longer *your WebDAV server can
-  create a writable folder*, it is **your agent can create a folder and Conduck
-  can read it**. Measured across 26 live turns on six gateways, that distinction
-  decides the lane: a folder created over WebDAV belongs to whoever the file
-  server runs as, and both flagship gateways run their agent as someone else and
-  are refused inside it — a *successful* creation is worse than a refused one,
-  because the agent can neither write in it nor replace it. The sentinel now
-  names a two-part folder, proves both parts absent, creates neither, and requires
-  the agent to make them and write the file inside. `PROPFIND` becomes a hard
-  requirement of the sentinel, because it is how the folder is proved fresh
-  beforehand and read afterwards, and the sentinel itself now issues no `MKCOL`
-  at all. The verb is still a requirement of the lane, though, and
-  `--check-adapter --files` still fails a server that refuses it: the app mints
-  no reply folder — and so delivers nothing automatically — on a lane where its
-  own nested write was rejected.
-- **The sentinel now also proves Conduck can read what the agent made.** The
-  folder belongs to the agent, so the file server has to list something it did not
-  create — and a folder that is `0700` under another user, or a server that
-  indexes only its own writes, answers a direct fetch perfectly while listing
-  nothing. Conduck never guesses a filename; it lists that one folder. So the
-  sentinel lists it too, and requires the output to be in the listing. That
-  failure now reports as its own cause and says plainly that the agent did
-  everything asked of it.
-- **The sentinel stopped grading how the agent words its reply.** Whether the reply
-  named the file was a pass/fail step, on the theory that a filename in plain text
-  was how a file reached you. It is not any more: the folder is. That check carried
-  its own copy of the app's filename rules, which is a copy that drifts, and it
-  could fail an agent whose file work was perfect.
-- **Existing Hermes installs will be asked to refresh their guidance block.** The
-  Conduck block in `.hermes.md` / `HERMES.md` no longer tells the agent to write
-  returned files at the working-directory root; it tells the agent to create the
-  folder that turn's message names and write the file inside it. Nothing creates
-  that folder in advance, so an instruction that only said *where* would leave the
-  agent nothing to write into. Because the wizard recognises its own block by its
-  exact text, every already-installed copy now reads as an older revision and is
-  offered a refresh, with your yes, in place between its markers. Nothing outside
-  the markers is touched. Under `--reuse-only`, where nothing may be written, an
-  older block no longer costs you the file lane: it is kept, with a note, and the
-  live sentinel a few steps later is what decides whether returned files actually
-  arrive. A **missing** block still leaves the lane out. OpenClaw's `TOOLS.md`
-  block changed the same way and has never had the staleness comparison, so it
-  simply refreshes.
-- **No host permission change is needed for any of this.** No unit file is edited,
-  no umask is widened, and no service is restarted: putting folder creation on the
-  agent's side removes the ownership mismatch instead of working around it.
+**From 0.12.0 this is a four-release jump.** 0.13.0, 0.14.0 and 0.14.1 were
+written but never tagged and never published, so all three arrive here with this
+release's own work. This entry is the short form of the whole of it: what is
+different for you, and what you have to do about it. The per-version sections in
+[CHANGELOG.md](https://github.com/gigaduckai/conduck-connect/blob/main/CHANGELOG.md)
+carry the long form.
+
+### What you have to do
+
+- **If you use file transfer, re-run `bash conduck-connect.sh --setup` for that
+  gateway and say yes when it offers to refresh your agent's guidance block.**
+  Your agent creates the reply folder now, so its instructions have to say so.
+  Conduck names one folder per reply, creates nothing, and reads only that
+  folder; the Conduck block in OpenClaw's `TOOLS.md` and in Hermes's
+  `.hermes.md` / `HERMES.md` used to tell the agent to write returned files at
+  the root of the shared folder, and nothing creates that folder in advance, so
+  an instruction that only said *where* would leave the agent nothing to write
+  into. The bar the lane is graded against moved with it: it is no longer *your
+  file server can create a folder*, it is **your agent can create a folder and
+  Conduck can read it back**. That distinction decides the lane — a folder
+  created over WebDAV belongs to whoever the file server runs as, and in the
+  usual OpenClaw and Hermes deployments the agent runs as somebody else, who is
+  then refused inside it. A folder the file server creates is worse than no
+  folder at all: the agent can neither write in it nor replace it. Setup
+  recognises an older block by its exact text and offers the replacement,
+  written between its own markers with your yes; nothing outside the markers is
+  touched. **On OpenClaw, test in a new conversation** — bootstrap files load at
+  session start, so a conversation already open will not see the new block. A
+  **missing** block still leaves the lane out, and under `--reuse-only`, where
+  nothing may be written, an older Hermes block no longer costs you the lane: it
+  is kept with a note, and the live sentinel a few steps later decides whether
+  returned files actually arrive. None of this needs a host permission change:
+  no unit file is edited, no umask widened, no service restarted. Putting folder
+  creation on the agent's side removes the ownership mismatch instead of working
+  around it.
+- **`PROPFIND` is a hard requirement of the file lane.** It is how the folder is
+  proved absent beforehand and read back afterwards, and Conduck never guesses a
+  filename — it lists that one folder. So a folder the agent can write but the
+  file server cannot list is now a named failure of its own, which says plainly
+  that the agent did everything asked of it, and `--check-adapter --files` fails
+  a server that refuses the verb.
+- **Scripts that read a check summary need the new prefix.** `CONDUCK_DOCTOR
+  schema=2` is now `CONDUCK_CHECK_ADAPTER schema=3`; `CONDUCK_COMPAT schema=1`
+  is now `CONDUCK_CHECK_SERVER schema=2`. The retired prefixes are not
+  dual-emitted, so a script grepping for one matches nothing. Exactly one
+  summary line is still the last line of every noninteractive run, so a
+  `tail -1` consumer keeps working.
+- **Retired flags fail with a named error** pointing at the replacement:
+  `--doctor` → `--check-adapter`, `--compat` → `--check-server`, `--show-qr` →
+  `--show-code`, `--openclaw` / `--hermes` → `--setup`. `--generic` still works
+  and is not going away — shipped app builds emit it.
+- **`CONDUCK_TOKEN` is explicit for both checks.** Set-but-empty
+  (`CONDUCK_TOKEN=`) is a deliberate keyless declaration; unset with no way to
+  ask now fails fast with that instruction instead of quietly grading the target
+  as keyless and calling the result a pass.
+- **Two new exit statuses.** `3` means a person stopped the run before it
+  finished — that used to exit `0`, so a wrapper read an abandoned setup as a
+  completed pairing. `4` means the action needs somebody at a terminal. `0`, `1`
+  and `2` are unchanged, and `CI=1` makes both checks end at their machine
+  summary rather than asking whether to continue into setup.
+- **`CONDUCK_CHECK_SERVER_MODEL` names the model `--check-server` grades.**
+  Without it the check takes whichever id `/v1/models` happens to list first,
+  which has nothing to do with the one you intend to use. Set it if your server
+  advertises more than one.
+- **If a 0.12.0 setup of yours was ever interrupted, check `tailscale serve
+  status` by hand.** In 0.12.0 the only record of how to close an exposure lived
+  in the running shell, so a run killed by a dropped connection, an OOM or a
+  `SIGKILL` could leave a route open with nothing on disk naming it.
+  Records are written to disk now; one written by a `main` build between these
+  releases may not be readable here, in which case it is left exactly where it
+  is, never acted on, and the run tells you to look for yourself — an unreadable
+  record may still name a live public exposure.
+
+### Security
+
+- **A root-owned write can no longer be steered by the agent's own account.**
+  The `TOOLS.md` installer refused a symlink and then wrote through the same
+  name a moment later, and the agent's own uid could win the gap between the two.
+  The refusal and the open are now inseparable, and a dangling link is no longer
+  created through.
+- **The shared folder can no longer be a directory holding this tool's own
+  state.** The gate refused only `/` and `$HOME`, so a folder containing this
+  setup's password files could be published read-write over WebDAV. Any root
+  containing the state directory is refused now, and the folder you name is
+  resolved before it is used — an unresolved path could be a symlink into your
+  whole home directory.
+- **A gateway cannot repaint its own verdict on your screen.** A gateway-supplied
+  `Content-Type` reached the terminal unsanitised, where an escape sequence could
+  erase a failure and draw a pass over it. It is stripped where it leaves its
+  parser now, as its siblings — model ids and wire error codes — already were.
+- **The Hermes key lands in a file whose mode is already correct**, rather than
+  being written first and tightened afterwards by a prompt that defaulted to
+  declining.
+- **A self-signed certificate is refused and cannot be overridden.** "I already
+  run my own HTTPS" is a gate: it accepts a certificate this machine trusts, or
+  it stops and names the three free routes to one that works. A pin can only
+  narrow trust a device already has, never grant it, so such a gateway never
+  worked on a real device whatever the setup code said. `certFP` and the
+  `selfsigned` transport are gone from the pairing payload and the saved profile,
+  and a saved setup naming either is filtered out of the menu rather than offered
+  and then failing. Certificate *diagnosis* stays: a refusal always says why.
+- **A URL carrying `user:pass@` is refused at every prompt and on both checks**,
+  so a password can never be echoed to your terminal, saved into a profile, or
+  ride inside a setup code.
+- **Every request this tool makes ignores curl's config files**, so a stray
+  `proxy`, `output`, redirect or include line in `~/.curlrc` can neither reroute
+  a secret nor make curl touch a file this tool never declared. Both check
+  commands additionally refuse *all* proxy environment variables — `-q` does not
+  cover `$http_proxy` / `$ALL_PROXY`, which could otherwise receive a bearer key
+  or forge an "it's up" answer about a local service.
+- **Your configuration folder (`${XDG_CONFIG_HOME:-~/.config}/conduck`) is
+  checked on every run**, not only the run that created it — it is made `0700`,
+  and the filenames inside it name every gateway you have paired. A folder left
+  open by an earlier version or a different umask is reported once per run with
+  the exact `chmod 700`, never silently re-permissioned, because this tool may
+  not have created it. A world-readable `~/.hermes/.env` (your gateway key is in
+  it) is reported the same way, with `chmod 600` offered as its own confirmed
+  step.
+- **`--forget` really closes the address in front of the gateway.** It removed
+  the saved setup, the file server and both copies of its password while a PUBLIC
+  Tailscale Funnel stayed open without ever being mentioned. It now asks
+  Tailscale what this machine is serving and closes a mapping only when it agrees
+  with the setup on all four of tailnet name, HTTPS port, local port and whether
+  it is public. Anything it cannot prove is named, left exactly as it is, and
+  printed with the command to close it by hand — including a saved address this
+  version cannot parse, which used to be dropped without a word. A route it could
+  not close now makes the command exit `1`; that answered `0` while the screen
+  said in as many words that it could not confirm.
+- **A Cloudflare quick tunnel is no longer asked whether it is public.** It
+  always is, and a `*.trycloudflare.com` address is recognised as one wherever it
+  appears — including one carrying a query or fragment — rather than being
+  accepted and then emitted inside a setup code.
+- **Setup stopped echoing keys**, and a credential-shaped answer typed at a
+  question that refuses one says so instead of being stored.
+
+### New since 0.12.0
+
+- **You can see what this machine has set up, change one field of it, or remove
+  it.** `--list` names your configuration folder and every saved setup in it —
+  address, how it is reached, model, shared folder, and whether its file server
+  is running right now — plus any file server left behind with no setup behind
+  it, which is a live authenticated WebDAV server over your agent's folder that
+  restarts at every boot. `--edit [id]` changes exactly one field and re-verifies
+  only what that change affects; it is the one-command fix for a Cloudflare quick
+  tunnel, which hands out a new hostname every time it restarts. `--forget <id>`
+  removes one setup completely, lists everything it will *not* touch as well as
+  everything it will, and is confirmed by typing the id rather than pressing
+  Enter.
+- **Every route to a setup code now makes one real photo turn.** A gateway that
+  quietly drops pictures used to pair cleanly, and the owner found out the first
+  time a photo vanished mid-conversation — the one failure the app cannot report,
+  because a dropped picture comes back as an ordinary confident reply. The run
+  draws six digits, sends them, and asks you before handing over a code for a
+  gateway that did not read them back. With nobody at the terminal it stops with
+  no code rather than printing a question into a log.
+- **One command surface, and the menu asks the decisive question.** No arguments
+  opens a welcome menu that says what the tool does and never does before you
+  pick anything; `--setup`, `--check-server [url]`, `--check-adapter [url]` and
+  `--show-code` go straight to those actions, and finishing one returns you to
+  the menu. The two checks are not interchangeable, and picking the wrong one is
+  the classic false red: **`--check-server` grades existing OpenAI-compatible
+  software that was not built for Conduck** against what the app actually
+  requires, while **`--check-adapter` is the stricter grade for software built
+  for Conduck**, which rightly fails a generic server on rules the app never
+  exercises.
+- **`i`, `b` and `q` do the same thing at every prompt.** Value prompts took the
+  keystroke as the answer — pressing `q` at *A short name for it* filed your
+  gateway, its service and its credential under `custom-q` permanently. Every
+  prompt now lists the controls that work there and honours them. A wrong answer
+  costs one question rather than the whole run: choosing OpenClaw where it is not
+  installed, or Tailscale without Tailscale, names what was looked for and asks
+  again.
+- **A passing check offers to continue straight into setup**, carrying the URL,
+  the authentication, the key and any proven required model with it. A failing
+  `--check-server` says how to fix and re-run it, and `--dry-run` ends by
+  printing the exact command that would run it for real.
+- **The port question says where the number comes from.** Setup lists the ports
+  actually listening on this machine with the program name the system reports,
+  as a numbered pick, alongside the plain-English rule and the command to find it
+  yourself. Typing the number by hand still works.
+- **Hermes's own recall is settled before you pair.** The default API-server
+  toolset carries `memory` and `session_search`, which can double-count context
+  because Conduck sends the whole history every turn; setup reports the scope it
+  finds and offers to remove those two and nothing else, as its own confirmed
+  step.
+- **`--list --json` is the machine-readable inventory** — one object with its own
+  `schemaVersion`, every saved setup and every orphaned file server. It needs no
+  terminal, changes nothing, and prints no key, no password and no setup code.
+  `AGENTS.md` is the full contract for an agent driving this tool, and each
+  machine-summary grammar is published in a comment block inside the script
+  itself.
+
+### Fixes you will notice
+
+- **The photo check stopped accusing gateways that did nothing wrong** — and
+  stopped believing one that admitted in the same breath that it was guessing.
+- **A model name you mistype is caught before it is saved.** Changing the model
+  of a saved setup asks your server for its own list and tells you whether your
+  name is on it. Reading that list needs the gateway's key, which this tool does
+  not store, so it asks first — and skipping is a normal answer, because a name
+  can be an alias a server accepts without advertising.
+- **The adapter check grades against contract revision 1.7**, and two of its
+  rules got harder since 0.12.0. An adapter that streams when the request
+  *headers* ask for a stream used to pass with a clean bill of health; it is
+  asked both ways now. And a response that rejects a request must still read the
+  body it was sent — an adapter that leaves it undrained makes its refusal
+  surface on a *later* request instead, so that is a counted conformance check
+  (`AUTH_CHAT_REJECT_BODY`) rather than a note. Nothing that passed for the right
+  reason changes verdict; an adapter that newly fails was answering some clients
+  in a way Conduck could never have read.
+- **A file server that is running is no longer reported as dead.** A shell that
+  cannot ask systemd at all — under `su`, `sudo -u`, `cron`, or a remote command
+  — looked identical to a stopped service. When the answer cannot be obtained the
+  script says so and changes nothing.
+- **A stock OpenClaw install stops being told its tool policy is broken.** The
+  policy is read the way OpenClaw reads it: ignoring case, with `group:fs`
+  meaning the same in `alsoAllow` as in `allow`. The wizard no longer switches
+  the `pdf` tool on, no longer rewrites a policy this read cannot reproduce, and
+  reports a key written as the wrong type instead of letting it vanish.
+- **An ordinary Hermes config no longer costs you the file lane.** Standard YAML
+  layout, footer comments, wrapped prose values and keys this tool does not
+  itself write are read rather than refused, and the config line the wizard tells
+  you to write by hand is one it can read back.
+- **Diagnosis stopped blaming the key.** A 403 on a gateway configured as keyless
+  is no longer reported as a rejected key, and a 5xx on a keyless gateway can now
+  say the server may want a credential. Nine distinct causes replaced one
+  "transfer failed (timed out or the connection dropped)".
+- **Install advice matches your distribution**, `sudo` is not assumed — root
+  needs no prefix and `doas` systems are recognised — and lingering is checked
+  against the right user.
+- **Setting up the same gateway again changes it instead of duplicating it**, and
+  setting up OpenClaw or Hermes a second time no longer silently replaces the
+  first without asking.
+- **A prompt with nobody there says so**, naming the question that went
+  unanswered and what was assumed, and Enter at "did you run it?" no longer
+  claims you ran a command you did not run.
+
+### Also in this release
+
+- **License:** Conduck-authored code is **Apache-2.0** from this release onward.
+  Published releases through 0.12.0 remain MIT and history is not rewritten. The
+  vendored Project Nayuki QR block stays MIT and unmodified. Every release ships
+  `LICENSE`, `NOTICE` and `THIRD_PARTY_NOTICES.md` beside the script and its
+  checksum; `TRADEMARKS.md`, `CONTRIBUTING.md` and a Conduck-aligned
+  `SECURITY.md` are in the repository.
+- **Two words for two secrets.** User-facing text says **key** for the one your
+  gateway checks and **password** for the file lane's, on every screen. Nothing a
+  machine reads changed: the payload keys, the environment variables, the config
+  paths, both check grammars and the `--list --json` fields all keep their
+  names.
+- **"Setup code", everywhere.** It is the app's word and now the only one this
+  tool uses. "Connector" and "helper" are gone from anything a user reads.
+- **`PAYLOAD.md` describes the fields the app actually reads**, including the
+  rule that a scanned code may restrict what a device does and never grant it.
+- **The release is still one plain file you can read before you run it** — now
+  assembled from the modules in `src/`, which CI proves reproduce it byte for
+  byte, so reading a module is reading the shipped code.
 
 ## [0.14.1] — the photo check stops accusing gateways that did nothing wrong
 

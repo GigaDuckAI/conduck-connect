@@ -65,7 +65,7 @@ Never hand-edit only the generated artifact: CI rejects source/artifact drift.
 - **`bash scripts/build-release.sh --check`** — proves the checked-in release
   artifact is byte-identical to the modular source.
 - **`bash scripts/build-release.sh --map`** — prints `module -> start_line`.
-  CI lints the ~6.5k-line generated artifact, not `src/*.inc.sh` (the modules
+  CI lints the generated artifact, not `src/*.inc.sh` (the modules
   share variables across file boundaries, so linting them standalone reports
   ~50 spurious "appears unused" findings). Use `--map` to translate a reported
   artifact line back to its module and offset.

@@ -158,7 +158,7 @@
 
 set -u -o pipefail
 
-VERSION="0.14.1"
+VERSION="0.15.0"
 PAYLOAD_VERSION=1
 # ---------------------------------------------------------------- utilities --
 

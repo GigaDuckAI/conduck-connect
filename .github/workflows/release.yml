@@ -48,6 +48,45 @@ jobs:
       - name: Generate checksum
         run: sha256sum conduck-connect.sh > conduck-connect.sh.sha256
 
+      - name: Extract this version's release notes
+        run: |
+          # The body is this version's changelog section and nothing else: a
+          # release whose notes carry every version ever shipped buries the one
+          # thing its reader came for. The version is re-derived from the built
+          # artifact rather than parsed out of the tag, because the step above
+          # already proved the two agree and the artifact is what ships.
+          # Every way this can be wrong stops the release instead of publishing
+          # the wrong body: no heading, two headings, or a heading with nothing
+          # under it. Published bytes are immutable, so a body is not fixable
+          # after the fact — an unpublished release is the cheaper failure.
+          # The version arrives as awk DATA, never as awk source, and a heading
+          # is matched literally and only at a line start, outside code fences,
+          # so neither a prerelease suffix nor an example in a fenced block can
+          # be mistaken for the section boundary.
+          script_version=$(sed -n 's/^VERSION="\([^"]*\)"$/\1/p' conduck-connect.sh)
+          test -n "$script_version"
+          awk -v ver="$script_version" '
+            BEGIN { head = "## [" ver "]" }
+            /^```/ { fence = !fence }
+            fence { if (inside) print; next }
+            index($0, head) == 1 &&
+              (length($0) == length(head) || substr($0, length(head) + 1, 1) ~ /[ \t]/) {
+              if (seen) { print "CHANGELOG.md carries more than one " head " heading" > "/dev/stderr"; exit 2 }
+              seen = 1; inside = 1; print; next
+            }
+            inside && index($0, "## [") == 1 { inside = 0 }
+            inside { print }
+            END { if (!seen) { print "CHANGELOG.md carries no " head " heading" > "/dev/stderr"; exit 1 } }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md" || {
+            echo "cannot take a release body for $script_version out of CHANGELOG.md" >&2
+            exit 1
+          }
+          body_lines=$(sed 1d "$RUNNER_TEMP/release-notes.md" | grep -c '[^[:space:]]' || true)
+          test "$body_lines" -gt 0 || {
+            echo "CHANGELOG.md section '## [$script_version]' is empty; refusing to publish a blank release body" >&2
+            exit 1
+          }
+
       - name: Publish release with assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -62,5 +101,5 @@ jobs:
             conduck-connect.sh conduck-connect.sh.sha256 \
             LICENSE NOTICE THIRD_PARTY_NOTICES.md \
             --title "$TAG" \
-            --notes-file CHANGELOG.md \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
             --verify-tag "${prerelease[@]}"

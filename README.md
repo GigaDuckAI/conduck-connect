@@ -38,7 +38,7 @@ Works on macOS and Linux. `-O` lands the whole file on disk before anything runs
 
 That is the point of shipping one plain file, and the Quick start writes it to disk **before** anything executes. This is deliberately *not* `curl | bash`, which pipes unread code straight into your shell — and would break the script's prompts anyway.
 
-Now the honest part: **the released script is about 18,500 lines.** Most of that is explanation, verification and refusals — it is a wizard that argues with you — but nobody reads 18,500 lines of shell to decide whether to run something, and a README that tells you to is not being straight with you. So read for a *question*, not from the top.
+Now the honest part: **the released script is far too long to read top to bottom.** Most of that length is explanation, verification and refusals — it is a wizard that argues with you — but nobody reads a file this size to decide whether to run something, and a README that tells you to is not being straight with you. So read for a *question*, not from the top.
 
 The release is one file, but it is assembled from the modules in [`src/`](src/), and those modules are your map. CI proves they reproduce the released script byte for byte, so reading a module is reading the shipped code — and each one opens with a comment stating its job and its reasoning.
 
@@ -442,7 +442,7 @@ Security issues: see **[SECURITY.md](SECURITY.md)** (private vulnerability repor
 
 The maintainable source is the numbered modules under [`src/`](src/), concatenated in `src/manifest.txt` order into the single `conduck-connect.sh` at the repository root. Edit a module, never the root script; CI rejects any drift between the two. [CONTRIBUTING.md](CONTRIBUTING.md) holds the invariants and the contracts shared with the app, and [AGENTS.md](AGENTS.md) is the short orientation for a contributor — human or AI — arriving cold.
 
-**Release boundary.** The Quick start always downloads the latest *published* release, not `main`. This checkout's source is at `v0.14.1`. `main` may carry changes under **Unreleased** in [CHANGELOG.md](CHANGELOG.md) that are not in the published asset, and rebuilding or testing the artifact locally does not publish it — the [releases page](https://github.com/gigaduckai/conduck-connect/releases) is the authority on what is live. Every release artifact is plain, unminified shell that can be read before it runs.
+**Release boundary.** The Quick start always downloads the latest *published* release, not `main`. This checkout's source is at `v0.15.0`. `main` may carry changes under **Unreleased** in [CHANGELOG.md](CHANGELOG.md) that are not in the published asset, and rebuilding or testing the artifact locally does not publish it — the [releases page](https://github.com/gigaduckai/conduck-connect/releases) is the authority on what is live. Every release artifact is plain, unminified shell that can be read before it runs.
 
 ## License
 

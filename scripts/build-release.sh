@@ -8,7 +8,7 @@
 #   --check     assert the checked-in artifact matches src/ (CI drift gate)
 #   --stdout    write the freshly built artifact to stdout, touching nothing
 #   --map       print "module -> first_line_in_artifact" so a diagnostic reported
-#               against the 6.5k-line artifact maps back to the module that owns it
+#               against the generated artifact maps back to the module that owns it
 #
 # The concatenation is guarded, because every failure below was reproduced as a
 # silent build success before these assertions existed:

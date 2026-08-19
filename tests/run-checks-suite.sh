@@ -6965,7 +6965,7 @@ run_help_surface_case() {
   # Written out, not read from the artifact: the point is that a release BUMPED
   # it, and a test that derives the number from the same file it grades can never
   # notice a release that forgot to.
-  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.14.1" ]; then
+  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.15.0" ]; then
     fail_case "$name" "--version did not print the expected public version"; return
   fi
   # The manage surface is public CLI, so --help owes it the same contract as the
