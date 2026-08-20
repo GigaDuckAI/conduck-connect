@@ -257,6 +257,23 @@ extract_funcs() { # extract_funcs <fn-name>… -> function source on stdout
   for n in "$@"; do sed -n "/^$n()/,/^}/p" "$SCRIPT"; done
 }
 
+# Search a shell variable WITHOUT a pipe. `grep_var "$v" -q …` is a
+# pipefail landmine, not a style preference: grep -q exits at the FIRST match and
+# closes the pipe, the writer then takes EPIPE with bytes still unwritten, and
+# `set -o pipefail` above turns that into a FAILED pipeline for a SUCCESSFUL match.
+# It cost a macOS runner fifteen prompt cases whose runtime had extracted perfectly
+# — the lift was fine, the transport reporting it was not. An early match is the
+# dangerous one, because it leaves the most unwritten behind.
+#
+# A here-string is written out in full before grep is exec'd, so no reader exists
+# that could close it early. The helper takes the haystack FIRST so call sites are
+# a prefix swap: everything from the grep options rightward stays exactly as it
+# was, including ERE patterns that contain their own `|`.
+grep_var() { # grep_var <haystack> <grep-arg>… -> grep's own status and output
+  local hay="$1"; shift
+  grep "$@" <<<"$hay"
+}
+
 PASS=0
 FAIL=0
 # Coverage a case could not run — reported after SUITE RESULT, never as a pass.
@@ -387,7 +404,7 @@ run_case() { # run_case <table-row>
   local summary nfail nlines frag
   assert_machine_output "$name" CONDUCK_CHECK_ADAPTER || return
   summary=$(tail -n 1 "$TMP/doctor.out")
-  if ! printf '%s\n' "$summary" | grep -Eq "$SUMMARY_RE"; then
+  if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
     fail_case "$name" "last line isn't a valid schema=3 summary: $summary"; return
   fi
   for frag in $frags; do
@@ -584,7 +601,7 @@ grade_adapter() { # grade_adapter <name> <rc> <expexit> <expfails> <args> <frags
   local summary nfail nlines frag
   assert_machine_output "$name" CONDUCK_CHECK_ADAPTER || return 1
   summary=$(tail -n 1 "$TMP/doctor.out")
-  if ! printf '%s\n' "$summary" | grep -Eq "$SUMMARY_RE"; then
+  if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
     fail_case "$name" "last line isn't a valid schema=3 summary: $summary"; return 1
   fi
   for frag in $frags; do
@@ -715,7 +732,8 @@ run_file_case() { # run_file_case <table-row>
         fail_case "$name" "adapter-check output leaked the WebDAV credential"; return
       fi
       local nonce
-      nonce=$(grep -oE '[0-9a-f]{64}' "$CAPTURE" 2>/dev/null | head -n 1)
+      nonce=$(grep -oE -m1 '[0-9a-f]{64}' "$CAPTURE" 2>/dev/null)
+      nonce=${nonce%%$'\n'*}
       if [ -z "$nonce" ]; then
         fail_case "$name" "no-leak: could not recover the sentinel nonce from the WebDAV capture"; return
       fi
@@ -810,7 +828,7 @@ run_signal_cleanup() {
   if [ "$rc" != "130" ]; then fail_case "$name" "exit $rc, expected 130 (SIGINT)"; return; fi
   assert_machine_output "$name" CONDUCK_CHECK_ADAPTER || return
   local summary; summary=$(tail -n 1 "$TMP/doctor.out")
-  if ! printf '%s\n' "$summary" | grep -Eq "$SUMMARY_RE"; then
+  if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
     fail_case "$name" "last line isn't a valid schema=3 summary: $summary"; return
   fi
   case " $summary " in *" exit=130 "*) ;; *) fail_case "$name" "summary lacks exit=130: $summary"; return ;; esac
@@ -979,7 +997,7 @@ run_server_case() { # run_server_case <table-row>
   local summary frag
   assert_machine_output "$name" CONDUCK_CHECK_SERVER || return
   summary=$(tail -n 1 "$TMP/doctor.out")
-  if ! printf '%s\n' "$summary" | grep -Eq "$SERVER_SUMMARY_RE"; then
+  if ! grep_var "$summary" -Eq "$SERVER_SUMMARY_RE"; then
     fail_case "$name" "last line isn't a valid CONDUCK_CHECK_SERVER schema=2 summary: $summary"; return
   fi
   for frag in $frags; do
@@ -1363,7 +1381,7 @@ run_menu_trap_rearm_case() {
   local name="menu-action-runs-with-its-own-exit-trap" out rc=0 hits
   local funcs
   funcs=$(extract_funcs menu_hub_loop)
-  if ! printf '%s\n' "$funcs" | grep -qF 'menu_hub_loop()'; then
+  if ! grep_var "$funcs" -qF 'menu_hub_loop()'; then
     fail_case "$name" "could not extract menu_hub_loop from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -1395,28 +1413,28 @@ exit "$rc"
   if [ "$rc" != "0" ]; then
     fail_case "$name" "the hub fixture exited $rc, expected 0 — the loop never came back for the second pass"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'ACTION ran'; then
+  if ! grep_var "$out" -qF 'ACTION ran'; then
     fail_case "$name" "the menu action was never dispatched, so nothing below grades a trap"; return
   fi
   # THE assertion: on_exit fired somewhere that could still see the action's state.
-  if ! printf '%s\n' "$out" | grep -qF 'ON_EXIT state=[inside-the-action]'; then
+  if ! grep_var "$out" -qF 'ON_EXIT state=[inside-the-action]'; then
     fail_case "$name" "the EXIT trap did not run for a menu-entered action — bash reset it on subshell entry and nothing re-armed it"; return
   fi
   # Twice: once at the end of the action, once at the end of the session. One
   # sighting means only the parent's file-scope trap ever ran.
-  hits=$(printf '%s\n' "$out" | grep -cF 'ON_EXIT state=')
+  hits=$(grep_var "$out" -cF 'ON_EXIT state=')
   if [ "$hits" != "2" ]; then
     fail_case "$name" "on_exit ran $hits times, expected 2 (once per action, once for the session)"; return
   fi
   # The signal routing is re-armed by the same three lines and is worth the same
   # keystroke: without it a Ctrl-C during a menu-entered action skips the EXIT trap
   # on macOS bash 3.2 entirely.
-  if ! printf '%s\n' "$out" | grep -qF "exit 130"; then
+  if ! grep_var "$out" -qF "exit 130"; then
     fail_case "$name" "the action's subshell had no INT handler — signal routing was not re-armed with the EXIT trap"; return
   fi
   # …and an action that returns MENU_RETURN_STATUS returns to the hub rather than
   # ending the session, which is what makes the two sightings above two and not one.
-  if ! printf '%s\n' "$out" | grep -qF 'AFTER_LOOP rc=0'; then
+  if ! grep_var "$out" -qF 'AFTER_LOOP rc=0'; then
     fail_case "$name" "the hub did not survive the action it dispatched"; return
   fi
   PASS=$((PASS+1))
@@ -1479,11 +1497,11 @@ prompt_stage() { # prompt_stage <case-name> <stage-label>
   printf -- '--- %s (exit %s) ---\n%s\n' "$2" "$PF_RC" "$PF_OUT" >> "$TMP/doctor.out"
   assert_runtime_defined "$1" "$PF_OUT"
 }
-pf_has() { printf '%s\n' "$PF_OUT" | grep -qF "$1"; }
-pf_count() { printf '%s\n' "$PF_OUT" | grep -cF "$1"; }
+pf_has() { grep_var "$PF_OUT" -qF "$1"; }
+pf_count() { grep_var "$PF_OUT" -cF "$1"; }
 
 # The prompt primitives, exercised in a real PTY without entering setup, and graded
-# as TWELVE independent sub-cases.
+# as FIFTEEN independent sub-cases.
 #
 # The contract they all share: a key is a control at a prompt IF AND ONLY IF that
 # prompt's own suffix advertises it, the answer travels on stdout and the intent
@@ -1500,7 +1518,7 @@ pf_count() { printf '%s\n' "$PF_OUT" | grep -cF "$1"; }
 # reason: one long script through eight prompts is a desynchronisation waiting to
 # happen, and it too names the wrong prompt when it drifts.
 #
-# `prompt-controls-and-defaults` survives as a SELECTOR that runs all twelve, because
+# `prompt-controls-and-defaults` survives as a SELECTOR that runs all fifteen, because
 # that is the name the triage tables and earlier notes use. Nothing prints it.
 PROMPT_SUBCASES="prompt-confirm-controls
 prompt-require-choice-retry
@@ -1527,8 +1545,8 @@ prompt_case_wanted() { # prompt_case_wanted <sub-case-name>
   return 1
 }
 
-# One lift for all twelve — it is one runtime — and a broken lift fails every
-# sub-case that was asked for. Failing only the first would report eleven passes for
+# One lift for all fifteen — it is one runtime — and a broken lift fails every
+# sub-case that was asked for. Failing only the first would report fourteen passes for
 # a runtime that was never assembled, which is the same vacuous-green the guard
 # exists to kill.
 #
@@ -1547,13 +1565,13 @@ prompt_controls_lift() {
   PROMPT_FUNCS=$(extract_funcs $lifted
                  sed -n '/^NO_ANSWER=/p;/^URL_USERINFO_HINT=/p' "$SCRIPT")
   for fn in $lifted; do
-    printf '%s\n' "$PROMPT_FUNCS" | grep -qF "$fn()" ||
+    grep_var "$PROMPT_FUNCS" -qF "$fn()" ||
       why="could not extract $fn from the release artifact"
   done
-  printf '%s\n' "$PROMPT_FUNCS" | grep -q '^NO_ANSWER=' ||
+  grep_var "$PROMPT_FUNCS" -q '^NO_ANSWER=' ||
     why="could not lift NO_ANSWER from the release artifact"
   [ -z "$why" ] && return 0
-  # Deliberately an EMPTY transcript: fail_case tails $TMP/doctor.out, and twelve
+  # Deliberately an EMPTY transcript: fail_case tails $TMP/doctor.out, and fifteen
   # copies of the same 25 lines is how a red run becomes unreadable.
   : > "$TMP/doctor.out"
   for sub in $PROMPT_SUBCASES; do
@@ -2687,7 +2705,7 @@ run_own_https_trust_gate_case() {
   # classify_own_https opens with warn_quick_tunnel_url on EVERY path, so the two
   # come along or the gate runs with its first line undefined.
   funcs=$(extract_funcs classify_own_https warn_quick_tunnel_url is_quick_tunnel_url)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'classify_own_https()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'classify_own_https()'; then
     fail_case "$name" "could not extract classify_own_https from the release artifact"; return
   fi
 
@@ -2696,7 +2714,7 @@ run_own_https_trust_gate_case() {
   out=$(run_classify_own_https_isolated "$funcs" 0 0 "") || rc=$?
   printf -- '--- trusted certificate ---\n%s\n' "$out" > "$TMP/doctor.out"
   assert_runtime_defined "$name" "$out" || return
-  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'TRANSPORT=public'; then
+  if [ "$rc" != "0" ] || ! grep_var "$out" -qF 'TRANSPORT=public'; then
     fail_case "$name" "a trusted certificate did not continue setup on the public transport"; return
   fi
 
@@ -2706,23 +2724,23 @@ run_own_https_trust_gate_case() {
   out=$(run_classify_own_https_isolated "$funcs" 60 18 "") || rc=$?
   printf -- '--- untrusted (self-signed) certificate ---\n%s\n' "$out" >> "$TMP/doctor.out"
   assert_runtime_defined "$name" "$out" || return
-  if [ "$rc" = "0" ] || ! printf '%s\n' "$out" | grep -qF 'DIE '; then
+  if [ "$rc" = "0" ] || ! grep_var "$out" -qF 'DIE '; then
     fail_case "$name" "an untrusted certificate did not stop the run"; return
   fi
-  if printf '%s\n' "$out" | grep -qF 'CONFIRM '; then
+  if grep_var "$out" -qF 'CONFIRM '; then
     fail_case "$name" "the gate still offers an accept-it-anyway override"; return
   fi
-  if printf '%s\n' "$out" | grep -qF 'TRANSPORT='; then
+  if grep_var "$out" -qF 'TRANSPORT='; then
     fail_case "$name" "the gate fell through to a transport instead of stopping"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF "doesn't trust"; then
+  if ! grep_var "$out" -qF "doesn't trust"; then
     fail_case "$name" "the refusal did not name WHY the certificate failed"; return
   fi
   # Refusing without a remedy just moves the dead end. All three free routes,
   # named — Tailscale Serve, Let's Encrypt (IP certificates included), a proxy.
   local route
   for route in 'Tailscale Serve' "Let's Encrypt" 'Caddy'; do
-    if ! printf '%s\n' "$out" | grep -qF "$route"; then
+    if ! grep_var "$out" -qF "$route"; then
       fail_case "$name" "the refusal did not name the free route: $route"; return
     fi
   done
@@ -2732,13 +2750,13 @@ run_own_https_trust_gate_case() {
   rc=0
   out=$(run_classify_own_https_isolated "$funcs" 60 18 "expired") || rc=$?
   printf -- '--- untrusted AND expired ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if [ "$rc" = "0" ] || ! printf '%s\n' "$out" | grep -qF 'has expired'; then
+  if [ "$rc" = "0" ] || ! grep_var "$out" -qF 'has expired'; then
     fail_case "$name" "an untrusted, expired certificate did not report its expiry"; return
   fi
   rc=0
   out=$(run_classify_own_https_isolated "$funcs" 60 0 "") || rc=$?
   printf -- '--- wrong hostname ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if [ "$rc" = "0" ] || ! printf '%s\n' "$out" | grep -qF 'different hostname'; then
+  if [ "$rc" = "0" ] || ! grep_var "$out" -qF 'different hostname'; then
     fail_case "$name" "a wrong-host certificate was not diagnosed as such"; return
   fi
 
@@ -2825,7 +2843,7 @@ choose_exposure
 # that grows into the menu is how a terse row becomes a paragraph nobody reads.
 run_exposure_menu_quick_tunnel_case() {
   local name="exposure-menu-places-the-quick-tunnel" funcs out out_nocf rc
-  local row3 row4 explainer prompt row lines
+  local row3 row4 explainer prompt row lines nocf3 nocf4
 
   # The menu reaches its choice through prompt_into + require_choice, and those two
   # pull in the whole prompt contract (the suffix renderer, the echo, the literal
@@ -2840,10 +2858,10 @@ run_exposure_menu_quick_tunnel_case() {
             exposure_tailscale_ready exposure_cloudflared_ready explain_own_https_target
           sed -n '/^NO_ANSWER=/p' "$SCRIPT")
   if [ -z "$funcs" ] ||
-     ! printf '%s\n' "$funcs" | grep -qF 'choose_exposure()' ||
-     ! printf '%s\n' "$funcs" | grep -qF 'explain_exposure_paths()' ||
-     ! printf '%s\n' "$funcs" | grep -qF 'require_choice()' ||
-     ! printf '%s\n' "$funcs" | grep -qF 'explain_prompt()'; then
+     ! grep_var "$funcs" -qF 'choose_exposure()' ||
+     ! grep_var "$funcs" -qF 'explain_exposure_paths()' ||
+     ! grep_var "$funcs" -qF 'require_choice()' ||
+     ! grep_var "$funcs" -qF 'explain_prompt()'; then
     fail_case "$name" "could not extract the exposure menu from the release artifact"; return
   fi
 
@@ -2855,30 +2873,30 @@ run_exposure_menu_quick_tunnel_case() {
   if [ "$rc" != "10" ]; then
     fail_case "$name" "the menu did not go back on 'b' (status $rc) — the rows below may come from another path"; return
   fi
-  if printf '%s\n' "$out" | grep -qF 'SIDE_EFFECT '; then
+  if grep_var "$out" -qF 'SIDE_EFFECT '; then
     fail_case "$name" "info then back entered an exposure branch"; return
   fi
   for row in 1 2 3 4; do
-    if ! printf '%s\n' "$out" | grep -qF "  $row)"; then
+    if ! grep_var "$out" -qF "  $row)"; then
       fail_case "$name" "the menu no longer prints row $row"; return
     fi
   done
 
-  row3=$(printf '%s\n' "$out" | grep '^  3)')
-  row4=$(printf '%s\n' "$out" | grep '^  4)')
+  row3=$(grep_var "$out" '^  3)')
+  row4=$(grep_var "$out" '^  4)')
   # Non-vacuous: the cloudflared detection this case reasons about is really live.
-  if ! printf '%s\n' "$row3" | grep -qF 'cloudflared found'; then
+  if ! grep_var "$row3" -qF 'cloudflared found'; then
     fail_case "$name" "row 3 did not report the cloudflared this run has — the stub is not wired"; return
   fi
   # Row 4 must be recognisable to someone holding a quick-tunnel address: the
   # *.trycloudflare.com shape they are looking at, and Cloudflare's own name for it.
-  if ! printf '%s\n' "$row4" | grep -qiF 'trycloudflare.com' ||
-     ! printf '%s\n' "$row4" | grep -qiF 'quick tunnel'; then
+  if ! grep_var "$row4" -qiF 'trycloudflare.com' ||
+     ! grep_var "$row4" -qiF 'quick tunnel'; then
     fail_case "$name" "row 4 does not name the quick tunnel or its *.trycloudflare.com address"; return
   fi
   # …and row 3 must not claim it. Option 3 asks for a hostname in a zone the user
   # manages; a quick-tunnel address has no such zone, so that row is a dead end.
-  if printf '%s\n' "$row3" | grep -qiF 'trycloudflare'; then
+  if grep_var "$row3" -qiF 'trycloudflare'; then
     fail_case "$name" "row 3 claims the quick-tunnel address, which its flow cannot use"; return
   fi
   # Terse by design: one consequence plus one decisive constraint. Every row stays
@@ -2899,20 +2917,20 @@ run_exposure_menu_quick_tunnel_case() {
   # is no hand-written control prose left to grep for, and there must not be: the one
   # prompt in this tool where Back genuinely works used to be the one whose own
   # control list denied it. `b = back` appearing here is therefore correct.
-  prompt=$(printf '%s\n' "$out" | grep 'Choose 1-4')
+  prompt=$(grep_var "$out" 'Choose 1-4')
   if [ -z "$prompt" ]; then
     fail_case "$name" "the menu prompt no longer asks for an explicit 1-4"; return
   fi
-  if [ "$(printf '%s\n' "$prompt" | grep -cF 'Choose 1-4 (Enter = ask again; i = explain; b = back; q = stop)')" != "2" ]; then
+  if [ "$(grep_var "$prompt" -cF 'Choose 1-4 (Enter = ask again; i = explain; b = back; q = stop)')" != "2" ]; then
     fail_case "$name" "i did not return to the same prompt, with the same advertised controls"; return
   fi
-  if printf '%s\n' "$out" | grep -qiE 'recommend|\(default'; then
+  if grep_var "$out" -qiE 'recommend|\(default'; then
     fail_case "$name" "the menu or its comparison started recommending one of the four paths"; return
   fi
 
   # The `i` comparison has to agree with the row it explains, or the two drift and
   # the user gets a different answer depending on which one they read.
-  explainer=$(printf '%s\n' "$out" | grep '^EXPLAINER ' | tr '\n' ' ')
+  explainer=$(grep_var "$out" '^EXPLAINER ' | tr '\n' ' ')
   if [ -z "$explainer" ]; then
     fail_case "$name" "the 'i' comparison printed nothing"; return
   fi
@@ -2921,13 +2939,13 @@ run_exposure_menu_quick_tunnel_case() {
       fail_case "$name" "the 'i' comparison stopped explaining option $row"; return ;;
     esac
   done
-  if ! printf '%s\n' "$explainer" | grep -qiF 'trycloudflare.com' ||
-     ! printf '%s\n' "$explainer" | grep -qiF 'cloudflared tunnel --url'; then
+  if ! grep_var "$explainer" -qiF 'trycloudflare.com' ||
+     ! grep_var "$explainer" -qiF 'cloudflared tunnel --url'; then
     fail_case "$name" "the 'i' comparison does not name the quick tunnel or the command that prints its address"; return
   fi
   # Facts, not phrasing: reword freely and EXTEND the alternation. The pointer has
   # to place the quick tunnel on 4 rather than 3 — that is the whole confusion.
-  if ! printf '%s\n' "$explainer" | grep -qiE 'this one, not 3|this option, not 3|option 4, not 3|not option 3|belongs here'; then
+  if ! grep_var "$explainer" -qiE 'this one, not 3|this option, not 3|option 4, not 3|not option 3|belongs here'; then
     fail_case "$name" "the 'i' comparison no longer places the quick tunnel on option 4 rather than 3"; return
   fi
 
@@ -2939,13 +2957,18 @@ run_exposure_menu_quick_tunnel_case() {
   if [ "$rc" != "10" ]; then
     fail_case "$name" "the menu did not go back on 'b' without cloudflared (status $rc)"; return
   fi
-  if printf '%s\n' "$out_nocf" | grep -qF 'SIDE_EFFECT '; then
+  if grep_var "$out_nocf" -qF 'SIDE_EFFECT '; then
     fail_case "$name" "info then back entered an exposure branch without cloudflared"; return
   fi
-  if ! printf '%s\n' "$out_nocf" | grep '^  3)' | grep -qF 'not installed'; then
+  # Two greps in a row would put the second one's early exit in front of the
+  # first one's write — the same pipefail race grep_var exists to remove. Pull the
+  # row out first, then ask about it.
+  nocf3=$(grep_var "$out_nocf" '^  3)') || true
+  nocf4=$(grep_var "$out_nocf" '^  4)') || true
+  if ! grep_var "$nocf3" -qF 'not installed'; then
     fail_case "$name" "row 3 reported cloudflared on a host without it — the stub is not wired"; return
   fi
-  if ! printf '%s\n' "$out_nocf" | grep '^  4)' | grep -qiF 'trycloudflare.com'; then
+  if ! grep_var "$nocf4" -qiF 'trycloudflare.com'; then
     fail_case "$name" "the quick-tunnel cue is gated on a local cloudflared, so a tunnel run elsewhere is unnamed"; return
   fi
 
@@ -2977,7 +3000,7 @@ run_profile_legacy_file_reach_case() {
     fail_case "$name" "the production file-reach resolver lost its gateway-scope fallback"; return
   fi
   live_check=$(sed -n '/^show_qr_check_live()/,/^}/p' "$SCRIPT")
-  if ! printf '%s\n' "$live_check" | grep -qF 'fs_reach=$(show_qr_resolve_file_reach'; then
+  if ! grep_var "$live_check" -qF 'fs_reach=$(show_qr_resolve_file_reach'; then
     fail_case "$name" "the live drift check no longer uses the tested reach resolver"; return
   fi
 
@@ -3054,7 +3077,7 @@ run_profile_secret_exclusion_case() {
   # json_query/json_type ride along too: write_profile asks them what the existing
   # profile holds before it decides what to keep.
   writer=$(extract_funcs write_profile ensure_state_dir file_mode_is_open json_query json_type)
-  if [ -z "$writer" ] || ! printf '%s\n' "$writer" | grep -qF 'write_profile()'; then
+  if [ -z "$writer" ] || ! grep_var "$writer" -qF 'write_profile()'; then
     fail_case "$name" "could not extract write_profile from the release artifact"; return
   fi
 
@@ -3181,7 +3204,7 @@ run_profile_overwrite_guard_case() {
   local saved='{"schemaVersion":1,"gateway":{"id":"custom-shaped","kind":"custom","name":"Shaped probe","auth":"bearer","transport":"public","reach":"public","url":"https://old.example.test","localPort":"8080"},"fileServer":{"url":"https://files.example.test:8443","localPort":"5006","reach":"public","folder":"/home/probe/conduck-files"}}'
 
   writer=$(extract_funcs write_profile ensure_state_dir file_mode_is_open json_type json_query)
-  if [ -z "$writer" ] || ! printf '%s\n' "$writer" | grep -qF 'write_profile()'; then
+  if [ -z "$writer" ] || ! grep_var "$writer" -qF 'write_profile()'; then
     fail_case "$name" "could not extract write_profile from the release artifact"; return
   fi
   printf 'pairing-profile overwrite guard\n' > "$TMP/doctor.out"
@@ -3325,7 +3348,7 @@ emit_payload
 
 # 0 when the warning block states the fact <regex> describes.
 warning_states() { # warning_states <flattened-warning-block> <extended-regex>
-  printf '%s\n' "$1" | grep -qiE "$2"
+  grep_var "$1" -qiE "$2"
 }
 
 # The emitted warning is the only place a user is told what the code they are
@@ -3347,8 +3370,8 @@ run_pairing_warning_case() {
   # states directly, and an emit extracted without it would run with that block
   # silently missing — every assertion about it would then pass vacuously.
   emit=$(extract_funcs $EMIT_LIFT)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
-     || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
+  if [ -z "$emit" ] || ! grep_var "$emit" -qF 'emit_payload()' \
+     || ! grep_var "$emit" -qF 'pairing_capability_summary()'; then
     fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
   fi
 
@@ -3365,8 +3388,8 @@ run_pairing_warning_case() {
   assert_runtime_defined "$name" "$out_files$out_bare" || return
 
   # Non-vacuous: both runs really reached the emit, not an early return.
-  if ! printf '%s\n' "$out_files" | grep -qF 'conduck-setup:v1:' ||
-     ! printf '%s\n' "$out_bare"  | grep -qF 'conduck-setup:v1:'; then
+  if ! grep_var "$out_files" -qF 'conduck-setup:v1:' ||
+     ! grep_var "$out_bare" -qF 'conduck-setup:v1:'; then
     fail_case "$name" "emit_payload printed no setup code — the warning below proves nothing"; return
   fi
 
@@ -3375,10 +3398,10 @@ run_pairing_warning_case() {
   # every FACT assertion below still passes on the surrounding warn() block.
   local secrecy
   for secrecy in "$out_files" "$out_bare"; do
-    if [ "$(printf '%s\n' "$secrecy" | grep -cF 'Treat this code like a password.')" != "1" ]; then
+    if [ "$(grep_var "$secrecy" -cF 'Treat this code like a password.')" != "1" ]; then
       fail_case "$name" "the success screen said 'treat this code like a password' other than exactly once"; return
     fi
-    if ! printf '%s\n' "$secrecy" | grep -qF 'No secret is written to disk by this script'; then
+    if ! grep_var "$secrecy" -qF 'No secret is written to disk by this script'; then
       fail_case "$name" "the success screen stopped saying that no secret is saved on this machine"; return
     fi
   done
@@ -3395,13 +3418,13 @@ run_pairing_warning_case() {
   # regex's clothes, and it rots on the first reflow. Runs of whitespace collapse
   # for the same reason: the panel indents its continuation lines, so a phrase that
   # wraps arrives with three spaces in the middle of it.
-  block_files=$(printf '%s\n' "$out_files" | grep -E '^(WARNLINE|SECRECY) ' | sed -E 's/^(WARNLINE|SECRECY) //' | tr '\n' ' ' | tr -s ' ')
-  block_bare=$(printf '%s\n' "$out_bare" | grep -E '^(WARNLINE|SECRECY) ' | sed -E 's/^(WARNLINE|SECRECY) //' | tr '\n' ' ' | tr -s ' ')
+  block_files=$(grep_var "$out_files" -E '^(WARNLINE|SECRECY) ' | sed -E 's/^(WARNLINE|SECRECY) //' | tr '\n' ' ' | tr -s ' ')
+  block_bare=$(grep_var "$out_bare" -E '^(WARNLINE|SECRECY) ' | sed -E 's/^(WARNLINE|SECRECY) //' | tr '\n' ' ' | tr -s ' ')
   if [ -z "$block_files" ] || [ -z "$block_bare" ]; then
     fail_case "$name" "the pairing emit printed no warning at all"; return
   fi
-  if ! printf '%s\n' "$out_files" | grep -q '^SECRECY ' ||
-     ! printf '%s\n' "$out_bare" | grep -q '^SECRECY '; then
+  if ! grep_var "$out_files" -q '^SECRECY ' ||
+     ! grep_var "$out_bare" -q '^SECRECY '; then
     fail_case "$name" "emit_payload no longer prints the secrecy panel at all"; return
   fi
 
@@ -3468,13 +3491,13 @@ run_pairing_warning_case() {
   # and the last moment it is cheap: after the code is scanned, adding a lane
   # costs a full re-run of setup. An absence is not a statement, so the run
   # WITHOUT a lane has to say so in words rather than leave it to be noticed.
-  if ! printf '%s\n' "$out_files" | grep -qiE '^OKLINE .*file transfer'; then
+  if ! grep_var "$out_files" -qiE '^OKLINE .*file transfer'; then
     fail_case "$name" "a run WITH a file lane never states that the code carries file transfer"; return
   fi
-  if ! printf '%s\n' "$out_bare" | grep -qiE '^WARNLINE .*file transfer.*(not included|not in this|missing)'; then
+  if ! grep_var "$out_bare" -qiE '^WARNLINE .*file transfer.*(not included|not in this|missing)'; then
     fail_case "$name" "a run WITHOUT a file lane never states that file transfer is missing from the code"; return
   fi
-  if printf '%s\n' "$out_bare" | grep -qiE '^OKLINE .*file transfer'; then
+  if grep_var "$out_bare" -qiE '^OKLINE .*file transfer'; then
     fail_case "$name" "a run WITHOUT a file lane claimed the code carries file transfer"; return
   fi
 
@@ -3491,15 +3514,15 @@ run_pairing_warning_case() {
     "https://gw.example.test" false "" "unproved") \
     || { printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
          fail_case "$name" "emit_payload failed to run with an unproved file lane"; return; }
-  if printf '%s\n' "$out_unproved" | grep -qiE '^OKLINE .*file transfer'; then
+  if grep_var "$out_unproved" -qiE '^OKLINE .*file transfer'; then
     printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
     fail_case "$name" "a lane whose agent access was never proved still got a green file-transfer line"; return
   fi
-  if ! printf '%s\n' "$out_unproved" | grep -qiE '^WARNLINE .*(not proved|could not be proved|untested|not tested)'; then
+  if ! grep_var "$out_unproved" -qiE '^WARNLINE .*(not proved|could not be proved|untested|not tested)'; then
     printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
     fail_case "$name" "an unproved file lane is in the code and the screen does not say so"; return
   fi
-  if ! printf '%s\n' "$out_unproved" | grep -qF 'https://files.example.test:8443'; then
+  if ! grep_var "$out_unproved" -qF 'https://files.example.test:8443'; then
     printf '%s\n' "$out_unproved" > "$TMP/doctor.out"
     fail_case "$name" "an unproved file lane rides in the code without naming the address it published"; return
   fi
@@ -3542,8 +3565,8 @@ run_pairing_check_suggestion_case() {
   # states directly, and an emit extracted without it would run with that block
   # silently missing — every assertion about it would then pass vacuously.
   emit=$(extract_funcs $EMIT_LIFT)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
-     || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
+  if [ -z "$emit" ] || ! grep_var "$emit" -qF 'emit_payload()' \
+     || ! grep_var "$emit" -qF 'pairing_capability_summary()'; then
     fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
   fi
 
@@ -3559,11 +3582,11 @@ run_pairing_check_suggestion_case() {
 
   # Non-vacuous: both runs really reached the emit, and the custom one really does
   # still offer the adapter grade — the thing the caveat below is about.
-  if ! printf '%s\n' "$out_custom" | grep -qF 'conduck-setup:v1:' ||
-     ! printf '%s\n' "$out_openclaw" | grep -qF 'conduck-setup:v1:'; then
+  if ! grep_var "$out_custom" -qF 'conduck-setup:v1:' ||
+     ! grep_var "$out_openclaw" -qF 'conduck-setup:v1:'; then
     fail_case "$name" "emit_payload printed no setup code — the screen proves nothing"; return
   fi
-  if ! printf '%s\n' "$out_custom" | grep -qF -- '--check-adapter'; then
+  if ! grep_var "$out_custom" -qF -- '--check-adapter'; then
     fail_case "$name" "the success screen no longer offers the adapter grade to a custom gateway"; return
   fi
 
@@ -3609,7 +3632,7 @@ run_pairing_check_suggestion_case() {
 run_pairing_check_targets_the_failed_route_case() {
   local name="pairing-checks-target-the-route-that-failed" emit out flat
   emit=$(extract_funcs $EMIT_LIFT)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'gw_loopback_base()'; then
+  if [ -z "$emit" ] || ! grep_var "$emit" -qF 'gw_loopback_base()'; then
     fail_case "$name" "could not extract emit_payload + gw_loopback_base from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -3666,7 +3689,7 @@ run_pairing_check_targets_the_failed_route_case() {
         "https://gw.example.test" false 11434)
   printf -- '--- success screen, local port known ---\n%s\n' "$out" >> "$TMP/doctor.out"
   flat=$(printf '%s\n' "$out" | tr '\n' ' ')
-  if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
+  if ! grep_var "$out" -qF 'conduck-setup:v1:'; then
     fail_case "$name" "the success arm printed no setup code — the screen proves nothing"; return
   fi
   if ! warning_states "$flat" '[-][-]check-server https://gw\.example\.test' ||
@@ -3692,12 +3715,12 @@ run_pairing_linger_caveat_case() {
   local name="pairing-code-restates-the-logout-caveat"
   local emit out flat arm
   emit=$(extract_funcs $EMIT_LIFT)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()'; then
+  if [ -z "$emit" ] || ! grep_var "$emit" -qF 'emit_payload()'; then
     fail_case "$name" "could not extract emit_payload from the release artifact"; return
   fi
   # A rename of the durability helper must break HERE, not silently stop the caveat:
   # the runner stubs the answer, so only this check proves the real function is asked.
-  if ! printf '%s\n' "$emit" | grep -qF 'fs_linger_enabled_linux'; then
+  if ! grep_var "$emit" -qF 'fs_linger_enabled_linux'; then
     fail_case "$name" "emit_payload no longer asks the file-lane module about lingering"; return
   fi
   if ! grep -q '^fs_linger_enabled_linux()' "$SCRIPT"; then
@@ -3722,7 +3745,7 @@ linux-no-unit|Linux||off|yes|no'
     printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
     assert_runtime_defined "$name" "$out" || return
     # Non-vacuous: the screen really was emitted, so an absent caveat means absent.
-    if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
+    if ! grep_var "$out" -qF 'conduck-setup:v1:'; then
       fail_case "$name" "[$arm] emit_payload printed no setup code"; return
     fi
     flat=$(printf '%s\n' "$out" | tr '\n' ' ')
@@ -3774,12 +3797,12 @@ run_pairing_quick_tunnel_reminder_case() {
   # states directly, and an emit extracted without it would run with that block
   # silently missing — every assertion about it would then pass vacuously.
   emit=$(extract_funcs $EMIT_LIFT)
-  if [ -z "$emit" ] || ! printf '%s\n' "$emit" | grep -qF 'emit_payload()' \
-     || ! printf '%s\n' "$emit" | grep -qF 'pairing_capability_summary()'; then
+  if [ -z "$emit" ] || ! grep_var "$emit" -qF 'emit_payload()' \
+     || ! grep_var "$emit" -qF 'pairing_capability_summary()'; then
     fail_case "$name" "could not extract emit_payload and its capability summary from the release artifact"; return
   fi
   # The shared predicate, not a local re-implementation — the whole point of the near-miss arm.
-  if ! printf '%s\n' "$emit" | grep -qF 'is_quick_tunnel_url()'; then
+  if ! grep_var "$emit" -qF 'is_quick_tunnel_url()'; then
     fail_case "$name" "emit_payload does not use the shared quick-tunnel predicate"; return
   fi
   : > "$TMP/doctor.out"
@@ -3799,10 +3822,10 @@ near-miss-host|https://not-really.trycloudflare.com.example.test|||none"
            fail_case "$name" "[$arm] emit_payload failed to run"; return; }
     printf -- '--- %s ---\n%s\n' "$arm" "$out" >> "$TMP/doctor.out"
     assert_runtime_defined "$name" "$out" || return
-    if ! printf '%s\n' "$out" | grep -qF 'conduck-setup:v1:'; then
+    if ! grep_var "$out" -qF 'conduck-setup:v1:'; then
       fail_case "$name" "[$arm] emit_payload printed no setup code"; return
     fi
-    flat=$(printf '%s\n' "$out" | grep '^WARNLINE ' | tr '\n' ' ')
+    flat=$(grep_var "$out" '^WARNLINE ' | tr '\n' ' ')
     if [ "$want" = "none" ]; then
       if warning_states "$flat" 'quick tunnel'; then
         fail_case "$name" "[$arm] an address that does not rotate was flagged as a quick tunnel"; return
@@ -3951,7 +3974,7 @@ printf "VERIFY_FAILED=%s LANE_DROPPED=%s\n" "$VERIFY_FAILED" "$FS_LANE_DROPPED_B
 run_moved_address_diagnosis_case() {
   local name="moved-address-is-not-a-server-error" funcs out flat arm
   funcs=$(extract_funcs $VERIFY_LIFT)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_url_drift_note()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'gw_url_drift_note()'; then
     fail_case "$name" "could not extract verify_all + gw_url_drift_note from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -4063,10 +4086,10 @@ doctor_models_check|--check-adapter'
     # The 401 and 403 arms must be SEPARATE. A shared `401|403)` is what produced the
     # defect, so its absence is the structural half of this guard — a future merge that
     # recombines them fails here rather than at a user's terminal.
-    if printf '%s\n' "$body" | grep -qE '^[[:space:]]*401\|403\)'; then
+    if grep_var "$body" -qE '^[[:space:]]*401\|403\)'; then
       fail_case "$name" "[$arm] 401 and 403 share one arm again — a keyless 403 will be told to supply a token"; return
     fi
-    if ! printf '%s\n' "$body" | grep -qE '^[[:space:]]*403\)'; then
+    if ! grep_var "$body" -qE '^[[:space:]]*403\)'; then
       fail_case "$name" "[$arm] no 403 arm at all"; return
     fi
 
@@ -4074,15 +4097,15 @@ doctor_models_check|--check-adapter'
     # sentence that made the recommended recovery actively misleading.
     local arm403
     arm403=$(printf '%s\n' "$body" | sed -n '/^[[:space:]]*403)/,/^[[:space:]]*[0-9?]\{3\})/p')
-    if printf '%s\n' "$arm403" | grep -qF 'CONDUCK_TOKEN'; then
+    if grep_var "$arm403" -qF 'CONDUCK_TOKEN'; then
       fail_case "$name" "[$arm] a 403 still tells the operator to set CONDUCK_TOKEN"; return
     fi
 
     # FACT 2 — it names what a 403 actually is, and the cause worth checking first.
-    if ! printf '%s\n' "$arm403" | grep -qiE 'refused|as it arrived'; then
+    if ! grep_var "$arm403" -qiE 'refused|as it arrived'; then
       fail_case "$name" "[$arm] a 403 does not say the request was refused as it arrived"; return
     fi
-    if ! printf '%s\n' "$arm403" | grep -qiF 'Host'; then
+    if ! grep_var "$arm403" -qiF 'Host'; then
       fail_case "$name" "[$arm] a 403 never names the Host check as the likely cause"; return
     fi
 
@@ -4090,7 +4113,7 @@ doctor_models_check|--check-adapter'
     # wants auth answers 401), and deleting it would trade one wrong cure for another.
     local arm401
     arm401=$(printf '%s\n' "$body" | sed -n '/^[[:space:]]*401)/,/^[[:space:]]*403)/p')
-    if ! printf '%s\n' "$arm401" | grep -qF 'CONDUCK_TOKEN'; then
+    if ! grep_var "$arm401" -qF 'CONDUCK_TOKEN'; then
       fail_case "$name" "[$arm] a keyless 401 no longer tells the operator how to supply a token"; return
     fi
   done <<EOF
@@ -4113,7 +4136,7 @@ run_keyless_5xx_credential_case() {
   # curl_gw refuses a token it cannot print safely before it sends anything, so the
   # experiment below only runs at all with credential_value_safe present.
   funcs=$(extract_funcs curl_gw credential_value_safe gw_5xx_credential_note)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_5xx_credential_note()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'gw_5xx_credential_note()'; then
     fail_case "$name" "could not extract curl_gw + gw_5xx_credential_note from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -4191,14 +4214,14 @@ gw_5xx_credential_note
 
     case "$expect" in
       yes)
-        if ! printf '%s\n' "$out" | grep -qF 'wants a key after all'; then
+        if ! grep_var "$out" -qF 'wants a key after all'; then
           fail_case "$name" "[$arm] a keyless gateway whose answer depends on the key was not told so"
           kill "$FPID" 2>/dev/null; return
         fi
         # Both observed statuses must be shown, or the operator is asked to take the
         # verdict on faith instead of reading the measurement that produced it.
-        if ! printf '%s\n' "$out" | grep -qF 'HTTP 500 without one' ||
-           ! printf '%s\n' "$out" | grep -qF 'HTTP 400 with one'; then
+        if ! grep_var "$out" -qF 'HTTP 500 without one' ||
+           ! grep_var "$out" -qF 'HTTP 400 with one'; then
           fail_case "$name" "[$arm] the claim did not show the two statuses it rests on"
           kill "$FPID" 2>/dev/null; return
         fi
@@ -4220,7 +4243,7 @@ EOF
 run_keyless_403_diagnosis_case() {
   local name="keyless-403-is-not-a-rejected-token" funcs out flat arm
   funcs=$(extract_funcs $VERIFY_LIFT)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'gw_403_route_note()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'gw_403_route_note()'; then
     fail_case "$name" "could not extract verify_all + gw_403_route_note from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -4333,7 +4356,7 @@ ARMS
 run_file_lane_failure_names_the_gateway_case() {
   local name="file-fault-does-not-mask-a-dead-gateway" funcs out flat
   funcs=$(extract_funcs $VERIFY_LIFT)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'verify_all()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'verify_all()'; then
     fail_case "$name" "could not extract verify_all from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -4520,18 +4543,18 @@ print("token_stored=%s" % d["tokenStored"])
 PY
 ) || { fail_case "$name" "could not read the JSON report back"; return; }
   printf -- '--- report facts ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qF 'ids=broken,custom-good'; then
+  if ! grep_var "$out" -qF 'ids=broken,custom-good'; then
     fail_case "$name" "the JSON report did not list both the readable and the unreadable setup"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'broken_readable=False' ||
-     ! printf '%s\n' "$out" | grep -qF 'broken_problem=True'; then
+  if ! grep_var "$out" -qF 'broken_readable=False' ||
+     ! grep_var "$out" -qF 'broken_problem=True'; then
     fail_case "$name" "an unparseable profile was not reported as unreadable, with a reason"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'leftovers=orphan'; then
+  if ! grep_var "$out" -qF 'leftovers=orphan'; then
     fail_case "$name" "a service file with no profile behind it never reached leftovers[]"; return
   fi
   # The one field that is a claim about this tool rather than about this machine.
-  if ! printf '%s\n' "$out" | grep -qF 'token_stored=False'; then
+  if ! grep_var "$out" -qF 'token_stored=False'; then
     fail_case "$name" "the report stopped saying that no gateway token is stored"; return
   fi
 
@@ -4567,10 +4590,10 @@ print("leftovers=%s" % ",".join(sorted(l["id"] for l in d["leftovers"])))
 PY
 ) || { fail_case "$name" "--list --json (orphan only) did not parse as JSON"; return; }
   printf -- '%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qF 'setups=0'; then
+  if ! grep_var "$out" -qF 'setups=0'; then
     fail_case "$name" "a state dir with no profiles reported setups it does not have"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'leftovers=lonely'; then
+  if ! grep_var "$out" -qF 'leftovers=lonely'; then
     fail_case "$name" "a service unit with no profile anywhere never reached leftovers[]"; return
   fi
 
@@ -4616,18 +4639,18 @@ PY
     if [ "$rc" != "1" ]; then
       fail_case "$name" "--forget '$id' exited $rc, expected 1"; return
     fi
-    if ! printf '%s\n' "$out" | grep -qF 'is not a saved setup id'; then
+    if ! grep_var "$out" -qF 'is not a saved setup id'; then
       fail_case "$name" "--forget '$id' did not say why the id was refused"; return
     fi
     # The rule, not just the refusal: an operator who is told no needs to know
     # what a real id looks like, or the next attempt is another guess.
-    if ! printf '%s\n' "$out" | grep -qF 'lowercase letters, digits and hyphens'; then
+    if ! grep_var "$out" -qF 'lowercase letters, digits and hyphens'; then
       fail_case "$name" "the refusal did not state the id rule"; return
     fi
     # Nothing was read, so nothing was named. A transcript that echoed a
     # constructed path here would mean the id had already been concatenated into
     # one before it was checked.
-    if printf '%s\n' "$out" | grep -qF "$sd/profile-"; then
+    if grep_var "$out" -qF "$sd/profile-"; then
       fail_case "$name" "--forget '$id' built a path out of the id before validating it"; return
     fi
   done
@@ -4645,10 +4668,10 @@ PY
   out=$(env -u CI HOME="$home" XDG_CONFIG_HOME="$state" TERM=dumb bash "$SCRIPT" --forget \
           </dev/null 2>&1) || rc=$?
   printf -- '--- --forget (no id) ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if [ "$rc" != "2" ] || ! printf '%s\n' "$out" | grep -qF 'Usage error:'; then
+  if [ "$rc" != "2" ] || ! grep_var "$out" -qF 'Usage error:'; then
     fail_case "$name" "--forget with no id exited $rc, expected a usage error (2)"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF -- '--list'; then
+  if ! grep_var "$out" -qF -- '--list'; then
     fail_case "$name" "--forget with no id did not point at the command that shows the ids"; return
   fi
 
@@ -4839,15 +4862,15 @@ PY
 
   # Non-vacuity first. If the credential HAD been recovered, nothing would be
   # cleared and every assertion below would pass on a build with no fix in it.
-  if ! printf '%s\n' "$out" | grep -qF 'CONFIRM   Re-show the code for the GATEWAY ONLY'; then
+  if ! grep_var "$out" -qF 'CONFIRM   Re-show the code for the GATEWAY ONLY'; then
     fail_case "$name" "the gateway-only fallback never fired, so nothing cleared the lane"; return
   fi
   # The id the operator picked. Pre-fix this came back custom-b, read out of the
   # file — and it is the only thing deciding which file the next save writes.
-  if ! printf '%s\n' "$out" | grep -qF 'AFTER GW_ID=custom-a'; then
+  if ! grep_var "$out" -qF 'AFTER GW_ID=custom-a'; then
     fail_case "$name" "showing a setup code replaced the id the edit screen was working on"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'AFTER GW_ID=custom-a FS_URL=https://files.example.test:8443 FS_CRED=set'; then
+  if ! grep_var "$out" -qF 'AFTER GW_ID=custom-a FS_URL=https://files.example.test:8443 FS_CRED=set'; then
     fail_case "$name" "showing a setup code emptied the file lane the edit screen was holding"; return
   fi
 
@@ -5074,15 +5097,15 @@ run_manage_headless_refusals_case() {
   if [ "$rc" != "4" ]; then
     fail_case "$name" "--edit through a pipe exited $rc, expected 4"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'needs a person at a terminal'; then
+  if ! grep_var "$out" -qF 'needs a person at a terminal'; then
     fail_case "$name" "--edit through a pipe refused without saying what is missing"; return
   fi
   # Nothing was read. The inventory is built by validating every profile in the
   # directory, so naming one means the refusal came after that work.
-  if printf '%s\n' "$out" | grep -qF 'First gateway'; then
+  if grep_var "$out" -qF 'First gateway'; then
     fail_case "$name" "--edit rendered the saved setups before refusing"; return
   fi
-  if printf '%s\n' "$out" | grep -qF 'Which one? Choose'; then
+  if grep_var "$out" -qF 'Which one? Choose'; then
     fail_case "$name" "--edit asked which setup and consumed the answer before refusing"; return
   fi
 
@@ -5106,16 +5129,16 @@ run_manage_headless_refusals_case() {
     if [ "$rc" != "2" ]; then
       fail_case "$name" "$cmd $arg --dry-run exited $rc, expected a usage error (2)"; return
     fi
-    if ! printf '%s\n' "$out" | grep -qF 'Usage error:'; then
+    if ! grep_var "$out" -qF 'Usage error:'; then
       fail_case "$name" "$cmd $arg --dry-run did not identify itself as a usage error"; return
     fi
     # `--` because every one of these fragments starts with a flag name.
-    if ! printf '%s\n' "$out" | grep -qF -- "$want"; then
+    if ! grep_var "$out" -qF -- "$want"; then
       fail_case "$name" "$cmd $arg --dry-run did not say why this command has no dry run"; return
     fi
     # The narration those deleted branches would have produced. Its absence is
     # what says the refusal really did come first.
-    if printf '%s\n' "$out" | grep -qF '(dry-run:'; then
+    if grep_var "$out" -qF '(dry-run:'; then
       fail_case "$name" "$cmd narrated a dry run on an invocation it had refused"; return
     fi
   done
@@ -5385,7 +5408,7 @@ run_manage_edit_model_roster_case() {
   local name="manage-edit-model-roster-check" funcs out rc arm mode auth wanted url
   funcs=$(extract_funcs manage_probe_model manage_report_model_probe models_is_json curl_gw \
                         credential_value_safe safe_display)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'manage_probe_model()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'manage_probe_model()'; then
     fail_case "$name" "could not extract manage_probe_model from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -5439,35 +5462,35 @@ printf "RC %s\n" "$rc"
     if [ "$auth" = "none" ]; then
       # A saved setup that records auth=none has no token to be asked for, and a
       # hidden prompt on this screen is precisely what it promises not to do.
-      if printf '%s\n' "$out" | grep -qE 'CONFIRM-ASKED|PROMPTED'; then
+      if grep_var "$out" -qE 'CONFIRM-ASKED|PROMPTED'; then
         fail_case "$name" "[$arm] a keyless setup was asked for a credential"; return
       fi
     else
-      if ! printf '%s\n' "$out" | grep -qF 'CONFIRM-ASKED'; then
+      if ! grep_var "$out" -qF 'CONFIRM-ASKED'; then
         fail_case "$name" "[$arm] a bearer setup reached the hidden prompt with no question first"; return
       fi
       # Declining has to stop before the secret prompt, not after it.
-      if [ "$auth" = "declined" ] && printf '%s\n' "$out" | grep -qF 'PROMPTED'; then
+      if [ "$auth" = "declined" ] && grep_var "$out" -qF 'PROMPTED'; then
         fail_case "$name" "[$arm] a declined check still asked for the token"; return
       fi
     fi
     case "$want_rc" in
-      0) if ! printf '%s\n' "$out" | grep -qF "OK That server's model list carries $wanted"; then
+      0) if ! grep_var "$out" -qF "OK That server's model list carries $wanted"; then
            fail_case "$name" "[$arm] an advertised id was not confirmed"; return
          fi ;;
-      1) if ! printf '%s\n' "$out" | grep -qE "does NOT carry $wanted|names no model id at all"; then
+      1) if ! grep_var "$out" -qE "does NOT carry $wanted|names no model id at all"; then
            fail_case "$name" "[$arm] an id the server does not advertise was not called out"; return
          fi
          # The count and the first id are what turn "not in the list" into something
          # the operator can act on — and the disclaimer is what stops the first id
          # reading as a recommendation.
-         if [ "$arm" = "absent" ] && ! printf '%s\n' "$out" | grep -qF 'It advertises 2 model id(s); the first is fixture-echo'; then
+         if [ "$arm" = "absent" ] && ! grep_var "$out" -qF 'It advertises 2 model id(s); the first is fixture-echo'; then
            fail_case "$name" "[$arm] the warning named neither how many ids the server has nor one of them"; return
          fi ;;
-      2|3) if ! printf '%s\n' "$out" | grep -qF 'Not checked'; then
+      2|3) if ! grep_var "$out" -qF 'Not checked'; then
              fail_case "$name" "[$arm] a check that was not made did not say so"; return
            fi
-           if printf '%s\n' "$out" | grep -qF 'does NOT carry'; then
+           if grep_var "$out" -qF 'does NOT carry'; then
              fail_case "$name" "[$arm] a server that produced no model list was read as denying the id"; return
            fi ;;
     esac
@@ -5494,7 +5517,7 @@ EOF
 run_manage_edit_model_gate_case() {
   local name="manage-edit-model-gates-only-an-answered-roster" funcs out arm rc answer
   funcs=$(extract_funcs manage_edit_model)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'manage_edit_model()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'manage_edit_model()'; then
     fail_case "$name" "could not extract manage_edit_model from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -5531,30 +5554,30 @@ printf "LEFT-IN-STATE %s\n" "$GW_MODEL"
     assert_runtime_defined "$name" "$out" || return
 
     case "$want_gate" in
-      yes) if ! printf '%s\n' "$out" | grep -qF 'GATE-ASKED'; then
+      yes) if ! grep_var "$out" -qF 'GATE-ASKED'; then
              fail_case "$name" "[$arm] a roster that does not carry the id saved with no confirmation"; return
            fi ;;
-      no)  if printf '%s\n' "$out" | grep -qF 'GATE-ASKED'; then
+      no)  if grep_var "$out" -qF 'GATE-ASKED'; then
              fail_case "$name" "[$arm] the save was gated on something that says nothing about the model id"; return
            fi ;;
     esac
     case "$want_saved" in
-      yes) if ! printf '%s\n' "$out" | grep -qF 'SAVED candidate-model'; then
+      yes) if ! grep_var "$out" -qF 'SAVED candidate-model'; then
              fail_case "$name" "[$arm] the new model never reached the disk"; return
            fi
-           if ! printf '%s\n' "$out" | grep -qF 'LEFT-IN-STATE candidate-model'; then
+           if ! grep_var "$out" -qF 'LEFT-IN-STATE candidate-model'; then
              fail_case "$name" "[$arm] a saved model is not what the screen behind this will reprint"; return
            fi ;;
-      no)  if printf '%s\n' "$out" | grep -qF 'SAVED'; then
+      no)  if grep_var "$out" -qF 'SAVED'; then
              fail_case "$name" "[$arm] a refused model was written anyway"; return
            fi
-           if ! printf '%s\n' "$out" | grep -qF 'LEFT-IN-STATE old-model'; then
+           if ! grep_var "$out" -qF 'LEFT-IN-STATE old-model'; then
              fail_case "$name" "[$arm] a refused candidate stayed in the screen's state and would ride the next save"; return
            fi ;;
     esac
     # The report is always printed, whatever the outcome — a silent probe would
     # leave the operator with a green "Saved." and no idea what was checked.
-    if ! printf '%s\n' "$out" | grep -qF "REPORTED $rc"; then
+    if ! grep_var "$out" -qF "REPORTED $rc"; then
       fail_case "$name" "[$arm] the probe's finding was never put on screen"; return
     fi
   done <<EOF
@@ -5690,7 +5713,7 @@ print("setups=%d leftovers=%d" % (len(d["setups"]), len(d["leftovers"])))
 PY
 ) || { fail_case "$name" "--list --json with HOME unset did not parse as JSON"; return; }
   printf -- '%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qF 'setups=1'; then
+  if ! grep_var "$out" -qF 'setups=1'; then
     fail_case "$name" "--list --json with HOME unset lost the setup it can see without a home directory"; return
   fi
 
@@ -5821,7 +5844,7 @@ list|json
 edit|positional
 forget|positional
 '
-  local cells=0
+  local cells=0 cell_tail
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     cmd="${row%%|*}"; accepted=" ${row#*|} "
@@ -5845,12 +5868,13 @@ forget|positional
           # `positional` has no flag spelling, so its arm is graded on saying what
           # a bare argument means for this command instead.
           if [ "$mod" = "positional" ]; then
-            if ! printf '%s\n' "$out" | grep -qE "^CELL $cmd positional rc=2 \| REFUSED .*(id|URL|argument)"; then
+            if ! grep_var "$out" -qE "^CELL $cmd positional rc=2 \| REFUSED .*(id|URL|argument)"; then
               fail_case "$name" "--$cmd refused a bare argument without saying what one would have meant"; return
             fi
           else
-            if ! printf '%s\n' "$out" | grep -qF "CELL $cmd $mod rc=2 | REFUSED " ||
-               ! printf '%s\n' "$out" | sed -n "s/^CELL $cmd $mod rc=2 | //p" | grep -qF -- "--$mod"; then
+            cell_tail=$(sed -n "s/^CELL $cmd $mod rc=2 | //p" <<<"$out") || true
+            if ! grep_var "$out" -qF "CELL $cmd $mod rc=2 | REFUSED " ||
+               ! grep_var "$cell_tail" -qF -- "--$mod"; then
               fail_case "$name" "--$cmd refused $mod without naming the flag"; return
             fi
           fi ;;
@@ -5865,7 +5889,7 @@ EOF
 
   # A name the argument loop cannot set stops the run rather than reading as a
   # silent permission. Exit 3 is this harness's stub for die.
-  if ! printf '%s\n' "$out" | grep -qF "TYPO rc=3 | DIED Internal error: unknown CLI modifier 'not-a-real-modifier'."; then
+  if ! grep_var "$out" -qF "TYPO rc=3 | DIED Internal error: unknown CLI modifier 'not-a-real-modifier'."; then
     fail_case "$name" "an unknown modifier name did not stop the run — a typo in an accept list would read as permission"; return
   fi
   PASS=$((PASS+1))
@@ -6870,6 +6894,151 @@ PY
 # their engines are codepoint-based — so heredoc bodies are skipped rather than
 # exempted by name, which is what keeps the vendored QR encoder out of scope
 # without an exclusion list that rots.
+# The suite reads a shell variable hundreds of times, and for most of its life it
+# did so through `printf '%s\n' "$v" | grep -q …`. That shape is a race, not a
+# style: grep -q exits at the FIRST match and closes the pipe, the writer takes
+# EPIPE with bytes still unwritten, and `set -o pipefail` reports the whole
+# pipeline failed — for a search that SUCCEEDED. A macOS runner lost that race on
+# a 16 KB function lift and failed fifteen prompt cases whose runtime had
+# extracted perfectly; ubuntu, whose pipes are larger, never reproduced it. An
+# early match is the dangerous one, because it leaves the most unwritten behind.
+#
+# These two cases are the pair that keeps it dead: this one proves the replacement
+# transport survives what the old one could not, and the lint below refuses the old
+# shape's return.
+run_pipefail_transport_case() {
+  local name="variable-search-survives-an-early-reader" big rc=0
+  # fail_case tails this file; without the reset a failure here would be evidenced
+  # by the PREVIOUS case's transcript — in the one case whose job is diagnosis.
+  : > "$TMP/doctor.out"
+
+  # ~280 KB, every line a match, so the reader is satisfied by line 1 and the
+  # writer is left with essentially the whole payload undelivered. Doubled in a
+  # loop rather than `yes | head`, which is the very shape this pair forbids.
+  big='transport probe filler line, every line a match'
+  while [ "${#big}" -lt 280000 ]; do big="$big
+$big"; done
+
+  # The OLD transport, demonstrated with `head -n 1` rather than a real grep.
+  # Deliberate: whether `grep -q` drains its input before exiting is a property of
+  # the grep BUILD and of where the match sits, so a grep-based probe passes on
+  # some machines and would rot into a vacuous assertion. `head` always stops after
+  # its line, on every platform, so this half fails everywhere the bug is real.
+  rc=0
+  { printf '%s\n' "$big" 2>/dev/null | head -n 1 >/dev/null; } || rc=$?  # pipefail-lint: allow
+  if [ "$rc" = "0" ]; then
+    fail_case "$name" "the probe no longer demonstrates the failure it guards against — pipefail or the reader changed"; return
+  fi
+
+  # …and the transport the suite actually uses, over the same payload.
+  if ! grep_var "$big" -qF 'transport probe filler line'; then
+    fail_case "$name" "grep_var lost a match it should have found — the pipe-free search regressed"; return
+  fi
+  # Statuses and output still grep's own, or call sites silently change meaning.
+  if grep_var "$big" -qF 'a string that is definitely not in the payload'; then
+    fail_case "$name" "grep_var reported a match that is not there"; return
+  fi
+  if [ "$(grep_var 'a
+b
+a' -cF 'a')" != "2" ]; then
+    fail_case "$name" "grep_var no longer passes grep's output through unchanged"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Forbids the reintroduction of the shape run_pipefail_transport_case exists for.
+# Scope is every suite file, because they all set pipefail and all run in the same
+# CI job — the sibling suites carry their own copy of grep_var for that reason.
+run_pipe_grep_lint_case() {
+  local name="a-variable-search-never-goes-through-a-pipe" hits probe pf='print''f' lint="$TMP/pipe-grep-lint.awk"
+  : > "$TMP/doctor.out"
+
+  # awk in its own file for the same reason the locale lint uses one: bash 3.2
+  # mis-parses a heredoc nested in a command substitution. Comments are stripped
+  # first — the explanation above grep_var names the forbidden shape in prose, and
+  # a lint that fires on its own rationale gets deleted.
+  cat > "$lint" <<'AWK'
+/# pipefail-lint: allow/ { next }   # the two deliberate probes below, and nothing else
+{
+  line=$0
+  sub(/^[[:space:]]*#.*$/, "", line)
+  sub(/[[:space:]]#.*$/, "", line)
+  # Only readers that STOP EARLY are a hazard. grep -c, -n, -A and a bare grep all
+  # read to EOF, so the writer never meets a closed pipe; forbidding those would
+  # make the lint noise and get it deleted. `q` and `m` are the option letters that
+  # make grep quit before its input ends — in EVERY spelling: -q, -qF, -Eq, -qiF,
+  # -m 1 and the attached -m1 this suite itself uses in eight places.
+  #
+  # The WRITER is deliberately unconstrained. printf was the shape that failed on
+  # CI, but sed, echo, `declare -f` and grep_var itself feed the same race, and
+  # grep_var is now the idiom everywhere — so `grep_var … | grep -q …` is the
+  # likeliest way this comes back. What matters is the READER, on either side.
+  if (line ~ /\|[[:space:]]*grep[[:space:]]+-[a-zA-Z]*[qm]/)
+    printf "%s:%d: %s\n", FILENAME, FNR, substr(line,1,120)
+  else if (line ~ /\|[[:space:]]*head([[:space:]]|$)/)
+    printf "%s:%d: [head] %s\n", FILENAME, FNR, substr(line,1,120)
+}
+AWK
+
+  hits=$(awk -f "$lint" "$HERE"/*.sh)
+  if [ -n "$hits" ]; then
+    printf -- '--- variable searches routed through a pipe ---\n%s\n' "$hits" >> "$TMP/doctor.out"
+    fail_case "$name" "a search feeds an early-exiting reader through a pipe — use grep_var, or grep -m1 rather than piping into head (see above)"; return
+  fi
+
+  # Non-vacuous. A lint that stopped reading, or stopped recognising the shape,
+  # passes for free forever. The probes assemble the forbidden text at RUNTIME
+  # ($pf), so it never appears literally in this file for the lint to find.
+  if [ "$(awk 'END {print NR}' "$HERE"/*.sh)" -lt 5000 ]; then
+    fail_case "$name" "the lint read almost no source — its glob is broken"; return
+  fi
+  # The exact shape that failed on CI…
+  probe=$(awk -f "$lint" <<<"  $pf '%s\\n' \"\$funcs\" | grep -qF 'x()'")  # pipefail-lint: allow
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint no longer recognises a piped variable search"; return
+  fi
+  # …the same thing with sloppier spacing and a different option order…
+  probe=$(awk -f "$lint" <<<"  ! $pf '%s' \"\$1\"  |  grep -Eq -- \"\$re\"")  # pipefail-lint: allow
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint is defeated by spacing or option order"; return
+  fi
+  # …the attached-digit spelling of -m, which is what this suite itself writes…
+  probe=$(awk -f "$lint" <<<"  $pf '%s\\n' \"\$v\" | grep -m1 -F \"\$x\"")  # pipefail-lint: allow
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint misses -m1, the spelling this suite uses"; return
+  fi
+  # …a writer that is not printf, which is the likeliest reintroduction now that
+  # grep_var is the idiom…
+  probe=$(awk -f "$lint" <<<"  grep_var \"\$v\" -n 'x' | grep -qF 'y'")  # pipefail-lint: allow
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint only recognises printf as the writer"; return
+  fi
+  probe=$(awk -f "$lint" <<<"  sed -n '/^f()/,/^}/p' \"\$SCRIPT\" | grep -qF -- '--x'")  # pipefail-lint: allow
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint misses a sed range feeding an early-exiting grep"; return
+  fi
+  # …a pipeline that ends in head, where the early exit is head's rather than grep's…
+  probe=$(awk -f "$lint" <<<"  n=\$(grep_var \"\$v\" -n 'x' | head -1)")  # pipefail-lint: allow
+  if [ -z "$probe" ]; then
+    fail_case "$name" "the lint no longer recognises an early-exiting head"; return
+  fi
+  # …but NOT the replacement, or the lint forbids the fix…
+  probe=$(awk -f "$lint" <<<"  if ! grep_var \"\$funcs\" -qF 'x()'; then")  # pipefail-lint: allow
+  if [ -n "$probe" ]; then
+    fail_case "$name" "the lint fires on grep_var, which is the fix"; return
+  fi
+  # …and NOT prose in a comment, which is where the shape is explained.
+  probe=$(awk -f "$lint" <<<"# $pf '%s\\n' \"\$v\" | grep -q is the shape this forbids")  # pipefail-lint: allow
+  if [ -n "$probe" ]; then
+    fail_case "$name" "the lint fires on a comment, which would make it noise"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_locale_range_lint_case() {
   local name="ascii-classes-stay-enumerated" hits probe lint="$TMP/ascii-range-lint.awk"
   : > "$TMP/doctor.out"
@@ -6994,7 +7163,7 @@ run_ascii_id_locale_case() {
     if [ "$rc" != "1" ]; then
       fail_case "$name" "--forget '$id' exited $rc under $hostile, expected 1"; return
     fi
-    if ! printf '%s\n' "$out" | grep -qF 'is not a saved setup id'; then
+    if ! grep_var "$out" -qF 'is not a saved setup id'; then
       fail_case "$name" "--forget '$id' was not refused under $hostile — the id charset widened with the locale"; return
     fi
   done
@@ -7010,7 +7179,7 @@ run_ascii_id_locale_case() {
   out=$(printf 'n\n' | LC_ALL="$hostile" env -u CI HOME="$home" XDG_CONFIG_HOME="$state" \
           TERM=dumb bash "$SCRIPT" --forget custom-good 2>&1) || rc=$?
   printf -- '--- --forget custom-good (%s) ---\n%s\n' "$hostile" "$out" >> "$TMP/doctor.out"
-  if printf '%s\n' "$out" | grep -qF 'is not a saved setup id'; then
+  if grep_var "$out" -qF 'is not a saved setup id'; then
     fail_case "$name" "a valid lowercase id was refused under $hostile"; return
   fi
 
@@ -7381,7 +7550,7 @@ run_scope_quick_tunnel_case() {
   # near-miss host that is supposed to be asked.
   funcs=$(extract_funcs scope_choice is_quick_tunnel_url keyless_public_guard prompt_into)
   for fn in scope_choice is_quick_tunnel_url keyless_public_guard prompt_into; do
-    if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
+    if ! grep_var "$funcs" -qF "$fn()"; then
       fail_case "$name" "could not extract $fn from the release artifact"; return
     fi
   done
@@ -7390,10 +7559,10 @@ run_scope_quick_tunnel_case() {
   # a copy of the *.trycloudflare.com suffix inside scope_choice would drift from
   # the one in is_quick_tunnel_url and the two answers would disagree.
   scope_src=$(extract_funcs scope_choice)
-  if ! printf '%s\n' "$scope_src" | grep -qF 'is_quick_tunnel_url'; then
+  if ! grep_var "$scope_src" -qF 'is_quick_tunnel_url'; then
     fail_case "$name" "scope_choice does not derive reach from the shared quick-tunnel predicate"; return
   fi
-  if printf '%s\n' "$scope_src" | grep -qF 'trycloudflare'; then
+  if grep_var "$scope_src" -qF 'trycloudflare'; then
     fail_case "$name" "scope_choice matches the quick-tunnel host itself instead of calling the shared predicate"; return
   fi
 
@@ -7417,7 +7586,7 @@ quick-keyless-overridden|https://x.trycloudflare.com|none|true|public|no|0|warn"
     if [ "$rc" != "$exprc" ]; then
       fail_case "$name" "[$arm] exit $rc, expected $exprc"; return
     fi
-    if ! printf '%s\n' "$out" | grep -qF "SCOPE=$scope"; then
+    if ! grep_var "$out" -qF "SCOPE=$scope"; then
       fail_case "$name" "[$arm] reach came out as something other than $scope"; return
     fi
 
@@ -7425,22 +7594,22 @@ quick-keyless-overridden|https://x.trycloudflare.com|none|true|public|no|0|warn"
     # defeated on its own: the prompt function was never entered, AND the choice
     # the operator would have read was never printed.
     if [ "$asked" = "no" ]; then
-      if printf '%s\n' "$out" | grep -qF 'SIDE_EFFECT require_choice'; then
+      if grep_var "$out" -qF 'SIDE_EFFECT require_choice'; then
         fail_case "$name" "[$arm] an address the wizard can classify was put to the operator anyway"; return
       fi
-      if printf '%s\n' "$out" | grep -qF '2) Private'; then
+      if grep_var "$out" -qF '2) Private'; then
         fail_case "$name" "[$arm] the public/private menu was printed for a derived answer"; return
       fi
       # …and it says why, or the operator reads an unexplained PUBLIC verdict.
-      if ! printf '%s\n' "$out" | grep -qiF 'quick tunnel' ||
-         ! printf '%s\n' "$out" | grep -qiF 'public'; then
+      if ! grep_var "$out" -qiF 'quick tunnel' ||
+         ! grep_var "$out" -qiF 'public'; then
         fail_case "$name" "[$arm] reach was derived silently — the screen never named the quick tunnel or the verdict"; return
       fi
     else
-      if ! printf '%s\n' "$out" | grep -qF 'SIDE_EFFECT require_choice'; then
+      if ! grep_var "$out" -qF 'SIDE_EFFECT require_choice'; then
         fail_case "$name" "[$arm] reach this wizard cannot know was decided without asking"; return
       fi
-      if ! printf '%s\n' "$out" | grep -qF '2) Private'; then
+      if ! grep_var "$out" -qF '2) Private'; then
         fail_case "$name" "[$arm] the reach question stopped offering the two answers"; return
       fi
     fi
@@ -7449,23 +7618,23 @@ quick-keyless-overridden|https://x.trycloudflare.com|none|true|public|no|0|warn"
     # to arm. This is the consequence arm: refusal, not a warning the run ignores.
     case "$guard" in
       die)
-        if ! printf '%s\n' "$out" | grep -qF 'DIE Refusing to publish a keyless gateway.'; then
+        if ! grep_var "$out" -qF 'DIE Refusing to publish a keyless gateway.'; then
           fail_case "$name" "[$arm] a keyless gateway on a public quick tunnel was not refused"; return
         fi
-        if printf '%s\n' "$out" | grep -qF 'REACHED_END'; then
+        if grep_var "$out" -qF 'REACHED_END'; then
           fail_case "$name" "[$arm] the run continued past the keyless refusal"; return
         fi ;;
       warn)
-        if printf '%s\n' "$out" | grep -qF 'DIE '; then
+        if grep_var "$out" -qF 'DIE '; then
           fail_case "$name" "[$arm] --allow-keyless-public no longer overrides the refusal"; return
         fi
-        if ! printf '%s\n' "$out" | grep -qF 'allow-keyless-public' ||
-           ! printf '%s\n' "$out" | grep -qF 'REACHED_END'; then
+        if ! grep_var "$out" -qF 'allow-keyless-public' ||
+           ! grep_var "$out" -qF 'REACHED_END'; then
           fail_case "$name" "[$arm] the deliberate override ran without saying what it published"; return
         fi ;;
       none)
-        if printf '%s\n' "$out" | grep -qF 'DIE ' ||
-           ! printf '%s\n' "$out" | grep -qF 'REACHED_END'; then
+        if grep_var "$out" -qF 'DIE ' ||
+           ! grep_var "$out" -qF 'REACHED_END'; then
           fail_case "$name" "[$arm] a gateway with a token was stopped by the keyless guard"; return
         fi ;;
     esac
@@ -7507,14 +7676,14 @@ run_secret_shape_case() {
             control_suffix control_keys prompt_echo)
   for fn in looks_like_a_secret warn_answer_looked_like_a_secret confirm \
             control_suffix control_keys prompt_echo; do
-    if ! printf '%s\n' "$funcs" | grep -qF "$fn()"; then
+    if ! grep_var "$funcs" -qF "$fn()"; then
       fail_case "$name" "could not extract $fn from the release artifact"; return
     fi
   done
 
   # One caution, written once and called from every prompt — not re-typed per
   # prompt, where one copy quietly loses the rotate advice.
-  if ! printf '%s\n' "$funcs" | grep -qF 'warn_answer_looked_like_a_secret'; then
+  if ! grep_var "$funcs" -qF 'warn_answer_looked_like_a_secret'; then
     fail_case "$name" "confirm does not route a credential-shaped answer to the shared caution"; return
   fi
 
@@ -7533,22 +7702,22 @@ printf "CONFIRM_RC=%s\n" "$?"
   out=$(printf '%s\nn\n' "$secret" | env FUNCS="$funcs" bash -c "$harness" 2>&1) || rc=$?
   printf -- '--- pasted secret, piped ---\n%s\n' "$out" >> "$TMP/doctor.out"
 
-  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'CONFIRM_RC=1'; then
+  if [ "$rc" != "0" ] || ! grep_var "$out" -qF 'CONFIRM_RC=1'; then
     fail_case "$name" "the piped prompt did not recover and take the following answer"; return
   fi
-  hits=$(printf '%s\n' "$out" | grep -o -F -- "$secret" | wc -l | tr -d ' ')
+  hits=$(grep_var "$out" -o -F -- "$secret" | wc -l | tr -d ' ')
   if [ "$hits" != "0" ]; then
     fail_case "$name" "the wizard reprinted the pasted credential $hits time(s) — the caution must never echo the value"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'looked like a key or password' ||
-     ! printf '%s\n' "$out" | grep -qF 'If it was real, rotate it.'; then
+  if ! grep_var "$out" -qF 'looked like a key or password' ||
+     ! grep_var "$out" -qF 'If it was real, rotate it.'; then
     fail_case "$name" "a secret-shaped answer was refused without naming it as one"; return
   fi
   # The branch that belongs to a pipe. Telling a piped session the value is in its
   # scroll-back states something the operator can see is untrue, which is how they
   # learn to skip the next warning.
-  if ! printf '%s\n' "$out" | grep -qF 'Assume this session may have recorded it.' ||
-     printf '%s\n' "$out" | grep -qF 'It was shown as you typed it'; then
+  if ! grep_var "$out" -qF 'Assume this session may have recorded it.' ||
+     grep_var "$out" -qF 'It was shown as you typed it'; then
     fail_case "$name" "the piped caution claimed a terminal echo that never happened"; return
   fi
 
@@ -7558,26 +7727,28 @@ printf "CONFIRM_RC=%s\n" "$?"
       python3 "$PTY_RUN" 10 "$secret"$'\nn\n' bash -c "$harness" 2>&1) || rc=$?
   printf -- '--- pasted secret, real terminal ---\n%s\n' "$out" >> "$TMP/doctor.out"
 
-  if [ "$rc" != "0" ] || ! printf '%s\n' "$out" | grep -qF 'CONFIRM_RC=1'; then
+  if [ "$rc" != "0" ] || ! grep_var "$out" -qF 'CONFIRM_RC=1'; then
     fail_case "$name" "the terminal prompt did not recover and take the following answer"; return
   fi
-  hits=$(printf '%s\n' "$out" | grep -o -F -- "$secret" | wc -l | tr -d ' ')
+  hits=$(grep_var "$out" -o -F -- "$secret" | wc -l | tr -d ' ')
   if [ "$hits" != "1" ]; then
     fail_case "$name" "the credential appears $hits time(s) on a real terminal; exactly 1 is the tty echo and any more is a copy the wizard added"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'looked like a key or password' ||
-     ! printf '%s\n' "$out" | grep -qF 'If it was real, rotate it.'; then
+  if ! grep_var "$out" -qF 'looked like a key or password' ||
+     ! grep_var "$out" -qF 'If it was real, rotate it.'; then
     fail_case "$name" "a secret-shaped answer was refused without naming it as one"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'It was shown as you typed it' ||
-     printf '%s\n' "$out" | grep -qF 'Assume this session may have recorded it.'; then
+  if ! grep_var "$out" -qF 'It was shown as you typed it' ||
+     grep_var "$out" -qF 'Assume this session may have recorded it.'; then
     fail_case "$name" "the terminal caution did not point at the scroll-back the value is actually in"; return
   fi
   # Ordering: the caution has to sit under the value it is about. Weaker than the
   # count above — pty-run.py writes the whole input up front, so the echo lands
   # early no matter what — but it still catches a caution emitted before the read.
-  tok_line=$(printf '%s\n' "$out" | grep -n -F -- "$secret" | head -1 | cut -d: -f1)
-  caution_line=$(printf '%s\n' "$out" | grep -n -F 'looked like a key or password' | head -1 | cut -d: -f1)
+  # -m1 rather than `| head -1`: head exits after its line and would leave grep
+  # writing into a closed pipe, which under pipefail fails a search that worked.
+  tok_line=$(grep_var "$out" -n -m1 -F -- "$secret" | cut -d: -f1)
+  caution_line=$(grep_var "$out" -n -m1 -F 'looked like a key or password' | cut -d: -f1)
   if [ -z "$tok_line" ] || [ -z "$caution_line" ] || [ "$caution_line" -le "$tok_line" ]; then
     fail_case "$name" "the caution did not follow the answer it is about"; return
   fi
@@ -7611,7 +7782,7 @@ done
 
   while IFS='|' read -r want value; do
     [ -n "$want" ] || continue
-    if ! printf '%s\n' "$out" | grep -qF "PREDICATE $want|$want|$value"; then
+    if ! grep_var "$out" -qF "PREDICATE $want|$want|$value"; then
       fail_case "$name" "looks_like_a_secret should $want on '$value' and did not"; return
     fi
   done <<ARMS
@@ -7653,7 +7824,7 @@ run_fixture_bind_case() {
   offenders=$(grep -rnE '=[[:space:]]*(http\.server\.)?(Threading)?HTTPServer\(' \
     "$HERE"/*.py "$HERE/../scripts"/*.sh 2>/dev/null || true)
   if [ -n "$offenders" ]; then
-    fail_case "$name" "binds a stock HTTPServer, whose server_bind reverse-resolves before READY: $(printf '%s' "$offenders" | head -n 1)"
+    fail_case "$name" "binds a stock HTTPServer, whose server_bind reverse-resolves before READY: ${offenders%%$'\n'*}"
     return
   fi
   PASS=$((PASS+1))
@@ -7668,7 +7839,7 @@ run_curl_config_isolation_case() {
   # -q as argv[1]. That ordering matters; later -q does not suppress curlrc.
   curl_lines=$(grep -nE '^[[:space:]]*curl[[:space:]]|[|][[:space:]]*curl[[:space:]]|\$\(curl[[:space:]]|\)[[:space:]]*curl[[:space:]]' \
     "$SCRIPT" || true)
-  if printf '%s\n' "$curl_lines" | grep -vE 'curl[[:space:]]+-q([[:space:]]|$)' >/dev/null; then
+  if grep_var "$curl_lines" -vE 'curl[[:space:]]+-q([[:space:]]|$)' >/dev/null; then
     fail_case "$name" "a direct curl call does not put -q first"; return
   fi
 
@@ -7678,14 +7849,14 @@ run_curl_config_isolation_case() {
   # bearer token, on the model-probe path — so every one of them must also carry
   # --noproxy. This is written as a rule about the artifact, not about one
   # function, because the missed call site was found by reading, not by a test.
-  if printf '%s\n' "$curl_lines" | grep -F 'http://127.0.0.1' \
+  if grep_var "$curl_lines" -F 'http://127.0.0.1' \
      | grep -vF -- '--noproxy' >/dev/null; then
     fail_case "$name" "a curl call to a literal http://127.0.0.1 URL is missing --noproxy"; return
   fi
   # local_health_ok is the one loopback curl whose URL arrives as a variable, so
   # the literal-URL rule above cannot see it. A proxy answering 200 here forges
   # exactly the "your gateway is up" verdict the function exists to establish.
-  if ! sed -n '/^local_health_ok()/,/^}/p' "$SCRIPT" | grep -qF -- '--noproxy'; then
+  if ! grep_var "$(sed -n '/^local_health_ok()/,/^}/p' "$SCRIPT")" -qF -- '--noproxy'; then
     fail_case "$name" "local_health_ok probes loopback without --noproxy"; return
   fi
 
@@ -7746,8 +7917,8 @@ print(json.dumps({"error": {"code": bad}}))') \
   # 1) The /v1/models classifier: model id + Content-Type. curl_gw is stubbed so
   #    the case stays a pure unit test of the parser (no fixture, no network).
   funcs=$(extract_funcs safe_display models_is_json)
-  if ! printf '%s\n' "$funcs" | grep -qF 'models_is_json()' \
-     || ! printf '%s\n' "$funcs" | grep -qF 'safe_display()'; then
+  if ! grep_var "$funcs" -qF 'models_is_json()' \
+     || ! grep_var "$funcs" -qF 'safe_display()'; then
     fail_case "$name" "could not extract safe_display/models_is_json from the release artifact"; return
   fi
   out=$(FUNCS="$funcs" BODY="$hostile_models" bash -c '
@@ -7760,10 +7931,10 @@ models_is_json "http://127.0.0.1:1" >/dev/null 2>&1
 printf "ID<%s>\nCT<%s>\n" "$MODELS_FIRST_ID" "$MODELS_CONTENT_TYPE"
 ' 2>/dev/null) || { fail_case "$name" "models_is_json failed to run in isolation"; return; }
   printf '%s\n' "$out" > "$TMP/doctor.out"
-  if [ "$(printf '%s\n' "$out" | grep -c .)" != "2" ]; then
+  if [ "$(grep_var "$out" -c .)" != "2" ]; then
     fail_case "$name" "a control byte from the models reply produced extra output lines"; return
   fi
-  if ! printf '%s\n' "$out" | grep -q '^ID<gpt'; then
+  if ! grep_var "$out" -q '^ID<gpt'; then
     fail_case "$name" "the model id did not survive sanitising as usable text"; return
   fi
   case "$out" in *"$esc"*) fail_case "$name" "an ANSI escape from the models reply survived the classifier"; return ;; esac
@@ -7779,9 +7950,9 @@ printf "B<%s>\n" "$(safe_display "aaaaaaaaaa" 4)"
 printf "C<%s>\n" "$(safe_display "mistral-7b-instruct-v0.3-ü")"
 ') || { fail_case "$name" "safe_display failed to run in isolation"; return; }
   printf '%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qxF 'A<a[31mbcd>' \
-     || ! printf '%s\n' "$out" | grep -qxF 'B<aaaa…>' \
-     || ! printf '%s\n' "$out" | grep -qxF 'C<mistral-7b-instruct-v0.3-ü>'; then
+  if ! grep_var "$out" -qxF 'A<a[31mbcd>' \
+     || ! grep_var "$out" -qxF 'B<aaaa…>' \
+     || ! grep_var "$out" -qxF 'C<mistral-7b-instruct-v0.3-ü>'; then
     fail_case "$name" "safe_display did not strip, bound, and otherwise preserve as specified"; return
   fi
 
@@ -7801,10 +7972,10 @@ app_chat_loaded_eval >/dev/null 2>&1
 printf "REASON<%s>\n" "$CCE_REASON"
 ' 2>/dev/null) || { fail_case "$name" "app_chat_loaded_eval failed to run in isolation"; return; }
   printf '%s\n' "$out" >> "$TMP/doctor.out"
-  if [ "$(printf '%s\n' "$out" | grep -c .)" != "1" ]; then
+  if [ "$(grep_var "$out" -c .)" != "1" ]; then
     fail_case "$name" "a newline in error.code forged an extra transcript line"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'wire code "bad'; then
+  if ! grep_var "$out" -qF 'wire code "bad'; then
     fail_case "$name" "the wire code stopped reaching the verdict text at all"; return
   fi
   case "$out" in *"$esc"*) fail_case "$name" "an ANSI escape in error.code reached the verdict text"; return ;; esac
@@ -7823,7 +7994,7 @@ run_url_userinfo_refused_case() {
   local cred='https://spy:hunter2@gateway.example.test'
 
   funcs=$(extract_funcs url_has_userinfo doctor_accept_url)
-  if ! printf '%s\n' "$funcs" | grep -qF 'doctor_accept_url()'; then
+  if ! grep_var "$funcs" -qF 'doctor_accept_url()'; then
     fail_case "$name" "could not extract the URL acceptors from the release artifact"; return
   fi
   out=$(FUNCS="$funcs" CRED="$cred" bash -c '
@@ -7842,10 +8013,10 @@ doctor_accept_url "http://127.0.0.1:8080" >/dev/null || printf "REGRESSED<loopba
 printf "DONE\n"
 ') || { fail_case "$name" "doctor_accept_url failed to run in isolation"; return; }
   printf '%s\n' "$out" > "$TMP/doctor.out"
-  if printf '%s\n' "$out" | grep -q '^ACCEPTED<'; then
+  if grep_var "$out" -q '^ACCEPTED<'; then
     fail_case "$name" "doctor_accept_url accepted a URL carrying userinfo"; return
   fi
-  if printf '%s\n' "$out" | grep -q '^REGRESSED<'; then
+  if grep_var "$out" -q '^REGRESSED<'; then
     fail_case "$name" "the userinfo guard rejected a legitimate URL"; return
   fi
 
@@ -7855,8 +8026,8 @@ printf "DONE\n"
             control_suffix control_keys prompt_echo looks_like_a_secret \
             warn_answer_looked_like_a_secret
           sed -n '/^URL_USERINFO_HINT=/p' "$SCRIPT")
-  if ! printf '%s\n' "$funcs" | grep -qF 'ask_url()' \
-     || ! printf '%s\n' "$funcs" | grep -qF 'URL_USERINFO_HINT='; then
+  if ! grep_var "$funcs" -qF 'ask_url()' \
+     || ! grep_var "$funcs" -qF 'URL_USERINFO_HINT='; then
     fail_case "$name" "could not extract ask_url from the release artifact"; return
   fi
   out=$(FUNCS="$funcs" CRED="$cred" bash -c '
@@ -7867,13 +8038,13 @@ warn() { printf "! %s\n" "$*"; }
 printf "%s\nhttps://gateway.example.test\n" "$CRED" | ask_url "Address" "https://ai.example.com"
 ' 2>&1) || { fail_case "$name" "ask_url failed to run in isolation"; return; }
   printf '%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qF 'it is asked for separately, at a hidden prompt'; then
+  if ! grep_var "$out" -qF 'it is asked for separately, at a hidden prompt'; then
     fail_case "$name" "ask_url did not explain where the secret actually belongs"; return
   fi
-  if printf '%s\n' "$out" | grep -qF 'hunter2@gateway'; then
+  if grep_var "$out" -qF 'hunter2@gateway'; then
     fail_case "$name" "ask_url accepted or echoed back the credential-bearing URL"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'using https://gateway.example.test'; then
+  if ! grep_var "$out" -qF 'using https://gateway.example.test'; then
     fail_case "$name" "ask_url did not go on to accept the corrected URL"; return
   fi
 
@@ -7934,11 +8105,11 @@ run_owned_config_mode_change_case() {
   if [ "$exec_chmod" != "1" ]; then
     fail_case "$name" "expected exactly one executable chmod of the user's .env, found $exec_chmod"; return
   fi
-  announce_ln=$(grep -nF 'say "    chmod 600 $envf"' "$joined" | head -1 | cut -d: -f1)
-  confirm_ln=$(grep -nF 'confirm "  Append these now?"' "$joined" | head -1 | cut -d: -f1)
-  chmod_ln=$(grep -nF 'chmod 600 "$envf"' "$joined" | head -1 | cut -d: -f1)
-  append_ln=$(grep -nF '>> "$envf"' "$joined" | head -1 | cut -d: -f1)
-  gate_ln=$(grep -nF 'secure_owned_file_mode "$envf"' "$joined" | head -1 | cut -d: -f1)
+  announce_ln=$(grep -nF -m1 'say "    chmod 600 $envf"' "$joined" | cut -d: -f1)
+  confirm_ln=$(grep -nF -m1 'confirm "  Append these now?"' "$joined" | cut -d: -f1)
+  chmod_ln=$(grep -nF -m1 'chmod 600 "$envf"' "$joined" | cut -d: -f1)
+  append_ln=$(grep -nF -m1 '>> "$envf"' "$joined" | cut -d: -f1)
+  gate_ln=$(grep -nF -m1 'secure_owned_file_mode "$envf"' "$joined" | cut -d: -f1)
   if [ -z "$announce_ln" ] || [ -z "$confirm_ln" ] || [ -z "$chmod_ln" ] \
      || [ -z "$append_ln" ] || [ -z "$gate_ln" ]; then
     fail_case "$name" "could not locate the announce / confirm / chmod / append / backstop steps"; return
@@ -7960,7 +8131,7 @@ run_owned_config_mode_change_case() {
             confirm control_suffix control_keys prompt_echo explain_prompt quit_run \
             run_changes_nothing interactive_terminal looks_like_a_secret \
             warn_answer_looked_like_a_secret plan_add say ok warn note)
-  if ! printf '%s\n' "$funcs" | grep -qF 'secure_owned_file_mode()'; then
+  if ! grep_var "$funcs" -qF 'secure_owned_file_mode()'; then
     fail_case "$name" "could not extract secure_owned_file_mode from the release artifact"; return
   fi
 
@@ -7979,13 +8150,13 @@ printf "declined-rc=%d\n" "$?"
   if [ "$mode" != "0o644" ]; then
     fail_case "$name" "the mode changed without a yes (now $mode)"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF "chmod 600 $envf"; then
+  if ! grep_var "$out" -qF "chmod 600 $envf"; then
     fail_case "$name" "a declined run did not print the exact command"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'STILL readable'; then
+  if ! grep_var "$out" -qF 'STILL readable'; then
     fail_case "$name" "a declined run went quiet about the key still being readable"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'declined-rc=1'; then
+  if ! grep_var "$out" -qF 'declined-rc=1'; then
     fail_case "$name" "a declined run did not report the still-open mode to its caller"; return
   fi
 
@@ -7999,10 +8170,10 @@ printf "y\n" | secure_owned_file_mode "$ENVF" "your API server key"
 printf "failed-rc=%d\n" "$?"
 ' 2>&1) || true
   printf -- '--- chmod failed ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qF 'STILL readable'; then
+  if ! grep_var "$out" -qF 'STILL readable'; then
     fail_case "$name" "a failed chmod was reported as success"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'failed-rc=1'; then
+  if ! grep_var "$out" -qF 'failed-rc=1'; then
     fail_case "$name" "a failed chmod did not report the still-open mode to its caller"; return
   fi
 
@@ -8018,7 +8189,7 @@ printf "accepted-rc=%d\n" "$?"
   if [ "$mode" != "0o600" ]; then
     fail_case "$name" "an approved run did not apply the chmod (mode $mode)"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'accepted-rc=0'; then
+  if ! grep_var "$out" -qF 'accepted-rc=0'; then
     fail_case "$name" "a successful tighten did not report success to its caller"; return
   fi
 
@@ -8030,7 +8201,7 @@ DRY_RUN=false; REUSE_ONLY=false; PLAN=(); BOLD=""; RESET=""; DIM=""; YELLOW=""
 printf "quiet-rc=%d\n" "$?"
 ' 2>&1) || true
   printf -- '--- already private ---\n%s\n' "$out" >> "$TMP/doctor.out"
-  if [ "$(printf '%s\n' "$out" | grep -c .)" != "1" ]; then
+  if [ "$(grep_var "$out" -c .)" != "1" ]; then
     fail_case "$name" "an already-0600 file produced output instead of staying silent"; return
   fi
 
@@ -8060,7 +8231,7 @@ run_hermes_key_lands_in_private_file_case() {
 
   funcs=$(extract_funcs configure_hermes hermes_api_server_port show_qr_is_port env_get \
             file_mode_is_open secure_owned_file_mode run_step mutate_guard)
-  if ! printf '%s\n' "$funcs" | grep -qF 'configure_hermes()'; then
+  if ! grep_var "$funcs" -qF 'configure_hermes()'; then
     fail_case "$name" "could not extract configure_hermes from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -8109,7 +8280,7 @@ printf "key-write-mode=%s\n" "$KEY_MODE"
 ' 2>&1) || true
   printf -- '--- accepted on a 0644 file ---\n%s\n' "$out" >> "$TMP/doctor.out"
   assert_runtime_defined "$name" "$out" || return
-  if ! printf '%s\n' "$out" | grep -qF 'key-write-mode=0o600'; then
+  if ! grep_var "$out" -qF 'key-write-mode=0o600'; then
     fail_case "$name" "the API server key was written into a file that was not 0600"; return
   fi
   mode=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$envf")
@@ -8121,14 +8292,14 @@ printf "key-write-mode=%s\n" "$KEY_MODE"
   fi
   # One question, not two. The whole point of announcing the chmod with the
   # append is that the secret does not wait behind a second default-No prompt.
-  if [ "$(printf '%s\n' "$out" | grep -c '^\[confirm\]')" != "1" ]; then
+  if [ "$(grep_var "$out" -c '^\[confirm\]')" != "1" ]; then
     fail_case "$name" "the mode change asked its own question instead of riding the append's"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF "chmod 600 $envf"; then
+  if ! grep_var "$out" -qF "chmod 600 $envf"; then
     fail_case "$name" "the exact chmod was never shown to the operator"; return
   fi
   # The generated key is a secret; it may reach the file and nothing else.
-  if printf '%s\n' "$out" | grep -qE '[0-9a-f]{64}'; then
+  if grep_var "$out" -qE '[0-9a-f]{64}'; then
     fail_case "$name" "the generated API server key appeared in the run's output"; return
   fi
 
@@ -8146,10 +8317,10 @@ printf "key-write-mode=%s\n" "$KEY_MODE"
 ' 2>&1) || true
   printf -- '--- chmod refused ---\n%s\n' "$out" >> "$TMP/doctor.out"
   assert_runtime_defined "$name" "$out" || return
-  if ! printf '%s\n' "$out" | grep -qF 'key-write-mode=0o644'; then
+  if ! grep_var "$out" -qF 'key-write-mode=0o644'; then
     fail_case "$name" "the arm meant to prove a failed chmod did not actually fail one"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'STILL readable'; then
+  if ! grep_var "$out" -qF 'STILL readable'; then
     fail_case "$name" "a chmod that did not take was reported as success"; return
   fi
   if ! grep -q '^API_SERVER_KEY=' "$envf"; then
@@ -8198,7 +8369,7 @@ run_chat_content_type_is_sanitised_case() {
 
   funcs=$(extract_funcs doctor_chat_request doctor_chat_eval doctor_transfer_reason \
             ct_is_json safe_display)
-  if ! printf '%s\n' "$funcs" | grep -qF 'doctor_chat_request()'; then
+  if ! grep_var "$funcs" -qF 'doctor_chat_request()'; then
     fail_case "$name" "could not extract doctor_chat_request from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -8241,10 +8412,10 @@ sys.exit(1 if any(x < 0x20 or x == 0x7f for x in b) else 0)' "$dir/$f.bin"; then
   if ! grep -qF 'Content-Type is' "$dir/reason.bin"; then
     fail_case "$name" "the failure reason stopped naming the Content-Type it rejected"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'hint=ct'; then
+  if ! grep_var "$out" -qF 'hint=ct'; then
     fail_case "$name" "a hostile Content-Type no longer grades as the content-type failure"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'clean-graded=json'; then
+  if ! grep_var "$out" -qF 'clean-graded=json'; then
     fail_case "$name" "sanitising moved the grade of a legitimate Content-Type"; return
   fi
   if [ "$(cat "$dir/clean-ct.bin")" != "application/json; charset=utf-8" ]; then
@@ -8265,8 +8436,8 @@ run_env_port_validation_case() {
   local name="env-ports-are-validated" funcs out home="$TMP/env-port-home"
 
   funcs=$(extract_funcs json_query json_get env_get show_qr_is_port openclaw_local_port hermes_api_server_port)
-  if ! printf '%s\n' "$funcs" | grep -qF 'hermes_api_server_port()' \
-     || ! printf '%s\n' "$funcs" | grep -qF 'openclaw_local_port()'; then
+  if ! grep_var "$funcs" -qF 'hermes_api_server_port()' \
+     || ! grep_var "$funcs" -qF 'openclaw_local_port()'; then
     fail_case "$name" "could not extract the port resolvers from the release artifact"; return
   fi
 
@@ -8279,7 +8450,7 @@ note() { :; }
 printf "H<%s>\nO<%s>\n" "$(hermes_api_server_port)" "$(openclaw_local_port)"
 ' 2>/dev/null) || { fail_case "$name" "the port resolvers failed to run in isolation"; return; }
   printf '%s\n' "$out" > "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qxF 'H<8642>' || ! printf '%s\n' "$out" | grep -qxF 'O<18789>'; then
+  if ! grep_var "$out" -qxF 'H<8642>' || ! grep_var "$out" -qxF 'O<18789>'; then
     fail_case "$name" "a trailing dotenv comment leaked into the resolved port"; return
   fi
 
@@ -8292,10 +8463,10 @@ note() { :; }
 printf "H<%s>\nO<%s>\n" "$(hermes_api_server_port)" "$(openclaw_local_port)"
 ' 2>/dev/null) || { fail_case "$name" "the port resolvers failed on the second pass"; return; }
   printf '%s\n' "$out" >> "$TMP/doctor.out"
-  if ! printf '%s\n' "$out" | grep -qxF 'H<8645>'; then
+  if ! grep_var "$out" -qxF 'H<8645>'; then
     fail_case "$name" "a valid API_SERVER_PORT was not read through verbatim"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qxF 'O<18789>'; then
+  if ! grep_var "$out" -qxF 'O<18789>'; then
     fail_case "$name" "an out-of-range OPENCLAW_GATEWAY_PORT was not replaced by the default"; return
   fi
 
@@ -8315,10 +8486,10 @@ run_check_tempfile_isolation_case() {
     fail_case "$name" "could not extract doctor_files_transport from the release artifact"; return
   fi
   printf '%s\n' "$body" > "$TMP/doctor.out"
-  if printf '%s\n' "$body" | grep -qE '\$\{?tmp\}?\.[a-z]'; then
+  if grep_var "$body" -qE '\$\{?tmp\}?\.[a-z]'; then
     fail_case "$name" "a probe path is still built by concatenating onto the mktemp name"; return
   fi
-  if ! printf '%s\n' "$body" | grep -qF 'mktemp -d'; then
+  if ! grep_var "$body" -qF 'mktemp -d'; then
     fail_case "$name" "the transport tier no longer stages its probes in a mktemp -d directory"; return
   fi
   PASS=$((PASS+1))
@@ -8343,15 +8514,15 @@ run_state_dir_mode_case() {
   # behavioural assertion below while skipping the exposure report entirely.
   artifact_mkdirs=$(grep -n 'mkdir -p "\$STATE_DIR"' "$SCRIPT")
   printf '%s\n' "$artifact_mkdirs" > "$TMP/doctor.out"
-  if [ "$(printf '%s\n' "$artifact_mkdirs" | grep -c .)" != "1" ]; then
+  if [ "$(grep_var "$artifact_mkdirs" -c .)" != "1" ]; then
     fail_case "$name" "\$STATE_DIR is created outside ensure_state_dir"; return
   fi
   funcs=$(extract_funcs ensure_state_dir file_mode_is_open warn)
-  if ! printf '%s\n' "$funcs" | grep -qF 'ensure_state_dir()'; then
+  if ! grep_var "$funcs" -qF 'ensure_state_dir()'; then
     fail_case "$name" "could not extract ensure_state_dir from the release artifact"; return
   fi
   # …and the sole mkdir must be the one inside ensure_state_dir.
-  if ! printf '%s\n' "$funcs" | grep -qF 'mkdir -p "$STATE_DIR"'; then
+  if ! grep_var "$funcs" -qF 'mkdir -p "$STATE_DIR"'; then
     fail_case "$name" "the one \$STATE_DIR mkdir is not the one inside ensure_state_dir"; return
   fi
 
@@ -8369,7 +8540,7 @@ printf "fresh-rc=%d\n" "$?"
   if [ "$mode" != "0o700" ]; then
     fail_case "$name" "a freshly created \$STATE_DIR is $mode, not 0o700"; return
   fi
-  if [ "$(printf '%s\n' "$out" | grep -c .)" != "1" ]; then
+  if [ "$(grep_var "$out" -c .)" != "1" ]; then
     fail_case "$name" "creating a fresh \$STATE_DIR produced output instead of staying silent"; return
   fi
 
@@ -8390,18 +8561,18 @@ printf "second-rc=%d\n" "$?"
   if [ "$mode" != "0o755" ]; then
     fail_case "$name" "an existing \$STATE_DIR was silently re-chmodded to $mode"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF "chmod 700 $dir"; then
+  if ! grep_var "$out" -qF "chmod 700 $dir"; then
     fail_case "$name" "an exposed \$STATE_DIR did not print the exact fix"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'can be listed by other accounts'; then
+  if ! grep_var "$out" -qF 'can be listed by other accounts'; then
     fail_case "$name" "an exposed \$STATE_DIR went quiet about who can read the listing"; return
   fi
-  if ! printf '%s\n' "$out" | grep -qF 'open-rc=0' || ! printf '%s\n' "$out" | grep -qF 'second-rc=0'; then
+  if ! grep_var "$out" -qF 'open-rc=0' || ! grep_var "$out" -qF 'second-rc=0'; then
     fail_case "$name" "reporting the exposure turned into a failure for the caller"; return
   fi
   # Said ONCE per run: three writers reach this helper in a single setup, and a
   # warning repeated at each of them is noise the user learns to skip.
-  if [ "$(printf '%s\n' "$out" | grep -cF "chmod 700 $dir")" != "1" ]; then
+  if [ "$(grep_var "$out" -cF "chmod 700 $dir")" != "1" ]; then
     fail_case "$name" "the exposure warning repeats on every call instead of once per run"; return
   fi
 
@@ -8417,7 +8588,7 @@ printf "blocked-rc=%d\n" "$?"
 ' 2>&1) || true
   printf -- '--- uncreatable ---\n%s\n' "$out" >> "$TMP/doctor.out"
   rm -f "$TMP/state-blocked"
-  if ! printf '%s\n' "$out" | grep -qF 'blocked-rc=1'; then
+  if ! grep_var "$out" -qF 'blocked-rc=1'; then
     fail_case "$name" "a \$STATE_DIR that could not be created did not report failure"; return
   fi
 
@@ -8482,7 +8653,7 @@ run_ci_gate_case() {
   fi
   # tr -d '\r': a PTY turns every \n into \r\n, which would break the $ anchor.
   local summary; summary=$(tail -n 1 "$TMP/doctor.out" | tr -d '\r')
-  if ! printf '%s\n' "$summary" | grep -Eq "$SERVER_SUMMARY_RE"; then
+  if ! grep_var "$summary" -Eq "$SERVER_SUMMARY_RE"; then
     fail_case "$name" "last line isn't a valid CONDUCK_CHECK_SERVER schema=2 summary: $summary"; return
   fi
   PASS=$((PASS+1))
@@ -8530,7 +8701,7 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.clos
   # BEFORE the optional setup handoff, so the last line is that question.
   # tr -d '\r': a PTY turns every \n into \r\n, which would break the $ anchor.
   summary=$(grep '^CONDUCK_CHECK_SERVER schema=' "$TMP/doctor.out" | tr -d '\r')
-  if ! printf '%s\n' "$summary" | grep -Eq "$SERVER_SUMMARY_RE"; then
+  if ! grep_var "$summary" -Eq "$SERVER_SUMMARY_RE"; then
     fail_case "$name" "not a valid CONDUCK_CHECK_SERVER schema=2 summary: $summary"; return
   fi
   # One `case` per fragment, never one glob chaining them: adjacent fields share
@@ -8664,7 +8835,7 @@ run_reject_body_matrix_case() {
   local name="reject-body-verdict-matrix" funcs pair want got
   funcs=$(extract_funcs doctor_parse_level_status doctor_busy_status \
                         doctor_desync_parse doctor_reject_body_check)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'doctor_reject_body_check()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'doctor_reject_body_check()'; then
     fail_case "$name" "could not extract the rejected-body check from the release artifact"; return
   fi
   : > "$TMP/doctor.out"
@@ -8823,7 +8994,7 @@ run_auth_eof_case() { # run_auth_eof_case <server|adapter>
   fi
   assert_machine_output "$name" "$prefix" || return
   local summary; summary=$(tail -n 1 "$TMP/doctor.out")
-  if ! printf '%s\n' "$summary" | grep -Eq "$re"; then
+  if ! grep_var "$summary" -Eq "$re"; then
     fail_case "$name" "last line isn't a valid $prefix summary: $summary"; return
   fi
   case " $summary " in *" $frag "*) ;; *)
@@ -8876,7 +9047,7 @@ run_preflight_missing_tool_case() { # <server|adapter> <python3|curl>
   fi
   assert_machine_output "$name" "$prefix" || return
   summary=$(tail -n 1 "$TMP/doctor.out")
-  if ! printf '%s\n' "$summary" | grep -Eq "$re"; then
+  if ! grep_var "$summary" -Eq "$re"; then
     fail_case "$name" "last line isn't a valid $prefix summary: $summary"; return
   fi
   case " $summary " in *" $frag "*) ;; *)
@@ -9328,9 +9499,9 @@ run_image_gate_placement_case() {
   local name="image-gate-runs-between-the-chat-turn-and-the-file-lane" verify funcs out flat
   local n_chat n_img n_lane
   verify=$(sed -n '/^verify_all()/,/^}/p' "$SCRIPT")
-  n_chat=$(printf '%s\n' "$verify" | grep -n 'app_chat_eval "\$body"' | head -1 | cut -d: -f1)
-  n_img=$(printf '%s\n'  "$verify" | grep -n 'verify_image_intake'    | head -1 | cut -d: -f1)
-  n_lane=$(printf '%s\n' "$verify" | grep -n 'FS_URL" \] && \[ -n "\$FS_CRED' | head -1 | cut -d: -f1)
+  n_chat=$(grep_var "$verify" -n -m1 'app_chat_eval "\$body"' | cut -d: -f1)
+  n_img=$(grep_var "$verify" -n -m1 'verify_image_intake'    | cut -d: -f1)
+  n_lane=$(grep_var "$verify" -n -m1 'FS_URL" \] && \[ -n "\$FS_CRED' | cut -d: -f1)
   : > "$TMP/doctor.out"
   printf 'chat=%s image=%s lane=%s\n' "$n_chat" "$n_img" "$n_lane" > "$TMP/doctor.out"
   if [ -z "$n_chat" ] || [ -z "$n_img" ] || [ -z "$n_lane" ] \
@@ -9339,7 +9510,7 @@ run_image_gate_placement_case() {
   fi
 
   funcs=$(extract_funcs verify_all gw_url_drift_note)
-  if [ -z "$funcs" ] || ! printf '%s\n' "$funcs" | grep -qF 'verify_all()'; then
+  if [ -z "$funcs" ] || ! grep_var "$funcs" -qF 'verify_all()'; then
     fail_case "$name" "could not extract verify_all from the release artifact"; return
   fi
 
@@ -9407,7 +9578,7 @@ BOLD=""; RESET=""; explain_action verification.image_ignored')
 run_shared_app_evaluator_wiring_case() {
   local name="shared-app-evaluator" verify
   verify=$(sed -n '/^verify_all()/,/^}/p' "$SCRIPT")
-  if ! printf '%s\n' "$verify" | grep -qF 'if app_chat_eval "$body"; then'; then
+  if ! grep_var "$verify" -qF 'if app_chat_eval "$body"; then'; then
     fail_case "$name" "normal setup verification does not call app_chat_eval"; return
   fi
   if [ "$(grep -c '^app_chat_eval()' "$SCRIPT")" != "1" ]; then
@@ -9969,6 +10140,14 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" ascii-classes-stay-enumerated "*) true ;; *) false ;; esac; then
   run_locale_range_lint_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" variable-search-survives-an-early-reader "*) true ;; *) false ;; esac; then
+  run_pipefail_transport_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" a-variable-search-never-goes-through-a-pipe "*) true ;; *) false ;; esac; then
+  run_pipe_grep_lint_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" ids-mean-the-same-in-every-locale "*) true ;; *) false ;; esac; then

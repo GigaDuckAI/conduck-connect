@@ -10,6 +10,17 @@
 # modules; ShellCheck deliberately does not infer that cross-file use.
 
 set -u -o pipefail
+# Search a shell variable WITHOUT a pipe. `printf … | grep -q` is a pipefail
+# landmine: grep -q exits at the FIRST match and closes the pipe, the writer takes
+# EPIPE with bytes still unwritten, and `set -o pipefail` above turns a SUCCESSFUL
+# match into a FAILED pipeline. A here-string is written out in full before grep is
+# exec'd, so no reader exists that could close it early. Canonical explanation and
+# the lint that forbids the old shape live in tests/run-checks-suite.sh.
+grep_var() { # grep_var <haystack> <grep-arg>… -> grep's own status and output
+  local hay="$1"; shift
+  grep "$@" <<<"$hay"
+}
+
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT="$HERE/.."
@@ -635,8 +646,8 @@ test_tools_block_is_agent_readable() {
     confirm() { return 0; }
     local out
     out=$(install_conduck_tools_block "$ws" 2>&1)
-    printf '%s' "$out" | grep -q 'chmod 644' \
-      && ! printf '%s' "$out" | grep -q 'block installed' \
+    grep_var "$out" -q 'chmod 644' \
+      && ! grep_var "$out" -q 'block installed' \
       && [ "$(file_mode "$target")" = "600" ] \
       && ! grep -q 'conduck-connect:begin' "$target"
   ); then
@@ -663,8 +674,8 @@ test_tools_block_is_agent_readable() {
     confirm() { return 0; }
     local out
     out=$(install_conduck_tools_block "$link_ws" 2>&1)
-    printf '%s' "$out" | grep -q 'symlink' \
-      && ! printf '%s' "$out" | grep -q 'block installed' \
+    grep_var "$out" -q 'symlink' \
+      && ! grep_var "$out" -q 'block installed' \
       && [ "$(cat "$victim")" = "ORIGINAL" ] \
       && ! grep -q 'conduck-connect:begin' "$victim"
   ); then
@@ -686,8 +697,8 @@ test_tools_block_is_agent_readable() {
     confirm() { return 0; }
     local out
     out=$(install_conduck_tools_block "$dangling_ws" 2>&1)
-    printf '%s' "$out" | grep -q 'symlink' \
-      && ! printf '%s' "$out" | grep -q 'block installed' \
+    grep_var "$out" -q 'symlink' \
+      && ! grep_var "$out" -q 'block installed' \
       && [ ! -e "$victim_dir/not-there" ]
   ); then
     pass "a dangling symlinked TOOLS.md creates nothing at its target"
@@ -1542,7 +1553,9 @@ terminal_field() { # <config> -> yes|no|unknown for the API-server scope's termi
 EXPECTED_ADVICE_NAMES="browser code_execution cronjob delegation file image_gen skills terminal todo vision web"
 
 hint_advice_line() { # hint_advice_line <transcript> -> the offered api_server list, or ""
-  printf '%s\n' "$1" | sed -n 's/^ *api_server: //p' | head -1
+  local all; all=$(sed -n 's/^ *api_server: //p' <<<"$1")
+  [ -n "$all" ] || return 0
+  printf '%s\n' "${all%%$'\n'*}"
 }
 
 # Everything the hint says about a bundle before it moves on to the global key —
@@ -3206,9 +3219,9 @@ test_hermes_recall_reach() {
   # ORDER is the part that matters — after the file lane so one line is edited
   # once, and before the dry-run exit so a planned run still reports.
   src=$(sed -n '/^run_setup()/,/^}/p' "$ROOT/src/99-main.inc.sh")
-  n_lane=$(printf '%s\n' "$src" | grep -n '^  setup_file_lane$' | head -1 | cut -d: -f1)
-  n_recall=$(printf '%s\n' "$src" | grep -n '^  hermes_recall_post_file_lane_step$' | head -1 | cut -d: -f1)
-  n_dry=$(printf '%s\n' "$src" | grep -n 'print_plan' | head -1 | cut -d: -f1)
+  n_lane=$(grep_var "$src" -n -m1 '^  setup_file_lane$' | cut -d: -f1)
+  n_recall=$(grep_var "$src" -n -m1 '^  hermes_recall_post_file_lane_step$' | cut -d: -f1)
+  n_dry=$(grep_var "$src" -n -m1 'print_plan' | cut -d: -f1)
   if [ -n "$n_lane" ] && [ -n "$n_recall" ] && [ -n "$n_dry" ] \
      && [ "$n_recall" -gt "$n_lane" ] && [ "$n_recall" -lt "$n_dry" ]; then
     pass "reach: setup asks after the file lane and before the dry-run exit"
@@ -3276,9 +3289,9 @@ test_hermes_recall_reach() {
   # die in show_qr_check_live without collecting a warning it cannot act on, and
   # verify_all must separate the finding from the code itself.
   body=$(declare -f run_show_qr)
-  n_live=$(printf '%s\n' "$body" | grep -n 'show_qr_check_live' | head -1 | cut -d: -f1)
-  n_recall=$(printf '%s\n' "$body" | grep -n 'show_qr_recall_scope' | head -1 | cut -d: -f1)
-  n_verify=$(printf '%s\n' "$body" | grep -n 'verify_all' | head -1 | cut -d: -f1)
+  n_live=$(grep_var "$body" -n -m1 'show_qr_check_live' | cut -d: -f1)
+  n_recall=$(grep_var "$body" -n -m1 'show_qr_recall_scope' | cut -d: -f1)
+  n_verify=$(grep_var "$body" -n -m1 'verify_all' | cut -d: -f1)
   if [ -n "$n_live" ] && [ -n "$n_recall" ] && [ -n "$n_verify" ] \
      && [ "$n_recall" -gt "$n_live" ] && [ "$n_recall" -lt "$n_verify" ]; then
     pass "reach: the re-show reports between the drift gate and verification"
@@ -3520,8 +3533,8 @@ test_local_service_gate() {
   if fs_local_service_ready; then
     fail "local cleanup refuses replacement symlink" "replacement symlink earned a clean pass"
   elif [ "$(cat "$served/unrelated-victim.txt" 2>/dev/null)" = "unrelated file must survive" ] \
-       && find "$served" -maxdepth 1 -type l \
-            -name 'conduck-connect-local-probe-*.txt' -print -quit | grep -q .; then
+       && [ -n "$(find "$served" -maxdepth 1 -type l \
+                   -name 'conduck-connect-local-probe-*.txt' -print -quit)" ]; then
     pass "local cleanup refuses replacement symlink"
   else
     fail "local cleanup refuses replacement symlink" "unrelated target changed or exact symlink was followed"
@@ -4140,7 +4153,7 @@ raise SystemExit(0 if len(wire) == 1 and saved and not stale
   start_adapter files-good "$served" "$token" || {
     fail "agent sentinel continues after custom cases" "adapter fixture failed to start"; stop_webdav; return; }
   GW_URL="http://127.0.0.1:$READY_PORT"
-  if find "$served" -mindepth 1 -print -quit | grep -q .; then
+  if [ -n "$(find "$served" -mindepth 1 -print -quit)" ]; then
     fail "agent sentinel exact cleanup" "probe artifacts remain"
   else
     pass "agent sentinel exact cleanup"
@@ -4205,7 +4218,7 @@ raise SystemExit(0 if len(wire) == 1 and saved and not stale
   # depth-limited search would report a clean folder without looking where the
   # artifact actually is, and the case would pass whether or not cleanup ran.
   elif [[ "$AGENT_FILE_PROBE_REASON" == *"replied before"* ]] \
-       && ! find "$served" -name 'output-*.txt' -print -quit | grep -q .; then
+       && [ -z "$(find "$served" -name 'output-*.txt' -print -quit)" ]; then
     pass "OpenClaw reply-first late write is rejected"
   else
     fail "OpenClaw reply-first late write is rejected" "wrong diagnostic or late artifact remained"
@@ -6616,9 +6629,9 @@ test_pdftotext_note_is_advisory() {
   # Placement: after readiness is settled (so a lane that already failed does not
   # collect an irrelevant package note) and before the guidance block that tells
   # the agent to use the tool.
-  n_ready=$(printf '%s\n' "$src" | grep -n 'hermes_file_readiness_step' | head -1 | cut -d: -f1)
-  n_pdf=$(printf '%s\n' "$src" | grep -n 'have pdftotext' | head -1 | cut -d: -f1)
-  n_install=$(printf '%s\n' "$src" | grep -n 'install_conduck_hermes_block' | head -1 | cut -d: -f1)
+  n_ready=$(grep_var "$src" -n -m1 'hermes_file_readiness_step' | cut -d: -f1)
+  n_pdf=$(grep_var "$src" -n -m1 'have pdftotext' | cut -d: -f1)
+  n_install=$(grep_var "$src" -n -m1 'install_conduck_hermes_block' | cut -d: -f1)
   if [ -n "$n_ready" ] && [ -n "$n_pdf" ] && [ -n "$n_install" ] \
      && [ "$n_pdf" -gt "$n_ready" ] && [ "$n_pdf" -lt "$n_install" ]; then
     pass "pdftotext note: comes after readiness and before the guidance block"

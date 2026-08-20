@@ -34,6 +34,17 @@
 #   bash tests/run-check-adapter-rclone-integration.sh
 
 set -u -o pipefail
+# Search a shell variable WITHOUT a pipe. `printf … | grep -q` is a pipefail
+# landmine: grep -q exits at the FIRST match and closes the pipe, the writer takes
+# EPIPE with bytes still unwritten, and `set -o pipefail` above turns a SUCCESSFUL
+# match into a FAILED pipeline. A here-string is written out in full before grep is
+# exec'd, so no reader exists that could close it early. Canonical explanation and
+# the lint that forbids the old shape live in tests/run-checks-suite.sh.
+grep_var() { # grep_var <haystack> <grep-arg>… -> grep's own status and output
+  local hay="$1"; shift
+  grep "$@" <<<"$hay"
+}
+
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SCRIPT="$HERE/../conduck-connect.sh"
@@ -105,8 +116,11 @@ start_rclone() { # start_rclone <served> <cred> [extra rclone args…] -> RCLONE
   # only the bracketed form leaves the port empty on a distro rclone, and the case
   # then reports "rclone serve failed to start" about a server that started fine.
   while [ "$i" -lt 100 ]; do
-    RPORT=$(grep -hoE 'Server started on \[?http://127\.0\.0\.1:[0-9]+' "$TMP/rclone.err" 2>/dev/null \
-            | grep -oE '[0-9]+$' | head -n 1)
+    RPORT=$(grep -hoE -m1 'Server started on \[?http://127\.0\.0\.1:[0-9]+' "$TMP/rclone.err" 2>/dev/null)
+    # -o prints one line PER MATCH, so take the FIRST line and only then the port:
+    # ##*: on the whole value would silently pick the last match's port if a single
+    # log line ever carried two, and every later request would hit a dead port.
+    RPORT=${RPORT%%$'\n'*}; RPORT=${RPORT##*:}
     [ -n "$RPORT" ] && break
     kill -0 "$RCLONE_PID" 2>/dev/null || break
     i=$((i+1)); sleep 0.1
@@ -126,7 +140,7 @@ assert_adapter() {
   if [ "$got" != "$exp" ]; then fail_case "$label" "failed-ID set '{$got}', expected '{$exp}'"; return 1; fi
   local summary frag
   summary=$(tail -n 1 "$TMP/doctor.out")
-  if ! printf '%s\n' "$summary" | grep -Eq "$SUMMARY_RE"; then
+  if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
     fail_case "$label" "last line isn't a valid schema=3 summary: $summary"; return 1
   fi
   for frag in "$@"; do
@@ -161,7 +175,8 @@ run_rclone_case() { # run_rclone_case <label> <expexit> <expfails> <frags-space-
 }
 
 printf 'adapter --files rclone integration — real `rclone serve webdav`, OS-assigned ports, per-run credential\n'
-printf 'rclone: %s\n' "$(rclone version | head -n 1)"
+rclone_banner=$(rclone version 2>/dev/null)
+printf 'rclone: %s\n' "${rclone_banner%%$'\n'*}"
 
 # default dir-cache-time (5m): the freshness trap. A direct-disk write stays
 # 404 over WebDAV; the immediate agent-output probe sees the same → FILE_E2E.

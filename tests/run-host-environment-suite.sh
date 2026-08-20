@@ -35,6 +35,16 @@
 #   bash tests/run-host-environment-suite.sh
 
 set -u -o pipefail
+# Search a shell variable WITHOUT a pipe. `printf … | grep -q` is a pipefail
+# landmine: grep -q exits at the FIRST match and closes the pipe, the writer takes
+# EPIPE with bytes still unwritten, and `set -o pipefail` turns a SUCCESSFUL match
+# into a FAILED pipeline. Canonical explanation and the lint that forbids the old
+# shape live in tests/run-checks-suite.sh.
+grep_var() { # grep_var <haystack> <grep-arg>… -> grep's own status and output
+  local hay="$1"; shift
+  grep "$@" <<<"$hay"
+}
+
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT="$HERE/.."
@@ -979,9 +989,9 @@ test_setup_lock_wiring() {
   expect_has "setup lock wiring: the EXIT trap keeps the exposure backstop" \
     "$body" "trap 'setup_lock_release; on_exit' EXIT"
   # …and it has to be taken before anything picks a port or writes a unit.
-  first_acquire=$(printf '%s\n' "$body" | grep -n '^ *setup_lock_acquire$' | head -1 | cut -d: -f1)
-  first_exposure=$(printf '%s\n' "$body" | grep -n 'choose_exposure' | head -1 | cut -d: -f1)
-  first_lane=$(printf '%s\n' "$body" | grep -n 'setup_file_lane' | head -1 | cut -d: -f1)
+  first_acquire=$(grep_var "$body" -n -m1 '^ *setup_lock_acquire$' | cut -d: -f1)
+  first_exposure=$(grep_var "$body" -n -m1 'choose_exposure' | cut -d: -f1)
+  first_lane=$(grep_var "$body" -n -m1 'setup_file_lane' | cut -d: -f1)
   if [ -n "$first_acquire" ] && [ -n "$first_exposure" ] && [ -n "$first_lane" ] \
      && [ "$first_acquire" -lt "$first_exposure" ] && [ "$first_acquire" -lt "$first_lane" ]; then
     pass "setup lock wiring: the lock precedes exposure and the file lane"
@@ -1486,9 +1496,9 @@ test_show_code_state_dir_wiring() {
   local body pick check secret
   body=$(sed -n '/^run_show_qr()/,/^}/p' "$SQ")
   expect_has "--show-code wiring: the state dir mode is checked" "$body" "ensure_state_dir"
-  pick=$(printf '%s\n' "$body" | grep -n 'show_qr_pick_profile' | head -1 | cut -d: -f1)
-  check=$(printf '%s\n' "$body" | grep -n '^ *ensure_state_dir$' | head -1 | cut -d: -f1)
-  secret=$(printf '%s\n' "$body" | grep -n 'show_qr_recover_gateway_secret' | head -1 | cut -d: -f1)
+  pick=$(grep_var "$body" -n -m1 'show_qr_pick_profile' | cut -d: -f1)
+  check=$(grep_var "$body" -n -m1 '^ *ensure_state_dir$' | cut -d: -f1)
+  secret=$(grep_var "$body" -n -m1 'show_qr_recover_gateway_secret' | cut -d: -f1)
   # After the picker (a profile file proves the directory exists, so `mkdir -p` is a
   # provable no-op and a "changes nothing" command creates nothing) and before any
   # secret is recovered.
