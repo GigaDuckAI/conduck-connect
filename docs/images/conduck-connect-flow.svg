@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="500" viewBox="0 0 1440 500" role="img" aria-labelledby="title description">
+  <title id="title">How conduck-connect pairs an AI server with Conduck</title>
+  <desc id="description">Your AI server is reviewed, configured, and verified by conduck-connect. It then creates a setup code that is scanned into the Conduck app. The process runs on your server with no GigaDuck relay or telemetry.</desc>
+  <rect width="1440" height="500" rx="28" fill="#0d1117"/>
+  <rect x="1" y="1" width="1438" height="498" rx="27" fill="none" stroke="#30363d" stroke-width="2"/>
+
+  <text x="72" y="70" fill="#f0f6fc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="32" font-weight="700">From your server to Conduck</text>
+  <text x="72" y="105" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19">One reviewed path from the AI you run to the Apple devices you use.</text>
+
+  <g transform="translate(72 150)">
+    <rect width="278" height="190" rx="18" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+    <circle cx="42" cy="42" r="18" fill="#1f6feb"/>
+    <path d="M33 43h18M37 35l-8 8 8 8M47 35l8 8-8 8" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="28" y="88" fill="#58a6ff" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" font-weight="700" letter-spacing="1.6">YOUR SERVER</text>
+    <text x="28" y="122" fill="#f0f6fc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="24" font-weight="650">Your AI</text>
+    <text x="28" y="151" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">OpenClaw · Hermes</text>
+    <text x="28" y="175" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">OpenAI-compatible</text>
+  </g>
+
+  <path d="M370 245h54" stroke="#484f58" stroke-width="3" stroke-linecap="round"/>
+  <path d="M414 237l12 8-12 8" fill="none" stroke="#484f58" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g transform="translate(446 150)">
+    <rect width="332" height="190" rx="18" fill="#161b22" stroke="#d29922" stroke-width="2"/>
+    <circle cx="42" cy="42" r="18" fill="#d29922"/>
+    <path d="M33 42l6 6 13-15" fill="none" stroke="#0d1117" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="28" y="88" fill="#e3b341" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" font-weight="700" letter-spacing="1.6">ON YOUR SERVER</text>
+    <text x="28" y="122" fill="#f0f6fc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="24" font-weight="650">conduck-connect</text>
+    <text x="28" y="151" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">Review · configure · verify</text>
+    <text x="28" y="175" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">HTTPS · chat · optional files</text>
+  </g>
+
+  <path d="M798 245h54" stroke="#484f58" stroke-width="3" stroke-linecap="round"/>
+  <path d="M842 237l12 8-12 8" fill="none" stroke="#484f58" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g transform="translate(874 150)">
+    <rect width="222" height="190" rx="18" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+    <rect x="28" y="24" width="38" height="38" rx="6" fill="#238636"/>
+    <path d="M38 34h8v8h-8zM50 34h6v6h-6zM38 46h6v6h-6zM49 45h8v8h-8z" fill="#ffffff"/>
+    <text x="28" y="88" fill="#3fb950" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" font-weight="700" letter-spacing="1.6">PAIR</text>
+    <text x="28" y="122" fill="#f0f6fc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="24" font-weight="650">Setup code</text>
+    <text x="28" y="151" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">QR or paste string</text>
+    <text x="28" y="175" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">Treat it as a secret</text>
+  </g>
+
+  <path d="M1116 245h54" stroke="#484f58" stroke-width="3" stroke-linecap="round"/>
+  <path d="M1160 237l12 8-12 8" fill="none" stroke="#484f58" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g transform="translate(1192 150)">
+    <rect width="176" height="190" rx="18" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+    <circle cx="42" cy="42" r="18" fill="#8957e5"/>
+    <path d="M37 33h10a6 6 0 0 1 6 6v9a6 6 0 0 1-6 6H37a6 6 0 0 1-6-6v-9a6 6 0 0 1 6-6z" fill="none" stroke="#ffffff" stroke-width="3"/>
+    <text x="28" y="88" fill="#a371f7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="15" font-weight="700" letter-spacing="1.6">APPLE</text>
+    <text x="28" y="122" fill="#f0f6fc" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="24" font-weight="650">Conduck</text>
+    <text x="28" y="151" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">Scan once</text>
+    <text x="28" y="175" fill="#8b949e" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17">Talk anywhere</text>
+  </g>
+
+  <rect x="72" y="391" width="1296" height="62" rx="16" fill="#161b22" stroke="#30363d"/>
+  <circle cx="105" cy="422" r="8" fill="#3fb950"/>
+  <text x="126" y="429" fill="#c9d1d9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="600">Runs on your server</text>
+  <circle cx="470" cy="422" r="8" fill="#3fb950"/>
+  <text x="491" y="429" fill="#c9d1d9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="600">No GigaDuck relay</text>
+  <circle cx="817" cy="422" r="8" fill="#3fb950"/>
+  <text x="838" y="429" fill="#c9d1d9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="600">Zero telemetry</text>
+  <circle cx="1091" cy="422" r="8" fill="#3fb950"/>
+  <text x="1112" y="429" fill="#c9d1d9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="600">Config changes ask first</text>
+</svg>

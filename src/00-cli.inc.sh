@@ -145,7 +145,8 @@
 # your phone exactly where they are, and says so before it starts.
 #
 # Where the rest is written down
-#   README.md            install, the full command reference, troubleshooting
+#   README.md            overview, audit-first install, common commands
+#   MANUAL.md            full command reference, operation, troubleshooting
 #   SECURITY.md          threat model, what is stored where, how to report
 #   WHAT-IT-TOUCHES.md   every path read or written, with undo steps
 #   https://conduck.com  the app, and the adapter contract these checks grade

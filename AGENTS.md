@@ -2,8 +2,9 @@
 
 `conduck-connect` walks someone through pairing a self-hosted AI gateway with the
 [Conduck](https://conduck.com) app, and carries two standalone diagnostics that
-grade someone else's server against what the app needs. `README.md` is the user
-manual and the best description of what the tool actually does.
+grade someone else's server against what the app needs. `README.md` is the
+public overview and quick start; `MANUAL.md` is the exhaustive operator manual
+and the best description of what the tool actually does.
 
 **Never edit `conduck-connect.sh`.** The file at the repository root is a
 generated artifact. The maintainable source is the numbered modules under `src/`,

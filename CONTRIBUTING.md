@@ -149,9 +149,10 @@ the two must not drift independently. Open an issue before changing any of them:
   green.
 - Rebuild `conduck-connect.sh` after every source edit and keep
   `build-release.sh --check` green.
-- Update **README.md**, **SECURITY.md**, and **WHAT-IT-TOUCHES.md** whenever the
-  script's **privilege, network, or persistent-state** behavior changes — those
-  docs are the audit surface and must stay accurate.
+- Update **README.md**, **MANUAL.md**, **SECURITY.md**, and
+  **WHAT-IT-TOUCHES.md** whenever the script's **privilege, network, or
+  persistent-state** behavior changes — those docs are the audit surface and
+  must stay accurate.
 - Keep the docs in **present tense** — they describe the current design, not the
   history of changes.
 - Sign off every commit (see above).

@@ -12,7 +12,7 @@
 - [ ] Edited `src/`, not the generated `conduck-connect.sh` — then rebuilt with `bash scripts/build-release.sh` so `bash scripts/build-release.sh --check` passes. This is CI's first step: an unrebuilt artifact fails the build before any test runs.
 - [ ] `bash tests/run-checks-suite.sh` passes.
 - [ ] Tests added or updated where behavior changed.
-- [ ] README.md / SECURITY.md / WHAT-IT-TOUCHES.md updated if privilege, network, or persistent-state behavior changed.
+- [ ] README.md / MANUAL.md / SECURITY.md / WHAT-IT-TOUCHES.md updated if privilege, network, or persistent-state behavior changed.
 - [ ] No secrets in the diff or description — pairing codes, bearer tokens, gateway URLs, file-lane credentials.
 - [ ] No new runtime dependencies (beyond `bash`/`python3`/`curl`/`openssl`) without prior discussion.
 - [ ] Docs stay present-tense.
