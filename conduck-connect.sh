@@ -245,6 +245,197 @@ url_has_userinfo() { # url_has_userinfo <url> -> 0 when the authority carries us
 }
 URL_USERINFO_HINT="A key or password doesn't belong in the address. Drop the \"user:pass@\" part and give the plain URL — it is asked for separately, at a hidden prompt."
 
+# The ONE answer to "is this an address only the local network can reach?", shared
+# by every prompt in this script that may accept a plain-http endpoint. It exists
+# because the Conduck app applies exactly this rule to every address it stores, and
+# the two have to agree: a wizard that accepted MORE would mint a setup code that
+# imports and then fails on the phone, and one that accepted LESS would refuse an
+# address the app is perfectly happy with.
+#
+# It is not a security boundary and not this tool's opinion. Apple's App Transport
+# Security decides from the address STRING, before any connection is attempted: a
+# loopback or private IPv4 literal, an IPv6 ULA or link-local literal and a
+# `.local` name are all permitted over plain http; a dotted domain name is refused
+# even when it resolves onto the very same private network, and so is the
+# carrier-grade NAT range an overlay VPN hands out. This function predicts that
+# verdict, so the refusal lands here in words instead of arriving later inside the
+# app as an unexplained failure.
+#
+# WHERE A CASE WAS NEVER MEASURED AGAINST ATS, THE KERNEL DECIDES IT. This path
+# hands over a bearer token in CLEARTEXT, so an unmeasured shape is allowed only
+# when a wrong prediction cannot cost the secret — that is, when the kernel
+# confines the traffic whichever way the verdict went. Two ranges qualify and stay
+# local: `127.0.0.0/8` past `127.0.0.1` (the kernel routes the whole /8 to `lo0`,
+# so a packet cannot leave the machine) and `fe80::/10` (link-local by definition,
+# and its IPv4 twin `169.254/16` WAS measured permitted). Every other unmeasured
+# shape is one a resolver or a route could carry beyond the local network, and is
+# refused: `0.0.0.0/8`, its IPv6 twin `::`, deprecated site-local `fec0::/10`, and
+# every single-label name. The asymmetry is the whole rule — a wrong refusal costs
+# one message, a wrong allowance costs the token.
+#
+# Pure Bash for the same reason url_has_userinfo is — doctor_accept_url runs before
+# the runtime preflight, so this may not depend on python3, curl, or even `tr`
+# existing. That is why every letter comparison below is spelled in both cases
+# rather than lowercased first.
+#
+# WHERE IT DELIBERATELY REFUSES MORE THAN THE APP DOES. The app classifies with
+# inet_aton, the platform's own legacy grammar and the one the resolver itself
+# falls back to, which reads `2130706433`, `0x7f.0.0.1`, `0177.0.0.1` and `127.1`
+# as addresses — and reads `010.1.1.1` as 8.1.1.1, a PUBLIC host. Bash cannot
+# reproduce that grammar, and guessing at it has an asymmetric cost: refusing an
+# address the app would have taken costs one retype, while accepting one the app
+# refuses mints a code that fails on somebody's phone with nothing here to explain
+# it. So a numeric host that is not a canonical four-part dotted quad is refused,
+# which is also what keeps `0xc0a80101` and `134744072` out — they are addresses
+# to the resolver, and one of them is 8.8.8.8.
+#
+# The same asymmetry covers IPv6, where it now costs only the IPv4-mapped
+# (`::ffff:192.168.1.1`) and IPv4-compatible (`::192.168.1.1`) forms: the app
+# unwraps those onto the IPv4 table and this function refuses them, because
+# reproducing that unwrap in shell buys nothing an operator can plausibly type at
+# this prompt. Site-local `fec0::/10` is refused on BOTH sides and is no longer a
+# divergence. Direction is safe throughout: across the whole table there is no
+# host this function accepts and the app refuses, only hosts it refuses and the
+# app would have taken.
+url_is_local_host() { # url_is_local_host <host[:port]> -> 0 when only the local network reaches it
+  local h="$1" hx o o1 o2 rest
+  # Junk first. curl and Foundation both end an authority at the first / ? or #,
+  # and an `@` inside one is userinfo — http://192.168.1.1@evil.example is a REMOTE
+  # host wearing a private address as a username, which is the exact trap this
+  # function exists not to fall into. None of these may be read as part of a host.
+  case "$h" in
+    ''|*@*|*/*|*'?'*|*'#'*|*[[:space:]]*) return 1 ;;
+  esac
+  case "$h" in
+    \[*)
+      # A bracketed IPv6 literal, with or without a :port.
+      case "$h" in
+        \[*\]|\[*\]:*) ;;
+        *) return 1 ;;                      # a bracket opened and never closed
+      esac
+      h="${h#\[}"; h="${h%%\]*}"
+      # A zone id names an interface, not a different address, and it has to come
+      # off BEFORE the literal is read: a parser handed `fe80::1%en0` whole reads a
+      # DIFFERENT address from the one `fe80::1` names.
+      case "$h" in *%*) h="${h%%\%*}" ;; esac
+      [ -n "$h" ] || return 1
+      case "$h" in *[!0123456789ABCDEFabcdef:]*) return 1 ;; esac
+      case "$h" in
+        ::1) return 0 ;;                    # loopback
+        # Unspecified `::`, the IPv6 twin of 0.0.0.0. Never measured against ATS,
+        # not confined to this machine the way loopback is, and nobody types it
+        # for a real server. Refused, per the unmeasured rule in the header.
+        ::)  return 1 ;;
+      esac
+      # ULA fc00::/7 and link-local fe80::/10, matched on the FULL first hextet and
+      # never on a text prefix: `fc0::1` is 0x0fc0 and `fe8::1` is 0x0fe8 — neither
+      # is in either range, yet both open with the letters a prefix test looks for.
+      hx="${h%%:*}"
+      case "$hx" in
+        [Ff][CcDd][0123456789ABCDEFabcdef][0123456789ABCDEFabcdef]) return 0 ;;
+        [Ff][Ee][89ABab][0123456789ABCDEFabcdef]) return 0 ;;
+        # Deprecated site-local fec0::/10 (fec0–feff), its own arm rather than the
+        # default so the refusal reads as deliberate: unmeasured against ATS,
+        # deprecated since RFC 3879, and — unlike link-local — routable beyond the
+        # link, so a wrong guess here could put the token on somebody else's wire.
+        [Ff][Ee][CcDdEeFf][0123456789ABCDEFabcdef]) return 1 ;;
+      esac
+      return 1 ;;                           # global unicast, NAT64, IPv4-mapped forms
+  esac
+  case "$h" in
+    *:*:*) return 1 ;;                      # an unbracketed IPv6 literal is not a legal authority
+    *:*)   h="${h%%:*}" ;;                  # host:port
+  esac
+  [ -n "$h" ] || return 1
+  # `myhost.local.` is the explicit-FQDN spelling of `myhost.local`, resolves
+  # identically, and fails a `.local` suffix test unless the dot comes off. Exactly
+  # one dot comes off: stripping a run of them is the classic suffix-bypass shape.
+  # The strip cannot flip a verdict: a single label is refused rooted or not, and
+  # `localhost`, `local` and `*.local` mean the same thing rooted.
+  case "$h" in *.) h="${h%.}" ;; esac
+  [ -n "$h" ] || return 1
+  case "$h" in
+    *[!0123456789.]*) ;;                    # holds a letter or a hyphen — a name, below
+    *)
+      # Digits and dots only: it is an address in canonical form, or it is nothing.
+      case "$h" in *.*.*.*.*) return 1 ;; esac        # five labels or more
+      case "$h" in *.*.*.*) ;; *) return 1 ;; esac    # fewer than four
+      o1="${h%%.*}"; rest="${h#*.}"
+      o2="${rest%%.*}"; rest="${rest#*.}"
+      for o in "$o1" "$o2" "${rest%%.*}" "${rest#*.}"; do
+        case "$o" in
+          ''|*[!0123456789]*) return 1 ;;
+          0) ;;                             # a lone zero is canonical
+          0*) return 1 ;;                   # a leading zero is OCTAL to inet_aton
+        esac
+        [ "${#o}" -le 3 ] || return 1
+        [ "$o" -le 255 ] || return 1
+      done
+      case "$o1" in
+        # "This network" 0.0.0.0/8. `http://0/` reaches THIS host on Darwin, which
+        # is exactly why it is a classic SSRF bypass string — and it is unmeasured
+        # against ATS, NOT kernel-confined the way 127/8 is, and nobody types it
+        # for a real server (a loopback user has `localhost` and `127.0.0.1`).
+        # Refused, per the header. The short inet_aton spellings of the same thing
+        # (`0`, `0.1`) never reach this arm: the canonical-quad test above already
+        # refuses everything that is not four dotted octets.
+        0)   return 1 ;;
+        10)  return 0 ;;
+        127) return 0 ;;
+        169) if [ "$o2" = "254" ]; then return 0; fi; return 1 ;;
+        172) if [ "$o2" -ge 16 ] && [ "$o2" -le 31 ]; then return 0; fi; return 1 ;;
+        192) if [ "$o2" = "168" ]; then return 0; fi; return 1 ;;
+        100)
+          # Carrier-grade NAT, 100.64.0.0/10 — the range an overlay VPN such as
+          # Tailscale hands out. Its own arm rather than the default, because this
+          # is the surprising exclusion and a reader has to be able to see it was
+          # deliberate: measured on iOS, a plain-http request to a 100.64/10 address
+          # is refused before it is attempted, exactly like a public one. A tailnet
+          # address wants the https certificate Tailscale Serve issues for it
+          # anyway, which is what option 1 of the exposure menu sets up.
+          return 1 ;;
+      esac
+      return 1 ;;
+  esac
+  case "$h" in
+    [Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]) return 0 ;;
+    [Ll][Oo][Cc][Aa][Ll]) return 0 ;;
+    *.[Ll][Oo][Cc][Aa][Ll]) return 0 ;;     # mDNS/Bonjour
+  esac
+  # EVERY OTHER NAME IS REFUSED — two families, one verdict, refused for different
+  # reasons.
+  #
+  # A DOTTED NAME, however private the machine behind it: the platform decides from
+  # the string, so a split-horizon name pointing straight at a LAN box collects the
+  # same refusal as a public one.
+  #
+  # A SINGLE LABEL, rooted or not — `nas`, `ollama`, `uz`, `uz.`. The hopeful
+  # reading is that a dotless name can only resolve through mDNS or this device's
+  # own search domain, both of them the local link. It is wrong: real one-label
+  # TLDs answer at the public DNS root with apex A records (`dig +short A uz.` ->
+  # 91.212.89.8, measured), so a resolver that falls through its search domains to
+  # the root would carry the bearer token in cleartext to a public host. Nothing
+  # that worked is lost — an unresolvable label dead-ends at "host not found"
+  # either way — and the refusal copy names the two spellings of the same machine
+  # that DO work: its IP literal, or its `.local` name. The app draws exactly this
+  # line, and the two have to agree.
+  return 1
+}
+# The refusal and the caveat, in one place each, because both are said at more than
+# one prompt and two spellings of one fact are two chances to drift. The refusal
+# names the spellings that DO work rather than the rule it is applying — and it
+# names BOTH of them, because `.local` is the one that rescues the operator whose
+# single-label `nas` was just turned down. The caveat names what is actually at
+# risk and what the lane cannot do, and gives no instruction, because by then the
+# operator has chosen and being lectured is not information.
+#
+# The app says the same two things in its own words. It attributes the rule to
+# "Apple" rather than to iOS because the same string renders on a Mac, and this
+# script says "Apple" for the same reason. Where the app says "this network" it is
+# running on the phone; this script runs on the server, so it says "that network".
+URL_PLAIN_HTTP_HINT="Apple allows plain http:// only to an address on your own network. Use the server's IP address or its name ending in .local, or https:// for anywhere else."
+URL_PLAIN_HTTP_WARNING="Not encrypted — anyone on that network can read your messages and your key. Works only on that network — not in the car or out with the Watch."
+
 OS="$(uname -s)"   # Linux | Darwin
 # ${HOME:-} so a check run in a HOME-less environment (a bare CI shell) doesn't
 # abort here under `set -u` on a path it never uses; the wizard would fail later
@@ -874,7 +1065,7 @@ validate_cli() {
         # The userinfo case gets its own message, and deliberately does NOT echo
         # the URL back: the rejected value contains the password.
         url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
-        usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+        usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
       fi
       cli_accept_only positional
       REUSE_ONLY=true
@@ -885,7 +1076,7 @@ validate_cli() {
         # The userinfo case gets its own message, and deliberately does NOT echo
         # the URL back: the rejected value contains the password.
         url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
-        usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+        usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
       fi
       cli_accept_only positional deep files
       REUSE_ONLY=true
@@ -1387,13 +1578,20 @@ require_choice() {  # require_choice "prompt" "regex" [action-id | help-fn] [all
 
 NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask you questions."
 
-# A URL prompt that NEVER aborts on a typo — loops until it gets an https:// URL
-# (or blank, when allow_blank=1, where leaving it out is a valid choice). Trims
-# whitespace, accepts a capitalised scheme, always shows an example. All human
-# output goes to stderr so $(...) captures only the URL.
+# A URL prompt that NEVER aborts on a typo — loops until it gets an address this
+# tool will pair (or blank, when allow_blank=1, where leaving it out is a valid
+# choice). Trims whitespace, accepts a capitalised scheme, always shows an example.
+# All human output goes to stderr so $(...) captures only the URL.
+#
+# What it accepts is the app's own admissibility rule, applied here so the wizard
+# cannot mint a setup code the app then refuses: any https:// address, or a plain
+# http:// one whose host only the local network can reach (url_is_local_host). The
+# advertised shape stays https — the prompt, the example and the footer all name it,
+# and plain http is taken when it is TYPED and never suggested, defaulted to, or
+# supplied by prepending a scheme to a schemeless answer.
 #
 # The controls are checked BEFORE any trimming or validation, and with no
-# "did you mean it literally?" question: nothing that fails the https:// test can
+# "did you mean it literally?" question: nothing that fails that test can
 # be a legal answer here, so `i`, `b` and `q` are unambiguous. Without them the
 # loop has no exit at all, and that matters more here than anywhere else — both
 # mandatory call sites sit immediately after a commitment the user may have made
@@ -1402,7 +1600,7 @@ NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask 
 ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] [action-id] [allow-back] -> URL or ""
   local prompt="$1" example="$2" allow_blank="${3:-0}"
   local blank_meaning="${4:-skip}" action="${5:-}" allow_back="${6:-false}"
-  local reply enter p
+  local reply enter p hostport
   say "  $prompt" >&2
   if [ "$allow_blank" = "1" ]; then enter="$blank_meaning"; else enter="ask again"; fi
   p="  https URL (e.g. $example; $(control_suffix "$enter" "$allow_back")) > "
@@ -1423,14 +1621,32 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] [action-
       [ "$allow_blank" = "1" ] && return 0
       warn "Please enter an https:// URL, for example $example." >&2; continue
     fi
-    case "$reply" in [Hh][Tt][Tt][Pp][Ss]://*) reply="https://${reply#*://}" ;; esac
+    case "$reply" in
+      [Hh][Tt][Tt][Pp][Ss]://*) reply="https://${reply#*://}" ;;
+      [Hh][Tt][Tt][Pp]://*)     reply="http://${reply#*://}" ;;
+    esac
+    # Userinfo is refused on BOTH schemes, and BEFORE the scheme is graded, because
+    # http://192.168.1.10@evil.example is a remote host wearing a private address as
+    # a username — the private-looking half is the bait, so the credential has to be
+    # named first or the local arm below would answer about the wrong host.
     if url_has_userinfo "$reply"; then
       warn "$URL_USERINFO_HINT" >&2; continue
     fi
     case "$reply" in
       https://?*) printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2; printf '%s' "$reply"; return 0 ;;
-      http://*)   warn "That's http:// — Conduck requires https:// (encrypted). Try again." >&2 ;;
+      http://?*)
+        # The authority ends at the first / ? or #, the same cut url_has_userinfo
+        # makes, so a path or a query cannot smuggle a host past the classifier.
+        hostport="${reply#http://}"; hostport="${hostport%%[/?#]*}"
+        if url_is_local_host "$hostport"; then
+          warn "$URL_PLAIN_HTTP_WARNING" >&2
+          printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2; printf '%s' "$reply"; return 0
+        fi
+        warn "$URL_PLAIN_HTTP_HINT" >&2 ;;
       *)          if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
+                  # A schemeless answer keeps its https refusal and is never given a
+                  # scheme here. Prepending http:// to a bare host is how plain http
+                  # becomes the default nobody chose.
                   warn "That has to start with https:// — for example $example. Try again." >&2 ;;
     esac
   done
@@ -2153,25 +2369,25 @@ explain_action() { # explain_action <action-id>
 
     gateway.custom.has_https)
       explain_panel \
-        "Say whether your server already answers on an address starting with https://" \
-        "The Conduck app talks only to encrypted addresses — that is what the s on the end of https means — and the encryption certificate has to be one your phone already trusts on its own. A server started at home normally answers only on the machine it runs on, which is not that." \
+        "Say whether your server already answers on a web address" \
+        "The Conduck app talks to encrypted https:// addresses, whose certificate has to be one your phone already trusts on its own — and to a plain http:// address only when that address is one nothing outside your own network can reach, such as 192.168.1.10 or a name ending .local. Apple's own rule, not ours: a plain address anywhere else is refused by the phone before the app sees it. A server started at home often answers only on the machine it runs on, which is neither." \
         "Yes asks you for that address next. No asks instead for the port number your server listens on locally, and then helps you put an encrypted address in front of it — Tailscale and Cloudflare both do that part for free." \
         "" \
         "Either answer by itself changes nothing about your server." \
-        "Answer No, which is what Enter does. Unless you deliberately set up a domain name and a certificate for this server, or somebody handed you an https:// address for it, you do not have one — and No is the path that builds you one."
+        "Answer Yes only if you can name the address — an https:// one you set up, or the local address a server like Ollama already answers on. Otherwise answer No, which is what Enter does, and setup builds you an encrypted address for free."
       ;;
 
-    # For the https:// address prompt itself (20-gateway.inc.sh, the ask_url that
-    # follows a Yes at gateway.custom.has_https). Its whole difficulty is that
-    # people paste the address of a chat page, or an address with /v1 on the end.
+    # For the address prompt itself (20-gateway.inc.sh, the ask_url that follows a
+    # Yes at gateway.custom.has_https). Its whole difficulty is that people paste
+    # the address of a chat page, or an address with /v1 on the end.
     gateway.custom.address)
       explain_panel \
-        "Type the https:// address that already reaches this server from outside" \
-        "This is the address the app itself will call, from a phone that may be nowhere near this machine, so it has to work from the open internet or from your VPN — not just from this desk." \
+        "Type the address this server already answers on" \
+        "This is the address the app itself will call. An https:// one works from anywhere the phone is. A plain http:// one is accepted only toward your own network — an IP address like 192.168.1.10, or a name ending .local; a bare name such as ollama is refused, and so is any ordinary domain name. What that lane costs you is two things. Nothing on it is encrypted, so anyone on that network can read your messages and your key. And it only works while the device is on that network — not in the car, and not out with the Watch." \
         "Give the BASE address only, with no /v1 and no other path on the end: this script and the app add the rest themselves (a pasted /v1 tail is trimmed off for you). A trailing slash is trimmed too." \
         "" \
         "Nothing about your server or your proxy is reconfigured; the address is checked and then used." \
-        "If you cannot name an https:// address you set up on purpose, you probably do not have one. Press b if it is offered, or stop with q and start again answering No at the previous question — setup will build you an encrypted address for free."
+        "If you cannot name an address you set up on purpose, and your server is not answering on a local address you know, press b if it is offered, or stop with q and start again answering No at the previous question — setup will build you an encrypted address for free."
       ;;
 
     # For the "A short name for it (shown in the app)" prompts. The answer is a
@@ -2625,7 +2841,7 @@ explain_action() { # explain_action <action-id>
     # exists to prevent.
     file.address.url)
       explain_panel \
-        "Type the https:// address that reaches the file server" \
+        "Type the address that reaches the file server" \
         "File transfer runs as its own small server on its own door, so it needs its own address. The gateway's address will not reach it, and pasting the gateway's address here produces a setup code that fails on the first attachment." \
         "Records the address, checks that the file server actually answers on it, and puts it in the setup code alongside the gateway's. Give the base address with no path on the end." \
         "Pressing Enter with nothing typed goes on to a question about leaving file transfer out of this setup code entirely." \
@@ -3554,10 +3770,16 @@ hermes_settings_match_url() { # hermes_settings_match_url <checked-url> -> 0 whe
   local url="$1" envf="${HOME:-}/.hermes/.env"
   local rest hostport host port declared_host declared_port key
 
-  # https means the app is pairing an address off this box (doctor_accept_url only
-  # ever admits plain http toward 127.*/localhost/[::1]), and a tailnet or proxy
+  # https means the app is pairing an address off this box, and a tailnet or proxy
   # hostname in front of this same Hermes is exactly the case that must not be
   # claimed: from here it is indistinguishable from someone else's gateway.
+  #
+  # Plain http is no longer proof of "this box" on its own — doctor_accept_url now
+  # admits any address the local network reaches, and 192.168.1.20:8642 may be a
+  # Hermes on a DIFFERENT machine whose settings this one cannot read. The claim
+  # this function makes is an attribution to THIS host's ~/.hermes/.env, so it keeps
+  # the loopback bar it always had and refuses everything else, rather than
+  # inheriting a widened one it was never reasoning about.
   case "$url" in
     [Hh][Tt][Tt][Pp]://?*) rest="${url#*://}" ;;
     *) return 1 ;;
@@ -3573,6 +3795,15 @@ hermes_settings_match_url() { # hermes_settings_match_url <checked-url> -> 0 whe
   esac
   [ -n "$port" ] || port="80"
   host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  # The loopback bar, kept explicitly here rather than borrowed from the URL
+  # acceptor above — see this function's header. The whole 127/8 and not just
+  # 127.0.0.1, because a wildcard bind genuinely does answer on every one of them
+  # and the declaration arms below are what decide which of those counts.
+  case "$host" in
+    localhost|'::1') ;;
+    127.*) case "$host" in *[!0123456789.]*) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
 
   [ -f "$envf" ] && [ -r "$envf" ] || return 1
   [ "$(env_get "$envf" "API_SERVER_ENABLED")" = "true" ] || return 1
@@ -4224,30 +4455,36 @@ configure_generic() {
       fi
     fi
 
-    # The address group — the https:// gate and whichever question it leads to —
+    # The address group — the address gate and whichever question it leads to —
     # in its own loop. Back at either of those questions returns to the gate
     # that sent the operator there, not to the top: a wrong `y` here is the most
     # likely wrong answer in Step 2, and until now it stranded the run at a URL
     # prompt with no exit at all. Back at the gate itself restarts the group,
     # which is where the name lives.
+    #
+    # The gate asks about an ADDRESS rather than about https specifically, because
+    # a server already answering on the local network — Ollama on its own port is
+    # the common one — has an address this tool will pair, and a question naming
+    # only https sends that operator down the build-me-a-tunnel path they do not
+    # need. What ask_url accepts is still the app's rule and nothing looser.
     local addr_rc
     while true; do
       GW_URL=""; GW_LOCAL_PORT=""
-      confirm "  Does it already have an https:// URL?" "gateway.custom.has_https" true
+      confirm "  Does it already answer on a web address?" "gateway.custom.has_https" true
       addr_rc=$?
       case "$addr_rc" in
         10) break ;;                      # back at the gate → restart the group
-        0)  prompt_into GW_URL ask_url "Its full https:// web address" "https://ai.example.com" \
+        0)  prompt_into GW_URL ask_url "Its full web address — https://, or http:// on your own network" "https://ai.example.com" \
               0 "" "gateway.custom.address" true && { apply_gateway_url_normalization; break; }
-            say ""; note "↩ Back to the https:// question."
+            say ""; note "↩ Back to the address question."
             continue ;;
         *)  ask_custom_gateway_port; addr_rc=$?
             [ "$addr_rc" = "0" ] && break
             if [ "$addr_rc" = "10" ]; then
-              say ""; note "↩ Back to the https:// question."
+              say ""; note "↩ Back to the address question."
               continue
             fi
-            die "Need the local port (or an https URL)." ;;
+            die "Need the local port (or a web address)." ;;
       esac
     done
     if [ "$addr_rc" = "10" ]; then
@@ -5168,12 +5405,15 @@ explain_exposure_paths() {
   say "                        the onward leg to this machine rides their encrypted tunnel."
   say "     Apple Watch:       works on its own, anywhere."
   say ""
-  say "  4) Your own HTTPS — reach is whatever you built"
-  say "     For a gateway that already has an https:// address — a reverse proxy or a"
-  say "     rented server (VPS). Its certificate has to be one your phone already"
-  say "     trusts by itself; a certificate you signed yourself does not qualify, and"
-  say "     there is no way for the app to make an exception (I explain the free ways"
-  say "     to get a real one if yours doesn't pass)."
+  say "  4) An address you already have — reach is whatever you built"
+  say "     For a gateway that already answers on one: an https:// address in front of a"
+  say "     reverse proxy or a rented server (VPS), or a plain http:// address on your own"
+  say "     network, which a server such as Ollama has by default. An https:// certificate"
+  say "     has to be one your phone already trusts by itself; a certificate you signed"
+  say "     yourself does not qualify, and there is no way for the app to make an exception"
+  say "     (I explain the free ways to get a real one if yours doesn't pass). A plain"
+  say "     http:// address encrypts nothing and is reachable only from that same network,"
+  say "     an Apple Watch away from your iPhone included."
   say "     A cloudflared quick tunnel is this one, not 3: the *.trycloudflare.com"
   say "     address 'cloudflared tunnel --url' prints comes with a certificate your"
   say "     devices already trust, and it needs no domain of your own."
@@ -5266,9 +5506,11 @@ explain_own_https_target() {
 
 choose_exposure() {
   # Generic with a ready URL skips the transport menu — but still puts the
-  # certificate through the same trust gate as menu option 4.
+  # certificate through the same trust gate as menu option 4. This is the route a
+  # gateway already serving on the local network takes: the address was typed at
+  # Step 2, and classify_own_https decides what can honestly be said about it.
   if [ -n "$GW_URL" ] && [ -z "$GW_LOCAL_PORT" ]; then
-    head_ "Step 3 — HTTPS reachability"
+    head_ "Step 3 — reachability"
     ok "Using your existing URL: $GW_URL"
     scope_choice
     keyless_public_guard
@@ -5325,8 +5567,8 @@ choose_exposure() {
     # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
     # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
     # would hide it whenever the tunnel runs from another terminal, host, or PATH.
-    say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
-    say "     You give the https:// address; its certificate has to be one your devices already trust."
+    say "  4) ${BOLD}I already have an address for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
+    say "     https:// with a certificate your devices already trust, or http:// on your own network."
     say ""
     if $SETUP_FROM_CHECK; then
       # "back out of", not "stop": on this route `b` returns to the offer that
@@ -5453,10 +5695,10 @@ choose_exposure() {
         # applies too) or the run stops.
         explain_own_https_target
         # Back returns to the menu. Without it this prompt is a loop whose only
-        # exit is a valid https:// URL or Ctrl-C — and it sits directly under a
-        # commitment ("I already run my own HTTPS") the user may have made wrongly,
-        # which is exactly when un-committing has to be possible.
-        prompt_into GW_URL ask_url "The https:// web address that reaches your gateway" \
+        # exit is an admissible URL or Ctrl-C — and it sits directly under a
+        # commitment ("I already have an address for it") the user may have made
+        # wrongly, which is exactly when un-committing has to be possible.
+        prompt_into GW_URL ask_url "The web address that reaches your gateway — https://, or http:// on your own network" \
           "https://ai.example.com" 0 "" "exposure.own_https" true || continue
         apply_gateway_url_normalization
         scope_choice
@@ -5628,14 +5870,35 @@ warn_quick_tunnel_url() {
   say ""
 }
 
-# The "I run my own HTTPS" gate. The certificate must be one THIS machine already
-# trusts, because that is the same bar the app applies on the phone: Apple's App
-# Transport Security refuses an untrusted chain before the app is consulted, and a
-# fingerprint pin cannot override it — a pin only NARROWS trust the device already
-# has, it never grants it. So there is no accept-anyway arm to offer; an untrusted
-# certificate ends the run, with the reason named and the free remedies listed.
+# The gate on an address the operator supplied. Where that address is ENCRYPTED,
+# its certificate must be one THIS machine already trusts, because that is the same
+# bar the app applies on the phone: Apple's App Transport Security refuses an
+# untrusted chain before the app is consulted, and a fingerprint pin cannot override
+# it — a pin only NARROWS trust the device already has, it never grants it. So there
+# is no accept-anyway arm to offer; an untrusted certificate ends the run, with the
+# reason named and the free remedies listed. An unencrypted address is a different
+# question entirely and is answered in the first arm below.
 classify_own_https() {  # GW_URL + SCOPE already set
   warn_quick_tunnel_url   # before the certificate gate: it is true whatever the cert says
+  # A plain-http address is the one route into pairing that does not pass through
+  # the certificate gate below, and that is not a loosening of it: there is no
+  # chain, no handshake and no fingerprint to evaluate, so "its certificate is
+  # trusted normally" would be the only dishonest thing this function could say
+  # about it. Nothing arbitrary reaches here — the prompt that accepted the address
+  # already refused every plain-http host the app will not store, so what is left is
+  # an address only the local network reaches, and the operator typed it themselves.
+  case "$GW_URL" in
+    [Hh][Tt][Tt][Pp]://*)
+      # "public" here means what it means for an https address given at option 4:
+      # an address the operator supplied, rather than a route this script opened.
+      TRANSPORT="public"
+      say ""
+      warn "$URL_PLAIN_HTTP_WARNING"
+      note "There is no certificate on an unencrypted address, so the trust check does not run —"
+      note "nothing about it was relaxed. Anything reachable from outside your own network still"
+      note "needs https://, and the app refuses a plain http:// address that is not a local one."
+      return 0 ;;
+  esac
   if $DRY_RUN; then
     TRANSPORT="public"   # provisional routing; a real run runs the trust gate
     plan_add "CHECK the certificate at $GW_URL — setup continues only if this machine trusts it"
@@ -8569,7 +8832,7 @@ setup_file_lane() {
       note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
       note "Its certificate must be trusted the same way the gateway's is; the app applies one rule to both."
       local h
-      ask_fs_url "The https:// web address that reaches it (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+      ask_fs_url "The web address that reaches it (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
       h="$ASK_FS_URL_RESULT"
       if [ -n "$h" ]; then
         FS_URL="$h"
@@ -12626,44 +12889,41 @@ ct_is_json() {
   [ "$ct" = "application/json" ]
 }
 
-# Accept an https URL anywhere, or plain http toward THIS machine only
-# (127.*/localhost/[::1]) — testing on the adapter's own host before HTTPS
-# exposure is exactly the right order, and refusing loopback http would force
-# people to expose first and test second. Echoes the normalized URL (trimmed,
-# trailing slashes stripped, scheme lowercased); rc 1 when unacceptable.
+# Accept an https URL anywhere, or plain http toward an address only the local
+# network reaches — the same boundary Apple enforces and the app applies, so the
+# wizard cannot accept an address the app will refuse. Testing on the adapter's own
+# host, or on the box across the room, before HTTPS exposure is exactly the right
+# order, and refusing local http would force people to expose first and test
+# second. Echoes the normalized URL (trimmed, trailing slashes stripped, scheme
+# lowercased); rc 1 when unacceptable.
 doctor_accept_url() { # doctor_accept_url <candidate>
-  local reply="$1" rest hostport host
+  local reply="$1" rest hostport
   reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
   while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done
   [ -n "$reply" ] || return 1
   # Pure Bash on purpose: validate_cli calls this before runtime preflight, so
   # a missing python3/curl (or any other executable) can never turn a runtime
   # dependency failure into exit-2 command misuse.
-  # Userinfo is refused on BOTH schemes. The loopback arm below has to (see its
-  # comment: http://127.0.0.1@evil.com is a REMOTE host); https needs it for the
+  # Userinfo is refused on BOTH schemes, and BEFORE the scheme is graded. The local
+  # arm below needs that ordering (see its comment: http://192.168.1.1@evil.com is a
+  # REMOTE host, and the private-looking half is the bait); https needs it for the
   # reason --show-code's profile validator already rejects it — this URL is
   # echoed to the terminal, saved to the profile, and paired into the app, and a
   # credential must never ride a routing field.
   url_has_userinfo "$reply" && return 1
   case "$reply" in
     [Hh][Tt][Tt][Pp][Ss]://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
-    [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-loopback
+    [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-local
     *) return 1 ;;
   esac
-  # A prefix glob is NOT enough to prove loopback: "http://127.0.0.1@evil.com"
+  # A prefix glob is NOT enough to prove the destination: "http://192.168.1.1@evil.com"
   # (curl reads the part before @ as a username and connects to evil.com) and
-  # "http://127.0.0.1.evil.com" (attacker's wildcard DNS) both start with
-  # "http://127." — and would carry the REAL bearer token in cleartext to a
-  # remote host. Parse out the authority and validate it strictly.
-  hostport="${rest%%/*}"
-  case "$hostport" in *@*|*' '*) return 1 ;; esac    # userinfo/junk → refuse
-  case "$hostport" in
-    '[::1]'|'[::1]:'*) ;;                            # IPv6 loopback (+ optional port)
-    [Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]:*) ;;
-    127.*) host="${hostport%%:*}"
-           case "$host" in *[!0-9.]*) return 1 ;; esac ;;  # 127.x must be a pure dotted quad
-    *) return 1 ;;
-  esac
+  # "http://192.168.1.1.evil.com" (attacker's wildcard DNS) both start with
+  # "http://192.168." — and would carry the REAL bearer token in cleartext to a
+  # remote host. Parse out the authority and hand it to the one classifier, which
+  # refuses both shapes and every other name that only looks private.
+  hostport="${rest%%[/?#]*}"
+  url_is_local_host "$hostport" || return 1
   printf 'http://%s' "$rest"; return 0
 }
 
@@ -12688,8 +12948,8 @@ doctor_accept_url() { # doctor_accept_url <candidate>
 doctor_ask_url() {  # doctor_ask_url [action-id | help-fn] -> URL on stdout (every human line to stderr)
   local action="${1:-}" reply url p
   say "  Where is the server? Its base address, without any /v1 tail (I strip that myself)." >&2
-  say "  Plain http:// is fine toward this machine (127.0.0.1/localhost) — test locally first," >&2
-  say "  expose over HTTPS after." >&2
+  say "  Plain http:// is fine toward an address on your own network (an IP like 192.168.1.10," >&2
+  say "  or a .local name) — test locally first, expose over HTTPS after." >&2
   p="  URL (e.g. http://127.0.0.1:8080; $(control_suffix "ask again" false)) > "
   while true; do
     prompt_echo "$p"
@@ -12711,9 +12971,9 @@ doctor_ask_url() {  # doctor_ask_url [action-id | help-fn] -> URL on stdout (eve
       warn "$URL_USERINFO_HINT" >&2; continue
     fi
     case "$reply" in
-      [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." >&2 ;;
+      [Hh][Tt][Tt][Pp]://*) warn "$URL_PLAIN_HTTP_HINT" >&2 ;;
       *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
-         warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." >&2 ;;
+         warn "That has to start with https:// — or http://<address on your own network>:<port> for a local test." >&2 ;;
     esac
   done
 }
@@ -14025,7 +14285,7 @@ doctor_files_resolve() {
         d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" password in the address — give the plain URL"
         d_say FILES_CONFIG "(the file-lane password goes in CONDUCK_FILES_PASS, the user in CONDUCK_FILES_USER)"
       else
-        d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward an address on your own network"
       fi
       return 1
     fi
@@ -15034,7 +15294,7 @@ run_doctor() {
   # Target: the positional URL if one was given, else ask.
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
-      || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+      || usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
   else
     say ""
     # explain_check_adapter is the prompt's `i` copy, passed by FUNCTION NAME
@@ -15470,7 +15730,8 @@ compat_on_exit() {
 # again. rc 0 = $GW_URL now holds a new address to grade; rc 1 = nothing left to
 # try (not a terminal, an empty answer, or the input ended), and the caller owns
 # the exit. Same acceptance rule as the first prompt — https anywhere, plain http
-# only toward this machine — so the retry can't relax what the first ask enforced.
+# only toward an address on your own network — so the retry can't relax what the
+# first ask enforced.
 compat_reask_url() {
   local reply url p
   interactive_terminal || return 1
@@ -15501,9 +15762,9 @@ compat_reask_url() {
       warn "$URL_USERINFO_HINT"; continue
     fi
     case "$reply" in
-      [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." ;;
+      [Hh][Tt][Tt][Pp]://*) warn "$URL_PLAIN_HTTP_HINT" ;;
       *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
-         warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." ;;
+         warn "That has to start with https:// — or http://<address on your own network>:<port> for a local test." ;;
     esac
   done
 }
@@ -15627,7 +15888,7 @@ run_compat() {
 
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
-      || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+      || usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
   else
     say ""
     # explain_check_server is passed as the prompt's `i` copy, not an action id:
@@ -16292,6 +16553,35 @@ emit_payload() {
   if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
     warn "It also carries the FILE-SERVER PASSWORD for your shared folder, so whoever holds"
     warn "this code can read and change the files in it."
+  fi
+  # An unencrypted address in this code is a fact about how the KEY travels, not
+  # only about the messages: the app sends the bearer token on every request, so on
+  # a plain-http lane anyone else on that network reads it and can then use the
+  # gateway as the operator. Said HERE and not only at the prompt that accepted the
+  # address, because this is the screen somebody is looking at when they decide to
+  # scan it, and that prompt has long scrolled away — the same argument the quick
+  # tunnel reminder below makes. --show-code re-emission lands here too.
+  # Matched on the scheme alone: by this point the address has already been through
+  # the one acceptor, so a plain-http one that got this far is a local one.
+  local plain_gw=false plain_fs=false
+  case "$GW_URL" in [Hh][Tt][Tt][Pp]://*) plain_gw=true ;; esac
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+    case "$FS_URL" in [Hh][Tt][Tt][Pp]://*) plain_fs=true ;; esac
+  fi
+  if $plain_gw || $plain_fs; then
+    if $plain_gw && $plain_fs; then
+      warn "The gateway address AND the file-lane address in this code are plain http:// — NOT ENCRYPTED."
+    elif $plain_gw; then
+      warn "The gateway address in this code is plain http:// — NOT ENCRYPTED."
+    else
+      warn "The file-lane address in this code is plain http:// — NOT ENCRYPTED."
+    fi
+    warn "Everything to and from it crosses your network in the clear, including the secret this"
+    warn "code carries for it, so anyone else on that network can read what you send and then use"
+    warn "it themselves. It also only works while the device is ON that network — away from it"
+    warn "nothing connects, and an Apple Watch used away from your iPhone never reaches it at all."
+    note "Put https:// in front of it whenever you want either of those to stop being true, then"
+    note "re-run me for a code that points at the new address."
   fi
   # What the code IS, said in the one place every route to a code passes through:
   # setup's own emission and --show-code's re-emission both land here. It states
@@ -17417,7 +17707,15 @@ print_plan() {
   esac
   case "$TRANSPORT" in
     tailscale) tr_h="Tailscale (private)" ;; funnel) tr_h="Tailscale Funnel (public)" ;;
-    cloudflare) tr_h="Cloudflare Tunnel (public)" ;; public) tr_h="your own HTTPS (trusted cert)" ;;
+    cloudflare) tr_h="Cloudflare Tunnel (public)" ;;
+    # "public" is the transport for any address the operator supplied rather than a
+    # route this script opened, and that now covers an unencrypted local one — so the
+    # label is read off the SCHEME. Calling a plain-http address "trusted cert" would
+    # be the one line on this screen that is not true of it.
+    public) case "$GW_URL" in
+              [Hh][Tt][Tt][Pp]://*) tr_h="the address you gave me (http:// — not encrypted)" ;;
+              *) tr_h="your own HTTPS (trusted cert)" ;;
+            esac ;;
     *) tr_h="to be decided during exposure" ;;
   esac
   case "$SCOPE" in
@@ -17628,6 +17926,22 @@ show_qr_is_https_host() { # show_qr_is_https_host <url> -> 0 iff https:// + sane
   case "$h" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]*) return 1 ;; esac
   return 0
 }
+# The admissibility rule for a stored endpoint, and the one the profile validator
+# applies: any https address with a sane authority, or a plain-http one whose host
+# only the local network can reach. It is the app's own rule — the app refuses an
+# inadmissible stored URL on READ as well as on import, so a profile this accepted
+# and the app rejected would produce a code that scans and then does nothing.
+#
+# Separate from show_qr_is_https_host rather than folded into it, because the
+# Tailscale mapping assertion in --forget genuinely does need https and nothing
+# else: it derives a port to close from the address, and a plain-http gateway has
+# no Tailscale mapping in front of it to close. One name per question.
+show_qr_is_admissible_endpoint() { # show_qr_is_admissible_endpoint <url> -> 0 iff the app would store it
+  show_qr_is_https_host "$1" && return 0
+  case "$1" in [Hh][Tt][Tt][Pp]://?*) ;; *) return 1 ;; esac
+  local a="${1#*://}"; a="${a%%[/?#]*}"
+  url_is_local_host "$a"
+}
 show_qr_is_port() { # show_qr_is_port <str> -> 0 if a decimal in 1..65535
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
   [ "${#1}" -le 5 ] || return 1        # length-bound so bash 3.2's intmax can't overflow
@@ -17756,9 +18070,9 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
         "That saved setup has an unknown auth mode '$auth'."
       return 1 ;;
   esac
-  show_qr_is_https_host "$url" || {
+  show_qr_is_admissible_endpoint "$url" || {
     show_qr_profile_field_invalid "$pf" 'The field is "gateway.url"' \
-      "That saved setup's gateway URL isn't a valid https:// address with a host."
+      "That saved setup's gateway URL isn't a valid https:// address with a host, and isn't a plain http:// address on your own network either."
     return 1
   }
   case "$transport" in
@@ -17807,9 +18121,9 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
       "That saved setup's file-server object has no URL."
     return 1
   fi
-  if [ -n "$fsurl" ] && ! show_qr_is_https_host "$fsurl"; then
+  if [ -n "$fsurl" ] && ! show_qr_is_admissible_endpoint "$fsurl"; then
     show_qr_profile_field_invalid "$pf" 'The field is "fileServer.url"' \
-      "That saved setup's file-server URL isn't a valid https:// address with a host."
+      "That saved setup's file-server URL isn't a valid https:// address with a host, and isn't a plain http:// address on your own network either."
     return 1
   fi
   if [ -n "$fsreach" ]; then
@@ -18266,7 +18580,7 @@ manage_transport_label() { # manage_transport_label <transport> <reach>
     tailscale) printf 'Tailscale — private (your tailnet only)' ;;
     funnel)    printf 'Tailscale Funnel — PUBLIC (reachable from the internet)' ;;
     cloudflare) printf 'Cloudflare Tunnel — %s' "${2:-public}" ;;
-    public)    printf 'your own HTTPS front — %s' "${2:-public}" ;;
+    public)    printf 'the address you gave me — %s' "${2:-public}" ;;
     *)         printf '%s — %s' "$(safe_display "${1:-unknown}" 40)" "${2:-unknown}" ;;
   esac
 }
@@ -18979,7 +19293,7 @@ manage_edit() { # manage_edit [<id>]
     fi
     say ""
     say "  ${BOLD}Change one thing${RESET}"
-    say "    1) Web address — the https:// address the app calls"
+    say "    1) Web address — the address the app calls"
     say "    2) Model"
     say "    3) Shared folder for file transfer"
     say "    4) Show this setup's code again (to pair a device, or after a change)"
@@ -19012,7 +19326,7 @@ manage_edit_address() { # manage_edit_address <id> <lane-preserved>
   say "  Currently: $(safe_display "${old:-?}" 200)"
   note "This is the address the Conduck app calls. Changing it here does not move any"
   note "tunnel or route — it records where the address now is."
-  prompt_into new ask_url "  The https:// address that reaches this gateway now" \
+  prompt_into new ask_url "  The address that reaches this gateway now" \
     "https://ai.example.com" 0 "" explain_manage_address true || return 0
   if [ "$new" = "$old" ]; then
     note "Same address as before — nothing to save."
@@ -19497,7 +19811,8 @@ manage_forget_grade_route() { # <id> <url> <lport> <verb> <label> <role> <claime
   # at all — with no port to look it up by, the silence rule below cannot speak for
   # it, so "nothing is open" is not a thing this branch is entitled to imply.
   #
-  # Not a hand-edit-only case: ask_url accepts anything shaped like https://?*, and
+  # Not a hand-edit-only case: ask_url accepts any admissible address — https://?*,
+  # or plain http toward the local network — and
   # --edit's transport check only asks whether the host ends in .ts.net, so a typo'd
   # tailnet name (box_1.tail1234.ts.net) is saved with no warning and lands here.
   if ! show_qr_is_https_host "$url" || ! show_qr_is_port "$cand_port" || [ -z "$cand_host" ]; then
@@ -20481,8 +20796,9 @@ explain_manage_forget() {
 explain_manage_address() {
   say ""
   say "  ${BOLD}What to type${RESET}"
-  say "  The https:// address that reaches this gateway from outside this machine —"
-  say "  the base address, with no /v1 and no other endpoint on the end. If you run"
+  say "  The address that reaches this gateway: an https:// one from anywhere, or a"
+  say "  plain http:// one that only your own network reaches. The base address, with"
+  say "  no /v1 and no other endpoint on the end. If you run"
   say "  a Cloudflare quick tunnel, it is the *.trycloudflare.com line cloudflared"
   say "  prints when it starts."
   say ""

@@ -888,12 +888,15 @@ explain_exposure_paths() {
   say "                        the onward leg to this machine rides their encrypted tunnel."
   say "     Apple Watch:       works on its own, anywhere."
   say ""
-  say "  4) Your own HTTPS — reach is whatever you built"
-  say "     For a gateway that already has an https:// address — a reverse proxy or a"
-  say "     rented server (VPS). Its certificate has to be one your phone already"
-  say "     trusts by itself; a certificate you signed yourself does not qualify, and"
-  say "     there is no way for the app to make an exception (I explain the free ways"
-  say "     to get a real one if yours doesn't pass)."
+  say "  4) An address you already have — reach is whatever you built"
+  say "     For a gateway that already answers on one: an https:// address in front of a"
+  say "     reverse proxy or a rented server (VPS), or a plain http:// address on your own"
+  say "     network, which a server such as Ollama has by default. An https:// certificate"
+  say "     has to be one your phone already trusts by itself; a certificate you signed"
+  say "     yourself does not qualify, and there is no way for the app to make an exception"
+  say "     (I explain the free ways to get a real one if yours doesn't pass). A plain"
+  say "     http:// address encrypts nothing and is reachable only from that same network,"
+  say "     an Apple Watch away from your iPhone included."
   say "     A cloudflared quick tunnel is this one, not 3: the *.trycloudflare.com"
   say "     address 'cloudflared tunnel --url' prints comes with a certificate your"
   say "     devices already trust, and it needs no domain of your own."
@@ -986,9 +989,11 @@ explain_own_https_target() {
 
 choose_exposure() {
   # Generic with a ready URL skips the transport menu — but still puts the
-  # certificate through the same trust gate as menu option 4.
+  # certificate through the same trust gate as menu option 4. This is the route a
+  # gateway already serving on the local network takes: the address was typed at
+  # Step 2, and classify_own_https decides what can honestly be said about it.
   if [ -n "$GW_URL" ] && [ -z "$GW_LOCAL_PORT" ]; then
-    head_ "Step 3 — HTTPS reachability"
+    head_ "Step 3 — reachability"
     ok "Using your existing URL: $GW_URL"
     scope_choice
     keyless_public_guard
@@ -1045,8 +1050,8 @@ choose_exposure() {
     # option 3's "✓ cloudflared found" as their row and lands on the one path that wants
     # a domain they don't have. Unconditional on purpose — gating it on `have cloudflared`
     # would hide it whenever the tunnel runs from another terminal, host, or PATH.
-    say "  4) ${BOLD}I already run my own HTTPS for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
-    say "     You give the https:// address; its certificate has to be one your devices already trust."
+    say "  4) ${BOLD}I already have an address for it${RESET}  (or a *.trycloudflare.com quick tunnel)"
+    say "     https:// with a certificate your devices already trust, or http:// on your own network."
     say ""
     if $SETUP_FROM_CHECK; then
       # "back out of", not "stop": on this route `b` returns to the offer that
@@ -1173,10 +1178,10 @@ choose_exposure() {
         # applies too) or the run stops.
         explain_own_https_target
         # Back returns to the menu. Without it this prompt is a loop whose only
-        # exit is a valid https:// URL or Ctrl-C — and it sits directly under a
-        # commitment ("I already run my own HTTPS") the user may have made wrongly,
-        # which is exactly when un-committing has to be possible.
-        prompt_into GW_URL ask_url "The https:// web address that reaches your gateway" \
+        # exit is an admissible URL or Ctrl-C — and it sits directly under a
+        # commitment ("I already have an address for it") the user may have made
+        # wrongly, which is exactly when un-committing has to be possible.
+        prompt_into GW_URL ask_url "The web address that reaches your gateway — https://, or http:// on your own network" \
           "https://ai.example.com" 0 "" "exposure.own_https" true || continue
         apply_gateway_url_normalization
         scope_choice
@@ -1348,14 +1353,35 @@ warn_quick_tunnel_url() {
   say ""
 }
 
-# The "I run my own HTTPS" gate. The certificate must be one THIS machine already
-# trusts, because that is the same bar the app applies on the phone: Apple's App
-# Transport Security refuses an untrusted chain before the app is consulted, and a
-# fingerprint pin cannot override it — a pin only NARROWS trust the device already
-# has, it never grants it. So there is no accept-anyway arm to offer; an untrusted
-# certificate ends the run, with the reason named and the free remedies listed.
+# The gate on an address the operator supplied. Where that address is ENCRYPTED,
+# its certificate must be one THIS machine already trusts, because that is the same
+# bar the app applies on the phone: Apple's App Transport Security refuses an
+# untrusted chain before the app is consulted, and a fingerprint pin cannot override
+# it — a pin only NARROWS trust the device already has, it never grants it. So there
+# is no accept-anyway arm to offer; an untrusted certificate ends the run, with the
+# reason named and the free remedies listed. An unencrypted address is a different
+# question entirely and is answered in the first arm below.
 classify_own_https() {  # GW_URL + SCOPE already set
   warn_quick_tunnel_url   # before the certificate gate: it is true whatever the cert says
+  # A plain-http address is the one route into pairing that does not pass through
+  # the certificate gate below, and that is not a loosening of it: there is no
+  # chain, no handshake and no fingerprint to evaluate, so "its certificate is
+  # trusted normally" would be the only dishonest thing this function could say
+  # about it. Nothing arbitrary reaches here — the prompt that accepted the address
+  # already refused every plain-http host the app will not store, so what is left is
+  # an address only the local network reaches, and the operator typed it themselves.
+  case "$GW_URL" in
+    [Hh][Tt][Tt][Pp]://*)
+      # "public" here means what it means for an https address given at option 4:
+      # an address the operator supplied, rather than a route this script opened.
+      TRANSPORT="public"
+      say ""
+      warn "$URL_PLAIN_HTTP_WARNING"
+      note "There is no certificate on an unencrypted address, so the trust check does not run —"
+      note "nothing about it was relaxed. Anything reachable from outside your own network still"
+      note "needs https://, and the app refuses a plain http:// address that is not a local one."
+      return 0 ;;
+  esac
   if $DRY_RUN; then
     TRANSPORT="public"   # provisional routing; a real run runs the trust gate
     plan_add "CHECK the certificate at $GW_URL — setup continues only if this machine trusts it"

@@ -82,6 +82,197 @@ url_has_userinfo() { # url_has_userinfo <url> -> 0 when the authority carries us
 }
 URL_USERINFO_HINT="A key or password doesn't belong in the address. Drop the \"user:pass@\" part and give the plain URL — it is asked for separately, at a hidden prompt."
 
+# The ONE answer to "is this an address only the local network can reach?", shared
+# by every prompt in this script that may accept a plain-http endpoint. It exists
+# because the Conduck app applies exactly this rule to every address it stores, and
+# the two have to agree: a wizard that accepted MORE would mint a setup code that
+# imports and then fails on the phone, and one that accepted LESS would refuse an
+# address the app is perfectly happy with.
+#
+# It is not a security boundary and not this tool's opinion. Apple's App Transport
+# Security decides from the address STRING, before any connection is attempted: a
+# loopback or private IPv4 literal, an IPv6 ULA or link-local literal and a
+# `.local` name are all permitted over plain http; a dotted domain name is refused
+# even when it resolves onto the very same private network, and so is the
+# carrier-grade NAT range an overlay VPN hands out. This function predicts that
+# verdict, so the refusal lands here in words instead of arriving later inside the
+# app as an unexplained failure.
+#
+# WHERE A CASE WAS NEVER MEASURED AGAINST ATS, THE KERNEL DECIDES IT. This path
+# hands over a bearer token in CLEARTEXT, so an unmeasured shape is allowed only
+# when a wrong prediction cannot cost the secret — that is, when the kernel
+# confines the traffic whichever way the verdict went. Two ranges qualify and stay
+# local: `127.0.0.0/8` past `127.0.0.1` (the kernel routes the whole /8 to `lo0`,
+# so a packet cannot leave the machine) and `fe80::/10` (link-local by definition,
+# and its IPv4 twin `169.254/16` WAS measured permitted). Every other unmeasured
+# shape is one a resolver or a route could carry beyond the local network, and is
+# refused: `0.0.0.0/8`, its IPv6 twin `::`, deprecated site-local `fec0::/10`, and
+# every single-label name. The asymmetry is the whole rule — a wrong refusal costs
+# one message, a wrong allowance costs the token.
+#
+# Pure Bash for the same reason url_has_userinfo is — doctor_accept_url runs before
+# the runtime preflight, so this may not depend on python3, curl, or even `tr`
+# existing. That is why every letter comparison below is spelled in both cases
+# rather than lowercased first.
+#
+# WHERE IT DELIBERATELY REFUSES MORE THAN THE APP DOES. The app classifies with
+# inet_aton, the platform's own legacy grammar and the one the resolver itself
+# falls back to, which reads `2130706433`, `0x7f.0.0.1`, `0177.0.0.1` and `127.1`
+# as addresses — and reads `010.1.1.1` as 8.1.1.1, a PUBLIC host. Bash cannot
+# reproduce that grammar, and guessing at it has an asymmetric cost: refusing an
+# address the app would have taken costs one retype, while accepting one the app
+# refuses mints a code that fails on somebody's phone with nothing here to explain
+# it. So a numeric host that is not a canonical four-part dotted quad is refused,
+# which is also what keeps `0xc0a80101` and `134744072` out — they are addresses
+# to the resolver, and one of them is 8.8.8.8.
+#
+# The same asymmetry covers IPv6, where it now costs only the IPv4-mapped
+# (`::ffff:192.168.1.1`) and IPv4-compatible (`::192.168.1.1`) forms: the app
+# unwraps those onto the IPv4 table and this function refuses them, because
+# reproducing that unwrap in shell buys nothing an operator can plausibly type at
+# this prompt. Site-local `fec0::/10` is refused on BOTH sides and is no longer a
+# divergence. Direction is safe throughout: across the whole table there is no
+# host this function accepts and the app refuses, only hosts it refuses and the
+# app would have taken.
+url_is_local_host() { # url_is_local_host <host[:port]> -> 0 when only the local network reaches it
+  local h="$1" hx o o1 o2 rest
+  # Junk first. curl and Foundation both end an authority at the first / ? or #,
+  # and an `@` inside one is userinfo — http://192.168.1.1@evil.example is a REMOTE
+  # host wearing a private address as a username, which is the exact trap this
+  # function exists not to fall into. None of these may be read as part of a host.
+  case "$h" in
+    ''|*@*|*/*|*'?'*|*'#'*|*[[:space:]]*) return 1 ;;
+  esac
+  case "$h" in
+    \[*)
+      # A bracketed IPv6 literal, with or without a :port.
+      case "$h" in
+        \[*\]|\[*\]:*) ;;
+        *) return 1 ;;                      # a bracket opened and never closed
+      esac
+      h="${h#\[}"; h="${h%%\]*}"
+      # A zone id names an interface, not a different address, and it has to come
+      # off BEFORE the literal is read: a parser handed `fe80::1%en0` whole reads a
+      # DIFFERENT address from the one `fe80::1` names.
+      case "$h" in *%*) h="${h%%\%*}" ;; esac
+      [ -n "$h" ] || return 1
+      case "$h" in *[!0123456789ABCDEFabcdef:]*) return 1 ;; esac
+      case "$h" in
+        ::1) return 0 ;;                    # loopback
+        # Unspecified `::`, the IPv6 twin of 0.0.0.0. Never measured against ATS,
+        # not confined to this machine the way loopback is, and nobody types it
+        # for a real server. Refused, per the unmeasured rule in the header.
+        ::)  return 1 ;;
+      esac
+      # ULA fc00::/7 and link-local fe80::/10, matched on the FULL first hextet and
+      # never on a text prefix: `fc0::1` is 0x0fc0 and `fe8::1` is 0x0fe8 — neither
+      # is in either range, yet both open with the letters a prefix test looks for.
+      hx="${h%%:*}"
+      case "$hx" in
+        [Ff][CcDd][0123456789ABCDEFabcdef][0123456789ABCDEFabcdef]) return 0 ;;
+        [Ff][Ee][89ABab][0123456789ABCDEFabcdef]) return 0 ;;
+        # Deprecated site-local fec0::/10 (fec0–feff), its own arm rather than the
+        # default so the refusal reads as deliberate: unmeasured against ATS,
+        # deprecated since RFC 3879, and — unlike link-local — routable beyond the
+        # link, so a wrong guess here could put the token on somebody else's wire.
+        [Ff][Ee][CcDdEeFf][0123456789ABCDEFabcdef]) return 1 ;;
+      esac
+      return 1 ;;                           # global unicast, NAT64, IPv4-mapped forms
+  esac
+  case "$h" in
+    *:*:*) return 1 ;;                      # an unbracketed IPv6 literal is not a legal authority
+    *:*)   h="${h%%:*}" ;;                  # host:port
+  esac
+  [ -n "$h" ] || return 1
+  # `myhost.local.` is the explicit-FQDN spelling of `myhost.local`, resolves
+  # identically, and fails a `.local` suffix test unless the dot comes off. Exactly
+  # one dot comes off: stripping a run of them is the classic suffix-bypass shape.
+  # The strip cannot flip a verdict: a single label is refused rooted or not, and
+  # `localhost`, `local` and `*.local` mean the same thing rooted.
+  case "$h" in *.) h="${h%.}" ;; esac
+  [ -n "$h" ] || return 1
+  case "$h" in
+    *[!0123456789.]*) ;;                    # holds a letter or a hyphen — a name, below
+    *)
+      # Digits and dots only: it is an address in canonical form, or it is nothing.
+      case "$h" in *.*.*.*.*) return 1 ;; esac        # five labels or more
+      case "$h" in *.*.*.*) ;; *) return 1 ;; esac    # fewer than four
+      o1="${h%%.*}"; rest="${h#*.}"
+      o2="${rest%%.*}"; rest="${rest#*.}"
+      for o in "$o1" "$o2" "${rest%%.*}" "${rest#*.}"; do
+        case "$o" in
+          ''|*[!0123456789]*) return 1 ;;
+          0) ;;                             # a lone zero is canonical
+          0*) return 1 ;;                   # a leading zero is OCTAL to inet_aton
+        esac
+        [ "${#o}" -le 3 ] || return 1
+        [ "$o" -le 255 ] || return 1
+      done
+      case "$o1" in
+        # "This network" 0.0.0.0/8. `http://0/` reaches THIS host on Darwin, which
+        # is exactly why it is a classic SSRF bypass string — and it is unmeasured
+        # against ATS, NOT kernel-confined the way 127/8 is, and nobody types it
+        # for a real server (a loopback user has `localhost` and `127.0.0.1`).
+        # Refused, per the header. The short inet_aton spellings of the same thing
+        # (`0`, `0.1`) never reach this arm: the canonical-quad test above already
+        # refuses everything that is not four dotted octets.
+        0)   return 1 ;;
+        10)  return 0 ;;
+        127) return 0 ;;
+        169) if [ "$o2" = "254" ]; then return 0; fi; return 1 ;;
+        172) if [ "$o2" -ge 16 ] && [ "$o2" -le 31 ]; then return 0; fi; return 1 ;;
+        192) if [ "$o2" = "168" ]; then return 0; fi; return 1 ;;
+        100)
+          # Carrier-grade NAT, 100.64.0.0/10 — the range an overlay VPN such as
+          # Tailscale hands out. Its own arm rather than the default, because this
+          # is the surprising exclusion and a reader has to be able to see it was
+          # deliberate: measured on iOS, a plain-http request to a 100.64/10 address
+          # is refused before it is attempted, exactly like a public one. A tailnet
+          # address wants the https certificate Tailscale Serve issues for it
+          # anyway, which is what option 1 of the exposure menu sets up.
+          return 1 ;;
+      esac
+      return 1 ;;
+  esac
+  case "$h" in
+    [Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]) return 0 ;;
+    [Ll][Oo][Cc][Aa][Ll]) return 0 ;;
+    *.[Ll][Oo][Cc][Aa][Ll]) return 0 ;;     # mDNS/Bonjour
+  esac
+  # EVERY OTHER NAME IS REFUSED — two families, one verdict, refused for different
+  # reasons.
+  #
+  # A DOTTED NAME, however private the machine behind it: the platform decides from
+  # the string, so a split-horizon name pointing straight at a LAN box collects the
+  # same refusal as a public one.
+  #
+  # A SINGLE LABEL, rooted or not — `nas`, `ollama`, `uz`, `uz.`. The hopeful
+  # reading is that a dotless name can only resolve through mDNS or this device's
+  # own search domain, both of them the local link. It is wrong: real one-label
+  # TLDs answer at the public DNS root with apex A records (`dig +short A uz.` ->
+  # 91.212.89.8, measured), so a resolver that falls through its search domains to
+  # the root would carry the bearer token in cleartext to a public host. Nothing
+  # that worked is lost — an unresolvable label dead-ends at "host not found"
+  # either way — and the refusal copy names the two spellings of the same machine
+  # that DO work: its IP literal, or its `.local` name. The app draws exactly this
+  # line, and the two have to agree.
+  return 1
+}
+# The refusal and the caveat, in one place each, because both are said at more than
+# one prompt and two spellings of one fact are two chances to drift. The refusal
+# names the spellings that DO work rather than the rule it is applying — and it
+# names BOTH of them, because `.local` is the one that rescues the operator whose
+# single-label `nas` was just turned down. The caveat names what is actually at
+# risk and what the lane cannot do, and gives no instruction, because by then the
+# operator has chosen and being lectured is not information.
+#
+# The app says the same two things in its own words. It attributes the rule to
+# "Apple" rather than to iOS because the same string renders on a Mac, and this
+# script says "Apple" for the same reason. Where the app says "this network" it is
+# running on the phone; this script runs on the server, so it says "that network".
+URL_PLAIN_HTTP_HINT="Apple allows plain http:// only to an address on your own network. Use the server's IP address or its name ending in .local, or https:// for anywhere else."
+URL_PLAIN_HTTP_WARNING="Not encrypted — anyone on that network can read your messages and your key. Works only on that network — not in the car or out with the Watch."
+
 OS="$(uname -s)"   # Linux | Darwin
 # ${HOME:-} so a check run in a HOME-less environment (a bare CI shell) doesn't
 # abort here under `set -u` on a path it never uses; the wizard would fail later
@@ -711,7 +902,7 @@ validate_cli() {
         # The userinfo case gets its own message, and deliberately does NOT echo
         # the URL back: the rejected value contains the password.
         url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
-        usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+        usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
       fi
       cli_accept_only positional
       REUSE_ONLY=true
@@ -722,7 +913,7 @@ validate_cli() {
         # The userinfo case gets its own message, and deliberately does NOT echo
         # the URL back: the rejected value contains the password.
         url_has_userinfo "$CHECK_URL" && usage_die "$URL_USERINFO_HINT"
-        usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+        usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
       fi
       cli_accept_only positional deep files
       REUSE_ONLY=true
@@ -1224,13 +1415,20 @@ require_choice() {  # require_choice "prompt" "regex" [action-id | help-fn] [all
 
 NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask you questions."
 
-# A URL prompt that NEVER aborts on a typo — loops until it gets an https:// URL
-# (or blank, when allow_blank=1, where leaving it out is a valid choice). Trims
-# whitespace, accepts a capitalised scheme, always shows an example. All human
-# output goes to stderr so $(...) captures only the URL.
+# A URL prompt that NEVER aborts on a typo — loops until it gets an address this
+# tool will pair (or blank, when allow_blank=1, where leaving it out is a valid
+# choice). Trims whitespace, accepts a capitalised scheme, always shows an example.
+# All human output goes to stderr so $(...) captures only the URL.
+#
+# What it accepts is the app's own admissibility rule, applied here so the wizard
+# cannot mint a setup code the app then refuses: any https:// address, or a plain
+# http:// one whose host only the local network can reach (url_is_local_host). The
+# advertised shape stays https — the prompt, the example and the footer all name it,
+# and plain http is taken when it is TYPED and never suggested, defaulted to, or
+# supplied by prepending a scheme to a schemeless answer.
 #
 # The controls are checked BEFORE any trimming or validation, and with no
-# "did you mean it literally?" question: nothing that fails the https:// test can
+# "did you mean it literally?" question: nothing that fails that test can
 # be a legal answer here, so `i`, `b` and `q` are unambiguous. Without them the
 # loop has no exit at all, and that matters more here than anywhere else — both
 # mandatory call sites sit immediately after a commitment the user may have made
@@ -1239,7 +1437,7 @@ NO_ANSWER="No answer (the input ended). Run me from a terminal, where I can ask 
 ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] [action-id] [allow-back] -> URL or ""
   local prompt="$1" example="$2" allow_blank="${3:-0}"
   local blank_meaning="${4:-skip}" action="${5:-}" allow_back="${6:-false}"
-  local reply enter p
+  local reply enter p hostport
   say "  $prompt" >&2
   if [ "$allow_blank" = "1" ]; then enter="$blank_meaning"; else enter="ask again"; fi
   p="  https URL (e.g. $example; $(control_suffix "$enter" "$allow_back")) > "
@@ -1260,14 +1458,32 @@ ask_url() {  # ask_url "prompt" "example" [allow_blank] [blank-meaning] [action-
       [ "$allow_blank" = "1" ] && return 0
       warn "Please enter an https:// URL, for example $example." >&2; continue
     fi
-    case "$reply" in [Hh][Tt][Tt][Pp][Ss]://*) reply="https://${reply#*://}" ;; esac
+    case "$reply" in
+      [Hh][Tt][Tt][Pp][Ss]://*) reply="https://${reply#*://}" ;;
+      [Hh][Tt][Tt][Pp]://*)     reply="http://${reply#*://}" ;;
+    esac
+    # Userinfo is refused on BOTH schemes, and BEFORE the scheme is graded, because
+    # http://192.168.1.10@evil.example is a remote host wearing a private address as
+    # a username — the private-looking half is the bait, so the credential has to be
+    # named first or the local arm below would answer about the wrong host.
     if url_has_userinfo "$reply"; then
       warn "$URL_USERINFO_HINT" >&2; continue
     fi
     case "$reply" in
       https://?*) printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2; printf '%s' "$reply"; return 0 ;;
-      http://*)   warn "That's http:// — Conduck requires https:// (encrypted). Try again." >&2 ;;
+      http://?*)
+        # The authority ends at the first / ? or #, the same cut url_has_userinfo
+        # makes, so a path or a query cannot smuggle a host past the classifier.
+        hostport="${reply#http://}"; hostport="${hostport%%[/?#]*}"
+        if url_is_local_host "$hostport"; then
+          warn "$URL_PLAIN_HTTP_WARNING" >&2
+          printf '  %s→ using %s%s\n' "$DIM" "$reply" "$RESET" >&2; printf '%s' "$reply"; return 0
+        fi
+        warn "$URL_PLAIN_HTTP_HINT" >&2 ;;
       *)          if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
+                  # A schemeless answer keeps its https refusal and is never given a
+                  # scheme here. Prepending http:// to a bare host is how plain http
+                  # becomes the default nobody chose.
                   warn "That has to start with https:// — for example $example. Try again." >&2 ;;
     esac
   done

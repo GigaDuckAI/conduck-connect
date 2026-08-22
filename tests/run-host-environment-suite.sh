@@ -84,9 +84,12 @@ lift "$FL" setup_file_lane fs_linger_enabled_linux fs_report_linger_linux
 # takes the whole run in one bite. Named here for what they bring, not for elegance:
 # `show_qr_profile_invalid` carries show_qr_validate_profile with it, and json_get
 # carries json_type + env_get. The bodies are the shipped ones either way.
-lift "$SQ" show_qr_profile_invalid show_qr_is_https_host show_qr_is_port show_qr_pick_profile \
+lift "$SQ" show_qr_profile_invalid show_qr_is_https_host show_qr_is_admissible_endpoint \
+           show_qr_is_port show_qr_pick_profile \
            show_qr_describe_saved_setup show_qr_warn_quick_tunnel
-lift "$UT" json_get prompt_into
+# url_is_local_host is what show_qr_is_admissible_endpoint asks about a plain-http
+# address, so the validator cannot be exercised without it.
+lift "$UT" json_get prompt_into url_is_local_host
 # Gateway identity: which saved gateway a re-run is changing, and which ids are
 # already spoken for. These read the same $STATE_DIR the picker above does.
 lift "$GW" gateway_id_is_taken report_gateway_id_collision pick_existing_custom_gateway

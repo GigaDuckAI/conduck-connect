@@ -25,7 +25,15 @@ print_plan() {
   esac
   case "$TRANSPORT" in
     tailscale) tr_h="Tailscale (private)" ;; funnel) tr_h="Tailscale Funnel (public)" ;;
-    cloudflare) tr_h="Cloudflare Tunnel (public)" ;; public) tr_h="your own HTTPS (trusted cert)" ;;
+    cloudflare) tr_h="Cloudflare Tunnel (public)" ;;
+    # "public" is the transport for any address the operator supplied rather than a
+    # route this script opened, and that now covers an unencrypted local one — so the
+    # label is read off the SCHEME. Calling a plain-http address "trusted cert" would
+    # be the one line on this screen that is not true of it.
+    public) case "$GW_URL" in
+              [Hh][Tt][Tt][Pp]://*) tr_h="the address you gave me (http:// — not encrypted)" ;;
+              *) tr_h="your own HTTPS (trusted cert)" ;;
+            esac ;;
     *) tr_h="to be decided during exposure" ;;
   esac
   case "$SCOPE" in

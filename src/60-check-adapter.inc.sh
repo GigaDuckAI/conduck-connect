@@ -235,44 +235,41 @@ ct_is_json() {
   [ "$ct" = "application/json" ]
 }
 
-# Accept an https URL anywhere, or plain http toward THIS machine only
-# (127.*/localhost/[::1]) — testing on the adapter's own host before HTTPS
-# exposure is exactly the right order, and refusing loopback http would force
-# people to expose first and test second. Echoes the normalized URL (trimmed,
-# trailing slashes stripped, scheme lowercased); rc 1 when unacceptable.
+# Accept an https URL anywhere, or plain http toward an address only the local
+# network reaches — the same boundary Apple enforces and the app applies, so the
+# wizard cannot accept an address the app will refuse. Testing on the adapter's own
+# host, or on the box across the room, before HTTPS exposure is exactly the right
+# order, and refusing local http would force people to expose first and test
+# second. Echoes the normalized URL (trimmed, trailing slashes stripped, scheme
+# lowercased); rc 1 when unacceptable.
 doctor_accept_url() { # doctor_accept_url <candidate>
-  local reply="$1" rest hostport host
+  local reply="$1" rest hostport
   reply="${reply#"${reply%%[![:space:]]*}"}"; reply="${reply%"${reply##*[![:space:]]}"}"
   while [ "${reply%/}" != "$reply" ]; do reply="${reply%/}"; done
   [ -n "$reply" ] || return 1
   # Pure Bash on purpose: validate_cli calls this before runtime preflight, so
   # a missing python3/curl (or any other executable) can never turn a runtime
   # dependency failure into exit-2 command misuse.
-  # Userinfo is refused on BOTH schemes. The loopback arm below has to (see its
-  # comment: http://127.0.0.1@evil.com is a REMOTE host); https needs it for the
+  # Userinfo is refused on BOTH schemes, and BEFORE the scheme is graded. The local
+  # arm below needs that ordering (see its comment: http://192.168.1.1@evil.com is a
+  # REMOTE host, and the private-looking half is the bait); https needs it for the
   # reason --show-code's profile validator already rejects it — this URL is
   # echoed to the terminal, saved to the profile, and paired into the app, and a
   # credential must never ride a routing field.
   url_has_userinfo "$reply" && return 1
   case "$reply" in
     [Hh][Tt][Tt][Pp][Ss]://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
-    [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-loopback
+    [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-local
     *) return 1 ;;
   esac
-  # A prefix glob is NOT enough to prove loopback: "http://127.0.0.1@evil.com"
+  # A prefix glob is NOT enough to prove the destination: "http://192.168.1.1@evil.com"
   # (curl reads the part before @ as a username and connects to evil.com) and
-  # "http://127.0.0.1.evil.com" (attacker's wildcard DNS) both start with
-  # "http://127." — and would carry the REAL bearer token in cleartext to a
-  # remote host. Parse out the authority and validate it strictly.
-  hostport="${rest%%/*}"
-  case "$hostport" in *@*|*' '*) return 1 ;; esac    # userinfo/junk → refuse
-  case "$hostport" in
-    '[::1]'|'[::1]:'*) ;;                            # IPv6 loopback (+ optional port)
-    [Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]|[Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]:*) ;;
-    127.*) host="${hostport%%:*}"
-           case "$host" in *[!0-9.]*) return 1 ;; esac ;;  # 127.x must be a pure dotted quad
-    *) return 1 ;;
-  esac
+  # "http://192.168.1.1.evil.com" (attacker's wildcard DNS) both start with
+  # "http://192.168." — and would carry the REAL bearer token in cleartext to a
+  # remote host. Parse out the authority and hand it to the one classifier, which
+  # refuses both shapes and every other name that only looks private.
+  hostport="${rest%%[/?#]*}"
+  url_is_local_host "$hostport" || return 1
   printf 'http://%s' "$rest"; return 0
 }
 
@@ -297,8 +294,8 @@ doctor_accept_url() { # doctor_accept_url <candidate>
 doctor_ask_url() {  # doctor_ask_url [action-id | help-fn] -> URL on stdout (every human line to stderr)
   local action="${1:-}" reply url p
   say "  Where is the server? Its base address, without any /v1 tail (I strip that myself)." >&2
-  say "  Plain http:// is fine toward this machine (127.0.0.1/localhost) — test locally first," >&2
-  say "  expose over HTTPS after." >&2
+  say "  Plain http:// is fine toward an address on your own network (an IP like 192.168.1.10," >&2
+  say "  or a .local name) — test locally first, expose over HTTPS after." >&2
   p="  URL (e.g. http://127.0.0.1:8080; $(control_suffix "ask again" false)) > "
   while true; do
     prompt_echo "$p"
@@ -320,9 +317,9 @@ doctor_ask_url() {  # doctor_ask_url [action-id | help-fn] -> URL on stdout (eve
       warn "$URL_USERINFO_HINT" >&2; continue
     fi
     case "$reply" in
-      [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." >&2 ;;
+      [Hh][Tt][Tt][Pp]://*) warn "$URL_PLAIN_HTTP_HINT" >&2 ;;
       *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
-         warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." >&2 ;;
+         warn "That has to start with https:// — or http://<address on your own network>:<port> for a local test." >&2 ;;
     esac
   done
 }

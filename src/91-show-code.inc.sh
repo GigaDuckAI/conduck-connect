@@ -161,6 +161,22 @@ show_qr_is_https_host() { # show_qr_is_https_host <url> -> 0 iff https:// + sane
   case "$h" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]*) return 1 ;; esac
   return 0
 }
+# The admissibility rule for a stored endpoint, and the one the profile validator
+# applies: any https address with a sane authority, or a plain-http one whose host
+# only the local network can reach. It is the app's own rule — the app refuses an
+# inadmissible stored URL on READ as well as on import, so a profile this accepted
+# and the app rejected would produce a code that scans and then does nothing.
+#
+# Separate from show_qr_is_https_host rather than folded into it, because the
+# Tailscale mapping assertion in --forget genuinely does need https and nothing
+# else: it derives a port to close from the address, and a plain-http gateway has
+# no Tailscale mapping in front of it to close. One name per question.
+show_qr_is_admissible_endpoint() { # show_qr_is_admissible_endpoint <url> -> 0 iff the app would store it
+  show_qr_is_https_host "$1" && return 0
+  case "$1" in [Hh][Tt][Tt][Pp]://?*) ;; *) return 1 ;; esac
+  local a="${1#*://}"; a="${a%%[/?#]*}"
+  url_is_local_host "$a"
+}
 show_qr_is_port() { # show_qr_is_port <str> -> 0 if a decimal in 1..65535
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
   [ "${#1}" -le 5 ] || return 1        # length-bound so bash 3.2's intmax can't overflow
@@ -289,9 +305,9 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
         "That saved setup has an unknown auth mode '$auth'."
       return 1 ;;
   esac
-  show_qr_is_https_host "$url" || {
+  show_qr_is_admissible_endpoint "$url" || {
     show_qr_profile_field_invalid "$pf" 'The field is "gateway.url"' \
-      "That saved setup's gateway URL isn't a valid https:// address with a host."
+      "That saved setup's gateway URL isn't a valid https:// address with a host, and isn't a plain http:// address on your own network either."
     return 1
   }
   case "$transport" in
@@ -340,9 +356,9 @@ show_qr_validate_profile() { # show_qr_validate_profile <profile-file>
       "That saved setup's file-server object has no URL."
     return 1
   fi
-  if [ -n "$fsurl" ] && ! show_qr_is_https_host "$fsurl"; then
+  if [ -n "$fsurl" ] && ! show_qr_is_admissible_endpoint "$fsurl"; then
     show_qr_profile_field_invalid "$pf" 'The field is "fileServer.url"' \
-      "That saved setup's file-server URL isn't a valid https:// address with a host."
+      "That saved setup's file-server URL isn't a valid https:// address with a host, and isn't a plain http:// address on your own network either."
     return 1
   fi
   if [ -n "$fsreach" ]; then

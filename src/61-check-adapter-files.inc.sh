@@ -205,7 +205,7 @@ doctor_files_resolve() {
         d_bad FILES_CONFIG "CONDUCK_FILES_URL carries a \"user:pass@\" password in the address — give the plain URL"
         d_say FILES_CONFIG "(the file-lane password goes in CONDUCK_FILES_PASS, the user in CONDUCK_FILES_USER)"
       else
-        d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward this machine (127.0.0.1/localhost)"
+        d_bad FILES_CONFIG "CONDUCK_FILES_URL must be https://… or http:// toward an address on your own network"
       fi
       return 1
     fi
@@ -1214,7 +1214,7 @@ run_doctor() {
   # Target: the positional URL if one was given, else ask.
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
-      || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+      || usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
   else
     say ""
     # explain_check_adapter is the prompt's `i` copy, passed by FUNCTION NAME

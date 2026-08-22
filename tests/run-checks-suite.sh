@@ -1187,7 +1187,7 @@ run_direct_setup_case() {
   if ! grep -qF 'Step 2 — your OpenAI-compatible server' "$TMP/doctor.out"; then
     fail_case "$name" "--setup did not enter the setup wizard"; return
   fi
-  if ! grep -qF 'Need the local port (or an https URL).' "$TMP/doctor.out"; then
+  if ! grep -qF 'Need the local port (or a web address).' "$TMP/doctor.out"; then
     fail_case "$name" "setup smoke test stopped for an unexpected reason"; return
   fi
   PASS=$((PASS+1))
@@ -4852,7 +4852,8 @@ PY
 
   funcs=$(extract_funcs manage_show_code manage_save_profile manage_profile_path \
     show_qr_load_profile show_qr_validate_profile show_qr_profile_invalid ascii_id_ok \
-    show_qr_profile_field_invalid show_qr_is_https_host show_qr_is_port \
+    show_qr_profile_field_invalid show_qr_is_https_host show_qr_is_admissible_endpoint \
+    url_is_local_host show_qr_is_port \
     show_qr_recover_gateway_secret show_qr_recover_file_lane \
     existing_fs_config linux_unit_candidates mac_unit_candidates \
     json_query json_get json_type write_profile ensure_state_dir)
@@ -7989,6 +7990,181 @@ printf "REASON<%s>\n" "$CCE_REASON"
 # calls credential-free, and paired into the app — which refuses userinfo on
 # every persisted endpoint URL. Both URL entry points must refuse it too, and
 # the refusal must name the real fix rather than say "use https://".
+# The plain-http boundary, graded against the shipped classifier. It is a PARITY
+# fixture, not a preference: the Conduck app admits a plain-http endpoint when — and
+# only when — its host is one that only the local network can reach, and applies that
+# rule on read as well as on import. A connector that accepted MORE would mint a
+# setup code that scans and then fails on the phone with nothing here to explain it;
+# one that accepted LESS would refuse an address the app is perfectly happy with.
+#
+# The rows that matter most are the ones that LOOK private and are not, because they
+# are the ones a hand-rolled check gets wrong: an address wearing a private literal
+# as a username, a wildcard-DNS name with a private literal as its first label, the
+# carrier-grade NAT range an overlay VPN hands out, a single-label name that a
+# resolver can carry to the public DNS root, and an IPv6 text prefix that is not the
+# range it resembles.
+#
+# The second half of the rule is about shapes NOBODY measured against ATS. This lane
+# hands over a bearer token in cleartext, so an unmeasured shape is admissible only
+# when the kernel confines the traffic whatever the platform would have decided:
+# 127.0.0.0/8 (routed entirely to lo0) and fe80::/10 (link-local by definition) stay
+# local, while 0.0.0.0/8, its v6 twin :: and deprecated site-local fec0::/10 — all
+# routable or bypass-shaped — are refused. Both halves are pinned below, because a
+# regression in either direction is silent otherwise.
+run_local_http_boundary_case() {
+  local name="plain-http-is-local-only" funcs out
+
+  funcs=$(extract_funcs url_has_userinfo url_is_local_host doctor_accept_url)
+  if ! grep_var "$funcs" -qF 'url_is_local_host()' \
+     || ! grep_var "$funcs" -qF 'doctor_accept_url()'; then
+    fail_case "$name" "could not extract the URL classifier from the release artifact"; return
+  fi
+  out=$(FUNCS="$funcs" bash -c '
+eval "$FUNCS"
+# Accepted: only the local network reaches these.
+for h in 10.0.0.1 172.16.0.1 172.31.255.254 192.168.1.10 169.254.1.1 \
+         127.0.0.1 127.5.5.5 \
+         "[::1]" "[fc00::1]" "[fd00::1]" "[fe80::1]" "[febf::1]" "[fe80::1%en0]" \
+         localhost LOCALHOST localhost. local local. gateway.local mac-mini.local.; do
+  url_is_local_host "$h" || printf "REFUSED_LOCAL<%s>\n" "$h"
+done
+# Refused. Two families. Apple refuses the measured ones over plain http before it
+# connects, so the wizard has to as well — 100.64/10 is the contested one and is
+# deliberate. The rest were never measured and are refused because the kernel does
+# not confine them, which is the only ground on which an unmeasured shape may pass.
+#
+#   SINGLE-LABEL NAMES, rooted or not. `nas`, `ollama`, `mac-mini`, `uz`, `uz.` —
+#   real one-label TLDs answer at the public DNS root with apex A records
+#   (`dig +short A uz.` -> 91.212.89.8, measured), so a resolver falling through its
+#   search domains could deliver the bearer token in cleartext to a public host.
+#   `localhost`, `local` and every `*.local` name stay in the accepted list above.
+#   0.0.0.0/8, its v6 twin `::`, and deprecated site-local fec0::/10 (fec0-feff,
+#   routable beyond the link unlike fe80::/10) go the same way.
+for h in 8.8.8.8 100.64.0.1 100.127.255.254 172.15.0.1 172.32.0.1 \
+         gateway.myhomelab.com nas.home.arpa box.lan host.internal \
+         192.168.1.50.nip.io 192.168.1.1.evil.com trycloudflare.com \
+         "192.168.1.1@evil.com" "[2001:db8::1]" "[fe8::1]" "[fc0::1]" \
+         nas ollama mac-mini uz uz. ws. myhost. \
+         0.0.0.0 0.1.2.3 0 "[::]" "[fec0::1]" "[feff::1]" \
+         2130706433 0xc0a80101 010.1.1.1 0177.0.0.1; do
+  url_is_local_host "$h" && printf "ACCEPTED_REMOTE<%s>\n" "$h"
+done
+# End to end through the acceptor, which normalises and re-asserts userinfo.
+doctor_accept_url "http://192.168.1.10:11434/" >/dev/null || printf "REGRESSED<lan>\n"
+doctor_accept_url "http://mac-mini.local:11434" >/dev/null || printf "REGRESSED<mdns>\n"
+doctor_accept_url "http://127.0.0.1:8080" >/dev/null     || printf "REGRESSED<loopback>\n"
+doctor_accept_url "https://gw.example.test" >/dev/null   || printf "REGRESSED<https>\n"
+# `http://ollama:11434` is the row that flipped: the app refuses a single-label
+# host, so minting a code for one would scan and then fail on the phone.
+for u in "http://gateway.example.test" "http://100.64.0.1:11434" \
+         "http://ollama:11434" "http://0.0.0.0:11434" "http://[::]:11434" \
+         "http://[fec0::1]:11434" \
+         "http://192.168.1.1@evil.example.test" "http://192.168.1.1.evil.example.test" \
+         "http://192.168.1.10 evil.example.test"; do
+  doctor_accept_url "$u" >/dev/null 2>&1 && printf "ACCEPTED<%s>\n" "$u"
+done
+printf "DONE\n"
+') || { fail_case "$name" "the URL classifier failed to run in isolation"; return; }
+  printf '%s\n' "$out" > "$TMP/doctor.out"
+  if ! grep_var "$out" -qF 'DONE'; then
+    fail_case "$name" "the classifier aborted part-way through"; return
+  fi
+  if grep_var "$out" -q '^REFUSED_LOCAL<'; then
+    fail_case "$name" "an address only the local network reaches was refused"; return
+  fi
+  if grep_var "$out" -q '^ACCEPTED_REMOTE<'; then
+    fail_case "$name" "a host the app treats as remote was called local"; return
+  fi
+  if grep_var "$out" -q '^ACCEPTED<'; then
+    fail_case "$name" "doctor_accept_url accepted a plain-http URL toward a remote host"; return
+  fi
+  if grep_var "$out" -q '^REGRESSED<'; then
+    fail_case "$name" "doctor_accept_url refused an address the app accepts"; return
+  fi
+
+  # The prompt: an admissible plain-http address is taken AND the caveat is stated,
+  # while an inadmissible one is refused with a message that names the two fixes
+  # rather than the rule. Both halves matter — silent acceptance and a bare "use
+  # https" are the two ways this prompt could be wrong.
+  funcs=$(extract_funcs url_has_userinfo url_is_local_host ask_url explain_prompt \
+            control_suffix control_keys prompt_echo looks_like_a_secret \
+            warn_answer_looked_like_a_secret
+          sed -n '/^URL_PLAIN_HTTP_HINT=/p;/^URL_PLAIN_HTTP_WARNING=/p;/^URL_USERINFO_HINT=/p' "$SCRIPT")
+  if ! grep_var "$funcs" -qF 'URL_PLAIN_HTTP_HINT=' \
+     || ! grep_var "$funcs" -qF 'URL_PLAIN_HTTP_WARNING='; then
+    fail_case "$name" "could not extract the plain-http prompt strings from the release artifact"; return
+  fi
+  out=$(FUNCS="$funcs" bash -c '
+eval "$FUNCS"
+DIM=""; RESET=""; YELLOW=""
+say() { printf "%s\n" "$*"; }
+warn() { printf "! %s\n" "$*"; }
+note() { printf "  %s\n" "$*"; }
+printf "http://gateway.example.test\nhttp://192.168.1.10:11434\n" | ask_url "Address" "https://ai.example.com"
+' 2>&1) || { fail_case "$name" "ask_url failed to run in isolation"; return; }
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  if ! grep_var "$out" -qF 'Apple allows plain http:// only to an address on your own network'; then
+    fail_case "$name" "ask_url did not name the boundary when it refused a plain-http domain name"; return
+  fi
+  # BOTH fixes, not just the IP one: `.local` is what rescues the operator whose
+  # single-label `nas` was turned down, and a refusal that omits it reads as "your
+  # server cannot be reached by name at all", which is false.
+  if ! grep_var "$out" -qF "Use the server's IP address or its name ending in .local"; then
+    fail_case "$name" "the refusal did not name both working spellings"; return
+  fi
+  if ! grep_var "$out" -qF 'Not encrypted'; then
+    fail_case "$name" "ask_url accepted a plain-http address without saying what it costs"; return
+  fi
+  # The reach limit is half the caveat: an operator told only "not encrypted" still
+  # expects the lane to work from the car and from a standalone Watch.
+  if ! grep_var "$out" -qF 'Works only on that network'; then
+    fail_case "$name" "the caveat did not say the lane works only on that network"; return
+  fi
+  if ! grep_var "$out" -qF 'using http://192.168.1.10:11434'; then
+    fail_case "$name" "ask_url did not go on to accept the local plain-http address"; return
+  fi
+
+  # The READ side. A profile the wizard just wrote has to come back through
+  # --show-code, and the app applies its admissibility rule on read as well as on
+  # import — so a validator that refused what setup accepted would mint a code and
+  # then refuse to re-show it.
+  funcs=$(extract_funcs show_qr_is_https_host show_qr_is_admissible_endpoint \
+            show_qr_is_port url_is_local_host)
+  if ! grep_var "$funcs" -qF 'show_qr_is_admissible_endpoint()'; then
+    fail_case "$name" "could not extract the stored-endpoint validator from the release artifact"; return
+  fi
+  out=$(FUNCS="$funcs" bash -c '
+eval "$FUNCS"
+for u in "https://gw.example.test" "https://gw.example.test:8443" \
+         "http://192.168.1.10:11434" "http://127.0.0.1:11434" \
+         "http://[fd00::1]:8080" "http://mac-mini.local"; do
+  show_qr_is_admissible_endpoint "$u" || printf "REFUSED<%s>\n" "$u"
+done
+# `http://ollama:11434` moved down here with the classifier: a profile written by an
+# older build can still hold one, and re-showing it would hand over a code the app
+# refuses on import.
+for u in "http://gw.example.test" "http://100.64.0.1:11434" "ftp://gw.example.test" \
+         "http://ollama:11434" "http://0.0.0.0:11434" "http://[fec0::1]:11434" \
+         "http://" "https://spy:hunter2@gw.example.test" "http://192.168.1.1@evil.example.test"; do
+  show_qr_is_admissible_endpoint "$u" && printf "ACCEPTED<%s>\n" "$u"
+done
+printf "DONE\n"
+') || { fail_case "$name" "the stored-endpoint validator failed to run in isolation"; return; }
+  printf '%s\n' "$out" >> "$TMP/doctor.out"
+  if ! grep_var "$out" -qF 'DONE'; then
+    fail_case "$name" "the stored-endpoint validator aborted part-way through"; return
+  fi
+  if grep_var "$out" -q '^REFUSED<'; then
+    fail_case "$name" "a saved profile the wizard can write would not validate on read"; return
+  fi
+  if grep_var "$out" -q '^ACCEPTED<'; then
+    fail_case "$name" "the stored-endpoint validator accepted an address the app refuses"; return
+  fi
+
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
 run_url_userinfo_refused_case() {
   local name="urls-refuse-embedded-credentials" funcs out
   local cred='https://spy:hunter2@gateway.example.test'
@@ -10248,6 +10424,10 @@ fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" urls-refuse-embedded-credentials "*) true ;; *) false ;; esac; then
   run_url_userinfo_refused_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" plain-http-is-local-only "*) true ;; *) false ;; esac; then
+  run_local_http_boundary_case
 fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" owned-config-mode-change-is-announced "*) true ;; *) false ;; esac; then

@@ -293,7 +293,8 @@ compat_on_exit() {
 # again. rc 0 = $GW_URL now holds a new address to grade; rc 1 = nothing left to
 # try (not a terminal, an empty answer, or the input ended), and the caller owns
 # the exit. Same acceptance rule as the first prompt — https anywhere, plain http
-# only toward this machine — so the retry can't relax what the first ask enforced.
+# only toward an address on your own network — so the retry can't relax what the
+# first ask enforced.
 compat_reask_url() {
   local reply url p
   interactive_terminal || return 1
@@ -324,9 +325,9 @@ compat_reask_url() {
       warn "$URL_USERINFO_HINT"; continue
     fi
     case "$reply" in
-      [Hh][Tt][Tt][Pp]://*) warn "Plain http:// only works toward this machine (127.0.0.1 or localhost). Anywhere else needs https://." ;;
+      [Hh][Tt][Tt][Pp]://*) warn "$URL_PLAIN_HTTP_HINT" ;;
       *) if looks_like_a_secret "$reply"; then warn_answer_looked_like_a_secret; fi
-         warn "That has to start with https:// — or http://127.0.0.1:<port> for a local test." ;;
+         warn "That has to start with https:// — or http://<address on your own network>:<port> for a local test." ;;
     esac
   done
 }
@@ -450,7 +451,7 @@ run_compat() {
 
   if [ -n "$CHECK_URL" ]; then
     GW_URL=$(doctor_accept_url "$CHECK_URL") \
-      || usage_die "Can't test '$CHECK_URL' — use https://… (or http://127.0.0.1:<port> for a local test)."
+      || usage_die "Can't test '$CHECK_URL' — use https://… (or http:// toward an address on your own network for a local test)."
   else
     say ""
     # explain_check_server is passed as the prompt's `i` copy, not an action id:

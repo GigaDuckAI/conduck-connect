@@ -183,25 +183,25 @@ explain_action() { # explain_action <action-id>
 
     gateway.custom.has_https)
       explain_panel \
-        "Say whether your server already answers on an address starting with https://" \
-        "The Conduck app talks only to encrypted addresses — that is what the s on the end of https means — and the encryption certificate has to be one your phone already trusts on its own. A server started at home normally answers only on the machine it runs on, which is not that." \
+        "Say whether your server already answers on a web address" \
+        "The Conduck app talks to encrypted https:// addresses, whose certificate has to be one your phone already trusts on its own — and to a plain http:// address only when that address is one nothing outside your own network can reach, such as 192.168.1.10 or a name ending .local. Apple's own rule, not ours: a plain address anywhere else is refused by the phone before the app sees it. A server started at home often answers only on the machine it runs on, which is neither." \
         "Yes asks you for that address next. No asks instead for the port number your server listens on locally, and then helps you put an encrypted address in front of it — Tailscale and Cloudflare both do that part for free." \
         "" \
         "Either answer by itself changes nothing about your server." \
-        "Answer No, which is what Enter does. Unless you deliberately set up a domain name and a certificate for this server, or somebody handed you an https:// address for it, you do not have one — and No is the path that builds you one."
+        "Answer Yes only if you can name the address — an https:// one you set up, or the local address a server like Ollama already answers on. Otherwise answer No, which is what Enter does, and setup builds you an encrypted address for free."
       ;;
 
-    # For the https:// address prompt itself (20-gateway.inc.sh, the ask_url that
-    # follows a Yes at gateway.custom.has_https). Its whole difficulty is that
-    # people paste the address of a chat page, or an address with /v1 on the end.
+    # For the address prompt itself (20-gateway.inc.sh, the ask_url that follows a
+    # Yes at gateway.custom.has_https). Its whole difficulty is that people paste
+    # the address of a chat page, or an address with /v1 on the end.
     gateway.custom.address)
       explain_panel \
-        "Type the https:// address that already reaches this server from outside" \
-        "This is the address the app itself will call, from a phone that may be nowhere near this machine, so it has to work from the open internet or from your VPN — not just from this desk." \
+        "Type the address this server already answers on" \
+        "This is the address the app itself will call. An https:// one works from anywhere the phone is. A plain http:// one is accepted only toward your own network — an IP address like 192.168.1.10, or a name ending .local; a bare name such as ollama is refused, and so is any ordinary domain name. What that lane costs you is two things. Nothing on it is encrypted, so anyone on that network can read your messages and your key. And it only works while the device is on that network — not in the car, and not out with the Watch." \
         "Give the BASE address only, with no /v1 and no other path on the end: this script and the app add the rest themselves (a pasted /v1 tail is trimmed off for you). A trailing slash is trimmed too." \
         "" \
         "Nothing about your server or your proxy is reconfigured; the address is checked and then used." \
-        "If you cannot name an https:// address you set up on purpose, you probably do not have one. Press b if it is offered, or stop with q and start again answering No at the previous question — setup will build you an encrypted address for free."
+        "If you cannot name an address you set up on purpose, and your server is not answering on a local address you know, press b if it is offered, or stop with q and start again answering No at the previous question — setup will build you an encrypted address for free."
       ;;
 
     # For the "A short name for it (shown in the app)" prompts. The answer is a
@@ -655,7 +655,7 @@ explain_action() { # explain_action <action-id>
     # exists to prevent.
     file.address.url)
       explain_panel \
-        "Type the https:// address that reaches the file server" \
+        "Type the address that reaches the file server" \
         "File transfer runs as its own small server on its own door, so it needs its own address. The gateway's address will not reach it, and pasting the gateway's address here produces a setup code that fails on the first attachment." \
         "Records the address, checks that the file server actually answers on it, and puts it in the setup code alongside the gateway's. Give the base address with no path on the end." \
         "Pressing Enter with nothing typed goes on to a question about leaving file transfer out of this setup code entirely." \

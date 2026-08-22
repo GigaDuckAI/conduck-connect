@@ -698,10 +698,16 @@ hermes_settings_match_url() { # hermes_settings_match_url <checked-url> -> 0 whe
   local url="$1" envf="${HOME:-}/.hermes/.env"
   local rest hostport host port declared_host declared_port key
 
-  # https means the app is pairing an address off this box (doctor_accept_url only
-  # ever admits plain http toward 127.*/localhost/[::1]), and a tailnet or proxy
+  # https means the app is pairing an address off this box, and a tailnet or proxy
   # hostname in front of this same Hermes is exactly the case that must not be
   # claimed: from here it is indistinguishable from someone else's gateway.
+  #
+  # Plain http is no longer proof of "this box" on its own — doctor_accept_url now
+  # admits any address the local network reaches, and 192.168.1.20:8642 may be a
+  # Hermes on a DIFFERENT machine whose settings this one cannot read. The claim
+  # this function makes is an attribution to THIS host's ~/.hermes/.env, so it keeps
+  # the loopback bar it always had and refuses everything else, rather than
+  # inheriting a widened one it was never reasoning about.
   case "$url" in
     [Hh][Tt][Tt][Pp]://?*) rest="${url#*://}" ;;
     *) return 1 ;;
@@ -717,6 +723,15 @@ hermes_settings_match_url() { # hermes_settings_match_url <checked-url> -> 0 whe
   esac
   [ -n "$port" ] || port="80"
   host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+  # The loopback bar, kept explicitly here rather than borrowed from the URL
+  # acceptor above — see this function's header. The whole 127/8 and not just
+  # 127.0.0.1, because a wildcard bind genuinely does answer on every one of them
+  # and the declaration arms below are what decide which of those counts.
+  case "$host" in
+    localhost|'::1') ;;
+    127.*) case "$host" in *[!0123456789.]*) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
 
   [ -f "$envf" ] && [ -r "$envf" ] || return 1
   [ "$(env_get "$envf" "API_SERVER_ENABLED")" = "true" ] || return 1
@@ -1368,30 +1383,36 @@ configure_generic() {
       fi
     fi
 
-    # The address group — the https:// gate and whichever question it leads to —
+    # The address group — the address gate and whichever question it leads to —
     # in its own loop. Back at either of those questions returns to the gate
     # that sent the operator there, not to the top: a wrong `y` here is the most
     # likely wrong answer in Step 2, and until now it stranded the run at a URL
     # prompt with no exit at all. Back at the gate itself restarts the group,
     # which is where the name lives.
+    #
+    # The gate asks about an ADDRESS rather than about https specifically, because
+    # a server already answering on the local network — Ollama on its own port is
+    # the common one — has an address this tool will pair, and a question naming
+    # only https sends that operator down the build-me-a-tunnel path they do not
+    # need. What ask_url accepts is still the app's rule and nothing looser.
     local addr_rc
     while true; do
       GW_URL=""; GW_LOCAL_PORT=""
-      confirm "  Does it already have an https:// URL?" "gateway.custom.has_https" true
+      confirm "  Does it already answer on a web address?" "gateway.custom.has_https" true
       addr_rc=$?
       case "$addr_rc" in
         10) break ;;                      # back at the gate → restart the group
-        0)  prompt_into GW_URL ask_url "Its full https:// web address" "https://ai.example.com" \
+        0)  prompt_into GW_URL ask_url "Its full web address — https://, or http:// on your own network" "https://ai.example.com" \
               0 "" "gateway.custom.address" true && { apply_gateway_url_normalization; break; }
-            say ""; note "↩ Back to the https:// question."
+            say ""; note "↩ Back to the address question."
             continue ;;
         *)  ask_custom_gateway_port; addr_rc=$?
             [ "$addr_rc" = "0" ] && break
             if [ "$addr_rc" = "10" ]; then
-              say ""; note "↩ Back to the https:// question."
+              say ""; note "↩ Back to the address question."
               continue
             fi
-            die "Need the local port (or an https URL)." ;;
+            die "Need the local port (or a web address)." ;;
       esac
     done
     if [ "$addr_rc" = "10" ]; then

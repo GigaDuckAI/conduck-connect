@@ -2,6 +2,55 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
+## [Unreleased]
+
+### Changed
+
+- **A plain `http://` address on your own network is now paired, not refused.**
+  The wizard's pairing prompt and both doctor prompts accept `http://` when the
+  host is one only the local network can reach — a loopback or private IP
+  literal, an IPv6 ULA or link-local literal, or a `.local` name. A server such
+  as **Ollama** answers on exactly that and cannot be
+  configured to do anything else, so refusing it outright left those setups with
+  no way through. `https://` remains what the prompts advertise and what every
+  exposure path builds; plain `http://` is taken when you type it and is never
+  suggested, defaulted to, or produced by prepending a scheme to a bare host.
+- **A domain name over plain `http://` is still refused, and so is the
+  carrier-grade NAT range an overlay VPN hands out.** That boundary is Apple's,
+  not this script's: App Transport Security decides it from the address string
+  before any connection is attempted, so a code carrying one would import and
+  then fail with nothing on screen to explain it. The wizard now applies the
+  same rule the app does, so the two cannot disagree about an address. Where
+  shell cannot reproduce the platform's own address grammar it refuses rather
+  than guesses — a numeric host has to be a canonical four-part dotted quad —
+  which makes the connector slightly stricter than the app and never looser.
+- **A bare one-word address such as `http://nas` or `http://ollama` is refused
+  too, with or without a trailing dot.** A name like that looks like it can only
+  mean something on your own network, and it cannot: real one-label top-level
+  domains answer at the public DNS root with ordinary A records (`dig +short A
+  uz.` returns 91.212.89.8), so a resolver that runs out of search domains can
+  send the request — and the gateway key riding it, in the clear — to a stranger's
+  machine. Nothing that worked is lost: a one-word name nothing can resolve failed
+  before too, just later and with no explanation. The refusal names the two
+  spellings of the same machine that do work — its IP address, or its `.local`
+  name. Three address shapes Apple was never measured on go the same way, because
+  nothing confines them to your network either: `0.0.0.0/8`, its IPv6 twin `::`,
+  and the deprecated site-local IPv6 range `fec0::/10`. Loopback (`127.0.0.0/8`)
+  and IPv6 link-local (`fe80::/10`) stay accepted — a packet to either cannot
+  leave the machine or the wire it is on, whatever Apple would have decided.
+- **What an unencrypted lane costs is stated wherever one appears.** The prompt
+  that accepts the address says it, and the screen that prints the setup code
+  says it again, naming the part that is easy to miss: the gateway key rides
+  every request, so anyone on that network can read the messages *and* use the
+  gateway afterwards — and the address only works while the device is on that
+  network, so a standalone Apple Watch never reaches it.
+- **A certificate is still not negotiable where there is one.** An `https://`
+  address you supply is verified exactly as before, and a self-signed one, a
+  private CA, an expired one or a wrong hostname still stops the run and names
+  the three free routes to a real certificate. An unencrypted address presents
+  no certificate at all, so there is nothing to evaluate and nothing a pin could
+  tighten; it is not a way in for the self-signed path.
+
 ## [0.15.0] — the folder your agent makes, and three releases that never shipped
 
 **From 0.12.0 this is a four-release jump.** 0.13.0, 0.14.0 and 0.14.1 were

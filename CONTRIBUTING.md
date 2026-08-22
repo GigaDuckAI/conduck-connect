@@ -106,20 +106,38 @@ not a bug fix — it needs prior discussion in an issue.
 - **The vendored Nayuki QR block is third-party** (Project Nayuki, MIT) and
   stays **unmodified**. CI verifies it against a pinned checksum and asserts it
   imports only the Python standard library; a change there fails the build.
-- **No self-signed path, and no certificate pinning.** The connector will not set
-  a user up on a certificate their devices do not already trust. Two independent
-  reasons, and both are permanent: App Transport Security lets an Apple app make
-  certificate evaluation stricter and never looser, so the app refuses such a
-  gateway below its own code; and the pairing payload carries no certificate
-  field by design, because a setup code is entirely attacker-supplied — a pin is
-  something a human types into the app, never something a tool hands it. So the
-  "I already run my own HTTPS" answer is a **gate**, not a preference: it
-  verifies, and on failure it stops and names the three free routes to a trusted
-  certificate. There is no accept-anyway override, and one cannot be added. The
-  suite asserts the released artifact carries no pinning symbol and no
-  `selfsigned` transport, and that a saved profile naming either is filtered out
-  of the menu rather than offered and then failing — while requiring both
-  certificate-diagnosis helpers to survive, so a refusal is always explained.
+- **No self-signed path, and no certificate pinning.** Where an address is
+  encrypted, the connector will not set a user up on a certificate their devices
+  do not already trust. Two independent reasons, and both are permanent: App
+  Transport Security lets an Apple app make certificate evaluation stricter and
+  never looser, so the app refuses such a gateway below its own code; and the
+  pairing payload carries no certificate field by design, because a setup code is
+  entirely attacker-supplied — a pin is something a human types into the app,
+  never something a tool hands it. So an `https://` address the user supplies is a
+  **gate**, not a preference: it verifies, and on failure it stops and names the
+  three free routes to a trusted certificate. There is no accept-anyway override,
+  and one cannot be added. The suite asserts the released artifact carries no
+  pinning symbol and no `selfsigned` transport, and that a saved profile naming
+  either is filtered out of the menu rather than offered and then failing — while
+  requiring both certificate-diagnosis helpers to survive, so a refusal is always
+  explained.
+- **A plain-`http` address is a different question, and it is not an exception to
+  the one above.** The connector accepts `http://` toward an address only the
+  local network can reach, because a large part of the self-hosting world serves
+  plain HTTP there and cannot be configured to do anything else. Nothing is being
+  trusted more loosely: there is no certificate, no chain and no fingerprint, so
+  there is nothing to evaluate and nothing a pin could tighten — which is exactly
+  why it is *not* a way in for the self-signed path, and why the app refuses a
+  stored fingerprint paired with such an address instead of dropping the pin. The
+  boundary itself is not negotiable and not ours: Apple decides it from the address
+  string before it connects, so a dotted domain name and the carrier-grade NAT
+  range are refused however private the machine behind them is. A single-label
+  name is refused too, rooted or not — the platform's verdict on one was never
+  measured, and this path carries a bearer token in cleartext, so a shape the
+  kernel does not confine is refused rather than guessed at. Plain `http` is
+  accepted when it is typed and is never suggested, defaulted to, or produced by
+  prepending a scheme; every prompt that takes one, and the screen that prints the
+  code, say plainly that the lane is unencrypted.
 
 ## Protocol changes need prior discussion
 
@@ -133,6 +151,12 @@ the two must not drift independently. Open an issue before changing any of them:
   frozen per schema number — field order, names, and enum values included — so
   *any* change to it, renaming the prefix included, must bump `schema=`;
 - **URL normalization**, which is pinned to the app's own fixtures;
+- **URL admissibility** — which addresses may be paired at all (`url_is_local_host`
+  and the prompts that call it). It is the same rule the app applies on import and
+  on read, so the two cannot drift independently: accept more than the app and the
+  wizard mints a code that imports and then fails, accept less and it refuses an
+  address the app is happy with. `tests/run-checks-suite.sh --only
+  plain-http-is-local-only` is the parity fixture;
 - any current-Apple-app request/body acceptance rule used by
   `--check-server`. This parity is scoped to the directly addressed endpoint:
   diagnostics intentionally do not follow redirects or forward credentials to

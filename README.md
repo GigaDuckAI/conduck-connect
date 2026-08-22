@@ -148,7 +148,7 @@ For an unattended check, add `CI=1`. Without it, a passing check in an interacti
 
 Interactive setup needs a real terminal and ends with a QR code a person scans. There is intentionally no unattended answer file or `--yes` flag. Fully machine-driven operations are limited to the documented checks and `--list --json`.
 
-Conduck accepts only an `https://` gateway address whose certificate the Apple device already trusts. The wizard explains the supported routes; the [full manual](MANUAL.md#reaching-your-gateway) covers Tailscale, Tailscale Funnel, Cloudflare Tunnel, reverse proxies, and existing HTTPS.
+Conduck accepts an `https://` gateway address whose certificate the Apple device already trusts — or a plain `http://` one when the address is a local-network one nothing outside can reach, which is how a server such as Ollama answers by default. A domain name over plain `http://` is refused however private the machine behind it is, and so is a bare one-word name such as `nas`: Apple decides that from the address before it connects, so the wizard refuses it too rather than mint a code that would fail on the phone. An IP address, or the same machine's `.local` name, is the spelling that works. The wizard explains the supported routes; the [full manual](MANUAL.md#reaching-your-gateway) covers Tailscale, Tailscale Funnel, Cloudflare Tunnel, reverse proxies, existing HTTPS, and the local-network case.
 
 ## Full documentation
 

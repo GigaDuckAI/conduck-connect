@@ -161,7 +161,7 @@ manage_transport_label() { # manage_transport_label <transport> <reach>
     tailscale) printf 'Tailscale — private (your tailnet only)' ;;
     funnel)    printf 'Tailscale Funnel — PUBLIC (reachable from the internet)' ;;
     cloudflare) printf 'Cloudflare Tunnel — %s' "${2:-public}" ;;
-    public)    printf 'your own HTTPS front — %s' "${2:-public}" ;;
+    public)    printf 'the address you gave me — %s' "${2:-public}" ;;
     *)         printf '%s — %s' "$(safe_display "${1:-unknown}" 40)" "${2:-unknown}" ;;
   esac
 }
@@ -874,7 +874,7 @@ manage_edit() { # manage_edit [<id>]
     fi
     say ""
     say "  ${BOLD}Change one thing${RESET}"
-    say "    1) Web address — the https:// address the app calls"
+    say "    1) Web address — the address the app calls"
     say "    2) Model"
     say "    3) Shared folder for file transfer"
     say "    4) Show this setup's code again (to pair a device, or after a change)"
@@ -907,7 +907,7 @@ manage_edit_address() { # manage_edit_address <id> <lane-preserved>
   say "  Currently: $(safe_display "${old:-?}" 200)"
   note "This is the address the Conduck app calls. Changing it here does not move any"
   note "tunnel or route — it records where the address now is."
-  prompt_into new ask_url "  The https:// address that reaches this gateway now" \
+  prompt_into new ask_url "  The address that reaches this gateway now" \
     "https://ai.example.com" 0 "" explain_manage_address true || return 0
   if [ "$new" = "$old" ]; then
     note "Same address as before — nothing to save."
@@ -1392,7 +1392,8 @@ manage_forget_grade_route() { # <id> <url> <lport> <verb> <label> <role> <claime
   # at all — with no port to look it up by, the silence rule below cannot speak for
   # it, so "nothing is open" is not a thing this branch is entitled to imply.
   #
-  # Not a hand-edit-only case: ask_url accepts anything shaped like https://?*, and
+  # Not a hand-edit-only case: ask_url accepts any admissible address — https://?*,
+  # or plain http toward the local network — and
   # --edit's transport check only asks whether the host ends in .ts.net, so a typo'd
   # tailnet name (box_1.tail1234.ts.net) is saved with no warning and lands here.
   if ! show_qr_is_https_host "$url" || ! show_qr_is_port "$cand_port" || [ -z "$cand_host" ]; then
@@ -2376,8 +2377,9 @@ explain_manage_forget() {
 explain_manage_address() {
   say ""
   say "  ${BOLD}What to type${RESET}"
-  say "  The https:// address that reaches this gateway from outside this machine —"
-  say "  the base address, with no /v1 and no other endpoint on the end. If you run"
+  say "  The address that reaches this gateway: an https:// one from anywhere, or a"
+  say "  plain http:// one that only your own network reaches. The base address, with"
+  say "  no /v1 and no other endpoint on the end. If you run"
   say "  a Cloudflare quick tunnel, it is the *.trycloudflare.com line cloudflared"
   say "  prints when it starts."
   say ""

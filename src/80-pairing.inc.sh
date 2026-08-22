@@ -242,6 +242,35 @@ emit_payload() {
     warn "It also carries the FILE-SERVER PASSWORD for your shared folder, so whoever holds"
     warn "this code can read and change the files in it."
   fi
+  # An unencrypted address in this code is a fact about how the KEY travels, not
+  # only about the messages: the app sends the bearer token on every request, so on
+  # a plain-http lane anyone else on that network reads it and can then use the
+  # gateway as the operator. Said HERE and not only at the prompt that accepted the
+  # address, because this is the screen somebody is looking at when they decide to
+  # scan it, and that prompt has long scrolled away — the same argument the quick
+  # tunnel reminder below makes. --show-code re-emission lands here too.
+  # Matched on the scheme alone: by this point the address has already been through
+  # the one acceptor, so a plain-http one that got this far is a local one.
+  local plain_gw=false plain_fs=false
+  case "$GW_URL" in [Hh][Tt][Tt][Pp]://*) plain_gw=true ;; esac
+  if [ -n "$FS_URL" ] && [ -n "$FS_CRED" ]; then
+    case "$FS_URL" in [Hh][Tt][Tt][Pp]://*) plain_fs=true ;; esac
+  fi
+  if $plain_gw || $plain_fs; then
+    if $plain_gw && $plain_fs; then
+      warn "The gateway address AND the file-lane address in this code are plain http:// — NOT ENCRYPTED."
+    elif $plain_gw; then
+      warn "The gateway address in this code is plain http:// — NOT ENCRYPTED."
+    else
+      warn "The file-lane address in this code is plain http:// — NOT ENCRYPTED."
+    fi
+    warn "Everything to and from it crosses your network in the clear, including the secret this"
+    warn "code carries for it, so anyone else on that network can read what you send and then use"
+    warn "it themselves. It also only works while the device is ON that network — away from it"
+    warn "nothing connects, and an Apple Watch used away from your iPhone never reaches it at all."
+    note "Put https:// in front of it whenever you want either of those to stop being true, then"
+    note "re-run me for a code that points at the new address."
+  fi
   # What the code IS, said in the one place every route to a code passes through:
   # setup's own emission and --show-code's re-emission both land here. It states
   # the password rule and the fact behind every "why is it asking me again?" —

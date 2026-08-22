@@ -2875,7 +2875,7 @@ setup_file_lane() {
       note "Give it the same reach as the gateway (both public, or both private) — attachments follow this address."
       note "Its certificate must be trusted the same way the gateway's is; the app applies one rule to both."
       local h
-      ask_fs_url "The https:// web address that reaches it (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
+      ask_fs_url "The web address that reaches it (leave blank to review omitting file transfer)" || die "$NO_ANSWER"
       h="$ASK_FS_URL_RESULT"
       if [ -n "$h" ]; then
         FS_URL="$h"

@@ -198,6 +198,16 @@ settings, as any HTTPS client would. Gateway model/chat requests send
 credentials: the wizard, both checks, and the saved-profile reader all refuse
 one, so a password can never end up inside a routing field or the setup code.
 
+An address you give may be a plain `http://` one when it is a local-network
+address — a loopback or private IP literal, an IPv6 ULA or link-local literal, or
+a `.local` name. Requests to such an address are unencrypted and carry the
+gateway token as any other request does, which is why every prompt that accepts
+one says so and the screen that prints the setup code says it again. A domain
+name over plain `http://` is refused, and so is a bare one-word name such as
+`nas` (real one-label TLDs answer at the public DNS root), and so is the
+carrier-grade NAT range an overlay VPN hands out — the app refuses all three, so
+the wizard does too.
+
 - Normal setup and `--show-code` verification may send a local health check,
   `GET /v1/models`, and a real `POST /v1/chat/completions` pong. Once that pong
   passes, one more `POST /v1/chat/completions` carries a small picture the
