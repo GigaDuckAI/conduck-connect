@@ -552,7 +552,8 @@ print_help() {
   say "  --allow-keyless-public With --setup: expert — permit a gateway with no key on a"
   say "                         publicly reachable transport."
   say "  --deep                 With --check-adapter: add a semantic image-input check."
-  say "  --files                With --check-adapter: also grade the configured file lane."
+  say "  --files                With --check-adapter: also grade the file lane — the one"
+  say "                         already paired, or one named with CONDUCK_FILES_* (below)."
   say "                         Writes and removes small probe files."
   say ""
   say "  bash conduck-connect.sh --help       print this reference and exit"
@@ -567,6 +568,12 @@ print_help() {
   say "  CI=1                        Never wait for a person: a passing check prints its"
   say "                              summary and exits instead of offering to continue into"
   say "                              setup. Accepts 1, true or yes."
+  say "  CONDUCK_FILES_URL           --check-adapter --files on a machine that has NOT been"
+  say "  CONDUCK_FILES_DIR           through --setup (every build rig): name the lane to grade."
+  say "  CONDUCK_FILES_PASS          URL is the file server's address (https://…, or http://"
+  say "  CONDUCK_FILES_USER          only toward this machine); DIR is the same absolute folder"
+  say "                              the adapter was given; PASS is its password; USER defaults"
+  say "                              to conduck. Set all of URL/DIR/PASS together, or none."
   say ""
   say "EXIT STATUS"
   say "  0  requested action succeeded (or a check passed)"
@@ -12655,7 +12662,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.8). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.9). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -12709,7 +12716,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
 # summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.8 harness=<ver>
+#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.9 harness=<ver>
 #     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
 #     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
 #     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
@@ -12740,7 +12747,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.8"
+DOCTOR_CONTRACT_REV="1.9"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
