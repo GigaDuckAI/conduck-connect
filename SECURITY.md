@@ -103,7 +103,9 @@ What it costs is stated plainly at every prompt that accepts one, and again on t
 
 ## The setup code is a secret
 
-The QR / paste setup code contains your gateway URL and its access token — and, when the file lane is set up, the file-server URL and its credential too. Treat it like a password: it is scannable by anyone who can see your screen, and whoever holds it can talk to your gateway and read or change files in the shared folder until you rotate those secrets. The script warns you of this when it emits the code.
+The QR / paste setup code contains your gateway URL and its access token — and, when the file lane is set up, the file-server URL and its credential too. Treat it like a password: it is scannable by anyone who can see your screen, and whoever holds it can talk to your gateway and read or change files in the shared folder until you rotate those secrets. The script warns you of this every time it emits a code that carries a secret, `--emit-code` included (a `--keyless` code with no file lane carries none, and says so instead) — there the warning goes to stderr so that stdout stays exactly the code, which means a redirected run puts the secret in a file. Redirect it somewhere you would put a password.
+
+`--emit-code` also never takes a secret on the command line. Both the gateway key and the file-server password arrive through the environment (`CONDUCK_TOKEN`, `CONDUCK_FILES_PASS`), because `argv` is readable by every process on the host through `ps`. There is no `--token` flag anywhere in this tool, for that reason.
 
 ## Embedded component
 

@@ -159,7 +159,7 @@
 
 set -u -o pipefail
 
-VERSION="0.15.0"
+VERSION="0.16.0"
 PAYLOAD_VERSION=1
 # ---------------------------------------------------------------- utilities --
 
@@ -421,6 +421,65 @@ url_is_local_host() { # url_is_local_host <host[:port]> -> 0 when only the local
   # line, and the two have to agree.
   return 1
 }
+
+# Does this authority name THIS machine, and only this machine?
+#
+# Deliberately much narrower than url_is_local_host, and not a security boundary
+# either — it decides how a failure is EXPLAINED, nothing else. "Only the local
+# network reaches it" still covers the box across the room and every address a
+# reverse proxy legitimately answers on, so a diagnosis that assumes an HTTPS
+# front in the way is fair there. On loopback it is not: nothing sits between the
+# probe and the process, so a gateway error status came out of the graded program
+# itself, and sending the reader to look at a proxy that does not exist wastes
+# the one hour they had.
+#
+# Pure Bash, both letter cases spelled out, for url_is_local_host's reason: the
+# callers run before the runtime preflight and may not depend on python3 or `tr`.
+url_is_loopback_host() { # url_is_loopback_host <host[:port]> -> 0 for 127.0.0.0/8, ::1 or localhost
+  local h="$1" o o2 rest
+  case "$h" in
+    ''|*@*|*/*|*'?'*|*'#'*|*[[:space:]]*) return 1 ;;
+  esac
+  case "$h" in
+    \[*)
+      case "$h" in \[*\]|\[*\]:*) ;; *) return 1 ;; esac
+      h="${h#\[}"; h="${h%%\]*}"
+      case "$h" in *%*) h="${h%%\%*}" ;; esac
+      # Only the canonical spelling. The long forms (0:0:…:1) are legal IPv6 and
+      # nobody types them at a prompt; failing to recognise one costs a less
+      # specific explanation, which is the safe direction for a message.
+      [ "$h" = "::1" ] && return 0
+      return 1 ;;
+  esac
+  case "$h" in
+    *:*:*) return 1 ;;
+    *:*)   h="${h%%:*}" ;;
+  esac
+  case "$h" in *.) h="${h%.}" ;; esac
+  [ -n "$h" ] || return 1
+  case "$h" in
+    [Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]) return 0 ;;
+  esac
+  # The whole of 127.0.0.0/8: the kernel routes every one of those addresses to
+  # lo0, so any of them names this machine. Canonical dotted quad only, the same
+  # subset url_is_local_host accepts — an address shape neither of them reads is
+  # simply not recognised as loopback, and the general explanation stands.
+  case "$h" in *[!0123456789.]*) return 1 ;; esac
+  case "$h" in *.*.*.*.*) return 1 ;; esac
+  case "$h" in *.*.*.*) ;; *) return 1 ;; esac
+  [ "${h%%.*}" = "127" ] || return 1
+  rest="${h#*.}"; o2="${rest%%.*}"; rest="${rest#*.}"
+  for o in "$o2" "${rest%%.*}" "${rest#*.}"; do
+    case "$o" in
+      ''|*[!0123456789]*) return 1 ;;
+      0) ;;
+      0*) return 1 ;;
+    esac
+    [ "${#o}" -le 3 ] || return 1
+    [ "$o" -le 255 ] || return 1
+  done
+  return 0
+}
 # The refusal and the caveat, in one place each, because both are said at more than
 # one prompt and two spellings of one fact are two chances to drift. The refusal
 # names the spellings that DO work rather than the rule it is applying — and it
@@ -455,7 +514,17 @@ DOCTOR_DEEP=false
 DOCTOR_FILES=false
 COMPAT=false
 CHECK_URL=""
-COMMAND=""         # menu | setup | check-server | check-adapter | show-code | list | edit | forget
+COMMAND=""         # menu | setup | check-server | check-adapter | show-code | emit-code | list | edit | forget
+# --emit-code's inputs. Every one of them arrives on argv EXCEPT the two secrets,
+# which arrive in the environment for the reason there is no --token flag
+# anywhere in this CLI: argv is readable by every process on the host via `ps`.
+EMIT_URL=""
+EMIT_MODEL=""
+EMIT_NAME=""
+EMIT_KIND=""
+EMIT_TRANSPORT=""
+EMIT_FILES_URL=""
+EMIT_KEYLESS=false
 SETUP_FROM_CHECK=false
 # Which check handed off (server | adapter). Read only for prompt wording, and
 # held as state because the identity question it phrases is asked later than the
@@ -492,7 +561,7 @@ MENU_RETURN_STATUS=20
 
 set_command() { # set_command <command>
   if [ -n "$COMMAND" ]; then
-    usage_die "Choose one action only: --setup, --check-server, --check-adapter, --show-code, --list, --edit or --forget."
+    usage_die "Choose one action only: --setup, --check-server, --check-adapter, --show-code, --emit-code, --list, --edit or --forget."
   fi
   COMMAND="$1"
 }
@@ -513,18 +582,35 @@ print_help() {
   say ""
   say "SYNOPSIS"
   say "  bash conduck-connect.sh [--setup | --check-server [url] | --check-adapter [url]"
-  say "                          | --show-code | --list [--json] | --edit [id]"
-  say "                          | --forget <id>] [options]"
+  say "                          | --emit-code --url <u> | --show-code | --list [--json]"
+  say "                          | --edit [id] | --forget <id>] [options]"
   say ""
   say "COMMANDS — scriptable (pass the url, set CI=1; no terminal needed)"
   say "  --check-server [url]   Grade software NOT built for Conduck against the app's core"
   say "                         wire protocol. Ends in one machine-readable summary line."
   say "  --check-adapter [url]  Grade software built specifically for Conduck against its"
   say "                         adapter contract. Ends in one machine-readable summary line."
+  say ""
+  say "  Both checks send REAL engine turns and wait up to 5 minutes for each, so budget"
+  say "  for the worst case: --check-server ~20 min · --check-adapter ~25 min · with"
+  say "  --deep ~30 min · with --files ~35 min. A turn in flight prints a heartbeat to"
+  say "  stderr every 30s, so a redirected run still shows the difference between slow"
+  say "  and wedged."
+  say ""
   say "  --list [--json]        List what is already set up on this machine: each saved"
   say "                         gateway's id, address, transport, model and shared folder,"
   say "                         and whether its file-lane service is running. Asks nothing,"
   say "                         changes nothing, and prints no key, password or setup code."
+  say "  --emit-code --url <u>  Print ONE setup code for a gateway you describe on this"
+  say "                         line, and nothing else, on stdout. Reads no saved setup,"
+  say "                         changes nothing, sends no request — so it works on a build"
+  say "                         rig before the gateway is exposed. The key comes from"
+  say "                         CONDUCK_TOKEN; --keyless is how you declare there is none."
+  say "                         Options: --model <id>, --name <shown-in-app>, --kind"
+  say "                         openclaw|hermes|custom (default custom), --transport"
+  say "                         tailscale|funnel|cloudflare|public (default public),"
+  say "                         --files-url <u> with CONDUCK_FILES_PASS for a file lane."
+  say "                         The code carries your key: treat every copy as the key."
   say ""
   say "COMMANDS — need a person at a terminal"
   say "  (no command)           Welcome menu: pick one of the actions below."
@@ -560,8 +646,11 @@ print_help() {
   say "  bash conduck-connect.sh --version    print the version and exit"
   say ""
   say "ENVIRONMENT"
-  say "  CONDUCK_TOKEN               The key for a check, so it never reaches your"
-  say "                              shell history or argv."
+  say "  CONDUCK_TOKEN               The key for a check, and the key --emit-code puts in"
+  say "                              the code, so it never reaches your shell history or"
+  say "                              argv. Export it EMPTY, or pass --keyless, to declare a"
+  say "                              keyless gateway deliberately: unset is never read as"
+  say "                              keyless."
   say "  CONDUCK_CHECK_SERVER_MODEL  --check-server only: grade the model you plan to use."
   say "                              Without it the named-model checks take whichever id"
   say "                              /v1/models happens to list first."
@@ -574,7 +663,10 @@ print_help() {
   say "  CONDUCK_FILES_USER          toward an address on your own network); DIR is the same"
   say "                              absolute folder the adapter was given; PASS is its password;"
   say "                              USER defaults to conduck. Set all of URL/DIR/PASS together,"
-  say "                              or none."
+  say "                              or none. PASS is also what --emit-code puts in the code"
+  say "                              beside --files-url — there, both or neither. A setup code"
+  say "                              carries no username, so --emit-code refuses a USER other"
+  say "                              than conduck rather than mint a lane that cannot sign in."
   say ""
   say "EXIT STATUS"
   say "  0  requested action succeeded (or a check passed)"
@@ -588,6 +680,8 @@ print_help() {
   say "  bash conduck-connect.sh --setup --dry-run   # see every change first; change nothing"
   say "  bash conduck-connect.sh --setup             # set up, verify, print the setup code"
   say "  CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-adapter https://ai.example.com"
+  say "  CONDUCK_TOKEN=… bash conduck-connect.sh --emit-code --url https://ai.example.com \\"
+  say "      --name 'My adapter' --model my-model   # one setup code on stdout, nothing else"
   say "  bash conduck-connect.sh --list              # what this machine already has set up"
   say "  bash conduck-connect.sh --edit my-gateway   # the quick tunnel handed out a new"
   say "                                              # address overnight: give this one setup"
@@ -615,12 +709,46 @@ case "${1:-}:${2:-}" in
   check:adapter) usage_die "The retired check adapter form is now --check-adapter [url] (try --help)." ;;
 esac
 
+# --emit-code is the first command here whose options take VALUES, and the loop
+# below walks argv one word at a time with no shift. Rather than rewrite the
+# parser every other command depends on, a value flag records itself here and the
+# NEXT word is consumed as its value. Empty between options, so a stray value can
+# never be read as one.
+CLI_PENDING_OPT=""
+
 for arg in "$@"; do
+  # The value half of a `--flag value` pair, claimed before anything else looks
+  # at this word: without that, `--name --setup` would silently start a wizard.
+  if [ -n "$CLI_PENDING_OPT" ]; then
+    # A value that looks like a flag is a forgotten value, not a value. Saying so
+    # here beats letting `--url --model gpt` fail three screens later as an
+    # unusable address, which is what it would otherwise look like.
+    case "$arg" in
+      -*) usage_die "--$CLI_PENDING_OPT needs a value, and '$arg' looks like another option (try --help)." ;;
+    esac
+    case "$CLI_PENDING_OPT" in
+      url)       EMIT_URL="$arg" ;;
+      model)     EMIT_MODEL="$arg" ;;
+      name)      EMIT_NAME="$arg" ;;
+      kind)      EMIT_KIND="$arg" ;;
+      transport) EMIT_TRANSPORT="$arg" ;;
+      files-url) EMIT_FILES_URL="$arg" ;;
+      *) die "Internal error: unknown pending option '$CLI_PENDING_OPT'." ;;
+    esac
+    CLI_PENDING_OPT=""
+    continue
+  fi
   case "$arg" in
     --setup)         set_command "setup" ;;
     --check-server)  set_command "check-server" ;;
     --check-adapter) set_command "check-adapter" ;;
     --show-code)     set_command "show-code" ;;
+    --emit-code)     set_command "emit-code" ;;
+    # The six value-taking options, all of them --emit-code's. validate_cli
+    # refuses every one of them on any other command.
+    --url|--model|--name|--kind|--transport|--files-url)
+      CLI_PENDING_OPT="${arg#--}" ;;
+    --keyless)  EMIT_KEYLESS=true ;;
     # The three manage commands. Their optional/required id arrives through the
     # same single positional slot the checks use for a URL — see CLI_POSITIONAL
     # below, and validate_cli, which is where a positional gets its meaning.
@@ -663,12 +791,16 @@ for arg in "$@"; do
         else usage_die "Unknown argument: $arg (try --help)"; fi ;;
   esac
 done
+# argv ended on a value flag with nothing after it. Caught here rather than left
+# empty, because an empty --url would otherwise be reported as a missing option
+# — which sends the reader looking for a flag they did type.
+[ -z "$CLI_PENDING_OPT" ] || usage_die "--$CLI_PENDING_OPT needs a value after it (try --help)."
 
 if [ -z "$COMMAND" ]; then
   if [ "$CLI_ARG_COUNT" = "0" ]; then
     COMMAND="menu"
   else
-    usage_die "Choose an action: --setup, --check-server, --check-adapter, --show-code, --list, --edit or --forget (try --help)."
+    usage_die "Choose an action: --setup, --check-server, --check-adapter, --show-code, --emit-code, --list, --edit or --forget (try --help)."
   fi
 fi
 
@@ -909,6 +1041,18 @@ CLI_REUSE_ONLY=$REUSE_ONLY
 CLI_ALLOW_KEYLESS_PUBLIC=$ALLOW_KEYLESS_PUBLIC
 CLI_DOCTOR_DEEP=$DOCTOR_DEEP
 CLI_DOCTOR_FILES=$DOCTOR_FILES
+# --emit-code's seven. None of them is rewritten by any action today — the command
+# exits before an action could — and they have twins anyway, because the rule above
+# is about the flag existing, not about today's callers: a modifier the argument
+# loop can set and validate_cli cannot restore is the hole that stays invisible
+# until some later hub session lands in it.
+CLI_EMIT_URL=$EMIT_URL
+CLI_EMIT_MODEL=$EMIT_MODEL
+CLI_EMIT_NAME=$EMIT_NAME
+CLI_EMIT_KIND=$EMIT_KIND
+CLI_EMIT_TRANSPORT=$EMIT_TRANSPORT
+CLI_EMIT_FILES_URL=$EMIT_FILES_URL
+CLI_EMIT_KEYLESS=$EMIT_KEYLESS
 
 # ------------------------------------------------------- the modifier table --
 #
@@ -931,7 +1075,7 @@ CLI_DOCTOR_FILES=$DOCTOR_FILES
 # than one, so it is fixed rather than alphabetical: the positional first, because a
 # command that takes no id at all should say so before it grades the flags around
 # it, then the modifiers in the order the arms have always met them.
-CLI_MODIFIERS="positional dry-run reuse-only deep files allow-keyless-public json"
+CLI_MODIFIERS="positional dry-run reuse-only deep files allow-keyless-public json url model name kind transport files-url keyless"
 
 # Did argv set this modifier? The ONLY reader of the flag globals, so a modifier
 # renamed in the argument loop breaks here rather than in seven command arms.
@@ -944,6 +1088,13 @@ cli_modifier_set() { # cli_modifier_set <modifier>
     files)                $DOCTOR_FILES ;;
     allow-keyless-public) $ALLOW_KEYLESS_PUBLIC ;;
     json)                 $MANAGE_JSON ;;
+    url)                  [ -n "$EMIT_URL" ] ;;
+    model)                [ -n "$EMIT_MODEL" ] ;;
+    name)                 [ -n "$EMIT_NAME" ] ;;
+    kind)                 [ -n "$EMIT_KIND" ] ;;
+    transport)            [ -n "$EMIT_TRANSPORT" ] ;;
+    files-url)            [ -n "$EMIT_FILES_URL" ] ;;
+    keyless)              $EMIT_KEYLESS ;;
     # An accept list naming a modifier the argument loop cannot set is a typo, and
     # a typo in an accept list reads as a silent permission — the exact failure this
     # table exists to end. It stops the run instead.
@@ -1004,6 +1155,16 @@ cli_modifier_refusal() { # cli_modifier_refusal <modifier> -> the sentence for $
         check-server|check-adapter) printf '%s' "--json only works with --list; a check ends in its own machine summary line." ;;
         *)                          printf '%s' "--json only works with --list." ;;
       esac ;;
+    # --emit-code's seven, refused everywhere else by the same default-deny rule
+    # as every other modifier. --setup gets the fuller sentence, because it is the
+    # command somebody reaches for these on: the wizard has no answer flags at all
+    # and never will, and being told which command DOES take them is the whole
+    # point of meeting this error rather than a generic one.
+    url|model|name|kind|transport|files-url|keyless)
+      case "$COMMAND" in
+        setup) printf '%s' "--$1 belongs to --emit-code. --setup asks its questions at the terminal and has no answer flags — see --help." ;;
+        *)     printf '%s' "--$1 only works with --emit-code." ;;
+      esac ;;
   esac
 }
 
@@ -1051,6 +1212,12 @@ validate_cli() {
   DRY_RUN=$CLI_DRY_RUN; REUSE_ONLY=$CLI_REUSE_ONLY
   DOCTOR_DEEP=$CLI_DOCTOR_DEEP; DOCTOR_FILES=$CLI_DOCTOR_FILES
   ALLOW_KEYLESS_PUBLIC=$CLI_ALLOW_KEYLESS_PUBLIC
+  # emit_code_validate normalises these in place — a trimmed URL, a defaulted kind,
+  # transport and name — so they are values this function WRITES, and every one of
+  # them is restored from argv here before it can be written a second time.
+  EMIT_URL=$CLI_EMIT_URL; EMIT_MODEL=$CLI_EMIT_MODEL; EMIT_NAME=$CLI_EMIT_NAME
+  EMIT_KIND=$CLI_EMIT_KIND; EMIT_TRANSPORT=$CLI_EMIT_TRANSPORT
+  EMIT_FILES_URL=$CLI_EMIT_FILES_URL; EMIT_KEYLESS=$CLI_EMIT_KEYLESS
   # The manage module's two inputs, handed over from what argv said. This is also
   # the line that keeps the menu path and the flag path honest about them: a
   # menu-entered --edit has no id on the command line, so it gets the empty string
@@ -1092,6 +1259,15 @@ validate_cli() {
     show-code)
       SHOW_QR=true
       cli_accept_only
+      REUSE_ONLY=true
+      ;;
+    # --emit-code mints a code from what it is TOLD, reads no saved state and
+    # sends no request. Marked reuse-only for the same reason --list is: it must
+    # be structurally unable to change anything on this host, whatever shared
+    # helper it ever ends up reaching.
+    emit-code)
+      cli_accept_only url model name kind transport files-url keyless
+      emit_code_validate
       REUSE_ONLY=true
       ;;
     # The three manage commands. --list is the scriptable one and is a pure read:
@@ -5154,6 +5330,19 @@ drop_file_lane() {
 # emitting a code, print exactly how to undo them. Non-interactive (safe in a trap).
 EMITTED=false
 on_exit() {
+  # FIRST, before anything prints: --setup's own agent sentinel sends real
+  # engine turns through doctor_chat_request, so the wizard inherits the turn
+  # ticker — and a run killed mid-turn leaves that subshell printing liveness
+  # lines into a terminal whose run has already ended, for as long as the turn
+  # cap allows. The doctor's and --check-server's traps each stop it for the
+  # same reason; this is the third caller, and the one whose trap is armed on
+  # every ordinary run. Guarded with declare -F, like the sentinel cleanup
+  # below, because the ticker is defined in module 60 and this module is
+  # assembled ahead of it — the same reason the chained cleanups above are
+  # guarded rather than called outright.
+  if declare -F doctor_turn_heartbeat_stop >/dev/null 2>&1; then
+    doctor_turn_heartbeat_stop
+  fi
   # The OpenClaw/Hermes setup sentinel registers exact nonce paths before any
   # remote creation. Keep that cleanup chained ahead of exposure reporting,
   # including exits where the optional lane state was already cleared.
@@ -12663,7 +12852,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.9). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.10). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -12693,6 +12882,11 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 # has confirmed that requirement — by re-sending its identical request with the
 # first advertised id — the later probes carry that id and grade their OWN rule,
 # and the missing-model failure is reported once, where it belongs.
+# CHAT_FRAMING then reads what CHAT_BASIC's reply SAID rather than how it was
+# shaped: every other chat check grades the envelope, so an adapter whose prompt
+# framing swallows the user's turn answers something fluent and unrelated and
+# passes all of them. It spends no turn of its own — it reads the answer already
+# on hand.
 # --deep adds the semantic image probe: a locally generated PNG showing 6
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
@@ -12716,9 +12910,9 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 #
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
-# summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.9 harness=<ver>
-#     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
+# summary, schema=4 (fixed field order, ASCII enums, no ANSI):
+#   CONDUCK_CHECK_ADAPTER schema=4 contract=v1 revision=1.10 harness=<ver>
+#     profile=<basic|deep|basic+files|deep+files> core=<PASS|FAIL|NOT_RUN>
 #     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
 #     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
 #     file_transport=<…> file_access=<…> file_e2e=<…>
@@ -12748,7 +12942,7 @@ print(json.dumps(p))') || die "Could not build the test request (python3 failed)
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.9"
+DOCTOR_CONTRACT_REV="1.10"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
@@ -12845,6 +13039,43 @@ check_setup_next_step() {
   say "      ${BOLD}bash conduck-connect.sh --setup${RESET}"
 }
 
+# Is the address being graded this machine's own loopback? Read only by the
+# failure explanations, which have to know whether anything can be sitting
+# BETWEEN the probe and the adapter: a 502 from a public address is usually the
+# HTTPS front reporting on a process behind it, and the same status from
+# 127.0.0.1 is the adapter's own answer, with no front anywhere in the picture.
+# The authority is cut the same way doctor_accept_url cuts it, so a path or a
+# query cannot smuggle a different host past the classifier.
+doctor_target_is_loopback() {
+  local rest hostport
+  case "$GW_URL" in
+    [Hh][Tt][Tt][Pp]://?*|[Hh][Tt][Tt][Pp][Ss]://?*) rest="${GW_URL#*://}" ;;
+    *) return 1 ;;
+  esac
+  hostport="${rest%%[/?#]*}"
+  url_is_loopback_host "$hostport"
+}
+
+# The host this run is grading, spelled the way the OPERATOR spelled it — no
+# scheme, no port. "127.0.0.1", "localhost" and "[::1]" are all the same
+# destination, and a verdict that names one back to somebody who typed another
+# reads as a diagnosis of an address they never touched. Falls back to the
+# literal loopback address only when GW_URL has no parsable authority, which is
+# a shape doctor_accept_url refuses before any check runs.
+doctor_target_host() {
+  local rest hostport
+  case "$GW_URL" in
+    [Hh][Tt][Tt][Pp]://?*|[Hh][Tt][Tt][Pp][Ss]://?*) rest="${GW_URL#*://}" ;;
+    *) printf '127.0.0.1'; return 0 ;;
+  esac
+  hostport="${rest%%[/?#]*}"; hostport="${hostport#*@}"
+  case "$hostport" in
+    "")      printf '127.0.0.1' ;;
+    \[*\]*)  printf '%s]' "${hostport%%\]*}" ;;   # bracketed IPv6 literal, port dropped
+    *)       printf '%s' "${hostport%%:*}" ;;
+  esac
+}
+
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
   # IMAGE_INPUT grades an optional capability's honesty; FILES_*/FILE_* grade
   # the optional file profile. None of them may flip core= (they still count
@@ -12920,7 +13151,16 @@ doctor_accept_url() { # doctor_accept_url <candidate>
   # credential must never ride a routing field.
   url_has_userinfo "$reply" && return 1
   case "$reply" in
-    [Hh][Tt][Tt][Pp][Ss]://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
+    [Hh][Tt][Tt][Pp][Ss]://?*)
+      # The authority is cut and required non-empty here for the same reason the
+      # http arm below cuts it: the prefix glob only proves SOMETHING follows
+      # "://", and "https:///v2" satisfies it with NO host at all. curl cannot
+      # resolve such a URL, and accepting it would echo it to the terminal, save
+      # it into the profile and pair it into the app as a dead address.
+      rest="${reply#*://}"
+      hostport="${rest%%[/?#]*}"
+      [ -n "$hostport" ] || return 1
+      printf 'https://%s' "$rest"; return 0 ;;
     [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-local
     *) return 1 ;;
   esac
@@ -13415,14 +13655,120 @@ DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
 # invisible to it, and would pass a check it should fail. Whoever changes it restores
 # it in the next line — a leaked value silently re-grades every later check.
 DCC_ACCEPT="application/json"
+
+# The one-word instruction CHAT_BASIC sends, held in a variable rather than
+# retyped at the call site. CHAT_FRAMING has to subtract this exact string from
+# the reply before it looks for the answer, so the two must be the SAME text by
+# construction: a probe whose prompt drifted from what the grader strips would
+# hand an echoing adapter its pass back.
+DOCTOR_PING_PROMPT="Reply with exactly: pong"
+
+# How often a turn in flight says it is still alive, in seconds.
+DOCTOR_HEARTBEAT_SECONDS=30
+# How long the ticker outlives the turn cap before ending itself, in seconds.
+# It exists so the two deadlines cannot coincide: a ticker whose self-exit landed
+# ON the cap would routinely be reaped in the milliseconds between curl returning
+# and stop() firing, and the pid stop() then signals is either gone or — once the
+# shell has reaped it — somebody else's. Past the cap it prints nothing; it is
+# only staying alive to be killed by its owner. The wake-up granularity is
+# DOCTOR_HEARTBEAT_SECONDS, so the real extra life is one sleep interval.
+DOCTOR_HEARTBEAT_GRACE=15
+# The ticking subshell's pid while one turn is in flight; empty otherwise.
+DCC_HEARTBEAT_PID=""
+
+# Liveness while a real engine turn is in flight.
+#
+# Every turn here waits up to five minutes, and a --deep run makes five of them,
+# so a legitimate worst case is close to twenty-five minutes; --files adds an
+# agent turn on top. Redirected to a file, such a run emits NOTHING between the
+# probe leaving and the answer arriving, and from outside there is no way to tell
+# a slow agent from a wedged one. That ambiguity has a measured cost: a campaign
+# builder killed a perfectly healthy run at 41 minutes.
+#
+# A separate ticking subshell, rather than a rewritten transfer, and that choice
+# is deliberate. The curl call stays the synchronous foreground call it has always
+# been: backgrounding it would re-plumb the one function every chat probe in the
+# whole script depends on, and its exit status, its body capture and its signal
+# behaviour are all load-bearing. This only prints.
+#
+# STDERR ONLY, and that is a hard rule rather than a preference. Stdout carries
+# the verdict transcript and, as its final line, the machine summary — a consumer
+# doing `tail -1` must never find a heartbeat there. Nothing in this function
+# writes to stdout, and it goes through printf rather than say() for exactly that
+# reason: say() prints to stdout by design.
+doctor_turn_heartbeat_start() { # doctor_turn_heartbeat_start <max-seconds> <what>
+  [ -z "$DCC_HEARTBEAT_PID" ] || return 0
+  case "$DOCTOR_HEARTBEAT_SECONDS" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$DOCTOR_HEARTBEAT_SECONDS" -gt 0 ] || return 0
+  # No `local` inside the subshell: it is only legal in a function body, and
+  # bash 3.2 is the oldest shell this has to run on. A subshell's assignments
+  # cannot leak anyway, which is the property `local` would have bought.
+  # The subshell inherits this function's positional parameters, so $1 is still
+  # the deadline and $2 still the description.
+  (
+    dhb_elapsed=0
+    dhb_end=$(( $1 + DOCTOR_HEARTBEAT_GRACE ))
+    while :; do
+      sleep "$DOCTOR_HEARTBEAT_SECONDS" || exit 0
+      dhb_elapsed=$((dhb_elapsed + DOCTOR_HEARTBEAT_SECONDS))
+      # Two deadlines, deliberately not the same one. PRINTING stops at the turn
+      # cap: by then curl's own --max-time is about to end the transfer, and a
+      # heartbeat claiming the run is still waiting would outlive the thing it
+      # describes. LIVING goes on a little past it, so that stop() — which fires
+      # the instant curl returns — normally signals a process that still exists
+      # rather than a pid the shell has already reaped and something else may
+      # since have been given.
+      [ "$dhb_elapsed" -lt "$dhb_end" ] || exit 0
+      [ "$dhb_elapsed" -lt "$1" ] || continue
+      printf '    … still waiting on %s (%ss elapsed; up to %ss for this turn)\n' \
+        "$2" "$dhb_elapsed" "$1" >&2
+    done
+  ) &
+  DCC_HEARTBEAT_PID=$!
+}
+
+# Stops the ticker and reaps it. Safe to call when none is running, and called on
+# EVERY exit path of a turn — including the failure one — and from every EXIT
+# trap, because a ticker left behind keeps printing into a transcript whose run
+# has already moved on.
+#
+# ACCEPTED LEAK, stated rather than hidden: this signals the subshell, and the
+# subshell's current `sleep` is a separate process that outlives it by up to
+# DOCTOR_HEARTBEAT_SECONDS. That orphan is harmless — a bare `sleep` holds
+# nothing, prints nothing, and cannot outlive one interval. Killing it too was
+# tried and reverted: `pkill -P` reaches it, but the subshell is still alive to
+# notice its foreground child die and writes bash's own "Terminated: 15  sleep"
+# line to STDERR, straight into the check transcript this function exists to
+# keep clean. Suppressing that depends on which signal bash decides not to
+# report, which is not a thing to hang a transcript guarantee on.
+#
+# The kill is guarded because an unguarded one writes "no such process" into the
+# same transcript when the ticker has already ended itself. That is rare by
+# construction — DOCTOR_HEARTBEAT_GRACE exists so the ticker outlives the turn
+# cap — but a turn that took longer than cap+grace, or a stop() called twice,
+# reaches it.
+doctor_turn_heartbeat_stop() {
+  [ -n "$DCC_HEARTBEAT_PID" ] || return 0
+  if kill -0 "$DCC_HEARTBEAT_PID" 2>/dev/null; then
+    kill "$DCC_HEARTBEAT_PID" 2>/dev/null || true
+  fi
+  { wait "$DCC_HEARTBEAT_PID"; } 2>/dev/null || true
+  DCC_HEARTBEAT_PID=""
+  return 0
+}
+
 doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 iff transfer completed
   local out tail_ max_time="${2:-300}"
   DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
+  doctor_turn_heartbeat_start "$max_time" "the engine turn"
   # `out=$(…) || { rc=$?; }` on purpose: inside `if ! out=$(…); then` the `$?`
-  # is the NEGATED status (0), and the real code would be lost.
+  # is the NEGATED status (0), and the real code would be lost. The heartbeat is
+  # stopped AFTER that capture, for the same reason — the stop would overwrite $?.
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
         --max-time "$max_time" -H "Accept: $DCC_ACCEPT" \
-        -H "Content-Type: application/json" -d "$1" 2>/dev/null) || { DCC_CURL_RC=$?; return 1; }
+        -H "Content-Type: application/json" -d "$1" 2>/dev/null) \
+    || { DCC_CURL_RC=$?; doctor_turn_heartbeat_stop; return 1; }
+  doctor_turn_heartbeat_stop
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
   DCC_TIME="${tail_%% *}"
@@ -13769,6 +14115,23 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
       # as "you rejected the historical image", which is a wild-goose chase.
       case "$DCC_CODE" in
         502|503)
+          if doctor_target_is_loopback; then
+            # A loopback URL proves the request never left this machine, so the
+            # adapter almost certainly answered this itself — and the contract
+            # SPENDS 502 on exactly that: upstream_failure, the status an adapter
+            # returns when its engine crashed or came back with nothing usable.
+            # Sending this reader to a reverse proxy would send them to a program
+            # that is not running on this machine. Stated as what the URL PROVES
+            # rather than as a fact about their host: a proxy can be put on
+            # loopback, and only the operator knows whether they did.
+            d_say "$id" "(I am talking straight to $(doctor_target_host), so unless you have put a proxy on"
+            d_say "$id" " loopback yourself, this $DCC_CODE is your ADAPTER answering."
+            d_say "$id" " That is the contract's own upstream_failure path: the adapter is up and took the"
+            d_say "$id" " request, and its ENGINE crashed, exited, or came back with nothing it could turn"
+            d_say "$id" " into an answer. Its log holds the real story — read the entry for this request"
+            d_say "$id" " rather than the HTTP status, which is only the part that reached me.)"
+            return 1
+          fi
           d_say "$id" "(a $DCC_CODE is the HTTPS front talking, not your adapter: the front is up but got"
           d_say "$id" " nothing usable out of the adapter behind it. Most often that process is gone —"
           d_say "$id" " backgrounded with no supervisor, or crashed on this turn — or it is bound to a"
@@ -13776,6 +14139,18 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
           d_say "$id" " the same. Check it is running and supervised, then re-run me.)"
           return 1 ;;
         504)
+          # Same correction as the 502/503 arm, for the same reason: on loopback
+          # there is normally no proxy timeout to raise, and the contract spends
+          # 504 on the adapter's OWN ~285-second deadline.
+          if doctor_target_is_loopback; then
+            d_say "$id" "(I am talking straight to $(doctor_target_host), so unless you have put a proxy on"
+            d_say "$id" " loopback yourself, this 504 is your ADAPTER answering —"
+            d_say "$id" " the contract's upstream_timeout, which is the adapter cancelling a turn that hit"
+            d_say "$id" " its own internal deadline. Unless you put one there, there is no proxy timeout to"
+            d_say "$id" " raise here: either the engine genuinely runs longer than that, or it is wedged"
+            d_say "$id" " on this request.)"
+            return 1
+          fi
           d_say "$id" "(a 504 is the HTTPS front giving up on your adapter. Either the turn outruns the"
           d_say "$id" " front's proxy timeout — agent turns are slow, raise it — or the adapter is wedged"
           d_say "$id" " on this request and its own log will say so.)"
@@ -13828,6 +14203,130 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
     notstring) d_say "$id" "(in the RESPONSE, content must be a non-empty STRING — null or parts-form content is refused)" ;;
     ct)        d_say "$id" "(answer with Content-Type: application/json — parameters like charset are fine)" ;;
   esac
+  return 1
+}
+
+# Reads choices[0].message.content and reduces it to the one word CHAT_FRAMING
+# needs. Echoes exactly one of:
+#
+#   answered — "pong" survives OUTSIDE every copy of the probe's own prompt
+#   echo     — the trimmed content IS the sent prompt, byte for byte: a pure
+#              echo, which the check exempts (see doctor_framing_check)
+#   silent   — no "pong" is left once the prompt text is subtracted
+#   -        — nothing gradeable here (body will not parse, or content is not a
+#              string). That is not a "no": those are CHAT_BASIC's rules and it
+#              has already graded them, so the caller declines to grade rather
+#              than inventing a second failure for one fault.
+#
+# Subtracting the prompt is what closes the echo hole. The instruction contains
+# the word it asks for, so a plain substring search over the whole content marks
+# any adapter that returns the request — or a rendered transcript of it — as
+# having answered. Every case-blind occurrence of the FULL prompt string is cut
+# out first, and only what remains is searched.
+doctor_framing_read() { # doctor_framing_read <body-json> <sent-prompt>
+  printf '%s' "$1" | CONDUCK_CHECK_PROMPT="$2" python3 -c 'import json, os, sys
+try:
+    d = json.load(sys.stdin)
+    c = d["choices"][0]["message"]["content"]
+except Exception:
+    print("-"); sys.exit(0)
+if not isinstance(c, str):
+    print("-"); sys.exit(0)
+sent = os.environ["CONDUCK_CHECK_PROMPT"]
+if c.strip() == sent.strip():
+    print("echo"); sys.exit(0)
+low_c, low_s = c.lower(), sent.lower()
+if low_s:
+    kept, i = [], 0
+    while True:
+        j = low_c.find(low_s, i)
+        if j < 0:
+            kept.append(c[i:]); break
+        kept.append(c[i:j]); i = j + len(low_s)
+    rest = "".join(kept)
+else:
+    rest = c
+print("answered" if "pong" in rest.lower() else "silent")' 2>/dev/null
+}
+
+# Does the instruction survive this adapter's own prompt framing?
+#
+# CHAT_BASIC asks for the literal word "pong" and grades the ENVELOPE — strict
+# JSON, exactly one choice, a non-empty string. Nothing in that reads what the
+# words SAY, so an adapter that buries the user's turn under a persona, a system
+# prompt or a tool preamble passes every scripted gate with a fluent answer to a
+# question nobody asked. The build brief already calls that a defect; until now
+# the only thing enforcing it was the wizard's interactive verify step, which a
+# CI=1 run — every AI builder's run — never reaches. This is that rule, scripted.
+#
+# CONTAINS, case-blind, and deliberately not equality: "Pong." and "PONG" are an
+# engine doing as it was told, and holding a language model to an exact byte
+# string would fail conformant adapters over their engine's punctuation. What
+# fails is a reply with no "pong" anywhere — the instruction did not reach the
+# engine intact, or something else answered in its place.
+#
+# Two rules keep that search honest, and both are load-bearing:
+#
+#   1. The prompt is SUBTRACTED FIRST. "Reply with exactly: pong" contains the
+#      word it asks for, so a bare substring search over the whole content hands
+#      a pass to any adapter that returns the request instead of an answer —
+#      including one that replies with a rendered transcript of the conversation
+#      so far. Every case-blind occurrence of the full prompt is cut out, and
+#      only the remainder is searched.
+#   2. A reply that is EXACTLY the prompt, trimmed, PASSES anyway. That shape is
+#      not an accident: the adapter build brief has builders stand a development
+#      echo engine up first — one that deterministically returns the newest user
+#      message — and promises the ordinary profile can reach exit 0 against it.
+#      A pure echo is a stub answering as designed, and failing it would break
+#      the one workflow the brief tells every builder to start from. The carve-out
+#      is exact on purpose: the prompt buried inside a longer reply is a
+#      transcript being echoed at a person, and that stays red.
+#
+# So this is a HEURISTIC about one word, not a reading of the answer, and the
+# transcript says so. What it can see: the instruction's own word surviving
+# somewhere other than in a copy of the instruction. What it cannot see: whether
+# the reply makes sense, whether a persona rewrote everything around that word,
+# or whether an engine that happens to say "pong" while ignoring the turn slipped
+# through. Passing it is a floor, not a certificate.
+#
+# It grades the reply CHAT_BASIC ALREADY GOT. Sending a second turn would spend
+# another real engine turn — up to five more minutes on a slow agent — to ask the
+# identical question, so the call site runs this immediately after CHAT_BASIC,
+# before any later probe overwrites DCC_BODY.
+#
+# Not graded at all unless CHAT_BASIC came back with a reply worth reading: with
+# no gradeable reply there is nothing to read, and a framing verdict conjured out
+# of a transport failure is the same defect as any other invented cause.
+doctor_framing_check() { # doctor_framing_check <CHAT_BASIC capability meter>
+  local id="CHAT_FRAMING" verdict
+  [ "$1" = "PASS" ] || return 0
+  verdict=$(doctor_framing_read "$DCC_BODY" "$DOCTOR_PING_PROMPT")
+  case "$verdict" in
+    answered)
+      d_ok "$id" "framing — the word the turn asked for came back outside any copy of the turn itself"
+      return 0 ;;
+    echo)
+      d_ok "$id" "framing — the reply is the turn echoed back exactly (an echo engine answering as designed)"
+      d_say "$id" "(this passes deliberately: an adapter wired to a development echo engine returns the"
+      d_say "$id" " newest user message verbatim, which is the first thing the build brief has you stand"
+      d_say "$id" " up. Nothing here has read a real engine's answer yet, so re-run me once yours is"
+      d_say "$id" " behind the adapter — a reply that merely CONTAINS the turn, rather than being it,"
+      d_say "$id" " is a transcript coming back instead of an answer and fails.)"
+      return 0 ;;
+    -)
+      return 0 ;;
+  esac
+  d_bad "$id" "framing — the turn asked for \"pong\" and nothing outside the turn's own words says it (${DCE_LEN:-?} chars)"
+  d_say "$id" "(the envelope above is fine; what the engine ANSWERED is not. Conduck sends the user's"
+  d_say "$id" " words and expects the engine to answer THEM, so whatever your adapter wraps around a"
+  d_say "$id" " turn — a persona, a system prompt, a tool preamble, an agent scaffold — has to leave"
+  d_say "$id" " the instruction intact. I subtract my own prompt before looking, so a reply that quotes"
+  d_say "$id" " the request back — a chat transcript, a 'you asked:' preamble — counts for nothing;"
+  d_say "$id" " only a reply that echoes the turn and NOTHING else is exempt, as an echo stub. Send this"
+  d_say "$id" " turn through your adapter and read the reply: if a request to say one word comes back as"
+  d_say "$id" " something else, every real turn is being reshaped the same way, and the person talking"
+  d_say "$id" " to it has no way to see that. This only ever checked for one word — passing it is a"
+  d_say "$id" " floor, not proof your framing leaves a real instruction intact.)"
   return 1
 }
 
@@ -14124,6 +14623,12 @@ DF_URL=""; DF_DIR=""; DF_CRED=""; DF_USER="conduck"
 DF_DEV_INO=""      # "<dev>:<ino>" pinned at resolve time — every direct disk op revalidates
 DF_RUN=""          # per-run namespace nonce; every artifact name carries it
 DF_ARTS=()         # "tier<TAB>kind<TAB>relkey" — registered BEFORE creation; tier T|A, kind file|dir
+# A literal newline in a plain variable. The delete pass builds a newline-
+# delimited key list and tests it INSIDE $(…), where bash 3.2 — the shell macOS
+# ships — cannot parse a `case` at all: it reads the first pattern's ")" as the
+# end of the substitution. A variable keeps the test a prefix-strip instead.
+DF_NL='
+'
 DF_AGENT_RAN=false
 DF_WROTE=false     # true once a mutating operation could have created something. DF_ARTS
                    # proves only INTENT (registration precedes creation, by design), so
@@ -14973,16 +15478,85 @@ PY
   return 0
 }
 
+# Does this server route DELETE at all, or did it refuse THESE files?
+#
+# Measured, never inferred from the status, and the distinction is the whole
+# point. rclone's WebDAV layer (golang.org/x/net/webdav) answers 405 for a DELETE
+# it ROUTED and could not carry out: a removal that fails with EACCES comes back
+# Method Not Allowed, byte-identical to what a server with no DELETE at all
+# answers. Measured here against rclone 1.74: a file inside a directory the
+# server cannot write answers 405, and a hand-run DELETE by the owner answers
+# 204 — same server, same verb, opposite conclusions from the status alone.
+#
+# That is the single most likely refusal on a real lane, and it is the one the
+# file lane's ownership rule already warns about: the file server and the agent
+# usually run as different users, so the folder the AGENT created is one the file
+# server is refused inside. Reported as "DELETE unsupported" it read as a
+# harmless degradation, and the ownership problem underneath it went unseen.
+#
+# The discriminator is one DELETE aimed at a key this run minted and never
+# created. A server that implements the verb must answer 404 for it (RFC 4918 —
+# the resource is not there); some answer 2xx, treating removal as idempotent,
+# which is equally proof the verb is routed. A server that does not implement it
+# answers the same refusal it gives everything else. Sent only when a real DELETE
+# has already come back refused, so a clean lane pays nothing for it.
+#
+# 403 is its own answer, and never "the verb is missing". Method Not Allowed is
+# what a server says about a VERB; Forbidden is what it says about PERMISSION,
+# and a server that answers it for a name that does not even exist is refusing
+# the caller rather than declining the method. Filed under "unsupported" it sent
+# operators to look for a DELETE feature their server already has, past the
+# credential scope or the ownership wall that is actually stopping them.
+#
+# The control's SHAPE has to match the tier that was refused. RFC 4918 treats a
+# collection DELETE as a different, recursive operation, and servers implement
+# the two separately — a lane whose FILE deletes work while its DIRECTORY
+# deletes 405 has an unimplemented collection DELETE, not a permission problem.
+# Probing a file-shaped name on behalf of a directory refusal would answer the
+# wrong question, so the caller passes the tier and the collection probe carries
+# the trailing slash that makes it a collection.
+#
+# The control's own status is published in DF_DELETE_PROBE_CODE: the verdict
+# quotes it, and "answered 404" hardcoded under a probe that also accepts 2xx is
+# the same invented detail this function exists to stop.
+DF_DELETE_PROBE_CODE=""
+doctor_fs_delete_routed() { # doctor_fs_delete_routed <file|dir> -> 0 implemented · 1 not implemented · 2 unmeasurable · 3 authorization refusal
+  local code name="conduck-check-$DF_RUN-absent-probe"
+  [ "$1" = "dir" ] && name="$name/"
+  code=$(doctor_fs_code real -X DELETE "$DF_URL/$name")
+  DF_DELETE_PROBE_CODE="$code"
+  case "$code" in
+    2??|404) return 0 ;;
+    403)     return 3 ;;
+    405|501) return 1 ;;
+    *)       return 2 ;;
+  esac
+}
+
 # Graded cleanup: WebDAV DELETE capability + proof that every registered
 # artifact is gone. Unproven cleanup is ERROR on the owning meter — never
 # silence. Exact names only, never a glob.
 doctor_files_delete() {
-  local entry kind rel code webdav_ok=true del_unsupported=""
+  local entry kind rel code webdav_ok=true del_unsupported="" del_tier="" routed=0
+  # Which artifacts this server ACKNOWLEDGED removing, sentinel-wrapped so a
+  # substring test cannot match a partial key. The ground-truth walk below needs
+  # it: an acknowledged DELETE whose target is still on disk afterwards is the
+  # one failure that cleanup alone can never see, because cleanup unlinks the
+  # file either way and every artifact ends up gone.
+  local acked="$DF_NL"
   for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)
     [ "$kind" = "file" ] || continue
     code=$(doctor_fs_code real -X DELETE "$DF_URL/$rel")
-    case "$code" in 2??|404) ;; 403|405|501) webdav_ok=false; del_unsupported="$code" ;; *) webdav_ok=false ;; esac
+    case "$code" in
+      2??|404) acked="$acked$rel$DF_NL" ;;
+      # First refusal wins, tier and all. The control probe below has to be
+      # shaped like whatever was refused, and a later overwrite would send a
+      # collection-shaped probe on behalf of a file refusal or the reverse.
+      403|405|501) webdav_ok=false
+                   [ -n "$del_unsupported" ] || { del_unsupported="$code"; del_tier="file"; } ;;
+      *) webdav_ok=false ;;
+    esac
   done
   # Directories after files, and order among them does not matter: DELETE on a
   # collection is recursive in RFC 4918, so removing the box's outer segment
@@ -14992,7 +15566,12 @@ doctor_files_delete() {
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)
     [ "$kind" = "dir" ] || continue
     code=$(doctor_fs_code real -X DELETE "$DF_URL/$rel/")
-    case "$code" in 2??|404) ;; 403|405|501) webdav_ok=false; del_unsupported="$code" ;; *) webdav_ok=false ;; esac
+    case "$code" in
+      2??|404) acked="$acked$rel$DF_NL" ;;
+      403|405|501) webdav_ok=false
+                   [ -n "$del_unsupported" ] || { del_unsupported="$code"; del_tier="dir"; } ;;
+      *) webdav_ok=false ;;
+    esac
   done
   # Ground truth + guarded direct removal of anything that remains. Success
   # must be PROVEN: the checker prints a VERIFIED sentinel as its LAST line
@@ -15000,13 +15579,31 @@ doctor_files_delete() {
   # never read as "clean" (empty output without the sentinel is a failure,
   # not a pass; the trailing-sentinel order is what makes a partial crash
   # unspoofable).
-  local leftovers="" vout=""
+  #
+  # It reports on TWO channels, because "gone" and "the server removed it" are
+  # different claims and only one of them was ever measured. Plain lines are
+  # leftovers: artifacts this run could not remove, which is a real failure. Lines
+  # prefixed "G " are ghosts: artifacts whose DELETE this server ACKNOWLEDGED and
+  # which were still sitting on disk when the walk reached them. A ghost is not a
+  # leftover — the walk unlinks it like any other — but it is proof the
+  # acknowledgement was empty, and without recording it here nothing downstream
+  # could ever tell an honest DELETE from a 204 that did nothing.
+  local leftovers="" ghosts="" vout="" vbody="" vline
   if doctor_files_dir_ok; then
-    vout=$(for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do printf '%s\n' "$entry"; done \
+    # Prefix-strip rather than `case`, and that is a portability rule, not taste:
+    # bash 3.2 — the shell macOS ships — cannot parse a `case` inside $(…), it
+    # reads the first pattern's ")" as the end of the substitution.
+    vout=$(for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
+             rel=$(printf '%s' "$entry" | cut -f3)
+             dfa="-"
+             [ "${acked#*"$DF_NL$rel$DF_NL"}" != "$acked" ] && dfa="ack"
+             printf '%s\t%s\n' "$entry" "$dfa"
+           done \
       | python3 -c '
 import os, stat, sys
 root, run = sys.argv[1], sys.argv[2]
 left = []
+ghost = []
 dirs = []
 # Ownership is decided by the FIRST COMPONENT carrying the prefix this run
 # minted. It must stay anchored there: the deepest keys now sit two segments
@@ -15022,16 +15619,31 @@ def owned(rel):
         return False
     return parts[0].startswith(prefix)
 for line in sys.stdin.read().splitlines():
-    try:
-        tier, kind, rel = line.split("\t", 2)
-    except ValueError:
+    parts = line.split("\t")
+    if len(parts) < 3:
         continue
+    tier, kind, rel = parts[0], parts[1], parts[2]
+    # The ack column is what makes a ghost detectable. It is optional so an
+    # older caller (or a hand-run of this walk) still parses.
+    ack = len(parts) > 3 and parts[3] == "ack"
     if not owned(rel):
         left.append(tier + " " + rel); continue
     p = os.path.join(root, rel)
     rp = os.path.realpath(p)
     if not (rp == root or rp.startswith(root + os.sep)):
         left.append(tier + " " + rel); continue
+    # Ghost test BEFORE anything is removed, and before dirs are deferred: the
+    # server said this artifact was gone (2xx, or 404 "it is not here"), so its
+    # presence now is the acknowledgement contradicting itself. Removing a file
+    # never removes a directory and the rmdir pass runs later, so what this test
+    # sees for one entry never depends on another entry having been handled
+    # first. (No apostrophes in here: the whole program is single-quoted shell.)
+    if ack:
+        try:
+            os.lstat(p)
+            ghost.append(rel)
+        except Exception:
+            pass
     if kind == "dir":
         dirs.append((tier, p, rel)); continue
     try:
@@ -15065,20 +15677,143 @@ for tier, p, rel in dirs:
         left.append(tier + " " + rel)
 for x in left:
     print(x)
+for x in ghost:
+    print("G " + x)
 print("VERIFIED")' "$DF_DIR" "$DF_RUN" 2>/dev/null)
-    if [ "$vout" = "VERIFIED" ]; then leftovers=""
-    elif [ "${vout%$'\n'VERIFIED}" != "$vout" ]; then leftovers="${vout%$'\n'VERIFIED}"
-    else leftovers="? the cleanup checker itself failed — nothing proven"
+    if [ "$vout" = "VERIFIED" ]; then vbody=""
+    elif [ "${vout%$'\n'VERIFIED}" != "$vout" ]; then vbody="${vout%$'\n'VERIFIED}"
+    else vbody=""; leftovers="? the cleanup checker itself failed — nothing proven"
+    fi
+    # Split the walk's two channels. Only "G " lines are ghosts; everything else
+    # is a leftover, and the meter rules below still read leftovers by their
+    # "T "/"A " tier prefix exactly as before.
+    if [ -n "$vbody" ]; then
+      while IFS= read -r vline; do
+        [ -n "$vline" ] || continue
+        case "$vline" in
+          "G "*) ghosts="${ghosts}${ghosts:+$'\n'}${vline#G }" ;;
+          *)     leftovers="${leftovers}${leftovers:+$'\n'}${vline}" ;;
+        esac
+      done <<DCC_VOUT
+$vbody
+DCC_VOUT
     fi
   else
     leftovers="? folder identity changed mid-run — nothing removed directly"
   fi
   if [ -z "$leftovers" ]; then
-    if $webdav_ok; then
+    # Ghosts come FIRST, ahead of every other green arm. A server that answers a
+    # DELETE it does not perform passes the cleanup walk — the walk unlinks the
+    # file itself — and would otherwise collect the "verified gone" verdict while
+    # having removed nothing at all. It is the only arm here whose evidence is
+    # disk state rather than a status code, so no status-shaped branch can reach
+    # the same conclusion.
+    if [ -n "$ghosts" ]; then
+      local ghost_n
+      ghost_n=$(printf '%s\n' "$ghosts" | wc -l | tr -d ' ')
+      d_ok FILES_DELETE "DELETE is ACKNOWLEDGED but does not REMOVE — $ghost_n artifact(s) were still on disk afterwards (cleaned up directly)"
+      d_say FILES_DELETE "(this server answered these DELETEs as success — or as \"not here\" — and the files were"
+      d_say FILES_DELETE " still there when I looked. I removed them from disk myself, so the folder is clean now,"
+      d_say FILES_DELETE " but the app cannot: it has only the WebDAV route, and it believes what your server tells"
+      d_say FILES_DELETE " it. Every returned file will accumulate in the shared folder forever. Look for a stubbed"
+      d_say FILES_DELETE " DELETE handler, a read-only or overlay mount the server reports success on, or a proxy"
+      d_say FILES_DELETE " answering the verb in front of the real file server. Deletion is best-effort in the app,"
+      d_say FILES_DELETE " so the lane still passes — an honest 405 would be better than this.)"
+      if [ -n "$del_unsupported" ]; then
+        d_say FILES_DELETE "(other artifacts were refused outright with HTTP $del_unsupported — this server is doing both.)"
+      fi
+    elif $webdav_ok; then
       d_ok FILES_DELETE "WebDAV DELETE works — every check artifact removed and verified gone"
     elif [ -n "$del_unsupported" ]; then
-      d_ok FILES_DELETE "DELETE unsupported (HTTP $del_unsupported) — artifacts removed directly on disk instead"
-      d_say FILES_DELETE "(the app treats WebDAV deletion as best-effort, so this is a degradation, not a failure)"
+      local ctl_tier="${del_tier:-file}" ctl_code ctl_extra=""
+      routed=0; doctor_fs_delete_routed "$ctl_tier" || routed=$?
+      ctl_code="${DF_DELETE_PROBE_CODE:-?}"
+      # The idempotent-removal half-sentence rides only a 2xx control. A 404 is
+      # RFC 4918's plain answer and needs no gloss; a 2xx does, because a success
+      # for a name that never existed reads like a fault until you know some
+      # servers treat removal as idempotent.
+      case "$ctl_code" in
+        2??) ctl_extra=" (a 2xx for a name that never existed is that server treating removal as idempotent, which is equally proof the verb is routed)" ;;
+      esac
+      case "$routed" in
+        0)
+          if [ "$ctl_tier" = "dir" ]; then
+            # The control was FOLDER-shaped and came back routed, which is what
+            # rules out the other candidate: an unimplemented collection DELETE
+            # would have refused the absent folder too. So the verb is there for
+            # collections and only the folders this run touched were refused —
+            # and the folder the AGENT created is the one the file server owns
+            # least. Nothing here is about the file tier, which deleted fine.
+            d_ok FILES_DELETE "folder DELETE REFUSED on some artifacts (HTTP $del_unsupported) — removed directly on disk instead"
+            d_say FILES_DELETE "(files delete here; these FOLDERS were refused. This server does implement DELETE for"
+            d_say FILES_DELETE " folders: the same request aimed at a folder-shaped name that does not exist answered"
+            d_say FILES_DELETE " $ctl_code, so the $del_unsupported above is it refusing THESE folders rather than declining the"
+            d_say FILES_DELETE " collection verb.$ctl_extra"
+            d_say FILES_DELETE " That leaves the ownership one, which is also the likeliest: the file server and the"
+            d_say FILES_DELETE " agent run as different users, so a folder the AGENT created is one the file server"
+            d_say FILES_DELETE " is refused inside — removing it needs write permission on its PARENT. Give the two a"
+            d_say FILES_DELETE " shared group, setgid the shared folder, and give both a group-writable umask."
+            d_say FILES_DELETE " Deletion is best-effort in the app, so the lane still passes — but the folders it"
+            d_say FILES_DELETE " makes for returned files accumulate, and the same permission wall is what makes a"
+            d_say FILES_DELETE " real transfer fail on its second half.)"
+          else
+            d_ok FILES_DELETE "DELETE REFUSED on some artifacts (HTTP $del_unsupported) — removed directly on disk instead"
+            d_say FILES_DELETE "(this server does implement DELETE: the same request aimed at a name that does not"
+            d_say FILES_DELETE " exist answered $ctl_code, so the $del_unsupported above is it refusing THESE files rather than"
+            d_say FILES_DELETE " declining the verb.$ctl_extra"
+            d_say FILES_DELETE " The usual cause is the ownership one: the file server and the"
+            d_say FILES_DELETE " agent run as different users, so a folder the AGENT created is one the file server"
+            d_say FILES_DELETE " is refused inside. Give the two a shared group, setgid the shared folder, and give"
+            d_say FILES_DELETE " both a group-writable umask. Deletion is best-effort in the app, so the lane still"
+            d_say FILES_DELETE " passes — but returned files your file server can never clear out accumulate, and"
+            d_say FILES_DELETE " the same permission wall is what makes a real transfer fail on its second half.)"
+          fi
+          ;;
+        3)
+          # 403 is about the CALLER, never about the verb. Filed under "DELETE
+          # unsupported" it sent operators hunting for a feature their server
+          # already has, past the wall that is actually stopping them.
+          d_ok FILES_DELETE "DELETE REFUSED — authorization (HTTP $del_unsupported) — artifacts removed directly on disk instead"
+          d_say FILES_DELETE "(this is a permission wall, not a missing verb: a DELETE aimed at a name that does not"
+          d_say FILES_DELETE " exist was refused $ctl_code as well, and a server with no DELETE at all answers 405. Two"
+          d_say FILES_DELETE " things produce it. Either the credential this check authenticates with is read-only —"
+          d_say FILES_DELETE " check the WebDAV account's rights and give it delete on this share — or it is the"
+          d_say FILES_DELETE " ownership one: the file server and the agent run as different users, so a folder the"
+          d_say FILES_DELETE " AGENT created is one the file server is refused inside; give the two a shared group,"
+          d_say FILES_DELETE " setgid the shared folder, and give both a group-writable umask. Deletion is"
+          d_say FILES_DELETE " best-effort in the app, so the lane still passes — but returned files your file server"
+          d_say FILES_DELETE " can never clear out accumulate, and the same wall is what makes a real transfer fail"
+          d_say FILES_DELETE " on its second half.)"
+          ;;
+        1)
+          if [ "$ctl_tier" = "dir" ]; then
+            # Files deleted fine and only the FOLDER requests were refused, and
+            # the control that confirmed it was folder-shaped. RFC 4918 makes
+            # removing a collection a separate, recursive operation, so this is
+            # a server shipping the file half of DELETE and not the other — not
+            # a permission wall, and nothing chown will fix.
+            d_ok FILES_DELETE "collection DELETE unsupported (HTTP $del_unsupported on folders) — removed directly on disk instead"
+            d_say FILES_DELETE "(files delete here; FOLDERS do not. Confirmed against a folder-shaped name that does"
+            d_say FILES_DELETE " not exist, which answered $ctl_code the same way, so this is the collection half of the"
+            d_say FILES_DELETE " verb missing rather than these folders being refused — RFC 4918 makes removing a"
+            d_say FILES_DELETE " collection a separate, recursive operation, and servers ship one half without the"
+            d_say FILES_DELETE " other. No ownership fix applies. The app treats WebDAV deletion as best-effort, so"
+            d_say FILES_DELETE " this is a degradation, not a failure — but the folders it makes for returned files"
+            d_say FILES_DELETE " will accumulate.)"
+          else
+            d_ok FILES_DELETE "DELETE unsupported (HTTP $del_unsupported) — artifacts removed directly on disk instead"
+            d_say FILES_DELETE "(confirmed against a name that does not exist, which answered $ctl_code the same way, so"
+            d_say FILES_DELETE " this is the verb missing rather than these files being refused. The app treats WebDAV"
+            d_say FILES_DELETE " deletion as best-effort, so this is a degradation, not a failure.)"
+          fi
+          ;;
+        *)
+          d_ok FILES_DELETE "DELETE refused (HTTP $del_unsupported) — artifacts removed directly on disk instead"
+          d_say FILES_DELETE "(I could not tell whether the verb is missing or these files were refused: the"
+          d_say FILES_DELETE " control request answered $ctl_code, which says nothing either way. Deletion is"
+          d_say FILES_DELETE " best-effort in the app regardless.)"
+          ;;
+      esac
     else
       d_ok FILES_DELETE "check artifacts removed (some DELETE requests failed; direct disk cleanup covered them)"
     fi
@@ -15173,25 +15908,32 @@ run_doctor_files() {
   return 0
 }
 
-# The frozen machine line (schema=3), and the published grammar for it.
+# The frozen machine line (schema=4), and the published grammar for it.
 #
 # Printed as the LAST line of EVERY adapter-check exit — green, red, or an early
 # die: fixed field order, ASCII enums, no ANSI. Any key added, removed, renamed or
 # given a new value bumps schema=, so a consumer pins the number it parses and
 # ignores a line carrying one it does not know. Renaming the prefix
 # CONDUCK_DOCTOR -> CONDUCK_CHECK_ADAPTER was such a change, which is why schema
-# went 2 -> 3. Exactly ONE summary line is emitted (consumers use `tail -1`), so
-# the retired prefix is never dual-emitted.
+# went 2 -> 3; teaching profile= to name the file tier — basic+files, deep+files —
+# added two values to an enum, which is the same kind of change and is why it went
+# 3 -> 4. Neither the fields nor their order moved across that second bump, so a
+# parser that reads by key and tolerates an unknown profile= value needs nothing
+# but the new number; one that matched profile=basic exactly is precisely the
+# consumer the bump exists to stop silently. Exactly ONE summary line is emitted
+# (consumers use `tail -1`), so a retired prefix is never dual-emitted.
 #
 # The domains are written HERE, in the one artifact a consumer is guaranteed to
 # have: the adapter build brief tells an agent to curl this script and nothing
 # else, so a grammar that lives only in the README is a grammar it cannot read.
 #
-#   schema=3            this grammar
+#   schema=4            this grammar
 #   contract=v1         the adapter contract family being graded
 #   revision=<n.n>      the contract revision this harness implements
 #   harness=<version>   conduck-connect's own version; informational, never a gate
-#   profile=            basic | deep — deep adds the semantic image probe
+#   profile=            basic | deep | basic+files | deep+files — two independent
+#                       axes, neither implying the other: deep adds the semantic
+#                       image probe, +files adds the whole file-lane surface
 #   core=               PASS | FAIL | NOT_RUN — the core wire contract's roll-up.
 #                       IMAGE_INPUT and every file check are excluded from it by
 #                       design: they grade optional capabilities
@@ -15236,7 +15978,7 @@ doctor_summary() { # doctor_summary <exit-code>
     core="PASS"
     [ "$DOCTOR_CORE_FAILS" -gt 0 ] && core="FAIL"
   fi
-  printf 'CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=%s harness=%s profile=%s core=%s history_image=%s stream=%s image_input=%s file_transport=%s file_access=%s file_e2e=%s checks=%s failed=%s exit=%s\n' \
+  printf 'CONDUCK_CHECK_ADAPTER schema=4 contract=v1 revision=%s harness=%s profile=%s core=%s history_image=%s stream=%s image_input=%s file_transport=%s file_access=%s file_e2e=%s checks=%s failed=%s exit=%s\n' \
     "$DOCTOR_CONTRACT_REV" "$VERSION" "$DOCTOR_PROFILE" "$core" \
     "$DOCTOR_HISTORY_IMAGE" "$DOCTOR_STREAM" "$DOCTOR_IMAGE_INPUT" \
     "$DOCTOR_FILE_TRANSPORT" "$DOCTOR_FILE_ACCESS" "$DOCTOR_FILE_E2E" \
@@ -15250,16 +15992,31 @@ doctor_summary() { # doctor_summary <exit-code>
 # unhandled signal — the summary line must ride even a Ctrl-C.
 doctor_on_exit() {
   local rc=$?
+  # Before anything else prints: a turn interrupted mid-flight leaves its ticker
+  # alive, and a heartbeat arriving after the machine summary would land AFTER
+  # the line a consumer reads with `tail -1`. It writes to stderr and the summary
+  # to stdout, so the two cannot actually collide in a parsed stream — but they
+  # share a terminal, and a liveness line printed under a finished verdict is a
+  # lie about a run that has already ended.
+  doctor_turn_heartbeat_stop
   on_exit
   $DOCTOR_FILES && doctor_files_cleanup_backstop
   doctor_summary "$rc"
 }
 
 run_doctor() {
-  # The machine summary must ride EVERY exit (frozen schema=3 grammar) — arm
+  # The machine summary must ride EVERY exit (the frozen machine line's grammar) — arm
   # it before anything can die. Flag-combination errors happen before this
   # function and are non-runs by definition: no doctor started, no summary.
+  # The profile names BOTH axes, because they are independent: --deep deepens the
+  # chat tier, --files adds a whole second surface, and neither implies the other.
+  # A run that reported only the deep axis called `--check-adapter --files` and a
+  # plain `--check-adapter` by the same name, so a transcript could not be told
+  # apart from a bare run at a glance — the reading nine builders across two
+  # campaigns got wrong. The file meters below always said which it was; a person
+  # scanning one line does not read four fields to answer one question.
   DOCTOR_PROFILE="basic"; $DOCTOR_DEEP && DOCTOR_PROFILE="deep"
+  $DOCTOR_FILES && DOCTOR_PROFILE="$DOCTOR_PROFILE+files"
   # --files was REQUESTED: the meters flip NOT_REQUESTED -> NOT_RUN here, so
   # even an early die reports "asked for, never executed" — never "not asked".
   if $DOCTOR_FILES; then
@@ -15372,11 +16129,20 @@ run_doctor() {
   say "  \"stream\": false — all three must be tolerated. Agents can be slow; I wait up to 5"
   say "  minutes per turn…"
   local payload
-  payload=$(python3 -c 'import json
-print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+  # The prompt comes from DOCTOR_PING_PROMPT rather than a literal here:
+  # CHAT_FRAMING subtracts that exact string from the reply before it looks for
+  # the answer, and a prompt that drifted from what the grader strips would give
+  # an echoing adapter its pass back.
+  payload=$(CONDUCK_CHECK_PROMPT="$DOCTOR_PING_PROMPT" python3 -c 'import json, os
+print(json.dumps({"messages": [{"role": "user", "content": os.environ["CONDUCK_CHECK_PROMPT"]}],
                   "stream": False, "conduck_check_probe": True}))') \
     || die "Could not build the test request (python3 failed)."
   doctor_chat_check CHAT_BASIC "chat: absent model + unknown field + stream:false" "$payload" plain || true
+  # Reads the reply CHAT_BASIC just got, so it must sit HERE — the next probe
+  # overwrites DCC_BODY, and re-asking would cost a second real engine turn to
+  # put the identical question. The meter, not the exit status: a probe that was
+  # never graded has no reply to read (see doctor_framing_check).
+  doctor_framing_check "$(doctor_capability_meter)" || true
 
   doctor_model_selection_check || true
 
@@ -15700,7 +16466,7 @@ sys.exit(0 if any(re.search(p, text, re.I | re.S) for p in pats) else 1)' 2>/dev
 # NOT_RUN means "this run never got far enough to measure it — fix what went red
 # above and run me again", and it never means "fine". NOT_REQUESTED means "you did
 # not ask for this profile", which is not a problem and must never be retried;
-# only --check-adapter's optional file profile emits it (schema=3). --check-server
+# only --check-adapter's optional file profile emits it (schema=4). --check-server
 # has no optional profile, so NOT_REQUESTED never appears here.
 #
 # exit=<n> versus the process exit status:
@@ -15727,6 +16493,10 @@ compat_summary() { # compat_summary <exit-code>
 
 compat_on_exit() {
   local rc=$?
+  # This command's chat probes go through doctor_chat_request too, so it inherits
+  # the turn heartbeat — and with it the duty to stop a ticker that a run
+  # interrupted mid-turn would otherwise leave printing past its own summary.
+  doctor_turn_heartbeat_stop
   on_exit
   compat_summary "$rc"
 }
@@ -16434,6 +17204,290 @@ if e("FS_URL") and e("FS_CRED"):
     p["fileServer"] = {"url": e("FS_URL"), "credential": e("FS_CRED")}
 print(json.dumps(p, separators=(",", ":")))
 PY
+}
+
+# ------------------------------------------------------------- --emit-code --
+#
+# The scriptable minter: the pairing code, built from what it is TOLD, with no
+# terminal, no saved state and no network.
+#
+# Why it exists. Eight independent AI builders, given only the public contract,
+# the build brief and --help, each concluded that producing a `conduck-setup:v1`
+# code was impossible without their operator — and each was right. --setup is the
+# only minter and it ends at a QR a person scans; --show-code re-emits a profile
+# that only a completed --setup writes, which a fresh build rig has never had. So
+# the last step of "build an adapter and prove it works" had no machine-drivable
+# form at all, and every one of them hand-rolled the base64 from PAYLOAD.md. That
+# they all got it right says the format spec is good; that they all had to says
+# this command was missing.
+#
+# What it deliberately does NOT do, and each has a reason:
+#   * it never writes a profile, so nothing about this host changes and a later
+#     --show-code is not quietly taught about a gateway nobody set up here;
+#   * it never sends a request, because a builder mints the code BEFORE the
+#     exposure exists — a minter that verified would be unusable at the one
+#     moment it is wanted, and --check-adapter is the command that verifies;
+#   * it prints no QR. A QR is for a person holding a phone; this output is for a
+#     pipe, and the text form is the same secret in the same v1 wrapping.
+#
+# It reuses build_pairing_payload_json and b64_nowrap rather than assembling
+# anything of its own, so a code from here and a code from --setup are the same
+# bytes for the same inputs, and a change to the payload cannot reach one without
+# reaching the other.
+#
+# The two secrets arrive in the ENVIRONMENT, never on argv, for the reason there
+# is no --token flag anywhere in this CLI: argv is readable by every process on
+# the host through `ps`.
+
+# Grade one free-form display string EXACTLY as the app grades it on import, and
+# hand back the trimmed form the app will actually keep. The app rejects the WHOLE
+# payload — not the offending field — when a name or a model id is over its cap or
+# carries a scalar that can spoof or corrupt rendered text, so a code minted around
+# one of those imports and dies with nothing on screen to explain it. Mirror of the
+# app's PairingPayload.sanitizedDisplayText + isDisplayHostile, including the caps.
+#
+# The trim mirrors Swift's .whitespacesAndNewlines, spelled out rather than left to
+# python's str.strip(): str.strip() ALSO eats the C0 file/group/record separators,
+# which the app does not trim and then refuses — so borrowing it would accept a name
+# the app rejects, the exact failure this function exists to stop.
+#
+# Echoes "<verdict> <detail>": "ok <trimmed-text>", "long <scalar-count>" or
+# "hostile U+XXXX". Echoes NOTHING when python3 is missing, and the caller then
+# leaves the value exactly as typed — this runs at validate_cli time, before the
+# runtime preflight, so a missing interpreter must never turn into an exit-2 command
+# misuse (the same rule doctor_accept_url keeps by staying pure Bash). run_emit_code
+# names the missing python3 as an exit-1 runtime failure moments later.
+emit_display_text_grade() { # emit_display_text_grade <text> <max-scalars>
+  EMIT_DT_TEXT="$1" EMIT_DT_MAX="$2" python3 - <<'PY' 2>/dev/null
+import os, sys
+text = os.environ["EMIT_DT_TEXT"]
+cap = int(os.environ["EMIT_DT_MAX"])
+# Swift's CharacterSet.whitespacesAndNewlines: TAB, the newline family (LF VT FF CR,
+# NEL, LINE/PARAGRAPH SEPARATOR) and general category Zs.
+ws = "".join(chr(c) for c in
+             (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680,
+              0x2028, 0x2029, 0x202F, 0x205F, 0x3000)) \
+     + "".join(chr(c) for c in range(0x2000, 0x200B))
+text = text.strip(ws)
+# len() over a str counts code points, which is the app's own unit (unicodeScalars).
+if len(text) > cap:
+    sys.stdout.write("long %d" % len(text))
+    raise SystemExit(0)
+for ch in text:
+    o = ord(ch)
+    if (o <= 0x1F or o == 0x7F or 0x80 <= o <= 0x9F          # C0 + DEL + C1
+            or o in (0x200E, 0x200F, 0x2028, 0x2029)         # LRM/RLM, LS/PS
+            or 0x202A <= o <= 0x202E or 0x2066 <= o <= 0x2069):  # bidi embed/override/isolate
+        sys.stdout.write("hostile U+%04X" % o)
+        raise SystemExit(0)
+sys.stdout.write("ok " + text)
+PY
+}
+
+# The two callers of the grader, held in one place so --name and --model cannot
+# drift apart. Refuses rather than truncates or strips, for the reason --name on a
+# builtin kind is refused: a silently altered label is one the operator read in
+# their terminal and will never see in the app. Sets EMIT_GRADED_TEXT to the trimmed
+# value; exits 2 on either refusal.
+emit_grade_display_text() { # emit_grade_display_text <flag> <field-word> <text> <max>
+  local graded verdict detail
+  graded=$(emit_display_text_grade "$3" "$4")
+  # No python3 to grade with — keep the value as typed and let run_emit_code report
+  # the missing interpreter as the runtime failure it is.
+  [ -n "$graded" ] || { EMIT_GRADED_TEXT="$3"; return 0; }
+  verdict="${graded%% *}"; detail="${graded#* }"
+  case "$verdict" in
+    long)
+      usage_die "$1 is $detail characters long. The app refuses a $2 over $4 characters — and it refuses the WHOLE setup code, not just that field. Shorten it." ;;
+    hostile)
+      usage_die "$1 contains $detail, which the app refuses in a $2: scalars like that reorder or break the text they are rendered in. It refuses the WHOLE setup code over one, so use plain text." ;;
+  esac
+  EMIT_GRADED_TEXT="$detail"
+}
+
+# argv-shape validation, at validate_cli time so a wrong invocation exits 2
+# before anything runs. The two SECRETS are checked in run_emit_code instead:
+# a missing environment variable is a runtime condition, and both checks already
+# report that one as exit 1 with the instruction attached.
+emit_code_validate() {
+  local url norm
+  # The app's own caps, named where they are used. Both live in PairingPayload.
+  local name_max=120 model_max=200
+  [ -n "$EMIT_URL" ] || usage_die "--emit-code needs the gateway's address: --url https://your.gateway (try --help)."
+  # The SAME admissibility rule --setup applies at its prompt, applied here as a
+  # function rather than a prompt. It has to be the same one: this command mints
+  # a code the app imports, and a minter that accepted an address the app refuses
+  # would hand somebody a code that fails on their phone with nothing to explain it.
+  url=$(doctor_accept_url "$EMIT_URL") || {
+    # The rejected value may contain a password, so the userinfo case never
+    # echoes it back — the same rule the checks' URL guard follows.
+    url_has_userinfo "$EMIT_URL" && usage_die "$URL_USERINFO_HINT"
+    usage_die "Can't pair '$EMIT_URL' — use https://… (or http:// toward an address only your own network can reach)."
+  }
+  EMIT_URL="$url"
+  # The SAME rewrite every other producer of a gateway URL applies — every one of
+  # them reaches apply_gateway_url_normalization, and this command is the only place
+  # a URL became a payload without passing through it. PAYLOAD.md promises --emit-code
+  # and --setup produce identical bytes for identical inputs, and without this line
+  # they do not: --url https://ai.example.com/v1 would mint a base the app appends
+  # /v1/… to a second time, and a ?key=… query would ride into the code. Fails OPEN on
+  # a python3 hiccup (empty result) for the reason the grader above does — this runs
+  # before the runtime preflight.
+  norm=$(normalize_gateway_base_url "$EMIT_URL")
+  if [ -n "$norm" ] && [ "$norm" != "$EMIT_URL" ]; then
+    # stderr, not `note`: stdout belongs to the code and nothing else. Said out loud
+    # rather than done quietly, because the address in the code is then not the
+    # address on the command line, and the wizard says the same sentence.
+    printf 'Using %s — Conduck adds /v1/… itself, so the base address must not already end in it.\n' "$norm" >&2
+    EMIT_URL="$norm"
+  fi
+
+  case "${EMIT_KIND:=custom}" in
+    openclaw|hermes|custom) ;;
+    *) usage_die "--kind takes openclaw, hermes or custom (given: '$EMIT_KIND')." ;;
+  esac
+  # A name is a CUSTOM gateway's field and only a custom gateway's — PAYLOAD.md
+  # omits it for the two named kinds, and the app knows what to call those two
+  # already. Refusing rather than dropping it: a silently discarded name is a
+  # label somebody expects to see in the app and never will.
+  if [ "$EMIT_KIND" != "custom" ] && [ -n "$EMIT_NAME" ]; then
+    usage_die "--name applies to --kind custom only; the app names an $EMIT_KIND gateway itself."
+  fi
+  # A model is the same story one field over, and the same refusal for the same
+  # reason: the app seeds a model override for a CUSTOM gateway only, so a model on
+  # a builtin kind is read, discarded, and never seen again. Somebody who passed
+  # --model meant the gateway to answer on that model; dropping it silently is how
+  # they find out weeks later, from the wrong model's replies.
+  if [ "$EMIT_KIND" != "custom" ] && [ -n "$EMIT_MODEL" ]; then
+    usage_die "--model applies to --kind custom only; the app ignores a model on an $EMIT_KIND gateway."
+  fi
+  # Both free-form fields are graded against the app's OWN import rules before
+  # anything is minted, and both are stored back TRIMMED, because the app trims them
+  # too — so what this command calls the name is what the app will call it. The trim
+  # has to happen before the default below: --name "   " is not a name the app will
+  # accept, and left untrimmed it would suppress the default and mint a code the app
+  # then refuses whole.
+  if [ -n "$EMIT_NAME" ]; then
+    emit_grade_display_text "--name" "gateway name" "$EMIT_NAME" "$name_max"
+    EMIT_NAME="$EMIT_GRADED_TEXT"
+  fi
+  if [ -n "$EMIT_MODEL" ]; then
+    emit_grade_display_text "--model" "model id" "$EMIT_MODEL" "$model_max"
+    EMIT_MODEL="$EMIT_GRADED_TEXT"
+  fi
+  # The app REJECTS a custom gateway carrying no name, so an empty one here would
+  # mint a code that imports and fails. "My gateway" is not invented for this
+  # command — it is the default the wizard's own name prompt offers, so pressing
+  # Enter there and omitting --name here produce the same code.
+  [ "$EMIT_KIND" = "custom" ] && [ -z "$EMIT_NAME" ] && EMIT_NAME="My gateway"
+
+  case "${EMIT_TRANSPORT:=public}" in
+    tailscale|funnel|cloudflare|public) ;;
+    *) usage_die "--transport takes tailscale, funnel, cloudflare or public (given: '$EMIT_TRANSPORT')." ;;
+  esac
+
+  if [ -n "$EMIT_FILES_URL" ]; then
+    url=$(doctor_accept_url "$EMIT_FILES_URL") || {
+      url_has_userinfo "$EMIT_FILES_URL" && usage_die "$URL_USERINFO_HINT"
+      usage_die "Can't use '$EMIT_FILES_URL' as the file server — use https://… (or http:// toward an address only your own network can reach)."
+    }
+    EMIT_FILES_URL="$url"
+  fi
+  return 0
+}
+
+# Mint it. Exit 1 for anything that is not an argv-shape problem, which by here
+# means one of the two secrets.
+run_emit_code() {
+  # python3 builds the payload and base64 wraps it. Named individually rather
+  # than through preflight, which would additionally demand curl and openssl:
+  # this command sends no request and mints no credential, and refusing to print
+  # a code on a box that lacks the tools for setting one up would be the same
+  # dead end --forget's own narrower check exists to avoid.
+  need python3 || die "--emit-code builds the pairing payload with python3, and this host doesn't have it."
+  need base64  || die "--emit-code needs base64 to wrap the payload, and this host doesn't have it."
+
+  # Fail CLOSED on a merely-absent key. An unset CONDUCK_TOKEN is silence, and
+  # reading silence as "this gateway has no key" mints a code that pairs the app
+  # to an authenticated gateway with no credential — it fails later, in the app,
+  # with nothing on screen to say why. Keyless has to be SAID: --keyless, or the
+  # set-but-empty CONDUCK_TOKEN that already means exactly this everywhere else
+  # in this tool.
+  local token="" auth="none"
+  if [ "${CONDUCK_TOKEN+set}" = "set" ]; then
+    token="$CONDUCK_TOKEN"
+    if [ -n "$token" ]; then
+      $EMIT_KEYLESS && usage_die "--keyless says this gateway has no key, but CONDUCK_TOKEN holds one. Drop the flag, or unset the variable."
+      # The same gate every other consumer of this variable applies before using it.
+      # A control character in a key is never deliberate — it is a newline or a tab
+      # picked up by however the key was copied — and minting one produces a code
+      # that carries a token the gateway will never recognise. The value is never
+      # echoed back: it is the key.
+      credential_value_safe "$token" || die "CONDUCK_TOKEN contains a control character, so it cannot go into a setup code. That is almost always a stray newline or tab from copying it — re-copy the key and try again."
+      auth="bearer"
+    fi
+  elif ! $EMIT_KEYLESS; then
+    die "No key to put in the code. Set CONDUCK_TOKEN=<key> (never pass it on the command line — argv is world-readable via ps). For a gateway that genuinely has none, say so with --keyless."
+  fi
+
+  local files_cred=""
+  if [ -n "$EMIT_FILES_URL" ]; then
+    [ "${CONDUCK_FILES_PASS+set}" = "set" ] && files_cred="$CONDUCK_FILES_PASS"
+    [ -n "$files_cred" ] || die "--files-url names a file server, so its password has to ride the code too: set CONDUCK_FILES_PASS=<password>. Leave both out for a gateway with no file lane."
+    credential_value_safe "$files_cred" || die "CONDUCK_FILES_PASS contains a control character, so it cannot go into a setup code. That is almost always a stray newline or tab from copying it — re-copy the password and try again."
+    # The payload has NO username field: the app always signs in to the file server
+    # as `conduck`. A build rig that graded its lane with CONDUCK_FILES_USER=webdav
+    # and then mints from the same environment would otherwise get a code whose lane
+    # 401s on the phone, with the variable that caused it still exported two commands
+    # up and nothing anywhere saying it was ignored.
+    if [ -n "${CONDUCK_FILES_USER:-}" ] && [ "$CONDUCK_FILES_USER" != "conduck" ]; then
+      die "CONDUCK_FILES_USER is '$CONDUCK_FILES_USER', but a setup code carries no username — the app always signs in to the file server as 'conduck'. Give the file server a 'conduck' account, or unset the variable before minting."
+    fi
+  elif [ -n "${CONDUCK_FILES_PASS:-}" ]; then
+    # The other half of "both or neither". A password with no address cannot go
+    # into the code at all, and dropping it silently is how somebody ships a
+    # gateway they believe carries a file lane and it does not.
+    die "CONDUCK_FILES_PASS is set but no file server was named. Add --files-url <address>, or unset the password."
+  fi
+
+  # The payload builder reads globals, so this is where argv becomes the same
+  # variables the wizard fills in — one assignment block, immediately above the
+  # call, so nothing between them can be reading a stale value.
+  GW_KIND="$EMIT_KIND"
+  GW_NAME="$EMIT_NAME"
+  GW_URL="$EMIT_URL"
+  GW_AUTH="$auth"
+  GW_TOKEN="$token"
+  GW_MODEL="$EMIT_MODEL"
+  FS_URL="$EMIT_FILES_URL"
+  FS_CRED="$files_cred"
+  TRANSPORT="$EMIT_TRANSPORT"
+
+  local payload encoded
+  payload=$(build_pairing_payload_json) || die "Could not build the pairing payload (python3 failed)."
+  [ -n "$payload" ] || die "Could not build the pairing payload."
+  encoded=$(printf '%s' "$payload" | b64_nowrap) || die "Could not base64-encode the pairing payload."
+  [ -n "$encoded" ] || die "Could not base64-encode the pairing payload."
+
+  # STDERR, and one line. Every other path that prints a code says out loud what it
+  # carries, and a scripted caller is not a reason to stop saying it — the code is
+  # going into a file or a log somewhere. stdout stays exactly the code and nothing
+  # else, so `$(…)` around this command captures a usable string.
+  #
+  # Composed from what this code ACTUALLY carries, because the two secrets are
+  # independent and a --keyless gateway with no file lane carries neither. A fixed
+  # "this carries the gateway key" over a keyless code is a false warning, and a
+  # false warning is how a true one stops being read.
+  if [ -n "$token" ]; then
+    printf 'This code carries the gateway key%s — treat every copy of it like the key itself.\n' \
+      "${files_cred:+ and the file-server password}" >&2
+  elif [ -n "$files_cred" ]; then
+    printf 'This code carries the file-server password — treat every copy of it like that password.\n' >&2
+  else
+    printf 'This code names a keyless gateway and carries no secret — but it still names your gateway.\n' >&2
+  fi
+  printf 'conduck-setup:v%s:%s\n' "$PAYLOAD_VERSION" "$encoded"
+  return 0
 }
 
 # What this code actually carries, in one place, immediately before it is shown.
@@ -21290,6 +22344,16 @@ dispatch_menu_command() {
       note "(changes no configuration; live gateway checks run, and a configured file lane gets one small PUT → GET → DELETE probe)"
       run_show_qr
       offer_menu_return
+      exit 0
+      ;;
+    # The one command that prints a setup code without a person, and the only
+    # thing it prints on stdout is that code. So no preflight (it would demand
+    # curl and openssl for a command that opens no socket and mints no
+    # credential), no offer_menu_return (there is no menu entry for it — the
+    # welcome menu is for somebody choosing what to do, and a scripted minter has
+    # already chosen), and no banner. It exits on its own status.
+    emit-code)
+      run_emit_code
       exit 0
       ;;
     setup)

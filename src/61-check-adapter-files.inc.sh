@@ -36,6 +36,12 @@ DF_URL=""; DF_DIR=""; DF_CRED=""; DF_USER="conduck"
 DF_DEV_INO=""      # "<dev>:<ino>" pinned at resolve time — every direct disk op revalidates
 DF_RUN=""          # per-run namespace nonce; every artifact name carries it
 DF_ARTS=()         # "tier<TAB>kind<TAB>relkey" — registered BEFORE creation; tier T|A, kind file|dir
+# A literal newline in a plain variable. The delete pass builds a newline-
+# delimited key list and tests it INSIDE $(…), where bash 3.2 — the shell macOS
+# ships — cannot parse a `case` at all: it reads the first pattern's ")" as the
+# end of the substitution. A variable keeps the test a prefix-strip instead.
+DF_NL='
+'
 DF_AGENT_RAN=false
 DF_WROTE=false     # true once a mutating operation could have created something. DF_ARTS
                    # proves only INTENT (registration precedes creation, by design), so
@@ -885,16 +891,85 @@ PY
   return 0
 }
 
+# Does this server route DELETE at all, or did it refuse THESE files?
+#
+# Measured, never inferred from the status, and the distinction is the whole
+# point. rclone's WebDAV layer (golang.org/x/net/webdav) answers 405 for a DELETE
+# it ROUTED and could not carry out: a removal that fails with EACCES comes back
+# Method Not Allowed, byte-identical to what a server with no DELETE at all
+# answers. Measured here against rclone 1.74: a file inside a directory the
+# server cannot write answers 405, and a hand-run DELETE by the owner answers
+# 204 — same server, same verb, opposite conclusions from the status alone.
+#
+# That is the single most likely refusal on a real lane, and it is the one the
+# file lane's ownership rule already warns about: the file server and the agent
+# usually run as different users, so the folder the AGENT created is one the file
+# server is refused inside. Reported as "DELETE unsupported" it read as a
+# harmless degradation, and the ownership problem underneath it went unseen.
+#
+# The discriminator is one DELETE aimed at a key this run minted and never
+# created. A server that implements the verb must answer 404 for it (RFC 4918 —
+# the resource is not there); some answer 2xx, treating removal as idempotent,
+# which is equally proof the verb is routed. A server that does not implement it
+# answers the same refusal it gives everything else. Sent only when a real DELETE
+# has already come back refused, so a clean lane pays nothing for it.
+#
+# 403 is its own answer, and never "the verb is missing". Method Not Allowed is
+# what a server says about a VERB; Forbidden is what it says about PERMISSION,
+# and a server that answers it for a name that does not even exist is refusing
+# the caller rather than declining the method. Filed under "unsupported" it sent
+# operators to look for a DELETE feature their server already has, past the
+# credential scope or the ownership wall that is actually stopping them.
+#
+# The control's SHAPE has to match the tier that was refused. RFC 4918 treats a
+# collection DELETE as a different, recursive operation, and servers implement
+# the two separately — a lane whose FILE deletes work while its DIRECTORY
+# deletes 405 has an unimplemented collection DELETE, not a permission problem.
+# Probing a file-shaped name on behalf of a directory refusal would answer the
+# wrong question, so the caller passes the tier and the collection probe carries
+# the trailing slash that makes it a collection.
+#
+# The control's own status is published in DF_DELETE_PROBE_CODE: the verdict
+# quotes it, and "answered 404" hardcoded under a probe that also accepts 2xx is
+# the same invented detail this function exists to stop.
+DF_DELETE_PROBE_CODE=""
+doctor_fs_delete_routed() { # doctor_fs_delete_routed <file|dir> -> 0 implemented · 1 not implemented · 2 unmeasurable · 3 authorization refusal
+  local code name="conduck-check-$DF_RUN-absent-probe"
+  [ "$1" = "dir" ] && name="$name/"
+  code=$(doctor_fs_code real -X DELETE "$DF_URL/$name")
+  DF_DELETE_PROBE_CODE="$code"
+  case "$code" in
+    2??|404) return 0 ;;
+    403)     return 3 ;;
+    405|501) return 1 ;;
+    *)       return 2 ;;
+  esac
+}
+
 # Graded cleanup: WebDAV DELETE capability + proof that every registered
 # artifact is gone. Unproven cleanup is ERROR on the owning meter — never
 # silence. Exact names only, never a glob.
 doctor_files_delete() {
-  local entry kind rel code webdav_ok=true del_unsupported=""
+  local entry kind rel code webdav_ok=true del_unsupported="" del_tier="" routed=0
+  # Which artifacts this server ACKNOWLEDGED removing, sentinel-wrapped so a
+  # substring test cannot match a partial key. The ground-truth walk below needs
+  # it: an acknowledged DELETE whose target is still on disk afterwards is the
+  # one failure that cleanup alone can never see, because cleanup unlinks the
+  # file either way and every artifact ends up gone.
+  local acked="$DF_NL"
   for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)
     [ "$kind" = "file" ] || continue
     code=$(doctor_fs_code real -X DELETE "$DF_URL/$rel")
-    case "$code" in 2??|404) ;; 403|405|501) webdav_ok=false; del_unsupported="$code" ;; *) webdav_ok=false ;; esac
+    case "$code" in
+      2??|404) acked="$acked$rel$DF_NL" ;;
+      # First refusal wins, tier and all. The control probe below has to be
+      # shaped like whatever was refused, and a later overwrite would send a
+      # collection-shaped probe on behalf of a file refusal or the reverse.
+      403|405|501) webdav_ok=false
+                   [ -n "$del_unsupported" ] || { del_unsupported="$code"; del_tier="file"; } ;;
+      *) webdav_ok=false ;;
+    esac
   done
   # Directories after files, and order among them does not matter: DELETE on a
   # collection is recursive in RFC 4918, so removing the box's outer segment
@@ -904,7 +979,12 @@ doctor_files_delete() {
     kind=$(printf '%s' "$entry" | cut -f2); rel=$(printf '%s' "$entry" | cut -f3)
     [ "$kind" = "dir" ] || continue
     code=$(doctor_fs_code real -X DELETE "$DF_URL/$rel/")
-    case "$code" in 2??|404) ;; 403|405|501) webdav_ok=false; del_unsupported="$code" ;; *) webdav_ok=false ;; esac
+    case "$code" in
+      2??|404) acked="$acked$rel$DF_NL" ;;
+      403|405|501) webdav_ok=false
+                   [ -n "$del_unsupported" ] || { del_unsupported="$code"; del_tier="dir"; } ;;
+      *) webdav_ok=false ;;
+    esac
   done
   # Ground truth + guarded direct removal of anything that remains. Success
   # must be PROVEN: the checker prints a VERIFIED sentinel as its LAST line
@@ -912,13 +992,31 @@ doctor_files_delete() {
   # never read as "clean" (empty output without the sentinel is a failure,
   # not a pass; the trailing-sentinel order is what makes a partial crash
   # unspoofable).
-  local leftovers="" vout=""
+  #
+  # It reports on TWO channels, because "gone" and "the server removed it" are
+  # different claims and only one of them was ever measured. Plain lines are
+  # leftovers: artifacts this run could not remove, which is a real failure. Lines
+  # prefixed "G " are ghosts: artifacts whose DELETE this server ACKNOWLEDGED and
+  # which were still sitting on disk when the walk reached them. A ghost is not a
+  # leftover — the walk unlinks it like any other — but it is proof the
+  # acknowledgement was empty, and without recording it here nothing downstream
+  # could ever tell an honest DELETE from a 204 that did nothing.
+  local leftovers="" ghosts="" vout="" vbody="" vline
   if doctor_files_dir_ok; then
-    vout=$(for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do printf '%s\n' "$entry"; done \
+    # Prefix-strip rather than `case`, and that is a portability rule, not taste:
+    # bash 3.2 — the shell macOS ships — cannot parse a `case` inside $(…), it
+    # reads the first pattern's ")" as the end of the substitution.
+    vout=$(for entry in ${DF_ARTS[@]+"${DF_ARTS[@]}"}; do
+             rel=$(printf '%s' "$entry" | cut -f3)
+             dfa="-"
+             [ "${acked#*"$DF_NL$rel$DF_NL"}" != "$acked" ] && dfa="ack"
+             printf '%s\t%s\n' "$entry" "$dfa"
+           done \
       | python3 -c '
 import os, stat, sys
 root, run = sys.argv[1], sys.argv[2]
 left = []
+ghost = []
 dirs = []
 # Ownership is decided by the FIRST COMPONENT carrying the prefix this run
 # minted. It must stay anchored there: the deepest keys now sit two segments
@@ -934,16 +1032,31 @@ def owned(rel):
         return False
     return parts[0].startswith(prefix)
 for line in sys.stdin.read().splitlines():
-    try:
-        tier, kind, rel = line.split("\t", 2)
-    except ValueError:
+    parts = line.split("\t")
+    if len(parts) < 3:
         continue
+    tier, kind, rel = parts[0], parts[1], parts[2]
+    # The ack column is what makes a ghost detectable. It is optional so an
+    # older caller (or a hand-run of this walk) still parses.
+    ack = len(parts) > 3 and parts[3] == "ack"
     if not owned(rel):
         left.append(tier + " " + rel); continue
     p = os.path.join(root, rel)
     rp = os.path.realpath(p)
     if not (rp == root or rp.startswith(root + os.sep)):
         left.append(tier + " " + rel); continue
+    # Ghost test BEFORE anything is removed, and before dirs are deferred: the
+    # server said this artifact was gone (2xx, or 404 "it is not here"), so its
+    # presence now is the acknowledgement contradicting itself. Removing a file
+    # never removes a directory and the rmdir pass runs later, so what this test
+    # sees for one entry never depends on another entry having been handled
+    # first. (No apostrophes in here: the whole program is single-quoted shell.)
+    if ack:
+        try:
+            os.lstat(p)
+            ghost.append(rel)
+        except Exception:
+            pass
     if kind == "dir":
         dirs.append((tier, p, rel)); continue
     try:
@@ -977,20 +1090,143 @@ for tier, p, rel in dirs:
         left.append(tier + " " + rel)
 for x in left:
     print(x)
+for x in ghost:
+    print("G " + x)
 print("VERIFIED")' "$DF_DIR" "$DF_RUN" 2>/dev/null)
-    if [ "$vout" = "VERIFIED" ]; then leftovers=""
-    elif [ "${vout%$'\n'VERIFIED}" != "$vout" ]; then leftovers="${vout%$'\n'VERIFIED}"
-    else leftovers="? the cleanup checker itself failed — nothing proven"
+    if [ "$vout" = "VERIFIED" ]; then vbody=""
+    elif [ "${vout%$'\n'VERIFIED}" != "$vout" ]; then vbody="${vout%$'\n'VERIFIED}"
+    else vbody=""; leftovers="? the cleanup checker itself failed — nothing proven"
+    fi
+    # Split the walk's two channels. Only "G " lines are ghosts; everything else
+    # is a leftover, and the meter rules below still read leftovers by their
+    # "T "/"A " tier prefix exactly as before.
+    if [ -n "$vbody" ]; then
+      while IFS= read -r vline; do
+        [ -n "$vline" ] || continue
+        case "$vline" in
+          "G "*) ghosts="${ghosts}${ghosts:+$'\n'}${vline#G }" ;;
+          *)     leftovers="${leftovers}${leftovers:+$'\n'}${vline}" ;;
+        esac
+      done <<DCC_VOUT
+$vbody
+DCC_VOUT
     fi
   else
     leftovers="? folder identity changed mid-run — nothing removed directly"
   fi
   if [ -z "$leftovers" ]; then
-    if $webdav_ok; then
+    # Ghosts come FIRST, ahead of every other green arm. A server that answers a
+    # DELETE it does not perform passes the cleanup walk — the walk unlinks the
+    # file itself — and would otherwise collect the "verified gone" verdict while
+    # having removed nothing at all. It is the only arm here whose evidence is
+    # disk state rather than a status code, so no status-shaped branch can reach
+    # the same conclusion.
+    if [ -n "$ghosts" ]; then
+      local ghost_n
+      ghost_n=$(printf '%s\n' "$ghosts" | wc -l | tr -d ' ')
+      d_ok FILES_DELETE "DELETE is ACKNOWLEDGED but does not REMOVE — $ghost_n artifact(s) were still on disk afterwards (cleaned up directly)"
+      d_say FILES_DELETE "(this server answered these DELETEs as success — or as \"not here\" — and the files were"
+      d_say FILES_DELETE " still there when I looked. I removed them from disk myself, so the folder is clean now,"
+      d_say FILES_DELETE " but the app cannot: it has only the WebDAV route, and it believes what your server tells"
+      d_say FILES_DELETE " it. Every returned file will accumulate in the shared folder forever. Look for a stubbed"
+      d_say FILES_DELETE " DELETE handler, a read-only or overlay mount the server reports success on, or a proxy"
+      d_say FILES_DELETE " answering the verb in front of the real file server. Deletion is best-effort in the app,"
+      d_say FILES_DELETE " so the lane still passes — an honest 405 would be better than this.)"
+      if [ -n "$del_unsupported" ]; then
+        d_say FILES_DELETE "(other artifacts were refused outright with HTTP $del_unsupported — this server is doing both.)"
+      fi
+    elif $webdav_ok; then
       d_ok FILES_DELETE "WebDAV DELETE works — every check artifact removed and verified gone"
     elif [ -n "$del_unsupported" ]; then
-      d_ok FILES_DELETE "DELETE unsupported (HTTP $del_unsupported) — artifacts removed directly on disk instead"
-      d_say FILES_DELETE "(the app treats WebDAV deletion as best-effort, so this is a degradation, not a failure)"
+      local ctl_tier="${del_tier:-file}" ctl_code ctl_extra=""
+      routed=0; doctor_fs_delete_routed "$ctl_tier" || routed=$?
+      ctl_code="${DF_DELETE_PROBE_CODE:-?}"
+      # The idempotent-removal half-sentence rides only a 2xx control. A 404 is
+      # RFC 4918's plain answer and needs no gloss; a 2xx does, because a success
+      # for a name that never existed reads like a fault until you know some
+      # servers treat removal as idempotent.
+      case "$ctl_code" in
+        2??) ctl_extra=" (a 2xx for a name that never existed is that server treating removal as idempotent, which is equally proof the verb is routed)" ;;
+      esac
+      case "$routed" in
+        0)
+          if [ "$ctl_tier" = "dir" ]; then
+            # The control was FOLDER-shaped and came back routed, which is what
+            # rules out the other candidate: an unimplemented collection DELETE
+            # would have refused the absent folder too. So the verb is there for
+            # collections and only the folders this run touched were refused —
+            # and the folder the AGENT created is the one the file server owns
+            # least. Nothing here is about the file tier, which deleted fine.
+            d_ok FILES_DELETE "folder DELETE REFUSED on some artifacts (HTTP $del_unsupported) — removed directly on disk instead"
+            d_say FILES_DELETE "(files delete here; these FOLDERS were refused. This server does implement DELETE for"
+            d_say FILES_DELETE " folders: the same request aimed at a folder-shaped name that does not exist answered"
+            d_say FILES_DELETE " $ctl_code, so the $del_unsupported above is it refusing THESE folders rather than declining the"
+            d_say FILES_DELETE " collection verb.$ctl_extra"
+            d_say FILES_DELETE " That leaves the ownership one, which is also the likeliest: the file server and the"
+            d_say FILES_DELETE " agent run as different users, so a folder the AGENT created is one the file server"
+            d_say FILES_DELETE " is refused inside — removing it needs write permission on its PARENT. Give the two a"
+            d_say FILES_DELETE " shared group, setgid the shared folder, and give both a group-writable umask."
+            d_say FILES_DELETE " Deletion is best-effort in the app, so the lane still passes — but the folders it"
+            d_say FILES_DELETE " makes for returned files accumulate, and the same permission wall is what makes a"
+            d_say FILES_DELETE " real transfer fail on its second half.)"
+          else
+            d_ok FILES_DELETE "DELETE REFUSED on some artifacts (HTTP $del_unsupported) — removed directly on disk instead"
+            d_say FILES_DELETE "(this server does implement DELETE: the same request aimed at a name that does not"
+            d_say FILES_DELETE " exist answered $ctl_code, so the $del_unsupported above is it refusing THESE files rather than"
+            d_say FILES_DELETE " declining the verb.$ctl_extra"
+            d_say FILES_DELETE " The usual cause is the ownership one: the file server and the"
+            d_say FILES_DELETE " agent run as different users, so a folder the AGENT created is one the file server"
+            d_say FILES_DELETE " is refused inside. Give the two a shared group, setgid the shared folder, and give"
+            d_say FILES_DELETE " both a group-writable umask. Deletion is best-effort in the app, so the lane still"
+            d_say FILES_DELETE " passes — but returned files your file server can never clear out accumulate, and"
+            d_say FILES_DELETE " the same permission wall is what makes a real transfer fail on its second half.)"
+          fi
+          ;;
+        3)
+          # 403 is about the CALLER, never about the verb. Filed under "DELETE
+          # unsupported" it sent operators hunting for a feature their server
+          # already has, past the wall that is actually stopping them.
+          d_ok FILES_DELETE "DELETE REFUSED — authorization (HTTP $del_unsupported) — artifacts removed directly on disk instead"
+          d_say FILES_DELETE "(this is a permission wall, not a missing verb: a DELETE aimed at a name that does not"
+          d_say FILES_DELETE " exist was refused $ctl_code as well, and a server with no DELETE at all answers 405. Two"
+          d_say FILES_DELETE " things produce it. Either the credential this check authenticates with is read-only —"
+          d_say FILES_DELETE " check the WebDAV account's rights and give it delete on this share — or it is the"
+          d_say FILES_DELETE " ownership one: the file server and the agent run as different users, so a folder the"
+          d_say FILES_DELETE " AGENT created is one the file server is refused inside; give the two a shared group,"
+          d_say FILES_DELETE " setgid the shared folder, and give both a group-writable umask. Deletion is"
+          d_say FILES_DELETE " best-effort in the app, so the lane still passes — but returned files your file server"
+          d_say FILES_DELETE " can never clear out accumulate, and the same wall is what makes a real transfer fail"
+          d_say FILES_DELETE " on its second half.)"
+          ;;
+        1)
+          if [ "$ctl_tier" = "dir" ]; then
+            # Files deleted fine and only the FOLDER requests were refused, and
+            # the control that confirmed it was folder-shaped. RFC 4918 makes
+            # removing a collection a separate, recursive operation, so this is
+            # a server shipping the file half of DELETE and not the other — not
+            # a permission wall, and nothing chown will fix.
+            d_ok FILES_DELETE "collection DELETE unsupported (HTTP $del_unsupported on folders) — removed directly on disk instead"
+            d_say FILES_DELETE "(files delete here; FOLDERS do not. Confirmed against a folder-shaped name that does"
+            d_say FILES_DELETE " not exist, which answered $ctl_code the same way, so this is the collection half of the"
+            d_say FILES_DELETE " verb missing rather than these folders being refused — RFC 4918 makes removing a"
+            d_say FILES_DELETE " collection a separate, recursive operation, and servers ship one half without the"
+            d_say FILES_DELETE " other. No ownership fix applies. The app treats WebDAV deletion as best-effort, so"
+            d_say FILES_DELETE " this is a degradation, not a failure — but the folders it makes for returned files"
+            d_say FILES_DELETE " will accumulate.)"
+          else
+            d_ok FILES_DELETE "DELETE unsupported (HTTP $del_unsupported) — artifacts removed directly on disk instead"
+            d_say FILES_DELETE "(confirmed against a name that does not exist, which answered $ctl_code the same way, so"
+            d_say FILES_DELETE " this is the verb missing rather than these files being refused. The app treats WebDAV"
+            d_say FILES_DELETE " deletion as best-effort, so this is a degradation, not a failure.)"
+          fi
+          ;;
+        *)
+          d_ok FILES_DELETE "DELETE refused (HTTP $del_unsupported) — artifacts removed directly on disk instead"
+          d_say FILES_DELETE "(I could not tell whether the verb is missing or these files were refused: the"
+          d_say FILES_DELETE " control request answered $ctl_code, which says nothing either way. Deletion is"
+          d_say FILES_DELETE " best-effort in the app regardless.)"
+          ;;
+      esac
     else
       d_ok FILES_DELETE "check artifacts removed (some DELETE requests failed; direct disk cleanup covered them)"
     fi
@@ -1085,25 +1321,32 @@ run_doctor_files() {
   return 0
 }
 
-# The frozen machine line (schema=3), and the published grammar for it.
+# The frozen machine line (schema=4), and the published grammar for it.
 #
 # Printed as the LAST line of EVERY adapter-check exit — green, red, or an early
 # die: fixed field order, ASCII enums, no ANSI. Any key added, removed, renamed or
 # given a new value bumps schema=, so a consumer pins the number it parses and
 # ignores a line carrying one it does not know. Renaming the prefix
 # CONDUCK_DOCTOR -> CONDUCK_CHECK_ADAPTER was such a change, which is why schema
-# went 2 -> 3. Exactly ONE summary line is emitted (consumers use `tail -1`), so
-# the retired prefix is never dual-emitted.
+# went 2 -> 3; teaching profile= to name the file tier — basic+files, deep+files —
+# added two values to an enum, which is the same kind of change and is why it went
+# 3 -> 4. Neither the fields nor their order moved across that second bump, so a
+# parser that reads by key and tolerates an unknown profile= value needs nothing
+# but the new number; one that matched profile=basic exactly is precisely the
+# consumer the bump exists to stop silently. Exactly ONE summary line is emitted
+# (consumers use `tail -1`), so a retired prefix is never dual-emitted.
 #
 # The domains are written HERE, in the one artifact a consumer is guaranteed to
 # have: the adapter build brief tells an agent to curl this script and nothing
 # else, so a grammar that lives only in the README is a grammar it cannot read.
 #
-#   schema=3            this grammar
+#   schema=4            this grammar
 #   contract=v1         the adapter contract family being graded
 #   revision=<n.n>      the contract revision this harness implements
 #   harness=<version>   conduck-connect's own version; informational, never a gate
-#   profile=            basic | deep — deep adds the semantic image probe
+#   profile=            basic | deep | basic+files | deep+files — two independent
+#                       axes, neither implying the other: deep adds the semantic
+#                       image probe, +files adds the whole file-lane surface
 #   core=               PASS | FAIL | NOT_RUN — the core wire contract's roll-up.
 #                       IMAGE_INPUT and every file check are excluded from it by
 #                       design: they grade optional capabilities
@@ -1148,7 +1391,7 @@ doctor_summary() { # doctor_summary <exit-code>
     core="PASS"
     [ "$DOCTOR_CORE_FAILS" -gt 0 ] && core="FAIL"
   fi
-  printf 'CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=%s harness=%s profile=%s core=%s history_image=%s stream=%s image_input=%s file_transport=%s file_access=%s file_e2e=%s checks=%s failed=%s exit=%s\n' \
+  printf 'CONDUCK_CHECK_ADAPTER schema=4 contract=v1 revision=%s harness=%s profile=%s core=%s history_image=%s stream=%s image_input=%s file_transport=%s file_access=%s file_e2e=%s checks=%s failed=%s exit=%s\n' \
     "$DOCTOR_CONTRACT_REV" "$VERSION" "$DOCTOR_PROFILE" "$core" \
     "$DOCTOR_HISTORY_IMAGE" "$DOCTOR_STREAM" "$DOCTOR_IMAGE_INPUT" \
     "$DOCTOR_FILE_TRANSPORT" "$DOCTOR_FILE_ACCESS" "$DOCTOR_FILE_E2E" \
@@ -1162,16 +1405,31 @@ doctor_summary() { # doctor_summary <exit-code>
 # unhandled signal — the summary line must ride even a Ctrl-C.
 doctor_on_exit() {
   local rc=$?
+  # Before anything else prints: a turn interrupted mid-flight leaves its ticker
+  # alive, and a heartbeat arriving after the machine summary would land AFTER
+  # the line a consumer reads with `tail -1`. It writes to stderr and the summary
+  # to stdout, so the two cannot actually collide in a parsed stream — but they
+  # share a terminal, and a liveness line printed under a finished verdict is a
+  # lie about a run that has already ended.
+  doctor_turn_heartbeat_stop
   on_exit
   $DOCTOR_FILES && doctor_files_cleanup_backstop
   doctor_summary "$rc"
 }
 
 run_doctor() {
-  # The machine summary must ride EVERY exit (frozen schema=3 grammar) — arm
+  # The machine summary must ride EVERY exit (the frozen machine line's grammar) — arm
   # it before anything can die. Flag-combination errors happen before this
   # function and are non-runs by definition: no doctor started, no summary.
+  # The profile names BOTH axes, because they are independent: --deep deepens the
+  # chat tier, --files adds a whole second surface, and neither implies the other.
+  # A run that reported only the deep axis called `--check-adapter --files` and a
+  # plain `--check-adapter` by the same name, so a transcript could not be told
+  # apart from a bare run at a glance — the reading nine builders across two
+  # campaigns got wrong. The file meters below always said which it was; a person
+  # scanning one line does not read four fields to answer one question.
   DOCTOR_PROFILE="basic"; $DOCTOR_DEEP && DOCTOR_PROFILE="deep"
+  $DOCTOR_FILES && DOCTOR_PROFILE="$DOCTOR_PROFILE+files"
   # --files was REQUESTED: the meters flip NOT_REQUESTED -> NOT_RUN here, so
   # even an early die reports "asked for, never executed" — never "not asked".
   if $DOCTOR_FILES; then
@@ -1284,11 +1542,20 @@ run_doctor() {
   say "  \"stream\": false — all three must be tolerated. Agents can be slow; I wait up to 5"
   say "  minutes per turn…"
   local payload
-  payload=$(python3 -c 'import json
-print(json.dumps({"messages": [{"role": "user", "content": "Reply with exactly: pong"}],
+  # The prompt comes from DOCTOR_PING_PROMPT rather than a literal here:
+  # CHAT_FRAMING subtracts that exact string from the reply before it looks for
+  # the answer, and a prompt that drifted from what the grader strips would give
+  # an echoing adapter its pass back.
+  payload=$(CONDUCK_CHECK_PROMPT="$DOCTOR_PING_PROMPT" python3 -c 'import json, os
+print(json.dumps({"messages": [{"role": "user", "content": os.environ["CONDUCK_CHECK_PROMPT"]}],
                   "stream": False, "conduck_check_probe": True}))') \
     || die "Could not build the test request (python3 failed)."
   doctor_chat_check CHAT_BASIC "chat: absent model + unknown field + stream:false" "$payload" plain || true
+  # Reads the reply CHAT_BASIC just got, so it must sit HERE — the next probe
+  # overwrites DCC_BODY, and re-asking would cost a second real engine turn to
+  # put the identical question. The meter, not the exit status: a probe that was
+  # never graded has no reply to read (see doctor_framing_check).
+  doctor_framing_check "$(doctor_capability_meter)" || true
 
   doctor_model_selection_check || true
 

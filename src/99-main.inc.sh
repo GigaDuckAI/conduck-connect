@@ -427,6 +427,16 @@ dispatch_menu_command() {
       offer_menu_return
       exit 0
       ;;
+    # The one command that prints a setup code without a person, and the only
+    # thing it prints on stdout is that code. So no preflight (it would demand
+    # curl and openssl for a command that opens no socket and mints no
+    # credential), no offer_menu_return (there is no menu entry for it — the
+    # welcome menu is for somebody choosing what to do, and a scripted minter has
+    # already chosen), and no banner. It exits on its own status.
+    emit-code)
+      run_emit_code
+      exit 0
+      ;;
     setup)
       preflight
       run_setup

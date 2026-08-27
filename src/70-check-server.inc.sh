@@ -255,7 +255,7 @@ sys.exit(0 if any(re.search(p, text, re.I | re.S) for p in pats) else 1)' 2>/dev
 # NOT_RUN means "this run never got far enough to measure it — fix what went red
 # above and run me again", and it never means "fine". NOT_REQUESTED means "you did
 # not ask for this profile", which is not a problem and must never be retried;
-# only --check-adapter's optional file profile emits it (schema=3). --check-server
+# only --check-adapter's optional file profile emits it (schema=4). --check-server
 # has no optional profile, so NOT_REQUESTED never appears here.
 #
 # exit=<n> versus the process exit status:
@@ -282,6 +282,10 @@ compat_summary() { # compat_summary <exit-code>
 
 compat_on_exit() {
   local rc=$?
+  # This command's chat probes go through doctor_chat_request too, so it inherits
+  # the turn heartbeat — and with it the duty to stop a ticker that a run
+  # interrupted mid-turn would otherwise leave printing past its own summary.
+  doctor_turn_heartbeat_stop
   on_exit
   compat_summary "$rc"
 }

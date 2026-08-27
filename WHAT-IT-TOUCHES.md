@@ -16,6 +16,17 @@ actually on this machine — every saved setup, where its files live, and any fi
 server still running with no setup behind it. Removing one is
 [`--forget <id>`](#removing-a-setup).
 
+Two commands touch nothing at all and are listed here so their absence from
+every table below reads as deliberate rather than as an omission. `--list` reads
+this script's own state directory and nothing else. **`--emit-code` reads no
+file and opens no socket**: it builds a setup code from the values you pass on
+the command line and the secrets you put in the environment, prints it, and
+exits. It writes no profile, so a code minted for a gateway does not teach this
+machine about that gateway, and a later `--show-code` still has nothing to
+re-emit. Its only output is the code on stdout and one warning on stderr —
+which, being a code, is a credential: see
+[SECURITY.md](SECURITY.md#the-setup-code-is-a-secret).
+
 ## Reads
 
 Everything here is read to discover the setup you already have. **Your gateway's own config file is read first and may be changed later in the same run** — always with your explicit yes, and only as the next table describes. The "Also changed?" column says which, so nothing here reads as a promise it isn't.

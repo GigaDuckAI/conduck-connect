@@ -258,6 +258,65 @@ url_is_local_host() { # url_is_local_host <host[:port]> -> 0 when only the local
   # line, and the two have to agree.
   return 1
 }
+
+# Does this authority name THIS machine, and only this machine?
+#
+# Deliberately much narrower than url_is_local_host, and not a security boundary
+# either — it decides how a failure is EXPLAINED, nothing else. "Only the local
+# network reaches it" still covers the box across the room and every address a
+# reverse proxy legitimately answers on, so a diagnosis that assumes an HTTPS
+# front in the way is fair there. On loopback it is not: nothing sits between the
+# probe and the process, so a gateway error status came out of the graded program
+# itself, and sending the reader to look at a proxy that does not exist wastes
+# the one hour they had.
+#
+# Pure Bash, both letter cases spelled out, for url_is_local_host's reason: the
+# callers run before the runtime preflight and may not depend on python3 or `tr`.
+url_is_loopback_host() { # url_is_loopback_host <host[:port]> -> 0 for 127.0.0.0/8, ::1 or localhost
+  local h="$1" o o2 rest
+  case "$h" in
+    ''|*@*|*/*|*'?'*|*'#'*|*[[:space:]]*) return 1 ;;
+  esac
+  case "$h" in
+    \[*)
+      case "$h" in \[*\]|\[*\]:*) ;; *) return 1 ;; esac
+      h="${h#\[}"; h="${h%%\]*}"
+      case "$h" in *%*) h="${h%%\%*}" ;; esac
+      # Only the canonical spelling. The long forms (0:0:…:1) are legal IPv6 and
+      # nobody types them at a prompt; failing to recognise one costs a less
+      # specific explanation, which is the safe direction for a message.
+      [ "$h" = "::1" ] && return 0
+      return 1 ;;
+  esac
+  case "$h" in
+    *:*:*) return 1 ;;
+    *:*)   h="${h%%:*}" ;;
+  esac
+  case "$h" in *.) h="${h%.}" ;; esac
+  [ -n "$h" ] || return 1
+  case "$h" in
+    [Ll][Oo][Cc][Aa][Ll][Hh][Oo][Ss][Tt]) return 0 ;;
+  esac
+  # The whole of 127.0.0.0/8: the kernel routes every one of those addresses to
+  # lo0, so any of them names this machine. Canonical dotted quad only, the same
+  # subset url_is_local_host accepts — an address shape neither of them reads is
+  # simply not recognised as loopback, and the general explanation stands.
+  case "$h" in *[!0123456789.]*) return 1 ;; esac
+  case "$h" in *.*.*.*.*) return 1 ;; esac
+  case "$h" in *.*.*.*) ;; *) return 1 ;; esac
+  [ "${h%%.*}" = "127" ] || return 1
+  rest="${h#*.}"; o2="${rest%%.*}"; rest="${rest#*.}"
+  for o in "$o2" "${rest%%.*}" "${rest#*.}"; do
+    case "$o" in
+      ''|*[!0123456789]*) return 1 ;;
+      0) ;;
+      0*) return 1 ;;
+    esac
+    [ "${#o}" -le 3 ] || return 1
+    [ "$o" -le 255 ] || return 1
+  done
+  return 0
+}
 # The refusal and the caveat, in one place each, because both are said at more than
 # one prompt and two spellings of one fact are two chances to drift. The refusal
 # names the spellings that DO work rather than the rule it is applying — and it
@@ -292,7 +351,17 @@ DOCTOR_DEEP=false
 DOCTOR_FILES=false
 COMPAT=false
 CHECK_URL=""
-COMMAND=""         # menu | setup | check-server | check-adapter | show-code | list | edit | forget
+COMMAND=""         # menu | setup | check-server | check-adapter | show-code | emit-code | list | edit | forget
+# --emit-code's inputs. Every one of them arrives on argv EXCEPT the two secrets,
+# which arrive in the environment for the reason there is no --token flag
+# anywhere in this CLI: argv is readable by every process on the host via `ps`.
+EMIT_URL=""
+EMIT_MODEL=""
+EMIT_NAME=""
+EMIT_KIND=""
+EMIT_TRANSPORT=""
+EMIT_FILES_URL=""
+EMIT_KEYLESS=false
 SETUP_FROM_CHECK=false
 # Which check handed off (server | adapter). Read only for prompt wording, and
 # held as state because the identity question it phrases is asked later than the
@@ -329,7 +398,7 @@ MENU_RETURN_STATUS=20
 
 set_command() { # set_command <command>
   if [ -n "$COMMAND" ]; then
-    usage_die "Choose one action only: --setup, --check-server, --check-adapter, --show-code, --list, --edit or --forget."
+    usage_die "Choose one action only: --setup, --check-server, --check-adapter, --show-code, --emit-code, --list, --edit or --forget."
   fi
   COMMAND="$1"
 }
@@ -350,18 +419,35 @@ print_help() {
   say ""
   say "SYNOPSIS"
   say "  bash conduck-connect.sh [--setup | --check-server [url] | --check-adapter [url]"
-  say "                          | --show-code | --list [--json] | --edit [id]"
-  say "                          | --forget <id>] [options]"
+  say "                          | --emit-code --url <u> | --show-code | --list [--json]"
+  say "                          | --edit [id] | --forget <id>] [options]"
   say ""
   say "COMMANDS — scriptable (pass the url, set CI=1; no terminal needed)"
   say "  --check-server [url]   Grade software NOT built for Conduck against the app's core"
   say "                         wire protocol. Ends in one machine-readable summary line."
   say "  --check-adapter [url]  Grade software built specifically for Conduck against its"
   say "                         adapter contract. Ends in one machine-readable summary line."
+  say ""
+  say "  Both checks send REAL engine turns and wait up to 5 minutes for each, so budget"
+  say "  for the worst case: --check-server ~20 min · --check-adapter ~25 min · with"
+  say "  --deep ~30 min · with --files ~35 min. A turn in flight prints a heartbeat to"
+  say "  stderr every 30s, so a redirected run still shows the difference between slow"
+  say "  and wedged."
+  say ""
   say "  --list [--json]        List what is already set up on this machine: each saved"
   say "                         gateway's id, address, transport, model and shared folder,"
   say "                         and whether its file-lane service is running. Asks nothing,"
   say "                         changes nothing, and prints no key, password or setup code."
+  say "  --emit-code --url <u>  Print ONE setup code for a gateway you describe on this"
+  say "                         line, and nothing else, on stdout. Reads no saved setup,"
+  say "                         changes nothing, sends no request — so it works on a build"
+  say "                         rig before the gateway is exposed. The key comes from"
+  say "                         CONDUCK_TOKEN; --keyless is how you declare there is none."
+  say "                         Options: --model <id>, --name <shown-in-app>, --kind"
+  say "                         openclaw|hermes|custom (default custom), --transport"
+  say "                         tailscale|funnel|cloudflare|public (default public),"
+  say "                         --files-url <u> with CONDUCK_FILES_PASS for a file lane."
+  say "                         The code carries your key: treat every copy as the key."
   say ""
   say "COMMANDS — need a person at a terminal"
   say "  (no command)           Welcome menu: pick one of the actions below."
@@ -397,8 +483,11 @@ print_help() {
   say "  bash conduck-connect.sh --version    print the version and exit"
   say ""
   say "ENVIRONMENT"
-  say "  CONDUCK_TOKEN               The key for a check, so it never reaches your"
-  say "                              shell history or argv."
+  say "  CONDUCK_TOKEN               The key for a check, and the key --emit-code puts in"
+  say "                              the code, so it never reaches your shell history or"
+  say "                              argv. Export it EMPTY, or pass --keyless, to declare a"
+  say "                              keyless gateway deliberately: unset is never read as"
+  say "                              keyless."
   say "  CONDUCK_CHECK_SERVER_MODEL  --check-server only: grade the model you plan to use."
   say "                              Without it the named-model checks take whichever id"
   say "                              /v1/models happens to list first."
@@ -411,7 +500,10 @@ print_help() {
   say "  CONDUCK_FILES_USER          toward an address on your own network); DIR is the same"
   say "                              absolute folder the adapter was given; PASS is its password;"
   say "                              USER defaults to conduck. Set all of URL/DIR/PASS together,"
-  say "                              or none."
+  say "                              or none. PASS is also what --emit-code puts in the code"
+  say "                              beside --files-url — there, both or neither. A setup code"
+  say "                              carries no username, so --emit-code refuses a USER other"
+  say "                              than conduck rather than mint a lane that cannot sign in."
   say ""
   say "EXIT STATUS"
   say "  0  requested action succeeded (or a check passed)"
@@ -425,6 +517,8 @@ print_help() {
   say "  bash conduck-connect.sh --setup --dry-run   # see every change first; change nothing"
   say "  bash conduck-connect.sh --setup             # set up, verify, print the setup code"
   say "  CI=1 CONDUCK_TOKEN=… bash conduck-connect.sh --check-adapter https://ai.example.com"
+  say "  CONDUCK_TOKEN=… bash conduck-connect.sh --emit-code --url https://ai.example.com \\"
+  say "      --name 'My adapter' --model my-model   # one setup code on stdout, nothing else"
   say "  bash conduck-connect.sh --list              # what this machine already has set up"
   say "  bash conduck-connect.sh --edit my-gateway   # the quick tunnel handed out a new"
   say "                                              # address overnight: give this one setup"
@@ -452,12 +546,46 @@ case "${1:-}:${2:-}" in
   check:adapter) usage_die "The retired check adapter form is now --check-adapter [url] (try --help)." ;;
 esac
 
+# --emit-code is the first command here whose options take VALUES, and the loop
+# below walks argv one word at a time with no shift. Rather than rewrite the
+# parser every other command depends on, a value flag records itself here and the
+# NEXT word is consumed as its value. Empty between options, so a stray value can
+# never be read as one.
+CLI_PENDING_OPT=""
+
 for arg in "$@"; do
+  # The value half of a `--flag value` pair, claimed before anything else looks
+  # at this word: without that, `--name --setup` would silently start a wizard.
+  if [ -n "$CLI_PENDING_OPT" ]; then
+    # A value that looks like a flag is a forgotten value, not a value. Saying so
+    # here beats letting `--url --model gpt` fail three screens later as an
+    # unusable address, which is what it would otherwise look like.
+    case "$arg" in
+      -*) usage_die "--$CLI_PENDING_OPT needs a value, and '$arg' looks like another option (try --help)." ;;
+    esac
+    case "$CLI_PENDING_OPT" in
+      url)       EMIT_URL="$arg" ;;
+      model)     EMIT_MODEL="$arg" ;;
+      name)      EMIT_NAME="$arg" ;;
+      kind)      EMIT_KIND="$arg" ;;
+      transport) EMIT_TRANSPORT="$arg" ;;
+      files-url) EMIT_FILES_URL="$arg" ;;
+      *) die "Internal error: unknown pending option '$CLI_PENDING_OPT'." ;;
+    esac
+    CLI_PENDING_OPT=""
+    continue
+  fi
   case "$arg" in
     --setup)         set_command "setup" ;;
     --check-server)  set_command "check-server" ;;
     --check-adapter) set_command "check-adapter" ;;
     --show-code)     set_command "show-code" ;;
+    --emit-code)     set_command "emit-code" ;;
+    # The six value-taking options, all of them --emit-code's. validate_cli
+    # refuses every one of them on any other command.
+    --url|--model|--name|--kind|--transport|--files-url)
+      CLI_PENDING_OPT="${arg#--}" ;;
+    --keyless)  EMIT_KEYLESS=true ;;
     # The three manage commands. Their optional/required id arrives through the
     # same single positional slot the checks use for a URL — see CLI_POSITIONAL
     # below, and validate_cli, which is where a positional gets its meaning.
@@ -500,12 +628,16 @@ for arg in "$@"; do
         else usage_die "Unknown argument: $arg (try --help)"; fi ;;
   esac
 done
+# argv ended on a value flag with nothing after it. Caught here rather than left
+# empty, because an empty --url would otherwise be reported as a missing option
+# — which sends the reader looking for a flag they did type.
+[ -z "$CLI_PENDING_OPT" ] || usage_die "--$CLI_PENDING_OPT needs a value after it (try --help)."
 
 if [ -z "$COMMAND" ]; then
   if [ "$CLI_ARG_COUNT" = "0" ]; then
     COMMAND="menu"
   else
-    usage_die "Choose an action: --setup, --check-server, --check-adapter, --show-code, --list, --edit or --forget (try --help)."
+    usage_die "Choose an action: --setup, --check-server, --check-adapter, --show-code, --emit-code, --list, --edit or --forget (try --help)."
   fi
 fi
 
@@ -746,6 +878,18 @@ CLI_REUSE_ONLY=$REUSE_ONLY
 CLI_ALLOW_KEYLESS_PUBLIC=$ALLOW_KEYLESS_PUBLIC
 CLI_DOCTOR_DEEP=$DOCTOR_DEEP
 CLI_DOCTOR_FILES=$DOCTOR_FILES
+# --emit-code's seven. None of them is rewritten by any action today — the command
+# exits before an action could — and they have twins anyway, because the rule above
+# is about the flag existing, not about today's callers: a modifier the argument
+# loop can set and validate_cli cannot restore is the hole that stays invisible
+# until some later hub session lands in it.
+CLI_EMIT_URL=$EMIT_URL
+CLI_EMIT_MODEL=$EMIT_MODEL
+CLI_EMIT_NAME=$EMIT_NAME
+CLI_EMIT_KIND=$EMIT_KIND
+CLI_EMIT_TRANSPORT=$EMIT_TRANSPORT
+CLI_EMIT_FILES_URL=$EMIT_FILES_URL
+CLI_EMIT_KEYLESS=$EMIT_KEYLESS
 
 # ------------------------------------------------------- the modifier table --
 #
@@ -768,7 +912,7 @@ CLI_DOCTOR_FILES=$DOCTOR_FILES
 # than one, so it is fixed rather than alphabetical: the positional first, because a
 # command that takes no id at all should say so before it grades the flags around
 # it, then the modifiers in the order the arms have always met them.
-CLI_MODIFIERS="positional dry-run reuse-only deep files allow-keyless-public json"
+CLI_MODIFIERS="positional dry-run reuse-only deep files allow-keyless-public json url model name kind transport files-url keyless"
 
 # Did argv set this modifier? The ONLY reader of the flag globals, so a modifier
 # renamed in the argument loop breaks here rather than in seven command arms.
@@ -781,6 +925,13 @@ cli_modifier_set() { # cli_modifier_set <modifier>
     files)                $DOCTOR_FILES ;;
     allow-keyless-public) $ALLOW_KEYLESS_PUBLIC ;;
     json)                 $MANAGE_JSON ;;
+    url)                  [ -n "$EMIT_URL" ] ;;
+    model)                [ -n "$EMIT_MODEL" ] ;;
+    name)                 [ -n "$EMIT_NAME" ] ;;
+    kind)                 [ -n "$EMIT_KIND" ] ;;
+    transport)            [ -n "$EMIT_TRANSPORT" ] ;;
+    files-url)            [ -n "$EMIT_FILES_URL" ] ;;
+    keyless)              $EMIT_KEYLESS ;;
     # An accept list naming a modifier the argument loop cannot set is a typo, and
     # a typo in an accept list reads as a silent permission — the exact failure this
     # table exists to end. It stops the run instead.
@@ -841,6 +992,16 @@ cli_modifier_refusal() { # cli_modifier_refusal <modifier> -> the sentence for $
         check-server|check-adapter) printf '%s' "--json only works with --list; a check ends in its own machine summary line." ;;
         *)                          printf '%s' "--json only works with --list." ;;
       esac ;;
+    # --emit-code's seven, refused everywhere else by the same default-deny rule
+    # as every other modifier. --setup gets the fuller sentence, because it is the
+    # command somebody reaches for these on: the wizard has no answer flags at all
+    # and never will, and being told which command DOES take them is the whole
+    # point of meeting this error rather than a generic one.
+    url|model|name|kind|transport|files-url|keyless)
+      case "$COMMAND" in
+        setup) printf '%s' "--$1 belongs to --emit-code. --setup asks its questions at the terminal and has no answer flags — see --help." ;;
+        *)     printf '%s' "--$1 only works with --emit-code." ;;
+      esac ;;
   esac
 }
 
@@ -888,6 +1049,12 @@ validate_cli() {
   DRY_RUN=$CLI_DRY_RUN; REUSE_ONLY=$CLI_REUSE_ONLY
   DOCTOR_DEEP=$CLI_DOCTOR_DEEP; DOCTOR_FILES=$CLI_DOCTOR_FILES
   ALLOW_KEYLESS_PUBLIC=$CLI_ALLOW_KEYLESS_PUBLIC
+  # emit_code_validate normalises these in place — a trimmed URL, a defaulted kind,
+  # transport and name — so they are values this function WRITES, and every one of
+  # them is restored from argv here before it can be written a second time.
+  EMIT_URL=$CLI_EMIT_URL; EMIT_MODEL=$CLI_EMIT_MODEL; EMIT_NAME=$CLI_EMIT_NAME
+  EMIT_KIND=$CLI_EMIT_KIND; EMIT_TRANSPORT=$CLI_EMIT_TRANSPORT
+  EMIT_FILES_URL=$CLI_EMIT_FILES_URL; EMIT_KEYLESS=$CLI_EMIT_KEYLESS
   # The manage module's two inputs, handed over from what argv said. This is also
   # the line that keeps the menu path and the flag path honest about them: a
   # menu-entered --edit has no id on the command line, so it gets the empty string
@@ -929,6 +1096,15 @@ validate_cli() {
     show-code)
       SHOW_QR=true
       cli_accept_only
+      REUSE_ONLY=true
+      ;;
+    # --emit-code mints a code from what it is TOLD, reads no saved state and
+    # sends no request. Marked reuse-only for the same reason --list is: it must
+    # be structurally unable to change anything on this host, whatever shared
+    # helper it ever ends up reaching.
+    emit-code)
+      cli_accept_only url model name kind transport files-url keyless
+      emit_code_validate
       REUSE_ONLY=true
       ;;
     # The three manage commands. --list is the scriptable one and is a pure read:

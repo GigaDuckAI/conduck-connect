@@ -146,7 +146,7 @@ the two must not drift independently. Open an issue before changing any of them:
 
 - the **`conduck-setup:v1`** pairing payload (see `PAYLOAD.md`);
 - the adapter/server **`[CHECK_ID]`** verdict identifiers;
-- the **machine-summary schemas** (`CONDUCK_CHECK_ADAPTER schema=3 …`,
+- the **machine-summary schemas** (`CONDUCK_CHECK_ADAPTER schema=4 …`,
   `CONDUCK_CHECK_SERVER schema=2 …`) that build scripts parse. The grammar is
   frozen per schema number — field order, names, and enum values included — so
   *any* change to it, renaming the prefix included, must bump `schema=`;
@@ -191,11 +191,14 @@ a `CHANGELOG.md` release heading in a feature PR unless a maintainer asks — th
 release is cut separately, with the checksum and license files it ships beside
 the script.
 
-A version lives in **three** places and the release workflow refuses the tag
-unless all three agree: `VERSION` in `src/00-cli.inc.sh` (rebuild the artifact
-after changing it), the `## [x.y.z]` heading in `CHANGELOG.md`, and the
-`source is at` line in the **Release boundary** paragraph of `README.md`. The
-README one is the easiest to forget and the tag fails on it, not on the push.
+A version lives in **four** places: `VERSION` in `src/00-cli.inc.sh` (rebuild
+the artifact after changing it), the `## [x.y.z]` heading in `CHANGELOG.md`,
+the `source is at` line in the **Release boundary** paragraph of `README.md`,
+and the deliberately independent `--version` pin in the help-surface case of
+`tests/run-checks-suite.sh` (independent so a forgotten bump turns a check red
+instead of passing quietly). The release workflow gates the first three and
+refuses the tag unless they agree; CI's suite catches the fourth. The README
+one is the easiest to forget and the tag fails on it, not on the push.
 
 ## Bugs, questions, and security
 

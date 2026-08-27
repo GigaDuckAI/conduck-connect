@@ -629,6 +629,19 @@ drop_file_lane() {
 # emitting a code, print exactly how to undo them. Non-interactive (safe in a trap).
 EMITTED=false
 on_exit() {
+  # FIRST, before anything prints: --setup's own agent sentinel sends real
+  # engine turns through doctor_chat_request, so the wizard inherits the turn
+  # ticker — and a run killed mid-turn leaves that subshell printing liveness
+  # lines into a terminal whose run has already ended, for as long as the turn
+  # cap allows. The doctor's and --check-server's traps each stop it for the
+  # same reason; this is the third caller, and the one whose trap is armed on
+  # every ordinary run. Guarded with declare -F, like the sentinel cleanup
+  # below, because the ticker is defined in module 60 and this module is
+  # assembled ahead of it — the same reason the chained cleanups above are
+  # guarded rather than called outright.
+  if declare -F doctor_turn_heartbeat_stop >/dev/null 2>&1; then
+    doctor_turn_heartbeat_stop
+  fi
   # The OpenClaw/Hermes setup sentinel registers exact nonce paths before any
   # remote creation. Keep that cleanup chained ahead of exposure reporting,
   # including exits where the optional lane state was already cleared.

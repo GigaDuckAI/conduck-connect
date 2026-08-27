@@ -36,10 +36,10 @@ a successful setup is a QR code (and the same string as text) that the person
 imports into the Conduck app on an iPhone, iPad or Mac. Nothing you can do in a
 terminal completes that.
 
-There is also no non-interactive answer mode: prompts cannot be piped in, there
-are no `--gateway=` / `--url=` answer flags, and the tool's whole safety model is
-one explicit consent per change to the machine. If you drive it through a PTY you
-will still stop at the QR.
+There is also no non-interactive answer mode for the *wizard*: its prompts cannot
+be piped in, it has no answer flags, and its whole safety model is one explicit
+consent per change to the machine. If you drive it through a PTY you will still
+stop at the QR.
 
 So do not attempt it. Hand your operator the command instead:
 
@@ -50,9 +50,16 @@ bash conduck-connect.sh --setup
 and tell them it ends in a QR code to scan with the Conduck app. If you run it
 anyway with no terminal, it exits **4** and prints the same explanation.
 
+**The setup CODE is a different question, and that one you can answer.** What a
+machine cannot do is walk a person through configuring and verifying a host. If
+you already know the gateway's address, its key and its model — the normal case
+when you just built the thing — `--emit-code` prints the code itself, with no
+terminal and no saved setup, and it is the same code `--setup` would have
+printed. Reach for it instead of hand-assembling the base64 from `PAYLOAD.md`.
+
 ## What you *can* run
 
-Three commands are fully machine-drivable. All three finish without a person.
+Four commands are fully machine-drivable. All four finish without a person.
 
 ```bash
 # Grade a server that was NOT built for Conduck against the app's wire protocol
@@ -60,6 +67,10 @@ CI=1 CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --check-server https://gw.ex
 
 # Grade a server that WAS built for Conduck against the adapter contract
 CI=1 CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --check-adapter http://127.0.0.1:8080
+
+# Print ONE setup code for a gateway you describe on the command line
+CONDUCK_TOKEN="$TOKEN" bash conduck-connect.sh --emit-code \
+  --url https://gw.example.com --name "My adapter" --model my-model
 
 # What this machine already has set up, as one JSON object
 bash conduck-connect.sh --list --json
@@ -75,10 +86,29 @@ bash conduck-connect.sh --list --json
   nothing, and prints no token, no password and no setup code. It is how you find
   the id that `--edit` and `--forget` want. Its top-level `schemaVersion` is the
   number to pin.
+- **`--emit-code` is how a machine produces a setup code.** It needs no
+  terminal, reads no saved setup, sends no request and writes nothing, so it works
+  on a build rig before the gateway is exposed — and it goes through the same
+  payload builder `--setup` does, so the code is byte-identical to the one the
+  wizard would print for the same gateway. `--url` is required and is held to the
+  same address rule the app applies on import. The key rides `CONDUCK_TOKEN`;
+  for a gateway that genuinely has none, say so with `--keyless` (or the
+  set-but-empty `CONDUCK_TOKEN` that means the same thing everywhere else here) —
+  an *unset* variable is never read as keyless. `--files-url` plus
+  `CONDUCK_FILES_PASS` add a file lane, both or neither. Stdout is exactly the
+  `conduck-setup:v1:…` string, so `$(…)` around it captures a usable value; the
+  one warning it prints goes to stderr. **The code carries the gateway key** —
+  treat every copy of it, and every log it lands in, as the key itself.
 - **Both checks send real requests** to the address you give them: real model and
   chat turns that may consume paid quota and land in that server's own history.
   `--check-adapter --files` additionally writes and removes named files in the
   configured shared folder. Neither check changes host configuration.
+- **Both checks are SLOW, legitimately.** Each real turn waits up to five
+  minutes, so budget roughly 20 minutes for `--check-server`, 25 for
+  `--check-adapter`, 30 with `--deep` and 35 with `--files`. A turn in flight
+  prints a heartbeat line to **stderr** every 30 seconds, which is how a
+  redirected run tells slow apart from wedged. Do not kill a quiet run that is
+  inside those bounds; read the heartbeat instead.
 
 Everything else needs a person. `--setup`, `--edit`, `--forget` and the
 no-argument welcome menu detect that nobody can answer and exit **4** with their
@@ -138,7 +168,7 @@ schema you do not know.
 
 ```
 CONDUCK_CHECK_SERVER  schema=2 harness=… wire=… models=… chat=… … exit=…
-CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=… profile=… core=… … exit=…
+CONDUCK_CHECK_ADAPTER schema=4 contract=v1 revision=… profile=… core=… … exit=…
 ```
 
 **The key/value domains are published inside the script itself, and that is the
@@ -148,7 +178,7 @@ file you downloaded:
 
 - `--check-server`, `schema=2` → the comment block above `compat_summary` in
   [`src/70-check-server.inc.sh`](src/70-check-server.inc.sh)
-- `--check-adapter`, `schema=3` → the comment block above `doctor_summary` in
+- `--check-adapter`, `schema=4` → the comment block above `doctor_summary` in
   [`src/61-check-adapter-files.inc.sh`](src/61-check-adapter-files.inc.sh)
 
 Both blocks also state the two rules that matter most to a retry loop, in full:

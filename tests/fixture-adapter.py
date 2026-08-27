@@ -106,6 +106,28 @@ Modes ("good" behavior unless listed):
                          (compat chat) even though a lenient reader would pass
     non-string-content   chat replies with parts-form (non-string) content
     bad-json             chat replies 200 with a non-JSON body
+    heavy-framing        every reply is a perfectly-formed, perfectly useless
+                         persona answer that never contains the word the turn
+                         asked for. The envelope is flawless — strict JSON, one
+                         choice, non-empty string content — so every other chat
+                         check passes it; what is broken is that the adapter's
+                         own prompt framing swallowed the user's instruction.
+                         This is the shape a real adapter ships when it wraps
+                         each turn in a system prompt or an agent scaffold, and
+                         only CHAT_FRAMING can see it
+    echo-exact           every reply is the newest user message returned
+                         verbatim — the development echo engine the adapter
+                         build brief has builders stand up first. CHAT_FRAMING
+                         exempts this shape by design, so the ordinary profile
+                         must reach exit 0 here
+    echo-transcript      every reply is a rendered chat transcript: the user's
+                         turn quoted back under a "User:" label, then an
+                         "Assistant:" line answering something else entirely.
+                         The prompt is IN the reply and the word it asked for
+                         rides along inside it, which is exactly what a plain
+                         substring search cannot tell apart from an answer.
+                         CHAT_FRAMING must go RED — the exemption is for a reply
+                         that IS the turn, never one that merely contains it
 
 File-agent modes (all behave like `good` for the ordinary chat checks; they
 diverge only on the doctor's --files turn — a user message carrying the
@@ -369,7 +391,32 @@ class Engine:
     """The deterministic 'AI': answers the doctor's prompts exactly."""
 
     @staticmethod
-    def reply(texts, digit_code):
+    def reply(texts, digit_code, mode=None):
+        # The framing defect, and it is deliberately answered FIRST: a heavily
+        # framed adapter loses the instruction before the engine sees it, so it
+        # cannot echo the digits either. Fluent, well-formed, and about nothing
+        # that was asked -- which is exactly why no envelope check catches it.
+        if mode == "heavy-framing":
+            return ("Certainly! I'd be happy to help you with that. Let me know "
+                    "if there's anything else you need.")
+        # The two echo shapes, also ahead of the digit path: an echo engine has
+        # no eyes either, so it cannot report an image's digits.
+        #
+        # echo-exact returns the newest user message and NOTHING else, which is
+        # what the build brief's development echo engine does and what
+        # CHAT_FRAMING deliberately exempts. echo-transcript wraps that same
+        # message in a conversation rendering plus an unrelated assistant line:
+        # the instruction -- and the word it asks for -- is present in the reply
+        # while nothing has answered it. The pair is the whole point. They differ
+        # only in what surrounds the echo, so a checker that passes both is doing
+        # a substring search over the request it just sent.
+        if mode == "echo-exact":
+            return "\n".join(texts).strip()
+        if mode == "echo-transcript":
+            return ("Here is the conversation so far.\n\n"
+                    "User: " + "\n".join(texts).strip() + "\n"
+                    "Assistant: Of course — I'm glad to help. Let me know what "
+                    "else you need and I'll take care of it.")
         if digit_code is not None:
             return digit_code
         text = "\n".join(texts).strip()
@@ -718,7 +765,7 @@ def make_handler(mode, token, models):
                     time.sleep(SLOW_DELAY)
                 reply = handle_file_turn(mode, files_dir, joined)
             else:
-                reply = Engine.reply(texts, digit_code)
+                reply = Engine.reply(texts, digit_code, mode)
 
             sse = (mode == "sse-despite-false" and not stream) or \
                   (mode == "sse-on-stream-true" and stream) or \

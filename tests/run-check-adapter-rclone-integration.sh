@@ -28,7 +28,7 @@
 #              an adapter-check defect.
 #
 # Assertion style mirrors the suite: exact exit code, the EXACT set of
-# failed [CHECK_ID]s, the schema=3 summary grammar as the last line, and the
+# failed [CHECK_ID]s, the schema=4 summary grammar as the last line, and the
 # required file-meter fragments.
 #
 #   bash tests/run-check-adapter-rclone-integration.sh
@@ -71,7 +71,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=[0-9]+\.[0-9]+ harness=[0-9][0-9.]* profile=(basic|deep) core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_access=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_e2e=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
+SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=4 contract=v1 revision=[0-9]+\.[0-9]+ harness=[0-9][0-9.]* profile=(basic|deep)(\+files)? core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_access=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) file_e2e=(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR) checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
 
 PASS=0; FAIL=0
 # The dumped file is an argument, not always doctor.out: a case that dies before
@@ -141,7 +141,7 @@ assert_adapter() {
   local summary frag
   summary=$(tail -n 1 "$TMP/doctor.out")
   if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
-    fail_case "$label" "last line isn't a valid schema=3 summary: $summary"; return 1
+    fail_case "$label" "last line isn't a valid schema=4 summary: $summary"; return 1
   fi
   for frag in "$@"; do
     case " $summary " in *" $frag "*) ;; *) fail_case "$label" "summary lacks '$frag': $summary"; return 1 ;; esac

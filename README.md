@@ -112,6 +112,7 @@ The setup code is a credential, not a receipt. It contains the gateway token and
 | `bash conduck-connect.sh --check-server [url]` | Check software not built specifically for Conduck |
 | `bash conduck-connect.sh --check-adapter [url]` | Check software implementing the Conduck adapter contract |
 | `bash conduck-connect.sh --list` | Show saved setups and file-server state without printing secrets |
+| `CONDUCK_TOKEN=… bash conduck-connect.sh --emit-code --url <url>` | Print one setup code and nothing else — no terminal, no saved setup, no requests |
 | `bash conduck-connect.sh --edit [id]` | Change one field and reverify what it affects |
 | `bash conduck-connect.sh --forget <id>` | Remove one setup after you confirm by typing its id |
 | `bash conduck-connect.sh --help` | Show every command, option, environment variable, and exit status |
@@ -146,7 +147,7 @@ For an unattended check, add `CI=1`. Without it, a passing check in an interacti
 - `python3`
 - `openssl`
 
-Interactive setup needs a real terminal and ends with a QR code a person scans. There is intentionally no unattended answer file or `--yes` flag. Fully machine-driven operations are limited to the documented checks and `--list --json`.
+Interactive setup needs a real terminal and ends with a QR code a person scans. There is intentionally no unattended answer file or `--yes` flag for the wizard. Fully machine-driven operations are the documented checks, `--list --json`, and `--emit-code` — which mints a setup code from what you pass it, without reading saved state or sending a request.
 
 Conduck accepts an `https://` gateway address whose certificate the Apple device already trusts — or a plain `http://` one when the address is a local-network one nothing outside can reach, which is how a server such as Ollama answers by default. A domain name over plain `http://` is refused however private the machine behind it is, and so is a bare one-word name such as `nas`: Apple decides that from the address before it connects, so the wizard refuses it too rather than mint a code that would fail on the phone. An IP address, or the same machine's `.local` name, is the spelling that works. The wizard explains the supported routes; the [full manual](MANUAL.md#reaching-your-gateway) covers Tailscale, Tailscale Funnel, Cloudflare Tunnel, reverse proxies, existing HTTPS, and the local-network case.
 
@@ -183,7 +184,7 @@ It remains valid until you rotate the secrets it carries. The complete format an
 
 The maintainable source is the numbered modules under [`src/`](src/), concatenated in `src/manifest.txt` order into the generated `conduck-connect.sh` artifact. Edit a module, never the root script. CI rejects drift between them.
 
-**Release boundary.** The Quick start downloads the latest published release, not `main`. This checkout's source is at `v0.15.0`. The [releases page](https://github.com/gigaduckai/conduck-connect/releases) is the authority on what users can download.
+**Release boundary.** The Quick start downloads the latest published release, not `main`. This checkout's source is at `v0.16.0`. The [releases page](https://github.com/gigaduckai/conduck-connect/releases) is the authority on what users can download.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before changing the tool.
 

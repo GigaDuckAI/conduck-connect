@@ -29,7 +29,14 @@ Modes ("good" behavior unless listed):
     read-only      every write verb (PUT/DELETE/MKCOL) answers 403
     open           no auth required anywhere — 2xx without credentials
     no-range       ignores Range, always answers 200 with the full body
-    no-delete      DELETE answers 405 (everything else good)
+    no-delete      DELETE answers 405 for EVERY path, present or absent — a
+                   server that genuinely does not implement the verb
+    delete-refused DELETE is routed but REFUSES what exists: 405 for a path
+                   that is there, 404 for one that is not. Measured shape of
+                   rclone's WebDAV layer, where a removal that fails on
+                   permissions surfaces as 405 — indistinguishable from
+                   no-delete by status alone, and the reason the checker
+                   must probe an absent name before concluding anything
     no-mkcol       MKCOL answers 405 (everything else good)
     no-final-newline GET removes one trailing newline from otherwise correct bytes
     first-output-404 the first GET of each existing output-*.txt answers 404
@@ -40,6 +47,28 @@ Modes ("good" behavior unless listed):
                     to unrelated-victim.txt, then answers 204
     delete-dir-lies DELETE removes files normally but answers 204 without
                     removing directories
+    delete-no-collection
+                   DELETE works normally on FILES and answers 405 for any
+                   collection-shaped request (a path ending in "/"), present or
+                   absent. RFC 4918 makes removing a collection a separate,
+                   recursive operation and servers ship the file half without
+                   it, so this is a real deployment shape rather than a
+                   permission problem. It is also the lane that proves the
+                   checker's absent-name control has to MATCH THE TIER it is
+                   explaining: a file-shaped control here answers 204, which
+                   would let the checker call an unimplemented collection
+                   DELETE an ownership refusal and send the operator to chown
+    delete-collection-refused
+                   DELETE works normally on FILES; for a collection-shaped
+                   request it is ROUTED but refuses what exists — 404 for a
+                   folder that is not there, 405 for one that is. delete-refused
+                   one tier down: the folder the agent created is the one the
+                   file server cannot remove, so the ownership remediation is
+                   the correct advice here and "unimplemented" would not be.
+                   Paired with delete-no-collection, the two are one assertion:
+                   identical statuses on the folders that exist, opposite
+                   conclusions, and only the folder-shaped control tells them
+                   apart
     propfind-hides-contents
                    PROPFIND answers 207 for a directory that exists but lists
                    only the collection itself, never its children — the shape a
@@ -347,6 +376,28 @@ def make_handler(cfg):
                 return self._send(204, b"")
             if mode == "read-only":
                 return self._send(403, "Read-only")
+            # BEFORE the path is resolved, and keyed on the trailing slash rather
+            # than on what is on disk: the point of this mode is that the verb is
+            # missing for collections, which has to hold for a name that does not
+            # exist too. That absent case is precisely what the checker's control
+            # probe asks about.
+            if mode == "delete-no-collection" \
+                    and self.path.split("?", 1)[0].endswith("/"):
+                return self._send(405, "Method Not Allowed")
+            # The other collection shape, and the opposite conclusion: the verb
+            # IS routed for collections (an absent one answers 404) and only an
+            # existing folder is refused. That is delete-refused one tier down —
+            # files come out fine and only the folder the agent made cannot be
+            # removed — so it is the lane where the ownership remediation is the
+            # right advice and "unimplemented" would be the wrong one.
+            if mode == "delete-collection-refused" \
+                    and self.path.split("?", 1)[0].endswith("/"):
+                probe = self._relpath()
+                if probe is None:
+                    return self._send(403, "Forbidden")
+                if not os.path.lexists(os.path.join(served, probe)):
+                    return self._send(404, "Not Found")
+                return self._send(405, "Method Not Allowed")
             rel = self._relpath()
             if rel is None:
                 return self._send(403, "Forbidden")
@@ -355,6 +406,11 @@ def make_handler(cfg):
                 st = os.lstat(full)
             except FileNotFoundError:
                 return self._send(404, "Not Found")
+            # AFTER the 404, deliberately: this mode routes DELETE and refuses
+            # only what exists, which is what makes it different from no-delete
+            # and what the checker's absent-name control has to be able to see.
+            if mode == "delete-refused":
+                return self._send(405, "Method Not Allowed")
             if mode == "delete-swaps-symlink" \
                     and rel.startswith("conduck-connect-local-probe-"):
                 victim = os.path.join(served, "unrelated-victim.txt")

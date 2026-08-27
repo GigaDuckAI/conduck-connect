@@ -2,10 +2,107 @@
 
 Notable changes to `conduck-connect`. Format loosely follows [Keep a Changelog](https://keepachangelog.com/); versions track the script's own `VERSION`.
 
-## [Unreleased]
+## [0.16.0] — a code a machine can mint, and a version that says what it grades
+
+### What you have to do
+
+- **If anything you run parses the adapter check's summary line, it needs
+  `schema=4`.** `CONDUCK_CHECK_ADAPTER schema=3` is now `schema=4`. No field was
+  added, removed, renamed or reordered — the only change is that `profile=` has
+  two more values, `basic+files` and `deep+files`, so a `--files` run is
+  distinguishable from a plain one at a glance instead of both reading
+  `profile=basic`. A parser that reads by key and tolerates an unfamiliar
+  `profile=` value needs nothing but the new number; one that matched
+  `profile=basic` exactly is the reader this bump exists to stop silently, which
+  is why the number moved for what is otherwise a small change. Exactly one
+  summary line is still the last line of a noninteractive run, so `tail -1` keeps
+  working. `CONDUCK_CHECK_SERVER` stays at `schema=2`.
+- **This release grades adapter contract revision 1.10** (0.15.0 grades 1.7).
+  `revision=` in the summary line and the banner both say so.
+- **Check `--version` before you trust a grade.** 0.15.0 and the revision it
+  grades were not in step: two builds answering `conduck-connect 0.15.0` graded
+  different contract revisions, and a green run under the older one meant
+  "conforms to 1.7" without saying so. The version number is the fix — a changed
+  grading now always arrives under a changed version — and there is nothing to do
+  beyond re-downloading and confirming the version you are holding.
+- **A passing basic `--check-adapter` run reports one more check than before**
+  (`checks=11`), because `CHAT_FRAMING` is new. `checks=` was never safe to key
+  on as an absolute number and still is not.
+
+### Added
+
+- **`--emit-code` prints a setup code without a person.** Give it
+  `--url <address>` and a key in `CONDUCK_TOKEN` and it writes exactly one
+  `conduck-setup:v1:…` string to stdout and nothing else. It reads no saved
+  setup, writes nothing, and sends no request, so it works on a fresh build rig
+  before the gateway is exposed to anything — and it goes through the same
+  payload builder `--setup` uses, so the code is byte-identical to the one the
+  wizard would have printed for the same gateway. Options: `--model`, `--name`
+  (a custom gateway's display name; defaults to the wizard's own default),
+  `--kind openclaw|hermes|custom`, `--transport`, and `--files-url` with
+  `CONDUCK_FILES_PASS` for a file lane. `--keyless` is how you declare a gateway
+  that genuinely has no key; an *unset* `CONDUCK_TOKEN` is refused rather than
+  read as keyless, so a forgotten export can never mint a credential-less code.
+  This closes the gap eight independent adapter builders hit in a row: the wizard
+  is the only interactive minter and `--show-code` can only re-emit a setup that
+  has already happened, so from the published documents alone the correct
+  conclusion was that a setup code needed the operator. It no longer does.
+  **The code carries your gateway key** — treat every copy of it, and every log
+  it lands in, as the key itself.
+- **`CHAT_FRAMING`: a new check that reads what your adapter SAID.** Every other
+  chat check grades the envelope — strict JSON, one choice, a non-empty string —
+  and none of them looks at the words. So an adapter that wraps each turn in a
+  persona, a system prompt or an agent scaffold heavy enough to swallow the
+  user's instruction answers something fluent and unrelated and passes every
+  scripted gate, failing first in front of whoever finally talks to it. The check
+  asks whether the reply to `Reply with exactly: pong` contains `pong`, compared
+  case-blind and as a substring — `Pong.` and `PONG` are an engine doing as it
+  was told — and it spends no turn of its own, reading the answer the first chat
+  probe already got.
+- **Long checks say they are alive.** A turn in flight prints a heartbeat to
+  **stderr** every 30 seconds (`… still waiting on the engine turn (90s elapsed;
+  up to 300s per turn)`), so a redirected run shows the difference between a slow
+  agent and a wedged one. `--help` now states the worst-case wall clock per
+  profile as well: roughly 20 minutes for `--check-server`, 25 for
+  `--check-adapter`, 30 with `--deep`, 35 with `--files`. Both halves answer the
+  same measured problem — a healthy check was killed at 41 minutes by somebody
+  with no way to tell it apart from a hang. The heartbeat never touches stdout,
+  so the verdict transcript and the machine summary are unaffected.
+
+### Fixed
+
+- **A refused `DELETE` is no longer reported as a file server that cannot
+  delete.** rclone's WebDAV layer answers `405 Method Not Allowed` for a deletion
+  it *routed and could not carry out* — a removal that fails on permissions comes
+  back byte-identical to what a server with no `DELETE` at all returns. The check
+  read that as "DELETE unsupported", printed a green degradation, and closed the
+  subject. That is exactly backwards on the most likely real cause: the file
+  server and the agent usually run as different users, so the folder the *agent*
+  created is one the file server is refused inside — the ownership trap the file
+  lane's own rules warn about, hidden underneath a tick. `FILES_DELETE` now
+  settles it by measurement, sending one `DELETE` at a name that does not exist:
+  a server that implements the verb answers `404` for that, a server that does
+  not answers the same refusal it gives everything else. When the verb is there,
+  the verdict says the files were REFUSED and names the ownership fix; when it
+  genuinely is not, the old wording stands and says it was confirmed. Deletion is
+  best-effort in the app either way, so neither outcome fails the lane.
+- **A `502`, `503` or `504` from a loopback address is explained as your
+  adapter's answer, not a proxy's.** Aimed at `127.0.0.1` those statuses used to
+  be described as "the HTTPS front talking" and the reader was sent to check a
+  reverse proxy that is not running on that machine. Nothing sits in front of
+  loopback, so the status came out of the adapter itself — which is what the
+  contract spends `502` and `504` on in the first place (`upstream_failure` and
+  `upstream_timeout`). The failure now says so and points at the adapter's own
+  log. Against any other address the explanation is unchanged.
 
 ### Changed
 
+- **A `--check-adapter --files` run says `profile=basic+files`.** Previously it
+  said `profile=basic`, identical to a run that graded no file lane at all, so a
+  transcript could not be told apart from a plain one without reading four more
+  fields. `--deep --files` says `deep+files`. The two flags stay independent —
+  neither implies the other — and nothing about which checks run has changed. See
+  the `schema=4` note above.
 - **A plain `http://` address on your own network is now paired, not refused.**
   The wizard's pairing prompt and both doctor prompts accept `http://` when the
   host is one only the local network can reach — a loopback or private IP

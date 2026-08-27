@@ -8,7 +8,7 @@
 # appears strict. Each case asserts:
 #   1. the check's exit code,
 #   2. the EXACT set of failed [CHECK_ID]s (nothing more, nothing less),
-#   3. the machine summary line: full schema grammar (adapter schema=3, server
+#   3. the machine summary line: full schema grammar (adapter schema=4, server
 #      schema=2), last line of output, EXACTLY ONE summary line (no retired
 #      prefix dual-emitted), required field values, and failed= consistent with
 #      the ✗ line count,
@@ -49,18 +49,18 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Every check id the deep profile can emit, sorted — the pass-mode inventory.
-ALL_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC HISTORY_IMAGE IMAGE_INPUT MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
-BASIC_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC HISTORY_IMAGE MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
+ALL_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC CHAT_FRAMING HISTORY_IMAGE IMAGE_INPUT MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
+BASIC_IDS="AUTH_CHAT_MISSING AUTH_CHAT_REJECT_BODY AUTH_CHAT_WRONG AUTH_MODELS_MISSING AUTH_MODELS_WRONG CHAT_BASIC CHAT_FRAMING HISTORY_IMAGE MODELS_ENVELOPE MODEL_SELECTION STREAM_SYNC"
 # The complete green file-lane inventory on a fully-conformant --files run — the
 # ids appended to the core inventory when a pass case carries --files.
 FILE_IDS="FILES_CONFIG FILES_WRITE_THROUGH FILES_AUTH_READ_MISSING FILES_AUTH_READ_WRONG FILES_AUTH_WRITE_MISSING FILES_AUTH_WRITE_WRONG FILES_READ_FRESH FILES_PROBE_COMPAT FILES_NESTED FILES_LISTING FILE_COPY_BYTES FILE_E2E FILES_DELETE"
 
-# The frozen schema=3 grammar — field order fixed; any change must bump schema=
+# The frozen schema=4 grammar — field order fixed; any change must bump schema=
 # (and this regex, and the freeze doc). The three file meters are NOT_REQUESTED
 # without --files; with it, each grades NOT_RUN|PASS|FAIL|ERROR independently.
 #
 # What is frozen is the GRAMMAR — field order, field names, enum values — plus the
-# two identity fields whose literals a consumer keys off (`schema=3`, `contract=v1`).
+# two identity fields whose literals a consumer keys off (`schema=4`, `contract=v1`).
 # Free-moving VALUES are matched by shape, never pinned: `revision=`, `harness=`,
 # `checks=`, `failed=` and `exit=` all move without breaking a single parser, and
 # pinning one of them turns an ordinary version bump into dozens of false failures
@@ -71,7 +71,7 @@ FILE_IDS="FILES_CONFIG FILES_WRITE_THROUGH FILES_AUTH_READ_MISSING FILES_AUTH_RE
 # with no owner rather than a review gate. The revision still has to be PRESENT,
 # in POSITION, and well-formed; that is what this regex is for.
 FMETER='(NOT_REQUESTED|NOT_RUN|PASS|FAIL|ERROR)'
-SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=[0-9]+\.[0-9]+ harness=[0-9][0-9.]* profile=(basic|deep) core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport='$FMETER' file_access='$FMETER' file_e2e='$FMETER' checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
+SUMMARY_RE='^CONDUCK_CHECK_ADAPTER schema=4 contract=v1 revision=[0-9]+\.[0-9]+ harness=[0-9][0-9.]* profile=(basic|deep)(\+files)? core=(PASS|FAIL|NOT_RUN) history_image=(PASS|FAIL|NOT_RUN) stream=(PASS|FAIL|NOT_RUN) image_input=(VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN) file_transport='$FMETER' file_access='$FMETER' file_e2e='$FMETER' checks=[0-9]+ failed=[0-9]+ exit=[0-9]+$'
 
 # Retired summary prefixes. The schema bump renamed CONDUCK_DOCTOR ->
 # CONDUCK_CHECK_ADAPTER and CONDUCK_COMPAT -> CONDUCK_CHECK_SERVER; consumers read
@@ -99,8 +99,25 @@ ESC=$(printf '\033')
 # (require-model), never the missing-model failure a third time.
 CASES='
 good|good|--deep|no|0|-|profile=deep core=PASS history_image=PASS stream=PASS image_input=VERIFIED file_transport=NOT_REQUESTED file_access=NOT_REQUESTED file_e2e=NOT_REQUESTED exit=0
-good-basic|good||no|0|-|profile=basic core=PASS history_image=PASS stream=PASS image_input=NOT_RUN checks=10 failed=0 exit=0
-direct-check-adapter|good||no|0|-|profile=basic core=PASS checks=10 failed=0 exit=0
+good-basic|good||no|0|-|profile=basic core=PASS history_image=PASS stream=PASS image_input=NOT_RUN checks=11 failed=0 exit=0
+heavy-framing|heavy-framing||no|1|CHAT_FRAMING|profile=basic core=FAIL history_image=PASS stream=PASS image_input=NOT_RUN checks=11 failed=1 exit=1
+# The echo pair, and neither row means anything without the other. Both adapters
+# return the turn that was just sent; they differ ONLY in what surrounds it, so a
+# CHAT_FRAMING that graded by searching its own prompt inside the reply would pass
+# both, and one that graded by equality against a real answer would fail both.
+# echo-exact is the development echo engine the build brief has every builder stand
+# up first, and the contract promises the ordinary profile can reach exit 0 against
+# it — so the exemption is a compatibility promise, not a leniency. echo-transcript
+# is that same message wrapped in a rendered conversation: the word the turn asked
+# for is in the reply and nothing has answered it, which is the defect.
+#
+# WITHOUT --deep on purpose: an echo engine has no eyes, so it cannot report the
+# digits in a picture, and the deep profile would fail IMAGE_INPUT for a reason
+# that has nothing to do with framing. (No apostrophes in this block — CASES is
+# single-quoted and one would end it.)
+echo-exact|echo-exact||no|0|-|profile=basic core=PASS history_image=PASS stream=PASS image_input=NOT_RUN checks=11 failed=0 exit=0
+echo-transcript|echo-transcript||no|1|CHAT_FRAMING|profile=basic core=FAIL history_image=PASS stream=PASS image_input=NOT_RUN checks=11 failed=1 exit=1
+direct-check-adapter|good||no|0|-|profile=basic core=PASS checks=11 failed=0 exit=0
 require-accept|require-accept|--deep|no|0|-|core=PASS image_input=VERIFIED exit=0
 app-success-2xx|app-success-2xx|--deep|no|1|MODELS_ENVELOPE|core=FAIL checks=1 failed=1 exit=1
 chat-success-201|chat-success-201|--deep|no|1|CHAT_BASIC,HISTORY_IMAGE,IMAGE_INPUT,MODEL_SELECTION,STREAM_SYNC|core=FAIL history_image=FAIL stream=FAIL image_input=FAIL exit=1
@@ -405,7 +422,7 @@ run_case() { # run_case <table-row>
   assert_machine_output "$name" CONDUCK_CHECK_ADAPTER || return
   summary=$(tail -n 1 "$TMP/doctor.out")
   if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
-    fail_case "$name" "last line isn't a valid schema=3 summary: $summary"; return
+    fail_case "$name" "last line isn't a valid schema=4 summary: $summary"; return
   fi
   for frag in $frags; do
     case " $summary " in *" $frag "*) ;; *)
@@ -563,6 +580,23 @@ run_case() { # run_case <table-row>
         fail_case "$name" "the stream hint doesn't say the app always sends stream: false"; return
       fi
       ;;
+    echo-exact)
+      # The exit code cannot tell a deliberate exemption from a check that simply
+      # did not look. The green has to SAY it is the echo carve-out, because the
+      # builder reading it is standing in front of a stub and needs to know this
+      # pass says nothing yet about the engine that will replace it.
+      if ! grep -qF 'an echo engine answering as designed' "$TMP/doctor.out"; then
+        fail_case "$name" "a pure echo passed without naming the echo-engine carve-out"; return
+      fi
+      ;;
+    echo-transcript)
+      # The mirror half. A transcript CONTAINS the turn, so the carve-out sentence
+      # must not appear here — printing it would mean the exemption matched on a
+      # substring and the pair below is only red by luck.
+      if grep -qF 'an echo engine answering as designed' "$TMP/doctor.out"; then
+        fail_case "$name" "a transcript reply claimed the echo-engine carve-out"; return
+      fi
+      ;;
   esac
   # 4 — pass modes: the complete ✓ inventory (every check genuinely ran)
   if [ "$expexit" = "0" ]; then
@@ -602,7 +636,7 @@ grade_adapter() { # grade_adapter <name> <rc> <expexit> <expfails> <args> <frags
   assert_machine_output "$name" CONDUCK_CHECK_ADAPTER || return 1
   summary=$(tail -n 1 "$TMP/doctor.out")
   if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
-    fail_case "$name" "last line isn't a valid schema=3 summary: $summary"; return 1
+    fail_case "$name" "last line isn't a valid schema=4 summary: $summary"; return 1
   fi
   for frag in $frags; do
     case " $summary " in *" $frag "*) ;; *)
@@ -641,13 +675,18 @@ grade_adapter() { # grade_adapter <name> <rc> <expexit> <expfails> <args> <frags
 #           misbehaving agent wrote outside them is still there — the "exact
 #           registered names only, never a glob" rule, stated as an assertion)
 FILE_CASES='
-files-good|files-good|good|full|--files|0|-|profile=basic core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
+files-good|files-good|good|full|--files|0|-|profile=basic+files core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
 files-not-requested|good|-|none|--deep|0|-|core=PASS file_transport=NOT_REQUESTED file_access=NOT_REQUESTED file_e2e=NOT_REQUESTED exit=0|-
 files-stale-cache|files-good|stale-listing|full|--files|1|FILES_READ_FRESH,FILE_E2E|core=PASS file_transport=FAIL file_access=PASS file_e2e=FAIL exit=1|-
 files-read-only|files-good|read-only|full|--files|1|FILES_NESTED,FILES_WRITE_THROUGH|core=PASS file_transport=FAIL file_access=PASS file_e2e=PASS exit=1|-
 files-open|files-good|open|full|--files|1|FILES_AUTH_READ_MISSING,FILES_AUTH_READ_WRONG,FILES_AUTH_WRITE_MISSING,FILES_AUTH_WRITE_WRONG|core=PASS file_transport=FAIL file_access=PASS file_e2e=PASS exit=1|-
 files-no-range|files-good|no-range|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|-
 files-no-delete|files-good|no-delete|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
+files-delete-refused|files-good|delete-refused|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
+files-delete-lies|files-good|delete-lies|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
+files-delete-dir-lies|files-good|delete-dir-lies|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
+files-delete-no-collection|files-good|delete-no-collection|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
+files-delete-collection-refused|files-good|delete-collection-refused|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
 files-no-mkcol|files-good|no-mkcol|full|--files|1|FILES_NESTED|core=PASS file_transport=FAIL file_access=PASS file_e2e=PASS exit=1|-
 files-mkcol-auto-parents|files-good|mkcol-refused-auto-parents|full|--files|0|-|core=PASS file_transport=PASS file_access=PASS file_e2e=PASS exit=0|dir-empty
 files-no-propfind|files-good|no-propfind|full|--files|1|FILES_LISTING,FILE_COPY_BYTES|core=PASS file_transport=FAIL file_access=ERROR file_e2e=NOT_RUN exit=1|dir-empty
@@ -776,6 +815,102 @@ run_file_case() { # run_file_case <table-row>
       if ! grep -qF 'Conduck refuses to read' "$TMP/doctor.out"; then
         fail_case "$name" "the red never says the app refuses this listing"; return
       fi ;;
+    # The two DELETE-405 lanes are ONE assertion in two halves, and neither is
+    # meaningful alone: both servers answer 405 for an artifact that exists, so
+    # the status cannot tell them apart and only the absent-name control can.
+    # Getting these backwards is the live defect this pair pins — a permission
+    # refusal reported as "this server has no DELETE" reads as a harmless
+    # degradation and buries the ownership problem underneath a green tick.
+    files-delete-refused)
+      if ! grep -qF 'DELETE REFUSED' "$TMP/doctor.out"; then
+        fail_case "$name" "a routed-but-refused DELETE was not reported as a refusal"; return
+      fi
+      if grep -qF 'DELETE unsupported' "$TMP/doctor.out"; then
+        fail_case "$name" "a server that DOES implement DELETE was called unsupported"; return
+      fi
+      if ! grep -qF 'does implement DELETE' "$TMP/doctor.out"; then
+        fail_case "$name" "the verdict never says the control proved the verb is there"; return
+      fi
+      # The whole point of separating the two: this one has an owner-side fix,
+      # and a verdict that does not name it leaves the reader nowhere to go.
+      if ! grep -qF 'setgid' "$TMP/doctor.out"; then
+        fail_case "$name" "the refusal does not name the ownership fix"; return
+      fi ;;
+    files-no-delete)
+      if ! grep -qF 'DELETE unsupported' "$TMP/doctor.out"; then
+        fail_case "$name" "a server with no DELETE at all was not reported as unsupported"; return
+      fi
+      if grep -qF 'DELETE REFUSED' "$TMP/doctor.out"; then
+        fail_case "$name" "a missing verb was reported as a refusal of these files"; return
+      fi
+      if ! grep -qF 'a name that does not exist' "$TMP/doctor.out"; then
+        fail_case "$name" "the verdict never says the control confirmed it"; return
+      fi ;;
+    # 403 is the third answer, and it is about the CALLER rather than the verb. A
+    # server that refuses an absent name too has not declined the method — it has
+    # refused this credential — so "DELETE unsupported" here would send the reader
+    # hunting for a feature their server already ships, past the wall stopping them.
+    # Both remedies are asserted because the 403 has two causes and the verdict
+    # cannot know which: a read-only WebDAV account, and the ownership split.
+    files-read-only)
+      if ! grep -qF 'DELETE REFUSED — authorization' "$TMP/doctor.out"; then
+        fail_case "$name" "a 403 on every DELETE was not reported as an authorization refusal"; return
+      fi
+      if grep -qF 'DELETE unsupported' "$TMP/doctor.out"; then
+        fail_case "$name" "a permission refusal was reported as a missing verb"; return
+      fi
+      if ! grep -qF "check the WebDAV account's rights" "$TMP/doctor.out"; then
+        fail_case "$name" "the 403 verdict does not name the read-only-credential cause"; return
+      fi
+      if ! grep -qF 'setgid' "$TMP/doctor.out"; then
+        fail_case "$name" "the 403 verdict does not name the ownership fix"; return
+      fi ;;
+    # The only arm whose evidence is disk state rather than a status code: this
+    # server answers every DELETE as success and removes nothing. The cleanup walk
+    # unlinks the artifacts itself, so a checker that graded on statuses alone would
+    # hand this the "verified gone" green — the one verdict it must never collect.
+    # delete-dir-lies is the same fault confined to the folder tier, and it is here
+    # because the ghost test has to survive the dirs-deferred half of the walk.
+    files-delete-lies|files-delete-dir-lies)
+      if ! grep -qF 'DELETE is ACKNOWLEDGED but does not REMOVE' "$TMP/doctor.out"; then
+        fail_case "$name" "an acknowledged-but-not-performed DELETE was not reported as one"; return
+      fi
+      if grep -qF 'verified gone' "$TMP/doctor.out"; then
+        fail_case "$name" "a server that removed nothing collected the verified-gone green"; return
+      fi ;;
+    # Files delete, folders 405 — present or absent. The control has to be
+    # FOLDER-shaped to see that: a file-shaped one answers 204 here, which would
+    # read as "the verb is routed" and turn an unimplemented collection DELETE into
+    # an ownership refusal. So no chown remedy may appear; nothing is misconfigured.
+    files-delete-no-collection)
+      if ! grep -qF 'collection DELETE unsupported' "$TMP/doctor.out"; then
+        fail_case "$name" "an unimplemented collection DELETE was not reported as one"; return
+      fi
+      # The phrase wraps across two transcript lines, so the assertion stops at the
+      # line break — grep is line-oriented and the full sentence never matches.
+      if ! grep -qF 'folder-shaped name that does' "$TMP/doctor.out"; then
+        fail_case "$name" "the verdict never says the control was folder-shaped"; return
+      fi
+      if grep -qF 'setgid' "$TMP/doctor.out"; then
+        fail_case "$name" "a missing collection verb was given an ownership remedy nothing can fix"; return
+      fi ;;
+    # The mirror image, and the pair is one assertion: identical 405s on the folders
+    # that exist, opposite conclusions, and only the folder-shaped control against an
+    # ABSENT folder (404 here, 405 above) tells them apart. Here the verb IS there and
+    # the ownership remedy is the right advice, so "unsupported" must appear nowhere.
+    files-delete-collection-refused)
+      if ! grep -qF 'folder DELETE REFUSED' "$TMP/doctor.out"; then
+        fail_case "$name" "a routed-but-refused folder DELETE was not reported as a refusal"; return
+      fi
+      if grep -qF 'unsupported' "$TMP/doctor.out"; then
+        fail_case "$name" "a server that DOES implement collection DELETE was called unsupported"; return
+      fi
+      if ! grep -qF 'does implement DELETE for' "$TMP/doctor.out"; then
+        fail_case "$name" "the verdict never says the control proved the collection verb is there"; return
+      fi
+      if ! grep -qF 'setgid' "$TMP/doctor.out"; then
+        fail_case "$name" "the folder refusal does not name the ownership fix"; return
+      fi ;;
   esac
 
   PASS=$((PASS+1))
@@ -829,7 +964,7 @@ run_signal_cleanup() {
   assert_machine_output "$name" CONDUCK_CHECK_ADAPTER || return
   local summary; summary=$(tail -n 1 "$TMP/doctor.out")
   if ! grep_var "$summary" -Eq "$SUMMARY_RE"; then
-    fail_case "$name" "last line isn't a valid schema=3 summary: $summary"; return
+    fail_case "$name" "last line isn't a valid schema=4 summary: $summary"; return
   fi
   case " $summary " in *" exit=130 "*) ;; *) fail_case "$name" "summary lacks exit=130: $summary"; return ;; esac
   local left; left=$(check_artifacts "$SERVED")
@@ -1160,6 +1295,380 @@ run_cli_rejection_case() { # run_cli_rejection_case <table-row>
   fi
   if ! grep -qF 'Usage error:' "$TMP/doctor.out"; then
     fail_case "$name" "exit 2 did not identify itself as a usage error"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# =============================================================== --emit-code ==
+#
+# The scriptable minter, driven END TO END. cli-modifier-matrix already grades
+# which flags this command accepts, but it stubs emit_code_validate out entirely
+# — every cell there would otherwise refuse for a reason that is not the modifier
+# under test — so nothing above this line has ever run --emit-code for real. The
+# command is a code generator for machines: its whole contract is the bytes it
+# prints, and until this group existed not one assertion read them.
+#
+# What these cases hold, and each is a defect that would ship silently otherwise:
+#   * stdout is EXACTLY the code, so `code=$(… --emit-code …)` is usable. Every
+#     human-facing line belongs on stderr, and one stray note on stdout breaks
+#     every caller at once.
+#   * the payload is the app's, field for field — asserted by decoding it and
+#     comparing the WHOLE canonical JSON, so a field that appears, disappears or
+#     changes shape fails here rather than on somebody's phone.
+#   * the URL is normalised exactly as --setup normalises it. PAYLOAD.md promises
+#     the two commands produce identical bytes for identical inputs; a /v1 left on
+#     the base makes the app ask for /v1/v1/chat/completions, and a ?key=… query
+#     rides a credential into a code nobody knew carried one.
+#   * the key never reaches stderr. The warning line says a key is IN the code;
+#     printing the key itself beside it would put it in every log that captured
+#     the run.
+#   * nothing is written. This command is supposed to leave the host untouched,
+#     and a profile quietly saved here would teach a later --show-code about a
+#     gateway nobody set up on this machine.
+
+# A literal distinctive enough that "the key never leaked" is an assertion rather
+# than a hope — a substring this specific cannot appear by coincidence.
+EMIT_TOKEN='tok-suite-9d41c7e2-never-printed'
+EMIT_GW='https://gw.example.test'
+EMIT_FS='https://files.example.test'
+
+# One --emit-code run with stdout and stderr kept APART (the split is what several
+# assertions below are about), HOME and the state directory isolated, and all three
+# environment inputs cleared first so a row declares everything it depends on.
+EMIT_HOME=""
+emit_run() { # emit_run <env-word…> -- <script-arg…>; stdout -> $TMP/emit.out, stderr -> $TMP/emit.err
+  local -a eenv=() eargs=()
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--" ]; then shift; break; fi
+    eenv+=("$1"); shift
+  done
+  eargs=("$@")
+  [ -n "$EMIT_HOME" ] || { EMIT_HOME="$TMP/emit-home"; mkdir -p "$EMIT_HOME"; }
+  local rc=0
+  # -u first, then the row's own assignments: env applies options before operands,
+  # so a row that SETS one of these still wins over the clearing above it.
+  env -u XDG_CONFIG_HOME -u CONDUCK_TOKEN -u CONDUCK_FILES_PASS -u CONDUCK_FILES_USER \
+      HOME="$EMIT_HOME" TERM=dumb ${eenv[@]+"${eenv[@]}"} \
+      bash "$SCRIPT" ${eargs[@]+"${eargs[@]}"} \
+      > "$TMP/emit.out" 2>"$TMP/emit.err" </dev/null || rc=$?
+  return "$rc"
+}
+
+# The minted code, decoded back to canonical JSON (sorted keys, no spaces) so a
+# case can compare the WHOLE payload in one assertion. Comparing the whole thing
+# rather than field by field is deliberate: it is the only form that catches a
+# field which should not be there at all.
+emit_decoded_payload() { # emit_decoded_payload -> canonical JSON, or a diagnostic word
+  python3 - "$TMP/emit.out" <<'PY'
+import base64, binascii, json, sys
+raw = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+line = raw.strip()
+prefix = "conduck-setup:v1:"
+if not line.startswith(prefix):
+    sys.stdout.write("NOT-A-V1-CODE"); raise SystemExit(0)
+try:
+    payload = json.loads(base64.b64decode(line[len(prefix):], validate=True))
+except (binascii.Error, ValueError) as exc:
+    sys.stdout.write("UNDECODABLE %s" % exc); raise SystemExit(0)
+sys.stdout.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+# stdout is a single line and that line is a v1 code — the shape every scripted
+# caller depends on, asserted before anything reads the payload.
+emit_stdout_is_one_code() { # emit_stdout_is_one_code <case-name> -> 0 iff it holds
+  local n
+  n=$(wc -l < "$TMP/emit.out" | tr -d ' ')
+  if [ "$n" != "1" ]; then
+    fail_case "$1" "stdout carried $n line(s), expected exactly the code: $(head -c 200 "$TMP/emit.out")"; return 1
+  fi
+  if ! grep -qE '^conduck-setup:v1:[A-Za-z0-9+/]+=*$' "$TMP/emit.out"; then
+    fail_case "$1" "stdout is not a bare v1 setup code: $(head -c 200 "$TMP/emit.out")"; return 1
+  fi
+  return 0
+}
+
+# name|env words (K=V, space-separated; "-" for none)|script args (word-split)|exit|message fragment
+#
+# Both exit codes are in one table on purpose, because WHICH one a refusal uses is
+# half the contract: an argv-shape problem is exit 2 and is decided before anything
+# runs, while a missing or malformed SECRET is a runtime condition and exits 1. A
+# wrapper distinguishes "you called me wrong" from "this host is not ready" by
+# nothing else. Values needing a byte a table cannot hold carry a @PLACEHOLDER@.
+# (No apostrophes anywhere below — the table is single-quoted and one would end it.)
+EMIT_REJECTION_CASES='
+emit-reject-no-url|-|--emit-code|2|--emit-code needs the gateway
+emit-reject-unset-token|-|--emit-code --url https://gw.example.test|1|No key to put in the code
+emit-reject-keyless-with-token|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --keyless|2|--keyless says this gateway has no key, but CONDUCK_TOKEN holds one
+emit-reject-name-on-openclaw|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --kind openclaw --name Rig|2|--name applies to --kind custom only
+emit-reject-model-on-hermes|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --kind hermes --model m-1|2|--model applies to --kind custom only
+emit-reject-bad-kind|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --kind nope|2|--kind takes openclaw, hermes or custom
+emit-reject-bad-transport|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --transport nope|2|--transport takes tailscale, funnel, cloudflare or public
+emit-reject-long-name|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --name @NAME121@|2|over 120 characters
+emit-reject-long-model|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --model @MODEL201@|2|over 200 characters
+emit-reject-hostile-name|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --name @BIDINAME@|2|U+202E
+emit-reject-token-control-char|CONDUCK_TOKEN=@TOKEN_NL@|--emit-code --url https://gw.example.test|1|CONDUCK_TOKEN contains a control character
+emit-reject-files-pass-control-char|CONDUCK_TOKEN=@TOKEN@ CONDUCK_FILES_PASS=@PASS_TAB@|--emit-code --url https://gw.example.test --files-url https://files.example.test|1|CONDUCK_FILES_PASS contains a control character
+emit-reject-files-user-override|CONDUCK_TOKEN=@TOKEN@ CONDUCK_FILES_PASS=fs-pass CONDUCK_FILES_USER=webdav|--emit-code --url https://gw.example.test --files-url https://files.example.test|1|always signs in to the file server as
+emit-reject-files-url-without-password|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https://gw.example.test --files-url https://files.example.test|1|set CONDUCK_FILES_PASS=<password>
+emit-reject-password-without-files-url|CONDUCK_TOKEN=@TOKEN@ CONDUCK_FILES_PASS=fs-pass|--emit-code --url https://gw.example.test|1|no file server was named
+emit-reject-hostless-url|CONDUCK_TOKEN=@TOKEN@|--emit-code --url https:///v2|2|use https://
+'
+
+# The bytes a pipe-separated table cannot carry. A function, not an inline `case`:
+# bash 3.2 — the shell macOS ships — cannot parse a `case` inside $(…), and every
+# call site here is a command substitution.
+emit_placeholder() { # emit_placeholder <word> -> the word with any placeholder resolved
+  case "$1" in
+    @TOKEN@)    printf '%s' "$EMIT_TOKEN" ;;
+    # One scalar over the app-side cap, so the refusal is about the boundary and
+    # not about being wildly long.
+    @NAME121@)  python3 -c 'import sys; sys.stdout.write("a" * 121)' ;;
+    @MODEL201@) python3 -c 'import sys; sys.stdout.write("m" * 201)' ;;
+    # RIGHT-TO-LEFT OVERRIDE: the app refuses it because it reorders every
+    # character rendered after it, which is how a name spoofs the one beside it.
+    @BIDINAME@) python3 -c 'import sys; sys.stdout.write("Rig‮qux")' ;;
+    # The copy-paste accidents, not deliberate values: a key that came out of a
+    # terminal with the newline still on it, and a password split across a tab.
+    @TOKEN_NL@) printf 'tok-first\ntok-second' ;;
+    @PASS_TAB@) printf 'pass-first\tpass-second' ;;
+    *)          printf '%s' "$1" ;;
+  esac
+}
+
+run_emit_rejection_case() { # run_emit_rejection_case <table-row>
+  local name envspec args expexit want rest="$1" w rc=0
+  name="${rest%%|*}"; rest="${rest#*|}"
+  envspec="${rest%%|*}"; rest="${rest#*|}"
+  args="${rest%%|*}"; rest="${rest#*|}"
+  expexit="${rest%%|*}"; want="${rest#*|}"
+
+  local -a eenv=() eargs=()
+  for w in $envspec; do
+    [ "$w" = "-" ] && continue
+    eenv+=("${w%%=*}=$(emit_placeholder "${w#*=}")")
+  done
+  for w in $args; do eargs+=("$(emit_placeholder "$w")"); done
+
+  emit_run ${eenv[@]+"${eenv[@]}"} -- ${eargs[@]+"${eargs[@]}"} || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+
+  if [ "$rc" != "$expexit" ]; then
+    fail_case "$name" "exit $rc, expected $expexit"; return
+  fi
+  # The refusal must not have minted anything. A command that prints a code AND
+  # complains is worse than either — a caller reading stdout gets a code built
+  # from input the tool just said it would not accept.
+  if grep -qF 'conduck-setup:v' "$TMP/emit.out"; then
+    fail_case "$name" "a refused invocation printed a setup code anyway"; return
+  fi
+  if ! grep -qF -- "$want" "$TMP/doctor.out"; then
+    fail_case "$name" "rejection did not name its reason ('$want')"; return
+  fi
+  # Which KIND of failure it is, said on the line itself. The exit code is for the
+  # wrapper; this is for the person reading the terminal.
+  if [ "$expexit" = "2" ]; then
+    if ! grep -qF 'Usage error:' "$TMP/doctor.out"; then
+      fail_case "$name" "exit 2 did not identify itself as a usage error"; return
+    fi
+  else
+    if ! grep -qF 'Error:' "$TMP/doctor.out"; then
+      fail_case "$name" "exit $expexit did not identify itself as an error"; return
+    fi
+  fi
+  # No refusal may quote the key back. The value is the secret; naming the
+  # VARIABLE is the whole of what a diagnostic is allowed to do.
+  if grep -qF "$EMIT_TOKEN" "$TMP/doctor.out"; then
+    fail_case "$name" "a refusal echoed the value of CONDUCK_TOKEN"; return
+  fi
+  # The one row whose distinguishing sentence carries an apostrophe and so cannot
+  # be a fragment in the table above: the refused ADDRESS is quoted back, which is
+  # what separates this from the identically-shaped file-server refusal.
+  if [ "$name" = "emit-reject-hostless-url" ] &&
+     ! grep -qF "Can't pair 'https:///v2'" "$TMP/doctor.out"; then
+    fail_case "$name" "the address refusal did not quote the address it refused"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# The happy path, read byte for byte. --url deliberately carries the /v1 suffix the
+# app appends itself, so ONE case proves the mint and the normalisation together —
+# they are the same defect from a caller who copied the address out of a config file.
+run_emit_mint_case() {
+  local name="emit-code-mints-the-app-payload" rc=0 got want
+  emit_run "CONDUCK_TOKEN=$EMIT_TOKEN" -- \
+    --emit-code --kind custom --url "$EMIT_GW/v1" --model suite-model-1 --name Suite-rig || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "exit $rc, expected 0"; return
+  fi
+  emit_stdout_is_one_code "$name" || return
+  got=$(emit_decoded_payload)
+  want='{"gateway":{"auth":"bearer","kind":"custom","model":"suite-model-1","name":"Suite-rig","token":"'$EMIT_TOKEN'","url":"'$EMIT_GW'"},"transport":"public","v":1}'
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "decoded payload is not the app payload:
+      got  $got
+      want $want"; return
+  fi
+  # Said out loud, on the channel that is not the code. Every other route that
+  # prints a code says what it carries, and a scripted caller is not a reason to
+  # stop saying it — the code is going into a file or a log somewhere.
+  if ! grep -qF 'This code carries the gateway key' "$TMP/emit.err"; then
+    fail_case "$name" "the mint did not say on stderr that the code carries the key"; return
+  fi
+  # …and says it WITHOUT reprinting the key beside it.
+  if grep -qF "$EMIT_TOKEN" "$TMP/emit.err"; then
+    fail_case "$name" "the key itself was printed to stderr next to the warning about it"; return
+  fi
+  # The normalisation is announced rather than done quietly: the address in the
+  # code is now not the address on the command line, and the wizard says the same
+  # sentence at its own prompt.
+  if ! grep -qF "Using $EMIT_GW" "$TMP/emit.err"; then
+    fail_case "$name" "the /v1 suffix was stripped without saying so"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A query string on the gateway address is the credential-shaped half of the same
+# normalisation, and it has its own case because it fails differently: a ?key=… that
+# rode into the payload would put a second secret in the code with nothing anywhere
+# saying it was there.
+run_emit_url_query_case() {
+  local name="emit-code-strips-the-url-query" rc=0 got want
+  emit_run "CONDUCK_TOKEN=$EMIT_TOKEN" -- \
+    --emit-code --url "$EMIT_GW/v1?key=query-secret-must-not-ride" || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "exit $rc, expected 0"; return
+  fi
+  emit_stdout_is_one_code "$name" || return
+  got=$(emit_decoded_payload)
+  # The default name rides along here, which is also the assertion for --kind: with
+  # no --kind given the payload is a custom gateway carrying the wizard default.
+  want='{"gateway":{"auth":"bearer","kind":"custom","name":"My gateway","token":"'$EMIT_TOKEN'","url":"'$EMIT_GW'"},"transport":"public","v":1}'
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "decoded payload kept the query (or drifted):
+      got  $got
+      want $want"; return
+  fi
+  if grep -qF 'query-secret-must-not-ride' "$TMP/emit.out"; then
+    fail_case "$name" "the query string rode into the minted code"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# A --name that is nothing but whitespace. The app trims display text and then
+# REFUSES a custom gateway with no name, so a value left untrimmed here would
+# suppress the default and mint a code that imports and dies on the phone with
+# nothing on screen to explain it.
+run_emit_blank_name_case() {
+  local name="emit-code-defaults-a-whitespace-name" rc=0 got want
+  emit_run "CONDUCK_TOKEN=$EMIT_TOKEN" -- --emit-code --url "$EMIT_GW" --name '   ' || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "exit $rc, expected 0"; return
+  fi
+  emit_stdout_is_one_code "$name" || return
+  got=$(emit_decoded_payload)
+  want='{"gateway":{"auth":"bearer","kind":"custom","name":"My gateway","token":"'$EMIT_TOKEN'","url":"'$EMIT_GW'"},"transport":"public","v":1}'
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "a whitespace-only name did not fall back to the wizard default:
+      got  $got
+      want $want"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# What the code carries, composed from what it ACTUALLY carries. The two secrets are
+# independent, so a fixed "this carries the gateway key" over a keyless code is a
+# false warning — and a false warning is how a true one stops being read.
+run_emit_keyless_case() {
+  local name="emit-code-says-which-secret-it-carries" rc=0 got want
+  emit_run -- --emit-code --url "$EMIT_GW" --keyless || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "keyless: exit $rc, expected 0"; return
+  fi
+  emit_stdout_is_one_code "$name" || return
+  got=$(emit_decoded_payload)
+  want='{"gateway":{"auth":"none","kind":"custom","name":"My gateway","url":"'$EMIT_GW'"},"transport":"public","v":1}'
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "a keyless mint is not the auth=none payload:
+      got  $got
+      want $want"; return
+  fi
+  if ! grep -qF 'names a keyless gateway and carries no secret' "$TMP/emit.err"; then
+    fail_case "$name" "a code carrying nothing did not say so"; return
+  fi
+  if grep -qF 'carries the gateway key' "$TMP/emit.err"; then
+    fail_case "$name" "a keyless code was announced as carrying a key"; return
+  fi
+
+  # Keyless gateway, file lane present: the OTHER secret, alone. This is the arm a
+  # fixed warning string gets wrong in both directions at once.
+  rc=0
+  emit_run CONDUCK_FILES_PASS=fs-pass -- \
+    --emit-code --url "$EMIT_GW" --keyless --files-url "$EMIT_FS" || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "keyless+files: exit $rc, expected 0"; return
+  fi
+  emit_stdout_is_one_code "$name" || return
+  got=$(emit_decoded_payload)
+  want='{"fileServer":{"credential":"fs-pass","url":"'$EMIT_FS'"},"gateway":{"auth":"none","kind":"custom","name":"My gateway","url":"'$EMIT_GW'"},"transport":"public","v":1}'
+  if [ "$got" != "$want" ]; then
+    fail_case "$name" "a keyless mint with a file lane is not the expected payload:
+      got  $got
+      want $want"; return
+  fi
+  if ! grep -qF 'carries the file-server password' "$TMP/emit.err"; then
+    fail_case "$name" "a code carrying only the file-server password did not say so"; return
+  fi
+  if grep -qF 'carries the gateway key' "$TMP/emit.err"; then
+    fail_case "$name" "a keyless code with a file lane was announced as carrying a gateway key"; return
+  fi
+  PASS=$((PASS+1))
+  printf 'SUITE ✓ %s\n' "$name"
+}
+
+# Nothing about this host changes. A profile written here would teach a later
+# --show-code about a gateway nobody set up on this machine, and the state
+# directory is created lazily, so "no new files at all" is the only form of this
+# assertion that cannot pass by accident.
+run_emit_writes_nothing_case() {
+  local name="emit-code-writes-nothing" rc=0 before after diff_out
+  local ehome="$TMP/emit-scratch-home"
+  rm -rf "$ehome"; mkdir -p "$ehome"
+  before=$(find "$ehome" | sort)
+  env -u XDG_CONFIG_HOME -u CONDUCK_FILES_PASS -u CONDUCK_FILES_USER \
+      HOME="$ehome" TERM=dumb "CONDUCK_TOKEN=$EMIT_TOKEN" \
+      bash "$SCRIPT" --emit-code --url "$EMIT_GW" --files-url "$EMIT_FS" \
+      > "$TMP/emit.out" 2>"$TMP/emit.err" </dev/null || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+  # The password is supplied so the run REACHES the mint; a run that refused would
+  # write nothing for the wrong reason and this case would pass vacuously.
+  if [ "$rc" != "1" ]; then
+    fail_case "$name" "the no-password lane exited $rc, expected 1"; return
+  fi
+  rc=0
+  env -u XDG_CONFIG_HOME -u CONDUCK_FILES_USER \
+      HOME="$ehome" TERM=dumb "CONDUCK_TOKEN=$EMIT_TOKEN" CONDUCK_FILES_PASS=fs-pass \
+      bash "$SCRIPT" --emit-code --url "$EMIT_GW" --files-url "$EMIT_FS" \
+      > "$TMP/emit.out" 2>"$TMP/emit.err" </dev/null || rc=$?
+  cat "$TMP/emit.out" "$TMP/emit.err" > "$TMP/doctor.out"
+  if [ "$rc" != "0" ]; then
+    fail_case "$name" "exit $rc, expected 0"; return
+  fi
+  emit_stdout_is_one_code "$name" || return
+  after=$(find "$ehome" | sort)
+  if [ "$before" != "$after" ]; then
+    diff_out=$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | tr '\n' ' ')
+    fail_case "$name" "--emit-code touched the filesystem: $diff_out"; return
   fi
   PASS=$((PASS+1))
   printf 'SUITE ✓ %s\n' "$name"
@@ -5785,11 +6294,19 @@ die() { printf "DIED %s\n" "$*"; exit 3; }
 doctor_accept_url() { printf "%s" "$1"; }
 url_has_userinfo() { return 1; }
 URL_USERINFO_HINT="a credential was in that URL"
-for COMMAND in setup check-server check-adapter show-code list edit forget; do
+# --emit-code'"'"'s own input rules (address admissibility, kind and transport
+# vocabularies, the name and model rules) are graded by the EMIT_REJECTION_CASES
+# table and the run_emit_* cases, which drive the real command end to end. Stubbed
+# here for the reason the URL grader above is: unstubbed, every emit-code cell
+# would refuse for a reason that is not the modifier under test.
+emit_code_validate() { return 0; }
+for COMMAND in setup check-server check-adapter show-code emit-code list edit forget; do
   for m in $CLI_MODIFIERS; do
     ( CLI_DRY_RUN=false; CLI_REUSE_ONLY=false; CLI_DOCTOR_DEEP=false
       CLI_DOCTOR_FILES=false; CLI_ALLOW_KEYLESS_PUBLIC=false; CLI_MANAGE_JSON=false
       CLI_POSITIONAL=""
+      CLI_EMIT_URL=""; CLI_EMIT_MODEL=""; CLI_EMIT_NAME=""; CLI_EMIT_KIND=""
+      CLI_EMIT_TRANSPORT=""; CLI_EMIT_FILES_URL=""; CLI_EMIT_KEYLESS=false
       case "$m" in
         positional)           CLI_POSITIONAL="https://example.com" ;;
         dry-run)              CLI_DRY_RUN=true ;;
@@ -5798,6 +6315,13 @@ for COMMAND in setup check-server check-adapter show-code list edit forget; do
         files)                CLI_DOCTOR_FILES=true ;;
         allow-keyless-public) CLI_ALLOW_KEYLESS_PUBLIC=true ;;
         json)                 CLI_MANAGE_JSON=true ;;
+        url)                  CLI_EMIT_URL="https://example.com" ;;
+        model)                CLI_EMIT_MODEL="a-model" ;;
+        name)                 CLI_EMIT_NAME="A name" ;;
+        kind)                 CLI_EMIT_KIND="custom" ;;
+        transport)            CLI_EMIT_TRANSPORT="public" ;;
+        files-url)            CLI_EMIT_FILES_URL="https://files.example.com" ;;
+        keyless)              CLI_EMIT_KEYLESS=true ;;
       esac
       # --forget is the one command with a REQUIRED positional, and it refuses a
       # missing one before it grades any flag. Without an id every forget cell
@@ -5830,7 +6354,7 @@ run_cli_matrix_case() {
   # The list itself. A modifier added to the argument loop and not classified below
   # would otherwise be graded against an accept list that has never heard of it.
   eval "mods=$mods"
-  if [ "$mods" != "positional dry-run reuse-only deep files allow-keyless-public json" ]; then
+  if [ "$mods" != "positional dry-run reuse-only deep files allow-keyless-public json url model name kind transport files-url keyless" ]; then
     fail_case "$name" "CLI_MODIFIERS changed to '$mods' — every command's accept list in this case needs a decision about it"; return
   fi
 
@@ -5841,6 +6365,7 @@ setup|dry-run reuse-only allow-keyless-public
 check-server|positional
 check-adapter|positional deep files
 show-code|
+emit-code|url model name kind transport files-url keyless
 list|json
 edit|positional
 forget|positional
@@ -5884,8 +6409,8 @@ forget|positional
   done <<EOF
 $pairs
 EOF
-  if [ "$cells" != "49" ]; then
-    fail_case "$name" "graded $cells cells, expected 49 — a command or a modifier went missing"; return
+  if [ "$cells" != "112" ]; then
+    fail_case "$name" "graded $cells cells, expected 112 — a command or a modifier went missing"; return
   fi
 
   # A name the argument loop cannot set stops the run rather than reading as a
@@ -7314,7 +7839,7 @@ run_help_surface_case() {
   # Written out, not read from the artifact: the point is that a release BUMPED
   # it, and a test that derives the number from the same file it grades can never
   # notice a release that forgot to.
-  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.15.0" ]; then
+  if [ "$(TERM=dumb bash "$SCRIPT" --version 2>/dev/null)" != "conduck-connect 0.16.0" ]; then
     fail_case "$name" "--version did not print the expected public version"; return
   fi
   # The manage surface is public CLI, so --help owes it the same contract as the
@@ -8544,7 +9069,7 @@ run_chat_content_type_is_sanitised_case() {
   rm -rf "$dir"; mkdir -p "$dir"
 
   funcs=$(extract_funcs doctor_chat_request doctor_chat_eval doctor_transfer_reason \
-            ct_is_json safe_display)
+            doctor_turn_heartbeat_start doctor_turn_heartbeat_stop ct_is_json safe_display)
   if ! grep_var "$funcs" -qF 'doctor_chat_request()'; then
     fail_case "$name" "could not extract doctor_chat_request from the release artifact"; return
   fi
@@ -10083,6 +10608,37 @@ while IFS= read -r row; do
 done <<EOF
 $CLI_REJECTION_CASES
 EOF
+
+while IFS= read -r row; do
+  [ -n "$row" ] || continue
+  case "$row" in \#*) continue ;; esac
+  if [ -n "$ONLY" ]; then
+    case " $ONLY " in *" ${row%%|*} "*) ;; *) continue ;; esac
+  fi
+  run_emit_rejection_case "$row"
+done <<EOF
+$EMIT_REJECTION_CASES
+EOF
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" emit-code-mints-the-app-payload "*) true ;; *) false ;; esac; then
+  run_emit_mint_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" emit-code-strips-the-url-query "*) true ;; *) false ;; esac; then
+  run_emit_url_query_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" emit-code-defaults-a-whitespace-name "*) true ;; *) false ;; esac; then
+  run_emit_blank_name_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" emit-code-says-which-secret-it-carries "*) true ;; *) false ;; esac; then
+  run_emit_keyless_case
+fi
+
+if [ -z "$ONLY" ] || case " $ONLY " in *" emit-code-writes-nothing "*) true ;; *) false ;; esac; then
+  run_emit_writes_nothing_case
+fi
 
 if [ -z "$ONLY" ] || case " $ONLY " in *" direct-setup "*) true ;; *) false ;; esac; then
   run_direct_setup_case

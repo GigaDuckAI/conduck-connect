@@ -116,6 +116,290 @@ print(json.dumps(p, separators=(",", ":")))
 PY
 }
 
+# ------------------------------------------------------------- --emit-code --
+#
+# The scriptable minter: the pairing code, built from what it is TOLD, with no
+# terminal, no saved state and no network.
+#
+# Why it exists. Eight independent AI builders, given only the public contract,
+# the build brief and --help, each concluded that producing a `conduck-setup:v1`
+# code was impossible without their operator — and each was right. --setup is the
+# only minter and it ends at a QR a person scans; --show-code re-emits a profile
+# that only a completed --setup writes, which a fresh build rig has never had. So
+# the last step of "build an adapter and prove it works" had no machine-drivable
+# form at all, and every one of them hand-rolled the base64 from PAYLOAD.md. That
+# they all got it right says the format spec is good; that they all had to says
+# this command was missing.
+#
+# What it deliberately does NOT do, and each has a reason:
+#   * it never writes a profile, so nothing about this host changes and a later
+#     --show-code is not quietly taught about a gateway nobody set up here;
+#   * it never sends a request, because a builder mints the code BEFORE the
+#     exposure exists — a minter that verified would be unusable at the one
+#     moment it is wanted, and --check-adapter is the command that verifies;
+#   * it prints no QR. A QR is for a person holding a phone; this output is for a
+#     pipe, and the text form is the same secret in the same v1 wrapping.
+#
+# It reuses build_pairing_payload_json and b64_nowrap rather than assembling
+# anything of its own, so a code from here and a code from --setup are the same
+# bytes for the same inputs, and a change to the payload cannot reach one without
+# reaching the other.
+#
+# The two secrets arrive in the ENVIRONMENT, never on argv, for the reason there
+# is no --token flag anywhere in this CLI: argv is readable by every process on
+# the host through `ps`.
+
+# Grade one free-form display string EXACTLY as the app grades it on import, and
+# hand back the trimmed form the app will actually keep. The app rejects the WHOLE
+# payload — not the offending field — when a name or a model id is over its cap or
+# carries a scalar that can spoof or corrupt rendered text, so a code minted around
+# one of those imports and dies with nothing on screen to explain it. Mirror of the
+# app's PairingPayload.sanitizedDisplayText + isDisplayHostile, including the caps.
+#
+# The trim mirrors Swift's .whitespacesAndNewlines, spelled out rather than left to
+# python's str.strip(): str.strip() ALSO eats the C0 file/group/record separators,
+# which the app does not trim and then refuses — so borrowing it would accept a name
+# the app rejects, the exact failure this function exists to stop.
+#
+# Echoes "<verdict> <detail>": "ok <trimmed-text>", "long <scalar-count>" or
+# "hostile U+XXXX". Echoes NOTHING when python3 is missing, and the caller then
+# leaves the value exactly as typed — this runs at validate_cli time, before the
+# runtime preflight, so a missing interpreter must never turn into an exit-2 command
+# misuse (the same rule doctor_accept_url keeps by staying pure Bash). run_emit_code
+# names the missing python3 as an exit-1 runtime failure moments later.
+emit_display_text_grade() { # emit_display_text_grade <text> <max-scalars>
+  EMIT_DT_TEXT="$1" EMIT_DT_MAX="$2" python3 - <<'PY' 2>/dev/null
+import os, sys
+text = os.environ["EMIT_DT_TEXT"]
+cap = int(os.environ["EMIT_DT_MAX"])
+# Swift's CharacterSet.whitespacesAndNewlines: TAB, the newline family (LF VT FF CR,
+# NEL, LINE/PARAGRAPH SEPARATOR) and general category Zs.
+ws = "".join(chr(c) for c in
+             (0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680,
+              0x2028, 0x2029, 0x202F, 0x205F, 0x3000)) \
+     + "".join(chr(c) for c in range(0x2000, 0x200B))
+text = text.strip(ws)
+# len() over a str counts code points, which is the app's own unit (unicodeScalars).
+if len(text) > cap:
+    sys.stdout.write("long %d" % len(text))
+    raise SystemExit(0)
+for ch in text:
+    o = ord(ch)
+    if (o <= 0x1F or o == 0x7F or 0x80 <= o <= 0x9F          # C0 + DEL + C1
+            or o in (0x200E, 0x200F, 0x2028, 0x2029)         # LRM/RLM, LS/PS
+            or 0x202A <= o <= 0x202E or 0x2066 <= o <= 0x2069):  # bidi embed/override/isolate
+        sys.stdout.write("hostile U+%04X" % o)
+        raise SystemExit(0)
+sys.stdout.write("ok " + text)
+PY
+}
+
+# The two callers of the grader, held in one place so --name and --model cannot
+# drift apart. Refuses rather than truncates or strips, for the reason --name on a
+# builtin kind is refused: a silently altered label is one the operator read in
+# their terminal and will never see in the app. Sets EMIT_GRADED_TEXT to the trimmed
+# value; exits 2 on either refusal.
+emit_grade_display_text() { # emit_grade_display_text <flag> <field-word> <text> <max>
+  local graded verdict detail
+  graded=$(emit_display_text_grade "$3" "$4")
+  # No python3 to grade with — keep the value as typed and let run_emit_code report
+  # the missing interpreter as the runtime failure it is.
+  [ -n "$graded" ] || { EMIT_GRADED_TEXT="$3"; return 0; }
+  verdict="${graded%% *}"; detail="${graded#* }"
+  case "$verdict" in
+    long)
+      usage_die "$1 is $detail characters long. The app refuses a $2 over $4 characters — and it refuses the WHOLE setup code, not just that field. Shorten it." ;;
+    hostile)
+      usage_die "$1 contains $detail, which the app refuses in a $2: scalars like that reorder or break the text they are rendered in. It refuses the WHOLE setup code over one, so use plain text." ;;
+  esac
+  EMIT_GRADED_TEXT="$detail"
+}
+
+# argv-shape validation, at validate_cli time so a wrong invocation exits 2
+# before anything runs. The two SECRETS are checked in run_emit_code instead:
+# a missing environment variable is a runtime condition, and both checks already
+# report that one as exit 1 with the instruction attached.
+emit_code_validate() {
+  local url norm
+  # The app's own caps, named where they are used. Both live in PairingPayload.
+  local name_max=120 model_max=200
+  [ -n "$EMIT_URL" ] || usage_die "--emit-code needs the gateway's address: --url https://your.gateway (try --help)."
+  # The SAME admissibility rule --setup applies at its prompt, applied here as a
+  # function rather than a prompt. It has to be the same one: this command mints
+  # a code the app imports, and a minter that accepted an address the app refuses
+  # would hand somebody a code that fails on their phone with nothing to explain it.
+  url=$(doctor_accept_url "$EMIT_URL") || {
+    # The rejected value may contain a password, so the userinfo case never
+    # echoes it back — the same rule the checks' URL guard follows.
+    url_has_userinfo "$EMIT_URL" && usage_die "$URL_USERINFO_HINT"
+    usage_die "Can't pair '$EMIT_URL' — use https://… (or http:// toward an address only your own network can reach)."
+  }
+  EMIT_URL="$url"
+  # The SAME rewrite every other producer of a gateway URL applies — every one of
+  # them reaches apply_gateway_url_normalization, and this command is the only place
+  # a URL became a payload without passing through it. PAYLOAD.md promises --emit-code
+  # and --setup produce identical bytes for identical inputs, and without this line
+  # they do not: --url https://ai.example.com/v1 would mint a base the app appends
+  # /v1/… to a second time, and a ?key=… query would ride into the code. Fails OPEN on
+  # a python3 hiccup (empty result) for the reason the grader above does — this runs
+  # before the runtime preflight.
+  norm=$(normalize_gateway_base_url "$EMIT_URL")
+  if [ -n "$norm" ] && [ "$norm" != "$EMIT_URL" ]; then
+    # stderr, not `note`: stdout belongs to the code and nothing else. Said out loud
+    # rather than done quietly, because the address in the code is then not the
+    # address on the command line, and the wizard says the same sentence.
+    printf 'Using %s — Conduck adds /v1/… itself, so the base address must not already end in it.\n' "$norm" >&2
+    EMIT_URL="$norm"
+  fi
+
+  case "${EMIT_KIND:=custom}" in
+    openclaw|hermes|custom) ;;
+    *) usage_die "--kind takes openclaw, hermes or custom (given: '$EMIT_KIND')." ;;
+  esac
+  # A name is a CUSTOM gateway's field and only a custom gateway's — PAYLOAD.md
+  # omits it for the two named kinds, and the app knows what to call those two
+  # already. Refusing rather than dropping it: a silently discarded name is a
+  # label somebody expects to see in the app and never will.
+  if [ "$EMIT_KIND" != "custom" ] && [ -n "$EMIT_NAME" ]; then
+    usage_die "--name applies to --kind custom only; the app names an $EMIT_KIND gateway itself."
+  fi
+  # A model is the same story one field over, and the same refusal for the same
+  # reason: the app seeds a model override for a CUSTOM gateway only, so a model on
+  # a builtin kind is read, discarded, and never seen again. Somebody who passed
+  # --model meant the gateway to answer on that model; dropping it silently is how
+  # they find out weeks later, from the wrong model's replies.
+  if [ "$EMIT_KIND" != "custom" ] && [ -n "$EMIT_MODEL" ]; then
+    usage_die "--model applies to --kind custom only; the app ignores a model on an $EMIT_KIND gateway."
+  fi
+  # Both free-form fields are graded against the app's OWN import rules before
+  # anything is minted, and both are stored back TRIMMED, because the app trims them
+  # too — so what this command calls the name is what the app will call it. The trim
+  # has to happen before the default below: --name "   " is not a name the app will
+  # accept, and left untrimmed it would suppress the default and mint a code the app
+  # then refuses whole.
+  if [ -n "$EMIT_NAME" ]; then
+    emit_grade_display_text "--name" "gateway name" "$EMIT_NAME" "$name_max"
+    EMIT_NAME="$EMIT_GRADED_TEXT"
+  fi
+  if [ -n "$EMIT_MODEL" ]; then
+    emit_grade_display_text "--model" "model id" "$EMIT_MODEL" "$model_max"
+    EMIT_MODEL="$EMIT_GRADED_TEXT"
+  fi
+  # The app REJECTS a custom gateway carrying no name, so an empty one here would
+  # mint a code that imports and fails. "My gateway" is not invented for this
+  # command — it is the default the wizard's own name prompt offers, so pressing
+  # Enter there and omitting --name here produce the same code.
+  [ "$EMIT_KIND" = "custom" ] && [ -z "$EMIT_NAME" ] && EMIT_NAME="My gateway"
+
+  case "${EMIT_TRANSPORT:=public}" in
+    tailscale|funnel|cloudflare|public) ;;
+    *) usage_die "--transport takes tailscale, funnel, cloudflare or public (given: '$EMIT_TRANSPORT')." ;;
+  esac
+
+  if [ -n "$EMIT_FILES_URL" ]; then
+    url=$(doctor_accept_url "$EMIT_FILES_URL") || {
+      url_has_userinfo "$EMIT_FILES_URL" && usage_die "$URL_USERINFO_HINT"
+      usage_die "Can't use '$EMIT_FILES_URL' as the file server — use https://… (or http:// toward an address only your own network can reach)."
+    }
+    EMIT_FILES_URL="$url"
+  fi
+  return 0
+}
+
+# Mint it. Exit 1 for anything that is not an argv-shape problem, which by here
+# means one of the two secrets.
+run_emit_code() {
+  # python3 builds the payload and base64 wraps it. Named individually rather
+  # than through preflight, which would additionally demand curl and openssl:
+  # this command sends no request and mints no credential, and refusing to print
+  # a code on a box that lacks the tools for setting one up would be the same
+  # dead end --forget's own narrower check exists to avoid.
+  need python3 || die "--emit-code builds the pairing payload with python3, and this host doesn't have it."
+  need base64  || die "--emit-code needs base64 to wrap the payload, and this host doesn't have it."
+
+  # Fail CLOSED on a merely-absent key. An unset CONDUCK_TOKEN is silence, and
+  # reading silence as "this gateway has no key" mints a code that pairs the app
+  # to an authenticated gateway with no credential — it fails later, in the app,
+  # with nothing on screen to say why. Keyless has to be SAID: --keyless, or the
+  # set-but-empty CONDUCK_TOKEN that already means exactly this everywhere else
+  # in this tool.
+  local token="" auth="none"
+  if [ "${CONDUCK_TOKEN+set}" = "set" ]; then
+    token="$CONDUCK_TOKEN"
+    if [ -n "$token" ]; then
+      $EMIT_KEYLESS && usage_die "--keyless says this gateway has no key, but CONDUCK_TOKEN holds one. Drop the flag, or unset the variable."
+      # The same gate every other consumer of this variable applies before using it.
+      # A control character in a key is never deliberate — it is a newline or a tab
+      # picked up by however the key was copied — and minting one produces a code
+      # that carries a token the gateway will never recognise. The value is never
+      # echoed back: it is the key.
+      credential_value_safe "$token" || die "CONDUCK_TOKEN contains a control character, so it cannot go into a setup code. That is almost always a stray newline or tab from copying it — re-copy the key and try again."
+      auth="bearer"
+    fi
+  elif ! $EMIT_KEYLESS; then
+    die "No key to put in the code. Set CONDUCK_TOKEN=<key> (never pass it on the command line — argv is world-readable via ps). For a gateway that genuinely has none, say so with --keyless."
+  fi
+
+  local files_cred=""
+  if [ -n "$EMIT_FILES_URL" ]; then
+    [ "${CONDUCK_FILES_PASS+set}" = "set" ] && files_cred="$CONDUCK_FILES_PASS"
+    [ -n "$files_cred" ] || die "--files-url names a file server, so its password has to ride the code too: set CONDUCK_FILES_PASS=<password>. Leave both out for a gateway with no file lane."
+    credential_value_safe "$files_cred" || die "CONDUCK_FILES_PASS contains a control character, so it cannot go into a setup code. That is almost always a stray newline or tab from copying it — re-copy the password and try again."
+    # The payload has NO username field: the app always signs in to the file server
+    # as `conduck`. A build rig that graded its lane with CONDUCK_FILES_USER=webdav
+    # and then mints from the same environment would otherwise get a code whose lane
+    # 401s on the phone, with the variable that caused it still exported two commands
+    # up and nothing anywhere saying it was ignored.
+    if [ -n "${CONDUCK_FILES_USER:-}" ] && [ "$CONDUCK_FILES_USER" != "conduck" ]; then
+      die "CONDUCK_FILES_USER is '$CONDUCK_FILES_USER', but a setup code carries no username — the app always signs in to the file server as 'conduck'. Give the file server a 'conduck' account, or unset the variable before minting."
+    fi
+  elif [ -n "${CONDUCK_FILES_PASS:-}" ]; then
+    # The other half of "both or neither". A password with no address cannot go
+    # into the code at all, and dropping it silently is how somebody ships a
+    # gateway they believe carries a file lane and it does not.
+    die "CONDUCK_FILES_PASS is set but no file server was named. Add --files-url <address>, or unset the password."
+  fi
+
+  # The payload builder reads globals, so this is where argv becomes the same
+  # variables the wizard fills in — one assignment block, immediately above the
+  # call, so nothing between them can be reading a stale value.
+  GW_KIND="$EMIT_KIND"
+  GW_NAME="$EMIT_NAME"
+  GW_URL="$EMIT_URL"
+  GW_AUTH="$auth"
+  GW_TOKEN="$token"
+  GW_MODEL="$EMIT_MODEL"
+  FS_URL="$EMIT_FILES_URL"
+  FS_CRED="$files_cred"
+  TRANSPORT="$EMIT_TRANSPORT"
+
+  local payload encoded
+  payload=$(build_pairing_payload_json) || die "Could not build the pairing payload (python3 failed)."
+  [ -n "$payload" ] || die "Could not build the pairing payload."
+  encoded=$(printf '%s' "$payload" | b64_nowrap) || die "Could not base64-encode the pairing payload."
+  [ -n "$encoded" ] || die "Could not base64-encode the pairing payload."
+
+  # STDERR, and one line. Every other path that prints a code says out loud what it
+  # carries, and a scripted caller is not a reason to stop saying it — the code is
+  # going into a file or a log somewhere. stdout stays exactly the code and nothing
+  # else, so `$(…)` around this command captures a usable string.
+  #
+  # Composed from what this code ACTUALLY carries, because the two secrets are
+  # independent and a --keyless gateway with no file lane carries neither. A fixed
+  # "this carries the gateway key" over a keyless code is a false warning, and a
+  # false warning is how a true one stops being read.
+  if [ -n "$token" ]; then
+    printf 'This code carries the gateway key%s — treat every copy of it like the key itself.\n' \
+      "${files_cred:+ and the file-server password}" >&2
+  elif [ -n "$files_cred" ]; then
+    printf 'This code carries the file-server password — treat every copy of it like that password.\n' >&2
+  else
+    printf 'This code names a keyless gateway and carries no secret — but it still names your gateway.\n' >&2
+  fi
+  printf 'conduck-setup:v%s:%s\n' "$PAYLOAD_VERSION" "$encoded"
+  return 0
+}
+
 # What this code actually carries, in one place, immediately before it is shown.
 # EVERY route that drops the file lane converges here — a confirmed skip at the
 # address prompt, a live probe that failed, an agent gate that could not be

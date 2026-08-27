@@ -1,7 +1,7 @@
 # ------------------------------------------------------------- check-adapter --
 #
 # --check-adapter: a black-box check of an adapter built for Conduck against the
-# rules at conduck.com/setup/adapter/v1/ (contract revision 1.9). Built for
+# rules at conduck.com/setup/adapter/v1/ (contract revision 1.10). Built for
 # people whose adapter was written for Conduck — by hand or by an AI coding
 # tool — around Claude Code, an agent framework, anything. It sends real
 # requests and grades the answers strictly; it never touches configs, saved
@@ -31,6 +31,11 @@
 # has confirmed that requirement — by re-sending its identical request with the
 # first advertised id — the later probes carry that id and grade their OWN rule,
 # and the missing-model failure is reported once, where it belongs.
+# CHAT_FRAMING then reads what CHAT_BASIC's reply SAID rather than how it was
+# shaped: every other chat check grades the envelope, so an adapter whose prompt
+# framing swallows the user's turn answers something fluent and unrelated and
+# passes all of them. It spends no turn of its own — it reads the answer already
+# on hand.
 # --deep adds the semantic image probe: a locally generated PNG showing 6
 # random digits (never named in the prompt or metadata) rides the newest
 # message — a reply carrying those digits proves the engine truly SAW the
@@ -54,9 +59,9 @@
 #
 # Output contract: every check verdict line carries a stable [CHECK_ID], and
 # the LAST line on every exit — pass, fail, or an early die — is the machine
-# summary, schema=3 (fixed field order, ASCII enums, no ANSI):
-#   CONDUCK_CHECK_ADAPTER schema=3 contract=v1 revision=1.9 harness=<ver>
-#     profile=<basic|deep> core=<PASS|FAIL|NOT_RUN>
+# summary, schema=4 (fixed field order, ASCII enums, no ANSI):
+#   CONDUCK_CHECK_ADAPTER schema=4 contract=v1 revision=1.10 harness=<ver>
+#     profile=<basic|deep|basic+files|deep+files> core=<PASS|FAIL|NOT_RUN>
 #     history_image=<PASS|FAIL|NOT_RUN> stream=<PASS|FAIL|NOT_RUN>
 #     image_input=<VERIFIED|DECLINED|UNVERIFIED|FAIL|NOT_RUN>
 #     file_transport=<…> file_access=<…> file_e2e=<…>
@@ -86,7 +91,7 @@
 
 DOCTOR_CHECKS=0
 DOCTOR_FAILS=0
-DOCTOR_CONTRACT_REV="1.9"
+DOCTOR_CONTRACT_REV="1.10"
 # Machine-summary state. "Core" = every check except the deep image probe:
 # IMAGE_INPUT failing still exits 1, but must never flip core=FAIL — it grades
 # an optional capability's honesty, not the core wire contract.
@@ -183,6 +188,43 @@ check_setup_next_step() {
   say "      ${BOLD}bash conduck-connect.sh --setup${RESET}"
 }
 
+# Is the address being graded this machine's own loopback? Read only by the
+# failure explanations, which have to know whether anything can be sitting
+# BETWEEN the probe and the adapter: a 502 from a public address is usually the
+# HTTPS front reporting on a process behind it, and the same status from
+# 127.0.0.1 is the adapter's own answer, with no front anywhere in the picture.
+# The authority is cut the same way doctor_accept_url cuts it, so a path or a
+# query cannot smuggle a different host past the classifier.
+doctor_target_is_loopback() {
+  local rest hostport
+  case "$GW_URL" in
+    [Hh][Tt][Tt][Pp]://?*|[Hh][Tt][Tt][Pp][Ss]://?*) rest="${GW_URL#*://}" ;;
+    *) return 1 ;;
+  esac
+  hostport="${rest%%[/?#]*}"
+  url_is_loopback_host "$hostport"
+}
+
+# The host this run is grading, spelled the way the OPERATOR spelled it — no
+# scheme, no port. "127.0.0.1", "localhost" and "[::1]" are all the same
+# destination, and a verdict that names one back to somebody who typed another
+# reads as a diagnosis of an address they never touched. Falls back to the
+# literal loopback address only when GW_URL has no parsable authority, which is
+# a shape doctor_accept_url refuses before any check runs.
+doctor_target_host() {
+  local rest hostport
+  case "$GW_URL" in
+    [Hh][Tt][Tt][Pp]://?*|[Hh][Tt][Tt][Pp][Ss]://?*) rest="${GW_URL#*://}" ;;
+    *) printf '127.0.0.1'; return 0 ;;
+  esac
+  hostport="${rest%%[/?#]*}"; hostport="${hostport#*@}"
+  case "$hostport" in
+    "")      printf '127.0.0.1' ;;
+    \[*\]*)  printf '%s]' "${hostport%%\]*}" ;;   # bracketed IPv6 literal, port dropped
+    *)       printf '%s' "${hostport%%:*}" ;;
+  esac
+}
+
 d_core_mark() { # d_core_mark <check-id> <pass|fail> — feed the core= rollup
   # IMAGE_INPUT grades an optional capability's honesty; FILES_*/FILE_* grade
   # the optional file profile. None of them may flip core= (they still count
@@ -258,7 +300,16 @@ doctor_accept_url() { # doctor_accept_url <candidate>
   # credential must never ride a routing field.
   url_has_userinfo "$reply" && return 1
   case "$reply" in
-    [Hh][Tt][Tt][Pp][Ss]://?*) printf 'https://%s' "${reply#*://}"; return 0 ;;
+    [Hh][Tt][Tt][Pp][Ss]://?*)
+      # The authority is cut and required non-empty here for the same reason the
+      # http arm below cuts it: the prefix glob only proves SOMETHING follows
+      # "://", and "https:///v2" satisfies it with NO host at all. curl cannot
+      # resolve such a URL, and accepting it would echo it to the terminal, save
+      # it into the profile and pair it into the app as a dead address.
+      rest="${reply#*://}"
+      hostport="${rest%%[/?#]*}"
+      [ -n "$hostport" ] || return 1
+      printf 'https://%s' "$rest"; return 0 ;;
     [Hh][Tt][Tt][Pp]://?*) rest="${reply#*://}" ;; # maybe-local
     *) return 1 ;;
   esac
@@ -753,14 +804,120 @@ DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
 # invisible to it, and would pass a check it should fail. Whoever changes it restores
 # it in the next line — a leaked value silently re-grades every later check.
 DCC_ACCEPT="application/json"
+
+# The one-word instruction CHAT_BASIC sends, held in a variable rather than
+# retyped at the call site. CHAT_FRAMING has to subtract this exact string from
+# the reply before it looks for the answer, so the two must be the SAME text by
+# construction: a probe whose prompt drifted from what the grader strips would
+# hand an echoing adapter its pass back.
+DOCTOR_PING_PROMPT="Reply with exactly: pong"
+
+# How often a turn in flight says it is still alive, in seconds.
+DOCTOR_HEARTBEAT_SECONDS=30
+# How long the ticker outlives the turn cap before ending itself, in seconds.
+# It exists so the two deadlines cannot coincide: a ticker whose self-exit landed
+# ON the cap would routinely be reaped in the milliseconds between curl returning
+# and stop() firing, and the pid stop() then signals is either gone or — once the
+# shell has reaped it — somebody else's. Past the cap it prints nothing; it is
+# only staying alive to be killed by its owner. The wake-up granularity is
+# DOCTOR_HEARTBEAT_SECONDS, so the real extra life is one sleep interval.
+DOCTOR_HEARTBEAT_GRACE=15
+# The ticking subshell's pid while one turn is in flight; empty otherwise.
+DCC_HEARTBEAT_PID=""
+
+# Liveness while a real engine turn is in flight.
+#
+# Every turn here waits up to five minutes, and a --deep run makes five of them,
+# so a legitimate worst case is close to twenty-five minutes; --files adds an
+# agent turn on top. Redirected to a file, such a run emits NOTHING between the
+# probe leaving and the answer arriving, and from outside there is no way to tell
+# a slow agent from a wedged one. That ambiguity has a measured cost: a campaign
+# builder killed a perfectly healthy run at 41 minutes.
+#
+# A separate ticking subshell, rather than a rewritten transfer, and that choice
+# is deliberate. The curl call stays the synchronous foreground call it has always
+# been: backgrounding it would re-plumb the one function every chat probe in the
+# whole script depends on, and its exit status, its body capture and its signal
+# behaviour are all load-bearing. This only prints.
+#
+# STDERR ONLY, and that is a hard rule rather than a preference. Stdout carries
+# the verdict transcript and, as its final line, the machine summary — a consumer
+# doing `tail -1` must never find a heartbeat there. Nothing in this function
+# writes to stdout, and it goes through printf rather than say() for exactly that
+# reason: say() prints to stdout by design.
+doctor_turn_heartbeat_start() { # doctor_turn_heartbeat_start <max-seconds> <what>
+  [ -z "$DCC_HEARTBEAT_PID" ] || return 0
+  case "$DOCTOR_HEARTBEAT_SECONDS" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$DOCTOR_HEARTBEAT_SECONDS" -gt 0 ] || return 0
+  # No `local` inside the subshell: it is only legal in a function body, and
+  # bash 3.2 is the oldest shell this has to run on. A subshell's assignments
+  # cannot leak anyway, which is the property `local` would have bought.
+  # The subshell inherits this function's positional parameters, so $1 is still
+  # the deadline and $2 still the description.
+  (
+    dhb_elapsed=0
+    dhb_end=$(( $1 + DOCTOR_HEARTBEAT_GRACE ))
+    while :; do
+      sleep "$DOCTOR_HEARTBEAT_SECONDS" || exit 0
+      dhb_elapsed=$((dhb_elapsed + DOCTOR_HEARTBEAT_SECONDS))
+      # Two deadlines, deliberately not the same one. PRINTING stops at the turn
+      # cap: by then curl's own --max-time is about to end the transfer, and a
+      # heartbeat claiming the run is still waiting would outlive the thing it
+      # describes. LIVING goes on a little past it, so that stop() — which fires
+      # the instant curl returns — normally signals a process that still exists
+      # rather than a pid the shell has already reaped and something else may
+      # since have been given.
+      [ "$dhb_elapsed" -lt "$dhb_end" ] || exit 0
+      [ "$dhb_elapsed" -lt "$1" ] || continue
+      printf '    … still waiting on %s (%ss elapsed; up to %ss for this turn)\n' \
+        "$2" "$dhb_elapsed" "$1" >&2
+    done
+  ) &
+  DCC_HEARTBEAT_PID=$!
+}
+
+# Stops the ticker and reaps it. Safe to call when none is running, and called on
+# EVERY exit path of a turn — including the failure one — and from every EXIT
+# trap, because a ticker left behind keeps printing into a transcript whose run
+# has already moved on.
+#
+# ACCEPTED LEAK, stated rather than hidden: this signals the subshell, and the
+# subshell's current `sleep` is a separate process that outlives it by up to
+# DOCTOR_HEARTBEAT_SECONDS. That orphan is harmless — a bare `sleep` holds
+# nothing, prints nothing, and cannot outlive one interval. Killing it too was
+# tried and reverted: `pkill -P` reaches it, but the subshell is still alive to
+# notice its foreground child die and writes bash's own "Terminated: 15  sleep"
+# line to STDERR, straight into the check transcript this function exists to
+# keep clean. Suppressing that depends on which signal bash decides not to
+# report, which is not a thing to hang a transcript guarantee on.
+#
+# The kill is guarded because an unguarded one writes "no such process" into the
+# same transcript when the ticker has already ended itself. That is rare by
+# construction — DOCTOR_HEARTBEAT_GRACE exists so the ticker outlives the turn
+# cap — but a turn that took longer than cap+grace, or a stop() called twice,
+# reaches it.
+doctor_turn_heartbeat_stop() {
+  [ -n "$DCC_HEARTBEAT_PID" ] || return 0
+  if kill -0 "$DCC_HEARTBEAT_PID" 2>/dev/null; then
+    kill "$DCC_HEARTBEAT_PID" 2>/dev/null || true
+  fi
+  { wait "$DCC_HEARTBEAT_PID"; } 2>/dev/null || true
+  DCC_HEARTBEAT_PID=""
+  return 0
+}
+
 doctor_chat_request() { # doctor_chat_request <payload-json> [max-seconds] -> 0 iff transfer completed
   local out tail_ max_time="${2:-300}"
   DCC_CODE=""; DCC_CT=""; DCC_TIME=""; DCC_BODY=""; DCC_CURL_RC=0
+  doctor_turn_heartbeat_start "$max_time" "the engine turn"
   # `out=$(…) || { rc=$?; }` on purpose: inside `if ! out=$(…); then` the `$?`
-  # is the NEGATED status (0), and the real code would be lost.
+  # is the NEGATED status (0), and the real code would be lost. The heartbeat is
+  # stopped AFTER that capture, for the same reason — the stop would overwrite $?.
   out=$(curl_gw -w '\n%{http_code} %{time_total} %{content_type}' "$GW_URL/v1/chat/completions" \
         --max-time "$max_time" -H "Accept: $DCC_ACCEPT" \
-        -H "Content-Type: application/json" -d "$1" 2>/dev/null) || { DCC_CURL_RC=$?; return 1; }
+        -H "Content-Type: application/json" -d "$1" 2>/dev/null) \
+    || { DCC_CURL_RC=$?; doctor_turn_heartbeat_stop; return 1; }
+  doctor_turn_heartbeat_stop
   tail_="${out##*$'\n'}"; DCC_BODY="${out%$'\n'*}"
   DCC_CODE="${tail_%% *}"; tail_="${tail_#* }"
   DCC_TIME="${tail_%% *}"
@@ -1107,6 +1264,23 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
       # as "you rejected the historical image", which is a wild-goose chase.
       case "$DCC_CODE" in
         502|503)
+          if doctor_target_is_loopback; then
+            # A loopback URL proves the request never left this machine, so the
+            # adapter almost certainly answered this itself — and the contract
+            # SPENDS 502 on exactly that: upstream_failure, the status an adapter
+            # returns when its engine crashed or came back with nothing usable.
+            # Sending this reader to a reverse proxy would send them to a program
+            # that is not running on this machine. Stated as what the URL PROVES
+            # rather than as a fact about their host: a proxy can be put on
+            # loopback, and only the operator knows whether they did.
+            d_say "$id" "(I am talking straight to $(doctor_target_host), so unless you have put a proxy on"
+            d_say "$id" " loopback yourself, this $DCC_CODE is your ADAPTER answering."
+            d_say "$id" " That is the contract's own upstream_failure path: the adapter is up and took the"
+            d_say "$id" " request, and its ENGINE crashed, exited, or came back with nothing it could turn"
+            d_say "$id" " into an answer. Its log holds the real story — read the entry for this request"
+            d_say "$id" " rather than the HTTP status, which is only the part that reached me.)"
+            return 1
+          fi
           d_say "$id" "(a $DCC_CODE is the HTTPS front talking, not your adapter: the front is up but got"
           d_say "$id" " nothing usable out of the adapter behind it. Most often that process is gone —"
           d_say "$id" " backgrounded with no supervisor, or crashed on this turn — or it is bound to a"
@@ -1114,6 +1288,18 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
           d_say "$id" " the same. Check it is running and supervised, then re-run me.)"
           return 1 ;;
         504)
+          # Same correction as the 502/503 arm, for the same reason: on loopback
+          # there is normally no proxy timeout to raise, and the contract spends
+          # 504 on the adapter's OWN ~285-second deadline.
+          if doctor_target_is_loopback; then
+            d_say "$id" "(I am talking straight to $(doctor_target_host), so unless you have put a proxy on"
+            d_say "$id" " loopback yourself, this 504 is your ADAPTER answering —"
+            d_say "$id" " the contract's upstream_timeout, which is the adapter cancelling a turn that hit"
+            d_say "$id" " its own internal deadline. Unless you put one there, there is no proxy timeout to"
+            d_say "$id" " raise here: either the engine genuinely runs longer than that, or it is wedged"
+            d_say "$id" " on this request.)"
+            return 1
+          fi
           d_say "$id" "(a 504 is the HTTPS front giving up on your adapter. Either the turn outruns the"
           d_say "$id" " front's proxy timeout — agent turns are slow, raise it — or the adapter is wedged"
           d_say "$id" " on this request and its own log will say so.)"
@@ -1166,6 +1352,130 @@ doctor_chat_check() { # doctor_chat_check <check-id> <label> <payload-json> <kin
     notstring) d_say "$id" "(in the RESPONSE, content must be a non-empty STRING — null or parts-form content is refused)" ;;
     ct)        d_say "$id" "(answer with Content-Type: application/json — parameters like charset are fine)" ;;
   esac
+  return 1
+}
+
+# Reads choices[0].message.content and reduces it to the one word CHAT_FRAMING
+# needs. Echoes exactly one of:
+#
+#   answered — "pong" survives OUTSIDE every copy of the probe's own prompt
+#   echo     — the trimmed content IS the sent prompt, byte for byte: a pure
+#              echo, which the check exempts (see doctor_framing_check)
+#   silent   — no "pong" is left once the prompt text is subtracted
+#   -        — nothing gradeable here (body will not parse, or content is not a
+#              string). That is not a "no": those are CHAT_BASIC's rules and it
+#              has already graded them, so the caller declines to grade rather
+#              than inventing a second failure for one fault.
+#
+# Subtracting the prompt is what closes the echo hole. The instruction contains
+# the word it asks for, so a plain substring search over the whole content marks
+# any adapter that returns the request — or a rendered transcript of it — as
+# having answered. Every case-blind occurrence of the FULL prompt string is cut
+# out first, and only what remains is searched.
+doctor_framing_read() { # doctor_framing_read <body-json> <sent-prompt>
+  printf '%s' "$1" | CONDUCK_CHECK_PROMPT="$2" python3 -c 'import json, os, sys
+try:
+    d = json.load(sys.stdin)
+    c = d["choices"][0]["message"]["content"]
+except Exception:
+    print("-"); sys.exit(0)
+if not isinstance(c, str):
+    print("-"); sys.exit(0)
+sent = os.environ["CONDUCK_CHECK_PROMPT"]
+if c.strip() == sent.strip():
+    print("echo"); sys.exit(0)
+low_c, low_s = c.lower(), sent.lower()
+if low_s:
+    kept, i = [], 0
+    while True:
+        j = low_c.find(low_s, i)
+        if j < 0:
+            kept.append(c[i:]); break
+        kept.append(c[i:j]); i = j + len(low_s)
+    rest = "".join(kept)
+else:
+    rest = c
+print("answered" if "pong" in rest.lower() else "silent")' 2>/dev/null
+}
+
+# Does the instruction survive this adapter's own prompt framing?
+#
+# CHAT_BASIC asks for the literal word "pong" and grades the ENVELOPE — strict
+# JSON, exactly one choice, a non-empty string. Nothing in that reads what the
+# words SAY, so an adapter that buries the user's turn under a persona, a system
+# prompt or a tool preamble passes every scripted gate with a fluent answer to a
+# question nobody asked. The build brief already calls that a defect; until now
+# the only thing enforcing it was the wizard's interactive verify step, which a
+# CI=1 run — every AI builder's run — never reaches. This is that rule, scripted.
+#
+# CONTAINS, case-blind, and deliberately not equality: "Pong." and "PONG" are an
+# engine doing as it was told, and holding a language model to an exact byte
+# string would fail conformant adapters over their engine's punctuation. What
+# fails is a reply with no "pong" anywhere — the instruction did not reach the
+# engine intact, or something else answered in its place.
+#
+# Two rules keep that search honest, and both are load-bearing:
+#
+#   1. The prompt is SUBTRACTED FIRST. "Reply with exactly: pong" contains the
+#      word it asks for, so a bare substring search over the whole content hands
+#      a pass to any adapter that returns the request instead of an answer —
+#      including one that replies with a rendered transcript of the conversation
+#      so far. Every case-blind occurrence of the full prompt is cut out, and
+#      only the remainder is searched.
+#   2. A reply that is EXACTLY the prompt, trimmed, PASSES anyway. That shape is
+#      not an accident: the adapter build brief has builders stand a development
+#      echo engine up first — one that deterministically returns the newest user
+#      message — and promises the ordinary profile can reach exit 0 against it.
+#      A pure echo is a stub answering as designed, and failing it would break
+#      the one workflow the brief tells every builder to start from. The carve-out
+#      is exact on purpose: the prompt buried inside a longer reply is a
+#      transcript being echoed at a person, and that stays red.
+#
+# So this is a HEURISTIC about one word, not a reading of the answer, and the
+# transcript says so. What it can see: the instruction's own word surviving
+# somewhere other than in a copy of the instruction. What it cannot see: whether
+# the reply makes sense, whether a persona rewrote everything around that word,
+# or whether an engine that happens to say "pong" while ignoring the turn slipped
+# through. Passing it is a floor, not a certificate.
+#
+# It grades the reply CHAT_BASIC ALREADY GOT. Sending a second turn would spend
+# another real engine turn — up to five more minutes on a slow agent — to ask the
+# identical question, so the call site runs this immediately after CHAT_BASIC,
+# before any later probe overwrites DCC_BODY.
+#
+# Not graded at all unless CHAT_BASIC came back with a reply worth reading: with
+# no gradeable reply there is nothing to read, and a framing verdict conjured out
+# of a transport failure is the same defect as any other invented cause.
+doctor_framing_check() { # doctor_framing_check <CHAT_BASIC capability meter>
+  local id="CHAT_FRAMING" verdict
+  [ "$1" = "PASS" ] || return 0
+  verdict=$(doctor_framing_read "$DCC_BODY" "$DOCTOR_PING_PROMPT")
+  case "$verdict" in
+    answered)
+      d_ok "$id" "framing — the word the turn asked for came back outside any copy of the turn itself"
+      return 0 ;;
+    echo)
+      d_ok "$id" "framing — the reply is the turn echoed back exactly (an echo engine answering as designed)"
+      d_say "$id" "(this passes deliberately: an adapter wired to a development echo engine returns the"
+      d_say "$id" " newest user message verbatim, which is the first thing the build brief has you stand"
+      d_say "$id" " up. Nothing here has read a real engine's answer yet, so re-run me once yours is"
+      d_say "$id" " behind the adapter — a reply that merely CONTAINS the turn, rather than being it,"
+      d_say "$id" " is a transcript coming back instead of an answer and fails.)"
+      return 0 ;;
+    -)
+      return 0 ;;
+  esac
+  d_bad "$id" "framing — the turn asked for \"pong\" and nothing outside the turn's own words says it (${DCE_LEN:-?} chars)"
+  d_say "$id" "(the envelope above is fine; what the engine ANSWERED is not. Conduck sends the user's"
+  d_say "$id" " words and expects the engine to answer THEM, so whatever your adapter wraps around a"
+  d_say "$id" " turn — a persona, a system prompt, a tool preamble, an agent scaffold — has to leave"
+  d_say "$id" " the instruction intact. I subtract my own prompt before looking, so a reply that quotes"
+  d_say "$id" " the request back — a chat transcript, a 'you asked:' preamble — counts for nothing;"
+  d_say "$id" " only a reply that echoes the turn and NOTHING else is exempt, as an echo stub. Send this"
+  d_say "$id" " turn through your adapter and read the reply: if a request to say one word comes back as"
+  d_say "$id" " something else, every real turn is being reshaped the same way, and the person talking"
+  d_say "$id" " to it has no way to see that. This only ever checked for one word — passing it is a"
+  d_say "$id" " floor, not proof your framing leaves a real instruction intact.)"
   return 1
 }
 
